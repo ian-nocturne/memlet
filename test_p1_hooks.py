@@ -22,9 +22,9 @@ from pathlib import Path
 from unittest import mock
 
 import memory_cli
-from prism_memory import memlet_bridge as mb
-from prism_memory import memlet_hooks as mh
-from prism_memory.memlet_wiki import estimate_tokens
+from memlet import memlet_bridge as mb
+from memlet import memlet_hooks as mh
+from memlet.memlet_wiki import estimate_tokens
 
 HERE = Path(__file__).resolve().parent
 CLI = HERE / "memory_cli.py"
@@ -115,8 +115,8 @@ def _tree(root):
 def _git_env(home):
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t",
                GIT_COMMITTER_EMAIL="t@example.invalid", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
-               HOME=str(home))
-    for k in ("CODEX_THREAD_ID", "PRISM_PARENT_SESSION_ID", "ANTIGRAVITY_AGENT"):
+               HOME=str(home), TMPDIR=str(home.parent), GIT_CEILING_DIRECTORIES=str(home.parent))
+    for k in ("CODEX_THREAD_ID", "MEMLET_PARENT_SESSION_ID", "ANTIGRAVITY_AGENT"):
         env.pop(k, None)
     return env
 
@@ -127,6 +127,11 @@ class _Case(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
         self.home = self.tmp / "home"
         self.home.mkdir()
+        # Contain discovery even when TMPDIR itself is inside a checkout. This
+        # also protects direct in-process installer calls, not only CLI children.
+        isolation = mock.patch.dict(os.environ, _git_env(self.home), clear=True)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         (self.repo / "AGENTS.md").write_text(AGENTS)
@@ -407,7 +412,7 @@ class InstallerTests(_Case):
         for f in HERE.glob("*.py"):
             if not f.name.startswith("test_"):
                 shutil.copy2(str(f), str(code / f.name))
-        shutil.copytree(str(HERE / "prism_memory"), str(code / "prism_memory"),
+        shutil.copytree(str(HERE / "memlet"), str(code / "memlet"),
                         ignore=shutil.ignore_patterns("__pycache__"))
         wrapper_dir = self.tmp / "py dir" / "o'neil"
         wrapper_dir.mkdir(parents=True)
@@ -627,7 +632,7 @@ class RuntimeTests(_Case):
         self.assertEqual(3, pend["counts"]["pendingNodes"])
         self.assertEqual(0, pend["counts"]["approvedNodes"])
         queue = json.loads((self.repo / mb.QUEUE_REL).read_text())
-        from prism_memory.memlet_dream import approval_state
+        from memlet.memlet_dream import approval_state
         self.assertEqual(3, len(queue["nodes"]))
         self.assertFalse(any(approval_state(n, "node") == "approved" for n in queue["nodes"]))
         self.assertFalse((self.repo / mb.PROMOTED_PAGE).exists())
@@ -709,7 +714,7 @@ class RuntimeTests(_Case):
         site.mkdir()
         (site / "sitecustomize.py").write_text(
             "import sys\nsys.path.insert(0, %r)\n"
-            "from prism_memory import memlet_bridge, memlet_wiki\n"
+            "from memlet import memlet_bridge, memlet_wiki\n"
             "def boom(*a, **k):\n    raise RuntimeError('SECRET-TRANSCRIPT-TEXT ' + repr(a))\n"
             "memlet_bridge.changed_check = boom\nmemlet_bridge.learn_from_transcript = boom\n"
             "memlet_wiki.build_handover = boom\n" % str(HERE))
@@ -750,7 +755,7 @@ class RuntimeTests(_Case):
         site.mkdir()
         (site / "sitecustomize.py").write_text(
             "import sys, time\nsys.path.insert(0, %r)\n"
-            "from prism_memory import memlet_bridge\n"
+            "from memlet import memlet_bridge\n"
             "def slow(*a, **k):\n    time.sleep(30)\n"
             "memlet_bridge.changed_check = slow\n" % str(HERE))
         cfg_path = self.repo / ".memlet" / "config.json"
@@ -900,10 +905,18 @@ class GitHookTests(_Case):
         self.assertFalse((self.repo / ".githooks" / "pre-commit").exists())
 
     def test_git_hooks_outside_a_work_tree_are_skipped_with_a_reason(self):
-        plain = self.tmp / "plain"
-        plain.mkdir()
+        # Deliberately nest the plain directory in a real scratch checkout: an
+        # uncontained git search would install hooks into that enclosing repo.
+        boundary = self.repo / "isolated"
+        plain = boundary / "plain"
+        plain.mkdir(parents=True)
         (plain / "AGENTS.md").write_text(AGENTS)
-        r = self.cli("init", ".", "--hooks", "--git-hooks", cwd=plain)
+        before = _tree(self.hooks_dir())
+        modes = {p.name: p.stat().st_mode for p in self.hooks_dir().iterdir()}
+        env = self.env(GIT_CEILING_DIRECTORIES=str(boundary))
+        r = self.cli("init", ".", "--hooks", "--git-hooks", cwd=plain, env=env)
+        self.assertEqual(before, _tree(self.hooks_dir()), "enclosing checkout hooks changed")
+        self.assertEqual(modes, {p.name: p.stat().st_mode for p in self.hooks_dir().iterdir()})
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertEqual("not inside a git work tree", json.loads(r.stdout)["hooks"]["gitHooks"]["skipped"])
 
@@ -1011,7 +1024,7 @@ class ReviewRound1Tests(_Case):
         self.assertEqual(before, _tree(self.repo))
 
     def test_r3_an_exception_inside_init_removes_what_init_created(self):
-        from prism_memory import memlet_wiki as mw
+        from memlet import memlet_wiki as mw
         real = mw.init_project
         before = _tree(self.repo)
 
@@ -1210,7 +1223,7 @@ class ReviewRound1Tests(_Case):
             for _ in range(48):
                 fh.write(b"x\n" * (512 * 1024))
         code = ("import resource, sys\nsys.path.insert(0, %r)\nfrom pathlib import Path\n"
-                "from prism_memory import memlet_hooks as h\n"
+                "from memlet import memlet_hooks as h\n"
                 "before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
                 "h._log(Path(%r), 'stop', 'synthetic')\n"
                 "after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
@@ -1246,7 +1259,7 @@ class ReviewRound1Tests(_Case):
         config_dir = self.tmp / "profile-home"
         config_dir.mkdir()
         (config_dir / "projects").symlink_to(t.parent, target_is_directory=True)
-        env = dict(self.env(), DELTAHARNESS_TRANSCRIPT_DIRS=str(t.parent))
+        env = dict(self.env(), MEMLET_TRANSCRIPT_DIRS=str(t.parent))
         out = self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(config_dir / "projects" / t.name)}, env=env)
         self.assertIn("queued as PENDING", out["systemMessage"])
         pend = mb.learn_pending(self.repo)
@@ -1259,7 +1272,7 @@ class ReviewRound1Tests(_Case):
         config_dir = self.tmp / "profile-home2"
         config_dir.mkdir()
         (config_dir / "projects").symlink_to(t.parent, target_is_directory=True)
-        env = {k: v for k, v in self.env().items() if k not in ("DELTAHARNESS_TRANSCRIPT_DIRS", "PRISM_TRANSCRIPT_DIRS")}
+        env = {k: v for k, v in self.env().items() if k not in ("MEMLET_TRANSCRIPT_DIRS",)}
         env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         out = self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(config_dir / "projects" / t.name)}, env=env)
         self.assertIn("queued as PENDING", out["systemMessage"])
@@ -1269,13 +1282,13 @@ class ReviewRound1Tests(_Case):
         t = self.write_transcript()
         link = t.parent / "alias.jsonl"
         link.symlink_to(t)
-        env = dict(self.env(), DELTAHARNESS_TRANSCRIPT_DIRS=str(t.parent))
+        env = dict(self.env(), MEMLET_TRANSCRIPT_DIRS=str(t.parent))
         self.assertIsNone(self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(link)}, env=env))
         self.assertFalse((self.repo / mb.QUEUE_REL).exists())
         self.assertIn("transcript file is a symbolic link", (self.repo / mh.LOG_REL).read_text())
 
     def test_lock_directory_override_is_used(self):
-        from prism_memory import memlet_dream as md
+        from memlet import memlet_dream as md
         p = md.queue_lock_path(self.repo / "q.json")
         self.assertEqual(Path(os.environ["MEMLET_LOCK_DIR"]).resolve(), p.parent.resolve())
 

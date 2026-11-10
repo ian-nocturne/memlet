@@ -7,7 +7,6 @@ dist/
 build/
 *.egg-info/
 *.sqlite3*
-.prism-memory/
+.memlet-store/
 
 .memlet/
-persona-canon.json

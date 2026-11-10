@@ -10,11 +10,11 @@ import time
 import unittest
 from pathlib import Path
 
-from prism_memory.code_anchors import (
+from memlet.code_anchors import (
     _extract_ts_js_signatures, extract_file_symbol_hashes,
     extract_file_symbol_signatures, normalized_symbol_ast_hash,
 )
-from prism_memory.memlet_wiki import (
+from memlet.memlet_wiki import (
     CONFIG_PATH, INDEX_PATH, _config_pins, _verify_rules, build_handover,
     classify_anchor, handover_signature, import_rules, init_project,
     verify_handover_checksum, verify_handover_markdown, repin_legacy_ts_anchors, wiki_status,
@@ -522,7 +522,7 @@ class AnchorRegressionTests(unittest.TestCase):
         self.assertEqual('active', result['anchors'][0]['status'])
 
     def legacy_python_pages(self):
-        from prism_memory import memlet_wiki as wiki
+        from memlet import memlet_wiki as wiki
         self.python_repo()
         old = extract_file_symbol_hashes(self.root / 'mod.py', legacy=True)['f']
         self.write(CONFIG_PATH, json.dumps({'pinnedAnchors': {'mod.py::f': {'astHash': old}}}))

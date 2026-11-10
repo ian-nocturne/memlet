@@ -2,8 +2,7 @@
 
 **Agent memory you can re-check.** Memlet ties each rule in `CLAUDE.md`, `AGENTS.md` or `.cursorrules` to the code it talks about and tells the agent when the two have drifted apart. It also turns finished sessions into lessons, each pinned to the lines it came from, that wait for your approval before any agent sees them.
 
-> Twin to **Routlet** under Ian · Nocturne Lab: *Routlet picks the route. Memlet carries the checked context.*
-> Formerly **DeltaHarness** / **Ieum Memory** / PRISM Memory. The legacy executables `ieum-memory`, `deltaharness`, and `prism-memory` still work for this release and print a one-line notice when run in a terminal.
+> Twin to **Routlet** as a sibling project: *Routlet picks the route. Memlet carries the checked context.*
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](pyproject.toml)
@@ -135,7 +134,7 @@ Everything else lives under `memlet admin <command>`; run `memlet admin --help` 
 ### 1. Install & Initialize (Zero External Dependencies Required)
 
 ```bash
-pip install git+https://github.com/ian-nocturne/deltaharness.git@v8.5.0
+pip install git+https://github.com/ian-nocturne/deltaharness.git@v9.0.0
 
 # One-command, zero-daemon setup: .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 memlet init .
@@ -176,7 +175,7 @@ memlet check . --format sarif > memlet-check.sarif
 memlet check --changed
 
 # Accept one anchor's new state after you have re-read its rule (instead of re-pinning everything)
-memlet check --accept "prism_memory/audit.py::audit_repository"
+memlet check --accept "memlet/audit.py::audit_repository"
 ```
 
 ### 3. Recall What Applies to a Task (`memlet recall`)
@@ -255,11 +254,11 @@ Hooks are strictly opt-in and are merged into your existing Claude Code settings
 
 A hook never blocks a session: on any error it prints nothing and exits 0. Beyond synthetic event payloads, the hooks were exercised in a headless Claude Code 2.1 session (`claude -p`) on macOS: the rules arrived at session start, the model was told about a stale rule right after its edit, and the session's lessons were queued as pending when it ended. Interactive sessions, other versions and other platforms were not tried.
 
-For hosts without lifecycle hooks (Codex, Cursor, any MCP client), register the `memlet-mcp` server (in Codex: a `[mcp_servers.memlet]` entry with `command = "memlet-mcp"` in the Codex config file). It exposes four tools next to the existing `prism_memory_*` tools: `memlet_check`, `memlet_recall`, `memlet_handover` (never writes a file), and `memlet_learn` (queue a transcript, list pending). Approving or rejecting a lesson is deliberately not available over MCP; it is a human decision made with `memlet learn --approve`. `memlet_learn` works only in a repository where `memlet init` has run, and reads a transcript only if it is a regular `.log`/`.jsonl` file of at most 8 MiB inside the repository or under a known agent transcript folder (`~/.claude/projects`, `$CLAUDE_CONFIG_DIR/projects`, `~/.codex/sessions`, `~/.muse/sessions`, `~/.prism-memory/sessions`). The transcript file itself may not be a symbolic link; a symlinked folder on the way is accepted only when the real file is inside one of those folders. The hooks apply the same symlink rule. The three read-only tools are annotated as read-only, so a host that asks for approval per tool call (Codex does) can run them without a prompt. The four tools were called from a real `codex exec` session on macOS; other MCP hosts were not tried.
+For hosts without lifecycle hooks (Codex, Cursor, any MCP client), register the `memlet-mcp` server (in Codex: a `[mcp_servers.memlet]` entry with `command = "memlet-mcp"` in the Codex config file). It exposes four tools next to the 19 `memlet_store_*` task-memory tools: `memlet_check`, `memlet_recall`, `memlet_handover` (never writes a file), and `memlet_learn` (queue a transcript, list pending). Approving or rejecting a lesson is deliberately not available over MCP; it is a human decision made with `memlet learn --approve`. `memlet_learn` works only in a repository where `memlet init` has run, and reads a transcript only if it is a regular `.log`/`.jsonl` file of at most 8 MiB inside the repository or under a known agent transcript folder (`~/.claude/projects`, `$CLAUDE_CONFIG_DIR/projects`, `~/.codex/sessions`, `~/.muse/sessions`). The transcript file itself may not be a symbolic link; a symlinked folder on the way is accepted only when the real file is inside one of those folders. The hooks apply the same symlink rule. The three read-only tools are annotated as read-only, so a host that asks for approval per tool call (Codex does) can run them without a prompt. The four tools were called from a real `codex exec` session on macOS; other MCP hosts were not tried.
 
 ### 7. Inspect Anchors, Lessons and the Handover in One Page (`memlet ui`)
 
-The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present; items nobody approved, or whose citation no longer verifies, are shown as pending, never as supported), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out. A repository without any `path::symbol` rule shows its real, empty state and one hint on how to write such a rule.
+The **Memlet Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present; items nobody approved, or whose citation no longer verifies, are shown as pending, never as supported). Every repository string is HTML-escaped and absolute host paths are left out. A repository without any `path::symbol` rule shows its real, empty state and one hint on how to write such a rule.
 
 ```bash
 memlet ui .                                   # writes .memlet/inspector.html after `memlet init` (alias: memlet inspector .)
@@ -293,9 +292,7 @@ memlet admin dream-recall --graph "$QUEUE" --query git hooks --max-tokens 1500 -
 
 - `import` and `wiki`: bring existing rule files into `.memlet/wiki/` and re-check every page.
 - The task-memory store: `capture`, `recall --query`, `brief`, `doctor` and related commands (see the memory engine section near the end).
-- `pack`: starter instruction bundles for a new project (`nextjs-supabase`, `fastapi-postgres`, `swift-ios`).
 - `benchmark`, `repo-benchmark`: the reproducible comparisons described below.
-- `rescue` and `anti-slop`: earlier side tools for triaging a stuck project and scoring UI copy. They still ship and still run, but they are not what Memlet is about and are not covered in this README.
 
 ### Command Reference
 
@@ -309,26 +306,19 @@ memlet admin dream-recall --graph "$QUEUE" --query git hooks --max-tokens 1500 -
 | `memlet handover [.] [--next-step "..."] [--rejected "..."] [--write]` / `--verify FILE` | Handover capsule with a checksum; verify a saved one. |
 | `memlet learn --transcript PATH` / `--pending` / `--approve ID... --by NAME [--reconsider\|--refresh-citations]` / `--reject ID... --by NAME` | Pending lesson queue with a human approval gate; approvals can be revoked. |
 | `memlet ui [.] [--out\|--output FILE]` | Self-contained, escaped HTML inspector. |
-| `memlet admin --help` | Every other command, grouped: memory store, rules/wiki, Dream, benchmarks, maintenance, side tools. |
-| `memlet --version` | Prints `8.5.0`. |
+| `memlet admin --help` | Every other command, grouped: memory store, rules/wiki, Dream, benchmarks and maintenance. |
+| `memlet --version` | Prints `9.0.0`. |
 
-**Upgrading from 8.4.x to 8.5.0**
+**Upgrading from 8.x to 9.0**
 
-- Old top-level names such as `memlet wiki`, `memlet import`, `memlet rescue` still work unchanged. In a terminal they print one line pointing to `memlet admin <name>`; in pipes and CI nothing extra is printed. Set `MEMLET_NO_DEPRECATION=1` to silence it.
-- A command that returns `ok: false` now exits `1` (it used to exit `0` in some cases), and an unexpected error prints its JSON on stderr instead of stdout.
-- `memlet --standalone` without `--task` now uses one task per repository. Memories stored earlier under the shared task are still there: read them with `--task standalone/main`.
-- `rule-recall` takes the query first: `memlet admin rule-recall "<query>" [--repo DIR]`. The older `rule-recall <dir> "<query>"` form still works.
-- Read commands no longer create pins. If `memlet handover` shows rules under "unpinned", run `memlet init` once.
-- TS/JS pins made by an earlier release are reported as `compatible-unverified` (`legacy_ts_basis_repin_required`) until you run `memlet check --repin-legacy-ts`.
-- User-facing messages are English by default.
-- `memlet check` in an initialised repository now also reports pinned anchors (`pinnedAnchors` in the JSON) and exits `1` when one is stale. `--format sarif` prints the SARIF document itself; earlier releases printed a JSON envelope with the document under `sarif`.
-- `rule-recall` no longer quotes a rule whose anchor is stale.
-- Python pins are stored with a new hash basis that is identical on Python 3.9–3.13. Pins from earlier releases still match on the interpreter that made them and are migrated the next time `memlet init` or `memlet admin wiki` runs.
-- A Dream queue you built yourself at `.memlet/dream/APPROVAL-QUEUE.json` (the path earlier documentation used) keeps working for `learn --pending` and `--approve`, but `memlet learn --transcript` refuses to mix into it: move it aside first. Its items start as pending.
-- A `HANDOVER.md` written by an earlier release has no text checksum; `memlet handover --verify` says so instead of reporting a mismatch. Regenerate it with `memlet handover --write`.
-- The first time the memory store is opened it is migrated in place (one column added); a copy named `<db>.bak-pre-migration-<UTC>` is written first. An older Memlet cannot write to the migrated store.
-- Managed writes under `.memlet/` are refused when `.memlet` or anything below it is a symbolic link, and instruction files reached through a symbolic link or outside the repository are ignored.
-- Instruction files larger than 1 MB are skipped.
+- 9.0 is a breaking release focused on code-anchored, re-checkable memory. The deployment rescue, UI/copy scoring, starter bundle and operational-security commands are removed. They are absent from `admin` too.
+- The only executables are `memlet` and `memlet-mcp`; the Python package is `memlet` and the MCP module is `memlet_mcp`. The server name is `memlet`. Task-memory MCP tools use `memlet_store_<operation>`; the four repository tools keep their names. Resource URIs use `memlet://`.
+- Use `MEMLET_HOME`, `MEMLET_MODEL_DIR`, `MEMLET_TRANSCRIPT_DIRS`, `MEMLET_PARENT_SESSION_ID` and `MEMLET_PROTECTED_PATHS`. Earlier variable names are no longer read.
+- The default user store is `~/.memlet-store`, separate from a repository's `.memlet/`. Existing user stores are never discovered by reading or migrating their contents. Point at your existing store explicitly with `memlet --root /path/to/existing-store ...` or `MEMLET_HOME=/path/to/existing-store`. An empty new store emits a notice with the old location when it exists.
+- Repository config, wiki, ledger, Dream data, snapshots, hook records and store databases from 8.5 remain readable. Managed rule blocks and hooks written by 8.5 can still be updated or removed; new blocks use `MEMLET_HARNESS_BEGIN/END`. Existing `memory_cli.py admin hook <event>` and `memlet admin hook <event>` commands continue to work.
+- The Action accepts `mode: audit` only. Every other mode exits 2 with a removal notice. The outputs are `status`, `finding-count` and `total-finding-count`; the default SARIF path is `memlet-check.sarif`.
+- The Inspector now shows memory, anchors, benchmarks and handovers. The capsule title is "Memlet Handover Capsule". Existing memories keep their content and provenance.
+- Surviving commands retain their exit codes and output structure apart from the specified name changes. Advanced top-level command aliases still point to `memlet admin <name>` and retain their terminal-only notice (`MEMLET_NO_DEPRECATION=1` silences it).
 
 ---
 
@@ -407,7 +397,7 @@ Memlet's checker is a **fast, deterministic, zero-network static analyzer** (`~1
 
 ## 🤖 GitHub Action Integration
 
-Add `.github/workflows/memlet-check.yml` to gate Pull Requests on instruction & memory drift, deploy blockers, or UI slop:
+Add `.github/workflows/memlet-check.yml` to gate Pull Requests on instruction and memory drift:
 
 ```yaml
 name: Memlet Check Gate
@@ -420,20 +410,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/deltaharness@v8.5.0
+      - uses: ian-nocturne/deltaharness@v9.0.0
         with:
-          mode: "audit" # 'audit', 'rescue', 'anti-slop', or 'all'
+          mode: "audit" # only supported mode
           repo-path: "."
           base-ref: ${{ github.event.pull_request.base.sha }}
           fail-on-drift: "true"
 ```
 
-Outputs (`status`, `finding-count`, `total-finding-count`, `slop-score`) and the default SARIF file name (`deltaharness-audit.sarif`) are unchanged. What changed in this release:
+Outputs are `status`, `finding-count` and `total-finding-count`. The default SARIF file is `memlet-check.sarif`.
 
-- `format` (`markdown`, `json`, `sarif`) now selects the report that is produced; it was previously ignored.
-- New input `python-version`. The Action no longer installs Python 3.11 by itself: it uses the runner's Python (3.9 or newer) unless you set this input (`python-version: "3.11"` restores the old behaviour).
+- `format` selects the report: `markdown`, `json` or `sarif`.
+- `python-version` optionally installs a chosen Python. Otherwise the Action uses Python 3.9 or newer from the runner.
 - `fail-on-drift` accepts only `true` or `false`; any other value is a configuration error.
-- `rescue` with only unverifiable environment variables, and `anti-slop` on a repository with no UI files, are warnings: the job passes and `status` is `UNVERIFIED`. Real blockers still fail the job.
 - A result the Action cannot interpret fails closed with exit code `2`.
 - The SARIF file is never written through a symbolic link.
 

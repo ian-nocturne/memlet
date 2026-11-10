@@ -16,15 +16,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from prism_memory import audit
-from prism_memory import code_anchors as ca
-from prism_memory import memlet_bridge as mb
-from prism_memory import memlet_brief as mbr
-from prism_memory import memlet_cortex as mc
-from prism_memory import memlet_dream as md
-from prism_memory import memlet_inspector as mi
-from prism_memory import memlet_wiki as mw
-from prism_memory import viberescue as vr
+from memlet import redaction
+from memlet import audit
+from memlet import code_anchors as ca
+from memlet import memlet_bridge as mb
+from memlet import memlet_brief as mbr
+from memlet import memlet_cortex as mc
+from memlet import memlet_dream as md
+from memlet import memlet_inspector as mi
+from memlet import memlet_wiki as mw
 
 ROOT = Path(__file__).resolve().parent
 CANARY = "PRIVATE_ACQUISITION_PLAN_7Z9"
@@ -182,25 +182,7 @@ class A1ManagedWriteTests(_Repo):
         self.assertFalse(res["ok"])
         self.assertEqual(b"KEEP", victim.read_bytes())
 
-    def test_rescue_refuses_a_leaf_symlink_and_writes_nothing(self):
-        repo = self.make_repo(init=False)
-        victim = self.outside() / "outside-rescue.md"
-        victim.write_text("KEEP\n")
-        (repo / "RESCUE_BRIEF.md").symlink_to(victim)
-        res = vr.build_rescue_bundle(repo, write_files=True)
-        self.assertFalse(res["ok"])
-        self.assertEqual(2, res["exitCode"])
-        self.assertIn("symlink", res["error"])
-        self.assertEqual("KEEP\n", victim.read_text())
-        self.assertFalse((repo / "ONE_PROMPT_RESCUE.md").exists())
-        self.assertFalse((repo / "rescue-bundle.json").exists())
 
-    def test_rescue_writes_regular_outputs_atomically(self):
-        repo = self.make_repo(init=False)
-        res = vr.build_rescue_bundle(repo, write_files=True)
-        for name in ("RESCUE_BRIEF.md", "ONE_PROMPT_RESCUE.md", "rescue-bundle.json"):
-            self.assertTrue((repo / name).is_file() and not (repo / name).is_symlink(), name)
-        self.assertNotIn("error", res)
 
     def test_inspector_default_output_symlink_is_refused(self):
         repo = self.make_repo()
@@ -248,8 +230,8 @@ class A2AncestorSymlinkReadTests(_Repo):
         self.assertNoCanary(mbr._source_lines(self.repo), "brief/index sources")
 
     def test_mcp_tools_do_not_expose_outside_text(self):
-        from prism_memory_mcp import PrismMemoryMCPServer
-        server = PrismMemoryMCPServer(_tmp(self, "final-a-store-"), default_task="review")
+        from memlet_mcp import MemletMCPServer
+        server = MemletMCPServer(_tmp(self, "final-a-store-"), default_task="review")
 
         def rpc(name, **args):
             return server.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -356,9 +338,9 @@ class A4BoundedWorkTests(_Repo):
         return res, time.monotonic() - start
 
     def test_reviewer_inputs_finish_fast_through_the_mcp_entry_points(self):
-        from prism_memory_mcp import PrismMemoryMCPServer
+        from memlet_mcp import MemletMCPServer
         repo = self.make_repo()
-        server = PrismMemoryMCPServer(_tmp(self, "final-a-store-"), default_task="review")
+        server = MemletMCPServer(_tmp(self, "final-a-store-"), default_task="review")
 
         def rpc(name, **args):
             return server.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -404,9 +386,9 @@ class A4BoundedWorkTests(_Repo):
             self.assertNotIn(leak, masked)
         orig = re.compile(mbr._EXTRA_SECRET_PATTERN, re.I)
         for sample in (secret, "x://a:b@c d", "MY_API_KEY = 'abcdefghij'", "sk-" + "a" * 20, "eyj" * 9):
+            self.assertEqual(re.compile(redaction._SECRET_VALUE_PATTERN).sub("#", sample),
+                             redaction.SECRET_VALUE_REDACT_RE.sub("#", sample))
             self.assertEqual(orig.sub("#", sample), mbr._EXTRA_SECRET_RE.sub("#", sample))
-            self.assertEqual(re.compile(vr._SECRET_VALUE_PATTERN).sub("#", sample),
-                             vr.SECRET_VALUE_REDACT_RE.sub("#", sample))
 
     def test_config_reads_never_block_on_a_fifo_and_are_size_capped(self):
         repo = self.make_repo()
@@ -428,8 +410,8 @@ class A4BoundedWorkTests(_Repo):
         os.mkfifo(repo / mw.CONFIG_PATH)
         scratch = _tmp(self, "final-a-home-")
         env = dict(os.environ, HOME=str(scratch), TMPDIR=str(scratch), PYTHONPATH=str(ROOT))
-        code = ("import json,sys; from prism_memory_mcp import PrismMemoryMCPServer; "
-                f"s=PrismMemoryMCPServer({str(scratch / 'store')!r}, default_task='review'); "
+        code = ("import json,sys; from memlet_mcp import MemletMCPServer; "
+                f"s=MemletMCPServer({str(scratch / 'store')!r}, default_task='review'); "
                 f"r=s.call_tool('memlet_handover', {{'repo_path': {str(repo)!r}}}); print('RETURNED')")
         start = time.monotonic()
         r = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=20, env=env,
@@ -553,7 +535,7 @@ def emoji():
 
 
 class A6CrossVersionHashTests(unittest.TestCase):
-    CODE = ("import json,sys; sys.path.insert(0, %r); from prism_memory import code_anchors as ca, memlet_wiki as mw; "
+    CODE = ("import json,sys; sys.path.insert(0, %r); from memlet import code_anchors as ca, memlet_wiki as mw; "
             "from pathlib import Path; p=Path(%r); r=Path(%r); "
             "print(json.dumps({'hashes': ca.extract_file_symbol_hashes(p), 'basis': ca.PYTHON_HASH_BASIS, "
             "'fp': mw._current_fingerprint(r, 'corpus.py', 'f')}))")
@@ -641,7 +623,7 @@ class A7PromotedPageOwnershipTests(_Repo):
 
 class N2MigrationBackupTests(unittest.TestCase):
     def test_legacy_store_is_backed_up_once_before_migration(self):
-        from prism_memory.standalone import StandaloneStore
+        from memlet.standalone import StandaloneStore
         root = _tmp(self, "final-a-n2-")
         db = root / "work.sqlite3"
         with sqlite3.connect(str(db)) as conn:

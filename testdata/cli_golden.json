@@ -39,44 +39,6 @@
     "kind": "empty"
    }
   },
-  "anti-slop": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "byCategory",
-     "cleanlinessScore",
-     "elapsedMs",
-     "exitCode",
-     "findingCount",
-     "findings",
-     "grade",
-     "markdownReport",
-     "ok",
-     "passedChecks",
-     "patchPromptMarkdown",
-     "returnedFindingCount",
-     "scannedFiles",
-     "slopScore",
-     "targetPath",
-     "totalFindingCount",
-     "truncated",
-     "verdict"
-    ],
-    "kind": "json"
-   }
-  },
-  "anti-slop-markdown": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "kind": "text"
-   }
-  },
   "audit": {
    "exit": 0,
    "stderr": {
@@ -1003,38 +965,6 @@
     "kind": "empty"
    }
   },
-  "opsec-fingerprint": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "exitCode",
-     "fingerprints",
-     "normalization",
-     "ok"
-    ],
-    "kind": "json"
-   }
-  },
-  "pack-list": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "exitCode",
-     "ok",
-     "packs",
-     "product",
-     "stacks",
-     "version"
-    ],
-    "kind": "json"
-   }
-  },
   "preflight": {
    "exit": 0,
    "stderr": {
@@ -1149,47 +1079,6 @@
    },
    "stdout": {
     "kind": "empty"
-   }
-  },
-  "rescue": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "blockers",
-     "bundleId",
-     "deployConfigs",
-     "elapsedMs",
-     "envAudit",
-     "exitCode",
-     "git",
-     "jsAnalysis",
-     "ok",
-     "onePromptRescueMarkdown",
-     "presentLockfiles",
-     "readiness",
-     "repoName",
-     "repoPath",
-     "rescueBriefMarkdown",
-     "scannedCodeFiles",
-     "scannedSqlFiles",
-     "secretSafety",
-     "stack",
-     "summary",
-     "unverified"
-    ],
-    "kind": "json"
-   }
-  },
-  "rescue-markdown": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "kind": "text"
    }
   },
   "rule-context": {
@@ -1443,38 +1332,6 @@
     "kind": "text"
    }
   },
-  "viberescue-alias": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "blockers",
-     "bundleId",
-     "deployConfigs",
-     "elapsedMs",
-     "envAudit",
-     "exitCode",
-     "git",
-     "jsAnalysis",
-     "ok",
-     "onePromptRescueMarkdown",
-     "presentLockfiles",
-     "readiness",
-     "repoName",
-     "repoPath",
-     "rescueBriefMarkdown",
-     "scannedCodeFiles",
-     "scannedSqlFiles",
-     "secretSafety",
-     "stack",
-     "summary",
-     "unverified"
-    ],
-    "kind": "json"
-   }
-  },
   "wiki": {
    "exit": 0,
    "stderr": {
@@ -1512,7 +1369,6 @@
   }
  },
  "help": {
-  "anti-slop": 0,
   "audit": 0,
   "backfill": 0,
   "backup": 0,
@@ -1541,14 +1397,10 @@
   "inspector": 0,
   "learn": 0,
   "links": 0,
-  "opsec-check": 0,
-  "opsec-fingerprint": 0,
-  "pack": 0,
   "preflight": 0,
   "read": 0,
   "recall": 0,
   "repo-benchmark": 0,
-  "rescue": 0,
   "restore": 0,
   "rule-context": 0,
   "rule-recall": 0,
@@ -1563,7 +1415,6 @@
   "sync-md": 0,
   "ui": 0,
   "verify-skill": 0,
-  "viberescue": 0,
   "wiki": 0
  }
 }

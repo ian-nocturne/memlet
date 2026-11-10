@@ -1,4 +1,4 @@
-"""Comprehensive regression tests for the PRISM Memory v3 procedural skill loop."""
+"""Comprehensive regression tests for the Memlet v9.0.0 procedural skill loop."""
 import contextlib
 import json
 import os
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import work_memory as ledger
 import memory_intelligence as memory
 import memory_skills as skills_ledger
-from prism_memory.standalone import StandaloneStore as WorkStore, StandaloneService as WorkService
+from memlet.standalone import StandaloneStore as WorkStore, StandaloneService as WorkService
 
 OWNER = '19f22446-0dce-4dce-945b-6011b559e10c'
 CLI = str(Path(__file__).resolve().parent / 'memory_cli.py')
@@ -45,8 +45,8 @@ class MemorySkillsLoopTests(unittest.TestCase):
             types.SimpleNamespace(get=lambda sid: {'mode': 'manual'}),
         )
         self.store = self.service.store
-        self.store.create('prism-memory', 'Memory Research', OWNER, goal='Skill loop', task='task-one')
-        self.store.create('prism-memory', 'Sibling Task', 'codex:sibling', goal='Sibling', task='task-sibling')
+        self.store.create('memlet', 'Memory Research', OWNER, goal='Skill loop', task='task-one')
+        self.store.create('memlet', 'Sibling Task', 'codex:sibling', goal='Sibling', task='task-sibling')
         self.store.create('other-proj', 'Other Project', 'codex:other', goal='Other', task='task-other')
         self.add_source(
             'user-1',
@@ -70,14 +70,14 @@ class MemorySkillsLoopTests(unittest.TestCase):
 
     def sample_card(self, **overrides):
         base = {
-            'situation': 'PRISM 기억·스킬 기능을 운영에 반영할 때 기존 대화와 실행을 보존하기',
+            'situation': 'Memlet 기억·스킬 기능을 운영에 반영할 때 기존 대화와 실행을 보존하기',
             'steps': [
                 '현재 입력 전달 중인지 확인하고 담당·상태·실행·전송 기록 스냅샷을 저장한다.',
                 '단위·회귀 검사를 통과한 뒤 기존 server.py 웹 프로세스만 재시작한다.',
                 '운영 API와 SQLite 원장을 다시 읽어 스냅샷과 일치하는지 검증한다.',
             ],
             'outcome': '기존 담당자·실행·전송 기록 손실 없이 새 기억·스킬 코드가 운영에 반영됨',
-            'conditions': '기존 PRISM 배포 경로를 사용하며 진행 중 입력 lease가 없는 경우',
+            'conditions': '기존 Memlet 배포 경로를 사용하며 진행 중 입력 lease가 없는 경우',
             'counterexamples': '결과 불명(unknown)인 요청을 재전송하거나 현재 DB를 과거 백업으로 덮어쓰지 않음',
         }
         base.update(overrides)
@@ -241,7 +241,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.learn_experience()
         # User explicitly confirms and updates the procedure
         user_card = self.sample_card(
-            conditions='사용자가 승인한 PRISM 운영 배포이며 진행 중 입력 lease가 없을 때만 적용',
+            conditions='사용자가 승인한 Memlet 운영 배포이며 진행 중 입력 lease가 없을 때만 적용',
         )
         res = self.learn_experience(
             op='replace',
@@ -320,7 +320,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         augmented = self.service.augment_turn(
             OWNER, '웹 프로세스만 교체해서 배포할 때 절차가 뭐야?', '웹 프로세스만 교체해서 배포할 때 절차가 뭐야?', 'turn-req-1',
         )
-        self.assertIn('<prism-memory-context', augmented)
+        self.assertIn('<memlet-context', augmented)
         self.assertIn('재사용 절차 스킬:', augmented)
         self.assertIn('skill:web-cutover', augmented)
 
@@ -372,7 +372,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
                 105,
             )
         # Scrub the host agent's session identity so the fixed test OWNER is accepted inside Codex workers.
-        child_env = {k: v for k, v in os.environ.items() if k not in ('CODEX_THREAD_ID', 'PRISM_PARENT_SESSION_ID')}
+        child_env = {k: v for k, v in os.environ.items() if k not in ('CODEX_THREAD_ID', 'MEMLET_PARENT_SESSION_ID')}
         sync_out = subprocess.check_output(
             [sys.executable, CLI, '--root', str(self.root), '--task', 'task-one', '--session', OWNER, 'skill-sync'],
             text=True, env=child_env,
@@ -528,7 +528,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.learn_experience(item_id='experience:cutover-v1', operation='op-cons-1')
         # Learn a second closely related experience with an extra step and extra counterexample
         variant_card = self.sample_card(
-            situation='PRISM 기억·스킬 기능을 운영에 배포할 때 기존 대화와 실행 원장을 안전하게 보존하기',
+            situation='Memlet 기억·스킬 기능을 운영에 배포할 때 기존 대화와 실행 원장을 안전하게 보존하기',
             steps=self.sample_card()['steps'] + ['포트 8765 리스닝과 /api/work 응답 정상 여부를 추가로 점검한다.'],
             counterexamples='포트 충돌 상태에서 강제 종료하거나 백업 DB로 덮어쓰지 않음',
         )
@@ -625,7 +625,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
                     'sourceRefs': [{'itemId': 'report-1', 'quote': '웹 프로세스만 교체'}],
                     'case': {
                         'title': '잘못된 무조건 함정 카드',
-                        'situation': 'PRISM 운영 웹 서버를 재시작할 때 발생하는 포트 충돌 상황',
+                        'situation': 'Memlet 운영 웹 서버를 재시작할 때 발생하는 포트 충돌 상황',
                         'symptom': '8765 포트가 이미 사용 중이어서 새 프로세스가 기동 직후 종료됨',
                         'avoidance': ['기존 리스닝 PID를 먼저 확인하고 안전하게 교체한다.'],
                         'conditions': '항상 무조건 적용',
@@ -644,14 +644,14 @@ class MemorySkillsLoopTests(unittest.TestCase):
                 'sourceRefs': [{'itemId': 'report-1', 'quote': '입력 전달 중인지 확인'}],
                 'case': {
                     'title': '입력 전달 lease 활성 중 웹 프로세스 재시작 함정',
-                    'situation': 'PRISM 운영 배포 중 사용자 입력 전달 lease가 남아 있는 상태',
+                    'situation': 'Memlet 운영 배포 중 사용자 입력 전달 lease가 남아 있는 상태',
                     'symptom': '진행 중인 응답 수신이 끊기거나 접수 상태가 unknown으로 남음',
                     'rootCause': 'input_leases 만료·해제 전에 웹 프로세스를 종료함',
                     'avoidance': [
                         'input_leases 테이블에 활성 토큰이 없는지 먼저 확인한다.',
                         '진행 중 입력이 있으면 완료 후 웹 프로세스를 교체한다.',
                     ],
-                    'conditions': 'PRISM 운영 웹 프로세스 교체 시 input_leases가 존재할 때만 적용',
+                    'conditions': 'Memlet 운영 웹 프로세스 교체 시 input_leases가 존재할 때만 적용',
                     'severity': 'critical',
                 },
             }],
@@ -858,25 +858,25 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertTrue(any(e['targetId'] == 'case:socket-handshake-trap' for e in api_links['links']))
 
     def test_v33_standalone_mcp_server_and_cli_bootstrap(self):
-        import prism_memory_mcp as mcp_mod
+        import memlet_mcp as mcp_mod
         with tempfile.TemporaryDirectory() as stand_dir:
-            srv = mcp_mod.PrismMemoryMCPServer(stand_dir, default_task='acme/standalone-task', default_session='agent-zero')
+            srv = mcp_mod.MemletMCPServer(stand_dir, default_task='acme/standalone-task', default_session='agent-zero')
             init_resp = srv.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}})
-            self.assertEqual('prism-memory-mcp', init_resp['result']['serverInfo']['name'])
+            self.assertEqual('memlet', init_resp['result']['serverInfo']['name'])
 
             tools_resp = srv.handle_rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {}})
             tool_names = {t['name'] for t in tools_resp['result']['tools']}
             self.assertGreaterEqual(len(tool_names), 10)
-            self.assertIn('prism_memory_capture', tool_names)
-            self.assertIn('prism_memory_inspector', tool_names)
-            self.assertIn('prism_memory_export_rules', tool_names)
+            self.assertIn('memlet_store_capture', tool_names)
+            self.assertIn('memlet_store_inspector', tool_names)
+            self.assertIn('memlet_store_export_rules', tool_names)
 
             cap_resp = srv.handle_rpc({
                 'jsonrpc': '2.0',
                 'id': 3,
                 'method': 'tools/call',
                 'params': {
-                    'name': 'prism_memory_capture',
+                    'name': 'memlet_store_capture',
                     'arguments': {
                         'text': '1. sqlite3 WAL 체크포인트 상태를 먼저 확인한다.\n2. 트랜잭션 락 해제 후 마이그레이션을 적용한다.',
                         'command': 'migrate_db.py',
@@ -891,13 +891,13 @@ class MemorySkillsLoopTests(unittest.TestCase):
 
             res_list = srv.handle_rpc({'jsonrpc': '2.0', 'id': 4, 'method': 'resources/list', 'params': {}})
             uris = [r['uri'] for r in res_list['result']['resources']]
-            self.assertIn('prism-memory://acme/standalone-task/inspector', uris)
+            self.assertIn('memlet://acme/standalone-task/inspector', uris)
 
             res_read = srv.handle_rpc({
                 'jsonrpc': '2.0',
                 'id': 5,
                 'method': 'resources/read',
-                'params': {'uri': 'prism-memory://acme/standalone-task/inspector'},
+                'params': {'uri': 'memlet://acme/standalone-task/inspector'},
             })
             insp_obj = json.loads(res_read['result']['contents'][0]['text'])
             self.assertEqual('acme/standalone-task', insp_obj['taskId'])
@@ -968,7 +968,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         )
         bench = self.service.action({'action': 'memory_benchmark', 'taskId': 'task-one', 'budget': 3000})
         self.assertTrue(bench['ok'])
-        self.assertIn(bench['version'], ('7.0', '8.0'))
+        self.assertEqual('9.0.0', bench['version'])
         self.assertGreater(bench['tokenEconomy']['rawCorpusChars'], bench['tokenEconomy']['deliveredPromptChars'])
         self.assertGreater(bench['tokenEconomy']['tokenSavingsVsFullHistoryPct'], 20.0)
         self.assertGreaterEqual(bench['retrievalQuality']['recallAt3'], 0.8)
@@ -1045,7 +1045,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertEqual(5, len(exp_res['writtenFiles']))
         updated_claude = claude_md.read_text(encoding='utf-8')
         self.assertIn('# Team Custom Header', updated_claude)
-        self.assertIn('<!-- PRISM_MEMORY_HARNESS_BEGIN -->', updated_claude)
+        self.assertIn('<!-- MEMLET_HARNESS_BEGIN -->', updated_claude)
         self.assertIn('skill:web-cutover', updated_claude)
 
         # Re-exporting in English updates only the marker block without duplicating the custom header
@@ -1116,7 +1116,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertIn('외부 웹훅 호출을 전면 차단한다.', t3)
 
     def test_v40_query_intent_adaptive_rrf_and_coverage_reranker_recall_at_1(self):
-        id_intent = memory.classify_query_intent('memory_intelligence.py v4.0 4388 skill:web-cutover')
+        id_intent = memory.classify_query_intent('memory_intelligence.py v9.0.0 4388 skill:web-cutover')
         self.assertEqual('identifier', id_intent['intent'])
         self.assertGreater(id_intent['weights']['lexical'], id_intent['weights']['semantic'])
 
@@ -1522,8 +1522,8 @@ class MemorySkillsLoopTests(unittest.TestCase):
                 self.assertIn((cid, ctext), core_after)
 
     def test_v84_js_ts_template_regex_jsx_and_hoc_signatures(self):
-        from prism_memory.code_anchors import extract_file_symbol_signatures
-        from prism_memory.audit import audit_repository
+        from memlet.code_anchors import extract_file_symbol_signatures
+        from memlet.audit import audit_repository
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1562,7 +1562,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
             self.assertEqual(1, aud['countsByRule'].get('missing_symbol', 0))
 
     def test_v84_audit_strict_workspace_cd_and_tutorial_guards(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1849,90 +1849,8 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertNotIn('ops@company.io', ' '.join(transferred['steps']))
         self.assertIn('<project>/', transferred['title'])
 
-    def test_v84_viberescue_string_env_rls_disable_and_written_files_scrub(self):
-        from prism_memory.viberescue import build_rescue_bundle
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            # 1) String literal `"process.env.REMOVED_API_KEY"` must NOT be flagged as an env reference
-            s_dir = root / 'str_ref'
-            s_dir.mkdir()
-            (s_dir / 'client.js').write_text('const example = "process.env.REMOVED_API_KEY";\n', encoding='utf-8')
-            res_str = build_rescue_bundle(s_dir)
-            self.assertEqual('STATIC_CHECKS_PASSED', res_str['readiness'])
-            self.assertEqual(0, res_str['exitCode'])
 
-            # 2) Later migration `DISABLE ROW LEVEL SECURITY` must flag BLOCKED
-            rls_dir = root / 'rls_dis'
-            rls_dir.mkdir()
-            (rls_dir / '001.sql').write_text(
-                'CREATE TABLE public.orders(id uuid, user_id uuid);\n'
-                'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n'
-                'CREATE POLICY own ON public.orders USING (auth.uid() = user_id);\n',
-                encoding='utf-8',
-            )
-            (rls_dir / '002.sql').write_text('ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n', encoding='utf-8')
-            res_rls = build_rescue_bundle(rls_dir)
-            self.assertEqual('BLOCKED', res_rls['readiness'])
-            self.assertEqual(1, res_rls['exitCode'])
-
-            # 3) `writtenFiles` paths must be scrubbed when `write_files=True`
-            sec_dir = root / ('vr_' + 'sk_live_' + 'syntheticAuditOnly12345')
-            sec_dir.mkdir()
-            (sec_dir / 'index.js').write_text('export const ok = 1;\n', encoding='utf-8')
-            res_sec = build_rescue_bundle(sec_dir, write_files=True)
-            self.assertTrue(res_sec['secretSafety']['verifiedOutputClean'])
-            self.assertNotIn('sk_live_' + 'syntheticAuditOnly12345', json.dumps(res_sec['writtenFiles']))
-
-    def test_v84_anti_slop_rgb_contrast_and_backup_preservation(self):
-        from prism_memory.anti_slop import scan_anti_slop, lock_design_system
-
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            # 1) `rgb(...)` low contrast detection
-            rgb_dir = root / 'rgb_case'
-            rgb_dir.mkdir()
-            lock_design_system(rgb_dir, write_files=True)
-            (rgb_dir / 'style.css').write_text('.btn { background: rgb(255, 255, 255); color: rgb(250, 250, 250); }\n', encoding='utf-8')
-            res_rgb = scan_anti_slop(rgb_dir)
-            self.assertFalse(res_rgb['ok'])
-            self.assertGreaterEqual(res_rgb['byCategory'].get('low_contrast_text', 0), 1)
-
-            # 2) Repeated `lock_design_system(..., force=True)` preserves original `.bak`
-            bak_dir = root / 'bak_case'
-            bak_dir.mkdir()
-            (bak_dir / 'DESIGN.md').write_text('ORIGINAL', encoding='utf-8')
-            (bak_dir / 'design-tokens.css').write_text('ORIGINAL_CSS', encoding='utf-8')
-            lock_design_system(bak_dir, write_files=True, force=True)
-            lock_design_system(bak_dir, write_files=True, force=True)
-            self.assertEqual('ORIGINAL', (bak_dir / 'DESIGN.md.bak').read_text(encoding='utf-8'))
-            self.assertEqual('ORIGINAL_CSS', (bak_dir / 'design-tokens.css.bak').read_text(encoding='utf-8'))
-
-    def test_v84_cli_and_action_exit_code_parity(self):
-        from prism_memory.viberescue import cli as vr_cli
-        import memory_cli, io
-        from contextlib import redirect_stdout
-
-        with tempfile.TemporaryDirectory() as td:
-            warn_dir = Path(td) / 'warn_case'
-            warn_dir.mkdir()
-            (warn_dir / '001.sql').write_text(
-                'CREATE TABLE public.items(id uuid);\n'
-                'ALTER TABLE public.items ENABLE ROW LEVEL SECURITY;\n'
-                'CREATE POLICY pub_read ON public.items USING (true);\n',
-                encoding='utf-8',
-            )
-            with redirect_stdout(io.StringIO()):
-                code_vr = vr_cli(['pack', str(warn_dir), '--format', 'json'])
-            old_argv = sys.argv
-            try:
-                sys.argv = ['prism-memory', 'rescue', str(warn_dir)]
-                with redirect_stdout(io.StringIO()):
-                    code_mem = memory_cli.cli()
-            finally:
-                sys.argv = old_argv
-            self.assertEqual(1, code_vr)
-            self.assertEqual(1, code_mem)
 
     def test_v70_ast_signature_self_healing_vs_breaking_change_guard(self):
         target_py = self.root / 'engine_core.py'
@@ -2022,7 +1940,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
             )
 
         # Turn 3: user responds with action directive ("제안대로 모두 진행해줘") -> counts trial use (`used_count >= 2`)
-        # but v8.1 governance caps implicit turn attribution at `trial-used` (never falsely promoting without explicit feedback or execution proof)
+        # but v9.0.0 governance caps implicit turn attribution at `trial-used` (never falsely promoting without explicit feedback or execution proof)
         view3 = self.store.memory('task-one', '제안대로 모두 진행해줘', 4000)
         _, meta3 = memory.build_turn_context(self.store, 'task-one', OWNER, view3, 'rec-t3', query='제안대로 모두 진행해줘')
         self.assertTrue(meta3['trajectoryAttribution']['attributed'])
@@ -2061,7 +1979,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
             memory.vectors._MODEL = saved_model
 
     def test_v70_contrastive_failure_to_case_and_subagent_capsule_and_mcp_v7(self):
-        from prism_memory_mcp import PrismMemoryMCPServer
+        from memlet_mcp import MemletMCPServer
         res = self.learn_experience()
         sk_id = res['skills'][0]['skillId']
 
@@ -2097,17 +2015,17 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertLessEqual(capsule_res['capsuleChars'], 1100)
         self.assertIn('<subagent-memory-capsule', capsule_res['capsuleText'])
 
-        # 3) MCP Server v7.0.0 / v8.0.0 with >=15 tools including prism_memory_capsule
-        mcp = PrismMemoryMCPServer(self.root, default_task='task-one', default_session=OWNER, standalone=False)
+        # 3) MCP Server v9.0.0 includes memlet_store_capsule.
+        mcp = MemletMCPServer(self.root, default_task='task-one', default_session=OWNER, standalone=False)
         init_resp = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'})
-        self.assertIn(init_resp['result']['serverInfo']['version'], ('7.0.0', '8.0.0'))
+        self.assertEqual('9.0.0', init_resp['result']['serverInfo']['version'])
         tools_resp = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
         tool_names = [t['name'] for t in tools_resp['result']['tools']]
         self.assertGreaterEqual(len(tool_names), 15)
-        self.assertIn('prism_memory_capsule', tool_names)
+        self.assertIn('memlet_store_capsule', tool_names)
 
     def test_v80_negation_aware_trajectory_attribution_and_skill_event_ledger(self):
-        from prism_memory.heuristics import analyze_trajectory_sentiment
+        from memlet.heuristics import analyze_trajectory_sentiment
         res = self.learn_experience()
         sk_id = res['skills'][0]['skillId']
 
@@ -2341,15 +2259,15 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertGreater(st['reuseIntensity'], 1.0)
 
         bench = memory.benchmark(self.store, 'task-one', budget=3000)
-        self.assertEqual('8.0', bench['version'])
+        self.assertEqual('9.0.0', bench['version'])
         self.assertIn('liveProvenance', bench['governance'])
         self.assertGreaterEqual(bench['governance']['liveProvenance']['checkedCount'], 1)
         self.assertEqual(0.0, bench['governance']['identityDriftScore'])
         self.assertIn('temporalGuardDetail', bench['retrievalQuality'])
 
     def test_v80_standalone_memory_engine_sdk_and_mcp_v8(self):
-        from prism_memory import MemoryEngine, StandaloneStore
-        from prism_memory_mcp import PrismMemoryMCPServer
+        from memlet import MemoryEngine, StandaloneStore
+        from memlet_mcp import MemletMCPServer
 
         with tempfile.TemporaryDirectory() as tmp:
             engine = MemoryEngine(tmp, default_task='sdk/demo', default_session='sdk-user')
@@ -2380,22 +2298,22 @@ class MemorySkillsLoopTests(unittest.TestCase):
             insp = engine.inspector(budget=2400)
             self.assertTrue(insp['ok'])
             bench = engine.benchmark(budget=2400)
-            self.assertEqual('8.0', bench['version'])
+            self.assertEqual('9.0.0', bench['version'])
 
-            # 4) Verify MCP Server v8.0.0 works directly with StandaloneStore and exposes 18 tools
-            mcp = PrismMemoryMCPServer(tmp, default_task='sdk/demo', default_session='sdk-user', store=engine.store)
+            # 4) Verify MCP Server v9.0.0 works directly with StandaloneStore and exposes 18 tools
+            mcp = MemletMCPServer(tmp, default_task='sdk/demo', default_session='sdk-user', store=engine.store)
             init_res = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'})
-            self.assertEqual('8.0.0', init_res['result']['serverInfo']['version'])
+            self.assertEqual('9.0.0', init_res['result']['serverInfo']['version'])
             tools_res = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
             tool_names = [t['name'] for t in tools_res['result']['tools']]
             self.assertGreaterEqual(len(tool_names), 18)
-            self.assertIn('prism_memory_heal_skills', tool_names)
-            self.assertIn('prism_memory_verify_skill', tool_names)
-            self.assertIn('prism_memory_doctor', tool_names)
-            self.assertIn('prism_memory_audit', tool_names)
+            self.assertIn('memlet_store_heal_skills', tool_names)
+            self.assertIn('memlet_store_verify_skill', tool_names)
+            self.assertIn('memlet_store_doctor', tool_names)
+            self.assertIn('memlet_store_audit', tool_names)
 
     def test_v80_astra_round2_p1_fixes(self):
-        from prism_memory import MemoryEngine, extract_file_symbol_signatures, extract_file_symbol_hashes, is_breaking_symbol_change
+        from memlet import MemoryEngine, extract_file_symbol_signatures, extract_file_symbol_hashes, is_breaking_symbol_change
         import memory_cli, io
         from contextlib import redirect_stdout
 
@@ -2463,7 +2381,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
             buf = io.StringIO()
             old_argv = sys.argv
             try:
-                sys.argv = ['prism-memory', '--root', tmp1, '--task', 'shared/task', 'schema']
+                sys.argv = ['memlet', '--root', tmp1, '--task', 'shared/task', 'schema']
                 with redirect_stdout(buf):
                     code = memory_cli.cli()
             finally:
@@ -2474,7 +2392,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
 
     def test_v80_astra_round3_counterexample_fixes(self):
         import hashlib, sqlite3
-        from prism_memory import extract_file_symbol_signatures, evaluation
+        from memlet import extract_file_symbol_signatures, evaluation
 
         with tempfile.TemporaryDirectory() as td:
             # 1) Conditional function inside `if True:` is collected by AST anchor scanner
@@ -2550,7 +2468,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
 
     def test_v81_execution_verification_cleanroom_wheel_and_repo_benchmark(self):
         import os, shutil
-        from prism_memory import (
+        from memlet import (
             MemoryEngine,
             resolve_default_data_root,
             doctor_environment,
@@ -2558,7 +2476,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
             restore_data_root,
             run_repo_evolution_benchmark,
         )
-        from prism_memory_mcp import PrismMemoryMCPServer
+        from memlet_mcp import MemletMCPServer
 
         # 1. Execution-backed skill verification (pass -> feedback-verified + verificationEvidence, fail -> needs_revision + pitfall case)
         target_py = self.root / 'calc_mod.py'
@@ -2610,9 +2528,9 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertEqual('trial-used', sk_still_unver['evidence_state'])
         self.assertEqual('compatible-unverified', sk_still_unver['source'].get('verificationStatus'))
 
-        # Re-verify via MCP tool `prism_memory_verify_skill` with failing proof -> degrades to needs_revision + synthesizes pitfall case
-        mcp = PrismMemoryMCPServer(self.root, default_task='task-one', default_session=OWNER, standalone=False, store=self.store)
-        ver_fail = mcp.call_tool('prism_memory_verify_skill', {
+        # Re-verify via MCP tool `memlet_store_verify_skill` with failing proof -> degrades to needs_revision + synthesizes pitfall case
+        mcp = MemletMCPServer(self.root, default_task='task-one', default_session=OWNER, standalone=False, store=self.store)
+        ver_fail = mcp.call_tool('memlet_store_verify_skill', {
             'task': 'task-one',
             'skillId': sk_id,
             'executionProof': {'command': 'pytest test_calc.py', 'exitCode': 1, 'output': 'AssertionError: tax mismatch'},
@@ -2625,12 +2543,12 @@ class MemorySkillsLoopTests(unittest.TestCase):
         # 2. Clean-room data root resolution, Doctor, Backup, and Restore
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            custom_home = td_path / 'user_prism_home'
-            fake_site_pkg = td_path / 'site-packages' / 'prism_memory'
+            custom_home = td_path / 'user_memlet_home'
+            fake_site_pkg = td_path / 'site-packages' / 'memlet'
             fake_site_pkg.mkdir(parents=True, exist_ok=True)
             resolved_root = resolve_default_data_root(
                 package_dir=fake_site_pkg,
-                env={'PRISM_MEMORY_HOME': str(custom_home)},
+                env={'MEMLET_HOME': str(custom_home)},
             )
             self.assertEqual(custom_home.resolve(), resolved_root)
 
@@ -2658,27 +2576,27 @@ class MemorySkillsLoopTests(unittest.TestCase):
 
             # 2b. Clean-room read-only site-packages subprocess verification (no WorkStore, read-only package dir)
             ro_site = td_path / 'venv' / 'lib' / 'python3' / 'site-packages'
-            ro_pkg = ro_site / 'prism_memory'
+            ro_pkg = ro_site / 'memlet'
             ro_pkg.mkdir(parents=True, exist_ok=True)
             src_dir = Path(__file__).resolve().parent
-            for mod_file in (src_dir / 'prism_memory').glob('*.py'):
+            for mod_file in (src_dir / 'memlet').glob('*.py'):
                 shutil.copy2(mod_file, ro_pkg / mod_file.name)
-            for py_mod in ('work_memory.py', 'memory_vectors.py', 'memory_skills.py', 'memory_intelligence.py', 'memory_cli.py', 'prism_memory_mcp.py'):
+            for py_mod in ('work_memory.py', 'memory_vectors.py', 'memory_skills.py', 'memory_intelligence.py', 'memory_cli.py', 'memlet_mcp.py'):
                 shutil.copy2(src_dir / py_mod, ro_site / py_mod)
             user_data_home = td_path / 'isolated_user_data'
             empty_cwd = td_path / 'empty_work_cwd'
             empty_cwd.mkdir(parents=True, exist_ok=True)
-            # Make site-packages and prism_memory package directory read-only (0o555)
+            # Make site-packages and memlet package directory read-only (0o555)
             for p_ro in [ro_pkg, ro_site]:
                 p_ro.chmod(0o555)
             try:
                 sub_env = {
                     **os.environ,
                     'PYTHONPATH': str(ro_site),
-                    'PRISM_MEMORY_HOME': str(user_data_home),
+                    'MEMLET_HOME': str(user_data_home),
                 }
                 sub_code = (
-                    "import json; from prism_memory import MemoryEngine; "
+                    "import json; from memlet import MemoryEngine; "
                     "eng = MemoryEngine(task='wheel/test', session='wheel-user'); "
                     "doc = eng.doctor(); "
                     "cap = eng.capture('1. 클린룸 휠 패키지를 로드한다.\\n2. 읽기 전용 site-packages 밖의 데이터 루트에 기록한다.', command='wheel_check', force=True); "
@@ -2710,15 +2628,15 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertEqual(8, bench_report['systemsEvaluated'])
         self.assertTrue(bench_report['multiDbIsolation']['isolated'])
 
-        prism_b = bench_report['baselines']['prism_v8_engine']
+        memlet_b = bench_report['baselines']['memlet_v9_engine']
         static_b = bench_report['baselines']['static_agents_md']
         bm25_b = bench_report['baselines']['vanilla_bm25']
         no_ast_a = bench_report['ablations']['ablation_no_ast_guard']
         no_ver_a = bench_report['ablations']['ablation_no_execution_verification_gate']
 
-        self.assertEqual(1.0, prism_b['taskSuccessRate'])
-        self.assertEqual(0.0, prism_b['staleProcedurePoisoningRate'])
-        self.assertEqual(0.0, prism_b['falseVerificationPromotionRate'])
+        self.assertEqual(1.0, memlet_b['taskSuccessRate'])
+        self.assertEqual(0.0, memlet_b['staleProcedurePoisoningRate'])
+        self.assertEqual(0.0, memlet_b['falseVerificationPromotionRate'])
         self.assertGreater(static_b['staleProcedurePoisoningRate'], 0.5)
         self.assertGreater(bm25_b['staleProcedurePoisoningRate'], 0.5)
         self.assertGreater(no_ast_a['staleProcedurePoisoningRate'], 0.5)
@@ -2726,12 +2644,12 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertGreater(bench_report['headlineComparison']['tokenSavingsFromDeltaPrompting'], 0.15)
 
     def test_v82_polyglot_anchors_zero_setup_audit_and_commit_bound_proof(self):
-        """v8.2 P0 Product Upgrade Bundle:
+        """v9.0.0 P0 Product Upgrade Bundle:
         1) Polyglot structural contract anchors (TypeScript/JS functions, arrow functions, classes, interfaces + package.json scripts + Makefile targets + explicit resolution metadata).
-        2) Zero-setup `deltaharness audit` (`audit_repository` + CLI/SDK/API/MCP) detecting missing_path, missing_script, missing_symbol, signature_drift, git-diff blast radius, and SARIF v2.1.0 / Markdown output.
+        2) Zero-setup `memlet audit` (`audit_repository` + CLI/SDK/API/MCP) detecting missing_path, missing_script, missing_symbol, signature_drift, git-diff blast radius, and SARIF v2.1.0 / Markdown output.
         3) Commit-bound execution verification proof (`headSha`, `dirtyWorktree`, `testCount`) + rejection of 0-tests (`Ran 0 tests` / `0 passed`) and empty executionProof.
         """
-        from prism_memory import (
+        from memlet import (
             MemoryEngine,
             audit_repository,
             extract_file_symbol_hashes,
@@ -2884,10 +2802,10 @@ class MemorySkillsLoopTests(unittest.TestCase):
             self.assertGreaterEqual(len(drift_audit['blastRadius']), 1)
             self.assertEqual('2.1.0', drift_audit['sarif']['version'])
 
-            # Also verify Markdown output via MemoryEngine.audit() and MCP `prism_memory_audit`
+            # Also verify Markdown output via MemoryEngine.audit() and MCP `memlet_store_audit`
             eng = MemoryEngine(repo_dir, task='poly/task-1', session='poly-owner')
             md_audit = eng.audit(repo_path=repo_dir, output_format='markdown')
-            self.assertIn('Ieum Check · Procedure & Instruction Audit', md_audit['formatted'])
+            self.assertIn('Memlet Check · Procedure & Instruction Audit', md_audit['formatted'])
 
             # 3. Commit-bound execution verification proof (`headSha`, `testCount`) & 0-tests rejection
             cap = eng.capture(
@@ -2922,135 +2840,6 @@ class MemorySkillsLoopTests(unittest.TestCase):
             self.assertEqual(3, ver_pass['verificationEvidence']['testCount'])
             self.assertEqual(40, len(ver_pass['verificationEvidence']['headSha']))
 
-    def test_v83_dual_track_packaging_viberescue_and_anti_slop(self):
-        """Verify Left-Hand (OSS GitHub Action & Quickstart) and Right-Hand (VibeRescue & Anti-Slop) modules."""
-        from prism_memory import (
-            build_rescue_bundle,
-            scan_anti_slop,
-            lock_design_system,
-        )
-
-        impl_root = Path(__file__).resolve().parent
-        self.assertTrue((impl_root / 'action.yml').exists())
-        self.assertTrue((impl_root / '.github' / 'workflows' / 'deltaharness-audit.yml').exists())
-        self.assertTrue((impl_root / 'README.md').exists())
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_dir = Path(tmp) / 'stuck-vibe-app'
-            repo_dir.mkdir(parents=True, exist_ok=True)
-
-            # 1. Create a realistic stuck Vibe-Coded Next.js + Supabase project with P1/P3/P6 issues
-            (repo_dir / 'package.json').write_text(
-                json.dumps({
-                    'name': 'stuck-vibe-app',
-                    'scripts': {'dev': 'next dev', 'build': 'next build'},
-                    'dependencies': {'next': '14.2.0', 'react': '18.3.0', '@supabase/supabase-js': '2.45.0'},
-                }),
-                encoding='utf-8',
-            )
-            # Competing lockfiles (npm + pnpm)
-            (repo_dir / 'package-lock.json').write_text('{}', encoding='utf-8')
-            (repo_dir / 'pnpm-lock.yaml').write_text('lockfileVersion: 6.0\n', encoding='utf-8')
-
-            # .env.local has a real secret (must NEVER leak) and is missing STRIPE_WEBHOOK_SECRET
-            secret_token = 'sk-proj-' + 'SUPER_SECRET_NEVER_LEAK_1234567890abcdef'
-            (repo_dir / '.env.local').write_text(
-                f'OPENAI_API_KEY={secret_token}\nNEXT_PUBLIC_SUPABASE_URL=https://example.supabase.co\n',
-                encoding='utf-8',
-            )
-            (repo_dir / '.env.example').write_text(
-                'OPENAI_API_KEY=\nNEXT_PUBLIC_SUPABASE_URL=\nSTRIPE_WEBHOOK_SECRET=\n',
-                encoding='utf-8',
-            )
-
-            # Client component exposing SUPABASE_SERVICE_ROLE_KEY and AI Slop UI/Copy
-            comp_dir = repo_dir / 'src' / 'components'
-            comp_dir.mkdir(parents=True, exist_ok=True)
-            (comp_dir / 'HeroCard.tsx').write_text(
-                '"use client";\n'
-                'export function HeroCard() {\n'
-                '  const adminKey = process.env.SUPABASE_SERVICE_ROLE_KEY;\n'
-                '  const missingHook = process.env.STRIPE_WEBHOOK_SECRET;\n'
-                '  return (\n'
-                '    <div className="bg-gradient-to-r from-purple-600 via-indigo-500 to-pink-500 shadow-2xl backdrop-blur">\n'
-                '      <h1 style={{ fontSize: "13.5px" }}>🚀 혁신적인 솔루션을 통해 생산성을 극대화합니다</h1>\n'
-                '      <button>✨ 시작하기</button>\n'
-                '    </div>\n'
-                '  );\n'
-                '}\n',
-                encoding='utf-8',
-            )
-
-            # SQL migration without ENABLE ROW LEVEL SECURITY
-            mig_dir = repo_dir / 'supabase' / 'migrations'
-            mig_dir.mkdir(parents=True, exist_ok=True)
-            (mig_dir / '001_init.sql').write_text(
-                'CREATE TABLE public.customer_invoices (id uuid primary key, amount int);\n',
-                encoding='utf-8',
-            )
-
-            # Run VibeRescue bundler (must report ok=False, exitCode=1, readiness=BLOCKED when critical blockers exist)
-            rescue = build_rescue_bundle(repo_dir, write_files=True, output_format='markdown')
-            self.assertFalse(rescue['ok'])
-            self.assertEqual(1, rescue['exitCode'])
-            self.assertEqual('BLOCKED', rescue['readiness'])
-            self.assertFalse(rescue['secretSafety']['rawEnvValuesIncluded'])
-            self.assertTrue(rescue['secretSafety']['verifiedOutputClean'])
-            # Ensure the secret value is NEVER present anywhere in JSON or Markdown
-            serialized_rescue = json.dumps(rescue, ensure_ascii=False)
-            self.assertNotIn(secret_token, serialized_rescue)
-            self.assertNotIn(secret_token, rescue['rescueBriefMarkdown'])
-            self.assertNotIn(secret_token, rescue['onePromptRescueMarkdown'])
-
-            blocker_kinds = {b['kind'] for b in rescue['blockers']}
-            if rescue['jsAnalysis']['mode'] == 'typescript-ast':
-                self.assertIn('client_secret_exposure', blocker_kinds)
-            else:
-                # Without the TypeScript parser the client finding is reported as UNVERIFIED (never decided by heuristics).
-                self.assertNotIn('client_secret_exposure', blocker_kinds)
-                self.assertTrue(any('STRIPE_SECRET_KEY' in u['reason'] or 'heuristic' in u['reason'] for u in rescue['unverified']))
-            self.assertIn('missing_env_key', blocker_kinds)
-            self.assertIn('supabase_rls_or_auth_gap', blocker_kinds)
-            self.assertIn('competing_lockfiles', blocker_kinds)
-            self.assertTrue((repo_dir / 'RESCUE_BRIEF.md').exists())
-            self.assertTrue((repo_dir / 'ONE_PROMPT_RESCUE.md').exists())
-
-            # Run Anti-Slop scanner before locking design system (must report ok=False, exitCode=1 when slopScore >= 20)
-            slop = scan_anti_slop(repo_dir, output_format='markdown')
-            self.assertFalse(slop['ok'])
-            self.assertEqual(1, slop['exitCode'])
-            self.assertGreater(slop['slopScore'], 30)
-            slop_cats = set(slop['byCategory'].keys())
-            self.assertIn('missing_design_lock', slop_cats)
-            self.assertIn('purple_radial_blob_slop', slop_cats)
-            self.assertIn('fractional_font_slop', slop_cats)
-            self.assertIn('emoji_chrome_slop', slop_cats)
-            self.assertIn('korean_ai_copy_slop', slop_cats)
-
-            # Lock Reference-First Design System and verify DESIGN.md & design-tokens.css
-            lock_res = lock_design_system(repo_dir, archetype='linear-precision', write_files=True)
-            self.assertTrue(lock_res['ok'])
-            self.assertTrue((repo_dir / 'DESIGN.md').exists())
-            self.assertTrue((repo_dir / 'design-tokens.css').exists())
-
-            # Clean the component and re-scan -> must achieve 0 Slop Score (Grade A+, ok=True, exitCode=0)
-            (comp_dir / 'HeroCard.tsx').write_text(
-                '"use client";\n'
-                'export function HeroCard() {\n'
-                '  return (\n'
-                '    <section className="surface-card">\n'
-                '      <h1>막힌 배포 환경과 누락된 환경변수를 10초 만에 찾아내요</h1>\n'
-                '      <button><span className="status-dot-sm" /> 진단 시작</button>\n'
-                '    </section>\n'
-                '  );\n'
-                '}\n',
-                encoding='utf-8',
-            )
-            clean_slop = scan_anti_slop(repo_dir)
-            self.assertTrue(clean_slop['ok'])
-            self.assertEqual(0, clean_slop['exitCode'])
-            self.assertEqual(0, clean_slop['slopScore'])
-            self.assertEqual('A+', clean_slop['grade'])
 
     def test_v84_astra_adversarial_edge_cases_and_standalone_service(self):
         """Verify all adversarial counterexamples from gpt-6-astra:high Round 1 Audit:
@@ -3058,38 +2847,16 @@ class MemorySkillsLoopTests(unittest.TestCase):
         2) Monorepo `cd packages/core && pnpm test` context resolution & `.github/workflows/*.yml` resolution.
         3) Single-identifier arrow function (`export const id = x => x`) and React `memo`/`forwardRef` HOC extraction.
         4) Invalid `--base` Git ref emits `invalid_git_ref` (`ok=False`, `exitCode=1`); broken TS syntax emits `syntax_error`.
-        5) `viberescue`: bracket env (`process.env["STRIPE_SECRET_KEY"]`), `import "server-only"`, multi-file SQL migrations,
-           `supabase_rls_enabled_without_policy`, multiline `USING (\\n true \\n)`, empty directory (`NO_TARGETS_FOUND`, `exitCode=2`),
-           and `ENV_UNVERIFIED` vs `STATIC_CHECKS_PASSED`.
-        6) `anti_slop`: empty directory (`UNVERIFIED`, `exitCode=2`), `.js`/`.mjs` and `products/` scanning, comment stripping,
-           CSS variable gradient resolution (`var(--blob)`), WCAG contrast check (`low_contrast_text`), 3+ nested bordered cards in HTML,
-           attribute-order-independent viewport zoom block, `apple-minimal` preset, and `--lock` overwrite protection (`--force`).
         7) `StandaloneStore` + `StandaloneService` full drop-in execution without `WorkStore` or `config_state`.
         """
-        from prism_memory import (
+        from memlet import (
             audit_repository,
-            build_rescue_bundle,
-            scan_anti_slop,
-            lock_design_system,
             extract_file_symbol_signatures,
         )
-        from prism_memory.standalone import StandaloneService
+        from memlet.standalone import StandaloneService
 
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-
-            # 1. Empty directory checks (must NEVER return CLEAN_READY or A+)
-            empty_dir = base / 'empty_folder'
-            empty_dir.mkdir(parents=True, exist_ok=True)
-            empty_rescue = build_rescue_bundle(empty_dir)
-            self.assertFalse(empty_rescue['ok'])
-            self.assertEqual(2, empty_rescue['exitCode'])
-            self.assertEqual('NO_TARGETS_FOUND', empty_rescue['readiness'])
-
-            empty_slop = scan_anti_slop(empty_dir)
-            self.assertFalse(empty_slop['ok'])
-            self.assertEqual(2, empty_slop['exitCode'])
-            self.assertEqual('UNVERIFIED', empty_slop['grade'])
 
             # 2. Commented-out JS/TS exports, HOC wrappers, single-identifier arrow functions, and broken syntax
             adv_repo = base / 'adv_repo'
@@ -3159,108 +2926,9 @@ class MemorySkillsLoopTests(unittest.TestCase):
             self.assertFalse(bad_ref_audit['ok'])
             self.assertIn('invalid_git_ref', bad_ref_audit['countsByRule'])
 
-            # 3. VibeRescue adversarial edge cases
-            vr_repo = base / 'vr_adv'
-            (vr_repo / 'src').mkdir(parents=True, exist_ok=True)
-            (vr_repo / 'supabase' / 'migrations').mkdir(parents=True, exist_ok=True)
-            # Server-only module using secret -> must NOT be flagged as client exposure
-            (vr_repo / 'src' / 'server_billing.ts').write_text(
-                'import "server-only";\n'
-                'export const key = process.env["STRIPE_SECRET_KEY"];\n',
-                encoding='utf-8',
-            )
-            # Client module using bracket notation secret -> MUST be flagged as client_secret_exposure
-            # Commented-out secret -> must NOT be flagged
-            (vr_repo / 'src' / 'client_pay.tsx').write_text(
-                '"use client";\n'
-                '// const safeComment = process.env.OPENAI_API_KEY;\n'
-                'export const leaked = process.env["STRIPE_SECRET_KEY"];\n',
-                encoding='utf-8',
-            )
-            # Multi-file SQL migrations: table1 has RLS + policy across 2 files; table2 has RLS enabled but 0 policies; table3 has multiline USING (true)
-            (vr_repo / 'supabase' / 'migrations' / '001_tables.sql').write_text(
-                'CREATE TABLE public.orders (id uuid primary key, user_id uuid);\n'
-                'CREATE TABLE public.audit_logs (id uuid primary key);\n'
-                'CREATE TABLE public.profiles (id uuid primary key);\n',
-                encoding='utf-8',
-            )
-            (vr_repo / 'supabase' / 'migrations' / '002_rls.sql').write_text(
-                'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n'
-                'CREATE POLICY "orders_owner" ON public.orders FOR ALL USING (auth.uid() = user_id);\n'
-                'ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;\n'
-                'ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n'
-                'CREATE POLICY "open_profiles" ON public.profiles FOR SELECT USING (\n  true\n);\n',
-                encoding='utf-8',
-            )
-            vr_res = build_rescue_bundle(vr_repo)
-            self.assertFalse(vr_res['ok'])
-            vr_msgs = "\n".join(b['message'] for b in vr_res['blockers'])
-            # orders must NOT be flagged because 002_rls.sql enables RLS and adds a valid policy
-            self.assertNotIn('`orders`', vr_msgs)
-            # audit_logs MUST be flagged for RLS enabled without policy
-            self.assertIn('`audit_logs`', vr_msgs)
-            # profiles MUST be flagged for multiline USING (true)
-            self.assertIn('`profiles`', vr_msgs)
-            # client_pay.tsx bracket notation MUST be flagged, server_billing.ts must NOT
-            client_exposures = [b for b in vr_res['blockers'] if b['kind'] == 'client_secret_exposure']
-            if vr_res['jsAnalysis']['mode'] == 'typescript-ast':
-                self.assertEqual(1, len(client_exposures))
-                self.assertIn('client_pay.tsx', client_exposures[0]['file'])
-            else:
-                self.assertEqual(0, len(client_exposures))
-                unverified_files = {u['file'] for u in vr_res['unverified']}
-                self.assertIn('src/client_pay.tsx', unverified_files)
-                self.assertNotIn('src/server_billing.ts', unverified_files)
-
-            # 4. Anti-Slop adversarial edge cases
-            slop_repo = base / 'slop_adv'
-            (slop_repo / 'products').mkdir(parents=True, exist_ok=True)
-            # Empty DESIGN.md and comment-only design-tokens.css -> must flag missing_design_lock
-            (slop_repo / 'DESIGN.md').write_text('', encoding='utf-8')
-            (slop_repo / 'design-tokens.css').write_text('/* only comment */\n', encoding='utf-8')
-            # CSS with var(--blob) purple and low WCAG contrast (#1E293B on #0F172A = 1.27:1)
-            (slop_repo / 'styles.css').write_text(
-                ':root { --blob: #8b5cf6; --bg-dark: #0F172A; --fg-dim: #1E293B; }\n'
-                '.hero { background: radial-gradient(circle, var(--blob), transparent); }\n'
-                '.btn { background-color: var(--bg-dark); color: var(--fg-dim); }\n',
-                encoding='utf-8',
-            )
-            # HTML with 3 nested bordered cards and reversed-order viewport zoom block
-            (slop_repo / 'products' / 'landing.html').write_text(
-                '<!doctype html><html><head>\n'
-                '<meta content="width=device-width, user-scalable=no, initial-scale=1" name="viewport">\n'
-                '</head><body>\n'
-                '<!-- 🚀 commented out emoji and 13.5px should be ignored -->\n'
-                '<div class="card border"><div class="panel border"><div class="box border">Nested</div></div></div>\n'
-                '</body></html>\n',
-                encoding='utf-8',
-            )
-            adv_slop = scan_anti_slop(slop_repo)
-            self.assertFalse(adv_slop['ok'])
-            adv_cats = set(adv_slop['byCategory'].keys())
-            self.assertIn('missing_design_lock', adv_cats)
-            self.assertIn('purple_radial_blob_slop', adv_cats)
-            self.assertIn('low_contrast_text', adv_cats)
-            self.assertIn('nested_card_box_slop', adv_cats)
-            self.assertIn('viewport_zoom_block', adv_cats)
-            self.assertNotIn('emoji_chrome_slop', adv_cats)
-            self.assertNotIn('fractional_font_slop', adv_cats)
-
-            # Test apple-minimal preset and overwrite protection
-            (slop_repo / 'DESIGN.md').write_text('# Custom User Design Lock\nDo not overwrite me without --force.\n', encoding='utf-8')
-            (slop_repo / 'design-tokens.css').write_text(':root { --bg-canvas: #ffffff; --text-primary: #111111; }\n', encoding='utf-8')
-            with self.assertRaises(FileExistsError):
-                lock_design_system(slop_repo, archetype='apple-minimal', write_files=True, force=False)
-            self.assertIn('Custom User Design Lock', (slop_repo / 'DESIGN.md').read_text(encoding='utf-8'))
-
-            forced_lock = lock_design_system(slop_repo, archetype='apple-minimal', write_files=True, force=True)
-            self.assertTrue(forced_lock['ok'])
-            self.assertTrue((slop_repo / 'DESIGN.md.bak').exists())
-            self.assertIn('Apple Human Interface', (slop_repo / 'DESIGN.md').read_text(encoding='utf-8'))
-
             # 5. StandaloneService full smoke test
             svc = StandaloneService(base / 'standalone_svc_root')
-            svc.store.create('prism-memory', 'Standalone Task', OWNER, goal='Standalone verification', task='task-sa')
+            svc.store.create('memlet', 'Standalone Task', OWNER, goal='Standalone verification', task='task-sa')
             aug = svc.augment_turn(OWNER, '스탠드얼론 서비스 점검', '스탠드얼론 서비스 점검', 'req-sa-1')
             self.assertEqual('스탠드얼론 서비스 점검', svc.strip_memory_for_display(aug))
             st = svc.action({'action': 'memory_stats', 'taskId': 'task-sa'})
@@ -3281,8 +2949,8 @@ class Round4RegressionTests(unittest.TestCase):
         return subprocess.check_output(['git', *args], cwd=repo, text=True, stderr=subprocess.DEVNULL).strip()
 
     def test_anonymous_default_export_and_line_metadata(self):
-        from prism_memory.code_anchors import extract_file_symbol_signatures
-        from prism_memory.audit import audit_repository
+        from memlet.code_anchors import extract_file_symbol_signatures
+        from memlet.audit import audit_repository
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td), {
                 'mod.ts': "export default function(a = ')') {\n  return a;\n}\n",
@@ -3296,7 +2964,7 @@ class Round4RegressionTests(unittest.TestCase):
             self.assertFalse([f for f in rep['findings'] if f.get('ruleId') == 'missing_symbol'])
 
     def test_historical_anchor_reads_head_commit_not_worktree(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td), {'mod.py': 'def real(a):\n    return a\n', 'AGENTS.md': 'Use `mod.py::real`.\n'})
             self._git(repo, 'init', '-q'); self._git(repo, 'config', 'user.email', 't@example.test'); self._git(repo, 'config', 'user.name', 'T')
@@ -3309,32 +2977,19 @@ class Round4RegressionTests(unittest.TestCase):
             self.assertGreaterEqual(committed, 1)
             self.assertEqual(committed, dirty)
 
-    def test_sql_string_and_comment_rls_do_not_count(self):
-        from prism_memory.viberescue import build_rescue_bundle
-        with tempfile.TemporaryDirectory() as td:
-            fake = self._repo(Path(td) / 'fake', {'m.sql': "CREATE TABLE public.o(id uuid); SELECT 'ALTER TABLE public.o ENABLE ROW LEVEL SECURITY;';\n/* ALTER TABLE public.o ENABLE ROW LEVEL SECURITY; */\n"})
-            self.assertNotEqual('STATIC_CHECKS_PASSED', build_rescue_bundle(fake)['summary']['readiness'])
-            real = self._repo(Path(td) / 'real', {'m.sql': 'CREATE TABLE public.t(id uuid, user_id uuid);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\nCREATE POLICY own ON public.t FOR SELECT USING ((SELECT auth.uid()) = user_id);\n'})
-            self.assertFalse([b for b in build_rescue_bundle(real)['blockers'] if 'rls' in str(b.get('ruleId', '')).lower()])
+
+
 
     def test_secret_masking_covers_tokens_without_false_positives(self):
-        from prism_memory.viberescue import scrub_text_secrets
+        from memlet.redaction import mask_sensitive_text as scrub_text_secrets
         for token in ('sk-proj-' + 'a' * 40, 'ghp_' + 'b' * 36, 'github_pat_' + 'c' * 60, 'AKIA' + 'D' * 16, 'xoxb-' + '123456789012-123456789012-' + 'e' * 24, 'postgres' + '://u:p@db.example.test/app'):
             self.assertNotIn(token, scrub_text_secrets('x ' + token + ' y'))
         for benign in ('task-20261017-abcdef0123456789', 'Run `desk-reviewer-2026-10-21.py`', 'pattern mysql://[^x]'):
             self.assertEqual(benign, scrub_text_secrets(benign))
 
-    def test_git_porcelain_keeps_first_filename_character(self):
-        from prism_memory.viberescue import build_rescue_bundle
-        with tempfile.TemporaryDirectory() as td:
-            repo = self._repo(Path(td), {'README.md': 'a\n', 'app.js': 'export const a = 1;\n'})
-            self._git(repo, 'init', '-q'); self._git(repo, 'config', 'user.email', 't@example.test'); self._git(repo, 'config', 'user.name', 'T')
-            self._git(repo, 'add', '.'); self._git(repo, 'commit', '-qm', 'init')
-            (repo / 'README.md').write_text('b\n')
-            self.assertIn('README.md', build_rescue_bundle(repo)['git']['modifiedFiles'])
 
     def test_dynamic_github_actions_command_is_unverified_not_skipped(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td), {'package.json': '{"scripts":{"test":"echo ok"}}', 'AGENTS.md': '```yaml\nrun: npm run ${{ matrix.script }}\nrun: npm run test\n```\n'})
             rep = audit_repository(repo)
@@ -3342,29 +2997,7 @@ class Round4RegressionTests(unittest.TestCase):
             self.assertGreaterEqual(rep['commandsChecked'], 1)
             self.assertEqual(0, rep['errorCount'])
 
-    def test_opsec_fingerprint_canary_blocks_without_plaintext(self):
-        import hashlib
-        cli = Path(__file__).resolve().parent / 'memory_cli.py'
-        canary = 'round4_unit_test_forbidden_identity'
-        with tempfile.TemporaryDirectory() as td:
-            repo = self._repo(Path(td) / 'repo', {'README.md': f'hello {canary}\n'})
-            canon = Path(td) / 'canon.json'
-            canon.write_text(json.dumps({'characters': {'t': {'forbidden_identifier_sha256_fingerprints': ['sha256:' + hashlib.sha256(canary.encode()).hexdigest()]}}}))
-            r = subprocess.run([sys.executable, '-B', str(cli), 'opsec-check', '--repo', str(repo), '--canon', str(canon)], capture_output=True, text=True)
-            self.assertEqual(1, r.returncode)
-            self.assertNotIn(canary, r.stdout + r.stderr)
-            canon.write_text(json.dumps({'characters': {'t': {'forbidden_identifier_sha256_fingerprints': ['sha256:nothex']}}}))
-            r = subprocess.run([sys.executable, '-B', str(cli), 'opsec-check', '--repo', str(repo), '--canon', str(canon)], capture_output=True, text=True)
-            self.assertEqual(2, r.returncode)
 
-    def test_secret_bundle_with_github_pat_path_stays_clean(self):
-        from prism_memory.viberescue import build_rescue_bundle
-        token = 'github_pat_' + 'a' * 82
-        with tempfile.TemporaryDirectory() as td:
-            repo = self._repo(Path(td), {'AGENTS.md': 'Use `src/' + token + '.py`.\n'})
-            bundle = build_rescue_bundle(repo)
-            self.assertNotIn(token, json.dumps(bundle))
-            self.assertTrue(bundle['secretSafety']['verifiedOutputClean'])
 
 
 
@@ -3435,7 +3068,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertIn('Human note.', idx.read_text(encoding='utf-8'))
 
     def test_memlet_wiki_reports_ast_anchor_status(self):
-        from prism_memory.memlet_wiki import wiki_status
+        from memlet.memlet_wiki import wiki_status
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td))
             # Before init: read-only preview, no files written.
@@ -3473,7 +3106,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual('unchanged', wiki_status(repo)['actions'][0]['op'])
 
     def test_memlet_ledger_records_user_edits_and_page_headers(self):
-        from prism_memory.memlet_wiki import wiki_status
+        from memlet.memlet_wiki import wiki_status
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td))
             code, out = self._cli('init', str(repo))
@@ -3529,7 +3162,7 @@ class MemletInitWikiTests(unittest.TestCase):
                 self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM wiki_events WHERE event_type='user_edit'").fetchone()[0])
 
     def test_memlet_optional_parameter_is_compatible_unverified(self):
-        from prism_memory.memlet_wiki import wiki_status
+        from memlet.memlet_wiki import wiki_status
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td))
             self.assertEqual(0, self._cli('init', str(repo))[0])
@@ -3581,7 +3214,7 @@ class MemletInitWikiTests(unittest.TestCase):
         return base
 
     def test_memlet_import_dry_run_tags_rules_with_live_ast_status(self):
-        from prism_memory.memlet_wiki import import_rules
+        from memlet.memlet_wiki import import_rules
         with tempfile.TemporaryDirectory() as td:
             repo = self._import_repo(Path(td))
             code, out = self._cli('import', str(repo), '--dry-run')
@@ -3613,7 +3246,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertIn('| `stale` | Sessions live in `legacy_auth.py`. | `CLAUDE.md:3` |', md)
 
     def test_memlet_import_writes_page_pins_and_ledger_then_detects_drift(self):
-        from prism_memory.memlet_wiki import import_rules, wiki_status
+        from memlet.memlet_wiki import import_rules, wiki_status
         with tempfile.TemporaryDirectory() as td:
             repo = self._import_repo(Path(td))
             code, out = self._cli('import', str(repo), '--from', 'auto')
@@ -3644,7 +3277,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(('active', 'ast_hash_match'), drift['mod.py::gone'])
 
     def test_memlet_handover_quarantines_stale_and_keeps_rejected(self):
-        from prism_memory.memlet_wiki import AUTHORITY_BOUNDARY, build_handover, handover_signature
+        from memlet.memlet_wiki import AUTHORITY_BOUNDARY, build_handover, handover_signature
         with tempfile.TemporaryDirectory() as td:
             repo = self._import_repo(Path(td))
             self.assertEqual(0, self._cli('import', str(repo))[0])
@@ -3677,13 +3310,13 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertNotEqual(cap['capsuleSignature'], handover_signature(dict(cap, nextAction='rm -rf /')))
 
     def test_memlet_handover_markdown_cli_write_and_budget(self):
-        from prism_memory.memlet_wiki import build_handover, estimate_tokens
+        from memlet.memlet_wiki import build_handover, estimate_tokens
         with tempfile.TemporaryDirectory() as td:
             repo = self._import_repo(Path(td))
             code, out = self._cli('handover', str(repo), '--next-step', 'Ship it', '--rejected', 'No retries in webhooks',
                                   '--format', 'markdown', '--write')
             self.assertEqual(0, code, out)
-            self.assertTrue(out.startswith('## Routlet × Memlet Verified Handover Capsule\n'), out)
+            self.assertTrue(out.startswith('## Memlet Handover Capsule\n'), out)
             with self.assertRaises(json.JSONDecodeError):
                 json.loads(out)
             self.assertIn('- Authority: read-only-context-only: execution and external side-effect approvals are NOT inherited', out)
@@ -3701,7 +3334,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(0, again['executionProof']['modifiedFilesCount'])
             # Many rules still fit the budget; trimmed items are counted, never silently dropped.
             (repo / 'AGENTS.md').write_text('# Rules\n' + ''.join(f'- Rule {i} keeps `mod.py::real` stable for caller group {i}.\n' for i in range(60)), encoding='utf-8')
-            from prism_memory.memlet_wiki import init_project
+            from memlet.memlet_wiki import init_project
             init_project(repo)  # explicit baseline before testing verified-rule budget trimming
             big = build_handover(repo, rejected=['No retries in webhooks'])
             self.assertLess(big['tokenEstimate'], 500)
@@ -3709,7 +3342,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(['No retries in webhooks'], [r['approach'] for r in big['rejectedApproaches']])
 
     def test_memlet_benchmark_compares_three_modes(self):
-        from prism_memory.memlet_wiki import run_refactoring_comparison_benchmark
+        from memlet.memlet_wiki import run_refactoring_comparison_benchmark
         res = run_refactoring_comparison_benchmark()
         modes = {m['mode']: m for m in res['modes']}
         self.assertEqual(['raw-markdown', 'unverified-wiki', 'memlet'], [m['mode'] for m in res['modes']])
@@ -3735,89 +3368,6 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertEqual(0, code, out)
         self.assertEqual(res['resultDigest'], json.loads(out)['resultDigest'])
 
-    def test_memlet_pack_generates_verified_stack_bundles_and_checksums(self):
-        import hashlib
-        from prism_memory.memlet_pack import PACK_FILES, PACK_STACKS, build_harness_pack, list_packs
-        expected = set(PACK_FILES) | {'MANIFEST.json'}
-        self.assertEqual(7, len(expected))
-        listing = list_packs()
-        self.assertEqual('Routlet × Memlet Harness Pack', listing['product'])
-        self.assertNotIn('Pro', listing['product'])
-        self.assertEqual(['nextjs-supabase', 'fastapi-postgres', 'swift-ios'], listing['stacks'])
-        for meta in listing['packs'].values():
-            self.assertEqual(5, len(meta['pitfalls']))
-        with self.assertRaises(ValueError):
-            build_harness_pack('rails')
-
-        # Dry run: everything in memory, nothing on disk, deterministic digest.
-        with tempfile.TemporaryDirectory() as td:
-            out_dir = Path(td) / 'packs'
-            dry = build_harness_pack('all', output_dir=str(out_dir), dry_run=True)
-            self.assertFalse(dry['written'])
-            self.assertFalse(out_dir.exists())
-            self.assertEqual(21, dry['fileCount'])
-            self.assertEqual(sum(p['totalBytes'] for p in dry['packs']), dry['totalBytes'])
-            self.assertEqual(dry['manifestDigest'], build_harness_pack()['manifestDigest'])
-            self.assertIn('| `swift-ios` | 7 |', dry['formatted'])
-            code, out = self._cli('pack', '--dry-run', '--format', 'markdown')
-            self.assertEqual(0, code, out)
-            self.assertIn(dry['manifestDigest'], out)
-            self.assertFalse(Path('nextjs-supabase').exists())
-
-            # Real write via the CLI: 7 files per stack, MANIFEST checksums match the bytes on disk.
-            code, out = self._cli('pack', '--output', str(out_dir))
-            self.assertEqual(0, code, out)
-            data = json.loads(out)
-            self.assertTrue(data['written'])
-            self.assertEqual(dry['manifestDigest'], data['manifestDigest'])
-            for stack in PACK_STACKS:
-                pack_dir = out_dir / stack
-                self.assertEqual(expected, {p.name for p in pack_dir.iterdir()})
-                manifest = json.loads((pack_dir / 'MANIFEST.json').read_text(encoding='utf-8'))
-                self.assertEqual('8.5.0', manifest['version'])
-                self.assertEqual(stack, manifest['stack'])
-                self.assertEqual(list(PACK_FILES), [f['path'] for f in manifest['files']])
-                for entry in manifest['files']:
-                    raw = (pack_dir / entry['path']).read_bytes()
-                    self.assertEqual(entry['sha256'], hashlib.sha256(raw).hexdigest())
-                    self.assertEqual(entry['bytes'], len(raw))
-                    self.assertNotIn(td.encode(), raw)
-                self.assertTrue(manifest['quickstart'])
-                pack_entry = next(p for p in data['packs'] if p['stack'] == stack)
-                self.assertEqual(hashlib.sha256((pack_dir / 'MANIFEST.json').read_bytes()).hexdigest(), pack_entry['manifestSha256'])
-                preset = json.loads((pack_dir / 'routlet-preset.json').read_text(encoding='utf-8'))
-                self.assertEqual({'performance', 'balanced', 'efficiency'}, set(preset['options']))
-                models = {preset['options'][o][r]['model'] for o in preset['options'] for r in ('plan', 'implement', 'review')}
-                self.assertEqual({'Claude Opus 5.5', 'Fable 5.1', 'GPT-6 Astra', 'GPT-6.1 Sol'}, models)
-                tokens = json.loads((pack_dir / 'anti-slop-tokens.json').read_text(encoding='utf-8'))
-                self.assertEqual({'linear', 'stripe', 'toss'}, set(tokens['palettes']))
-                for brand in tokens['palettes'].values():
-                    self.assertEqual({'dark', 'light'}, set(brand))
-                    for mode in brand.values():
-                        self.assertTrue(all(r >= 4.5 for r in mode['contrast'].values()), mode['contrast'])
-                constitution = (pack_dir / 'CLAUDE.md').read_text(encoding='utf-8')
-                for heading in ('## AST Symbol Anchor Conventions', '## Session Delta Rules', '## Human Gates'):
-                    self.assertIn(heading, constitution)
-                self.assertIn('::', constitution)
-                for vendor in ('Claude Code', 'Codex', 'Gemini', 'Cursor'):
-                    self.assertIn(vendor, (pack_dir / 'AGENTS.md').read_text(encoding='utf-8'))
-                skill = (pack_dir / 'SKILL.md').read_text(encoding='utf-8')
-                for heading in ('## Pre-flight Checks', '## Execution Receipt', '## Rollback'):
-                    self.assertIn(heading, skill)
-            # Re-running is idempotent.
-            code, out = self._cli('pack', '--output', str(out_dir), '--stack', 'swift-ios')
-            self.assertEqual(0, code, out)
-            self.assertEqual({'unchanged'}, {f['op'] for f in json.loads(out)['packs'][0]['files']})
-
-            # PITFALLS.md dead-ends travel through `memlet handover` as rejected approaches.
-            (Path(td) / 'repo').mkdir()
-            repo = self._repo(Path(td) / 'repo')
-            self.assertEqual(0, self._cli('init', str(repo))[0])
-            (repo / '.memlet' / 'wiki' / 'pitfalls.md').write_bytes((out_dir / 'fastapi-postgres' / 'PITFALLS.md').read_bytes())
-            code, out = self._cli('handover', str(repo))
-            self.assertEqual(0, code, out)
-            rejected = json.loads(out)['rejectedApproaches']
-            self.assertEqual(5, sum(1 for r in rejected if r['approach'].startswith('[')))
 
     def test_memlet_ui_inspector_renders_self_contained_escaped_html(self):
         payloads = ('<script>alert("xss")</script>', '<img src=x onerror=alert(1)>', '<svg onload=alert(2)>')
@@ -3851,15 +3401,11 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertNotIn(td, html)
             self.assertNotIn(str(Path(td).resolve()), html)
             self.assertNotIn('memlet-canary-do-not-read', html)
-            # AST health, benchmark, handover and Routlet matrix sections.
-            for section_id in ('t-health', 't-bench', 't-handover', 't-routing'):
+            # AST health, benchmark and handover sections.
+            for section_id in ('t-health', 't-bench', 't-handover'):
                 self.assertIn(f'id="{section_id}"', html)
-            for text in ('AST Anchor Health', 'Benchmark', 'Handover Capsule', 'Routlet', 'Apache-2.0', 'Stack Harness Packs'):
+            for text in ('AST Anchor Health', 'Benchmark', 'Handover Capsule', 'Apache-2.0'):
                 self.assertIn(text, html)
-            for forbidden_commercial in ('$19/' + 'mo', '$2' + '9', 'Pro ' + 'Pack', 'Pro ' + 'Harness', 'commercial ' + 'SDK'):
-                self.assertNotIn(forbidden_commercial, html)
-            for model in ('Claude Opus 5.5', 'Fable 5.1', 'Astra', 'Sol'):
-                self.assertIn(model, html)
 
             # Default target is .memlet/inspector.html; `inspector` (without --task) is the same command, and
             # re-rendering an unchanged repository is byte-identical.
@@ -3868,14 +3414,13 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(0, code, out)
             self.assertTrue(json.loads(out)['written'])
             first = default_file.read_text(encoding='utf-8')
-            self.assertIn('id="t-routing"', first)
             code, out = self._cli('ui', str(repo))
             self.assertEqual(0, code, out)
             self.assertEqual(first, default_file.read_text(encoding='utf-8'))
 
     def test_memlet_ui_memory_cortex_tab_is_default_safe_and_bounded(self):
         import re
-        from prism_memory import memlet_cortex, memlet_inspector
+        from memlet import memlet_cortex, memlet_inspector
         with tempfile.TemporaryDirectory() as td:
             repo = self._repo(Path(td))
             (repo / 'AGENTS.md').write_text('# Rules\n- Use `mod.py::real` <img src=x onerror=alert(1)> </script>.\n', encoding='utf-8')
@@ -3885,7 +3430,7 @@ class MemletInitWikiTests(unittest.TestCase):
         # Memory Cortex is the first, selected tab, rendered once per workspace, and the other tabs survive.
         self.assertIn('id="t-cortex-tab" aria-controls="t-cortex" aria-selected="true"', html)
         self.assertEqual(1, html.count(' data-cx-root>'))
-        for section_id in ('t-health', 't-bench', 't-handover', 't-routing'):
+        for section_id in ('t-health', 't-bench', 't-handover'):
             self.assertIn(f'id="{section_id}"', html)
         self.assertIn('stopped steering your agent', html)
         self.assertIn('QUARANTINE ORBIT', html)
@@ -3921,7 +3466,7 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertEqual('{"a":"\\u003c/script\\u003e \\u0026"}', memlet_cortex._json_for_html({'a': '</script> &'}))
 
     def test_memlet_handover_keeps_quarantined_anchors_under_budget_pressure(self):
-        from prism_memory import memlet_wiki
+        from memlet import memlet_wiki
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             (repo / 'mod.py').write_text(''.join(f'def keep_{i}(x):\n    return x\n\n' for i in range(40)), encoding='utf-8')
@@ -3938,7 +3483,7 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertGreater(cap['omitted']['activeConstraints'], 0)
 
     def test_audit_separates_confirmed_broken_paths_from_intentional_references(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
@@ -3965,7 +3510,7 @@ class MemletInitWikiTests(unittest.TestCase):
                 self.assertEqual('warning', by_target[soft]['severity'])
 
     def test_audit_reviewer_counterexamples_keep_required_paths_as_errors(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         cases = [
             ('AGENTS.md', '- Read required `data/feed.json` and compare with `data/feed.json.gz`.', 'data/feed.json', None),
             ('AGENTS.md', '- Read required `docs/policy.md` and compare with `$BASE/docs/policy.md`.', 'docs/policy.md', None),
@@ -3988,7 +3533,7 @@ class MemletInitWikiTests(unittest.TestCase):
 
     def test_audit_node_syntax_pass_does_not_verify_an_explicit_symbol(self):
         import shutil as _sh
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         if not _sh.which('node'):
             self.skipTest('node not installed')
         with tempfile.TemporaryDirectory() as td:
@@ -3999,7 +3544,7 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertTrue(any(f['severity'] == 'error' and f['targetPath'] == 'module.mjs' for f in rep['findings']), rep['findings'])
 
     def test_memlet_handover_never_exceeds_budget_silently_with_long_stale_paths(self):
-        from prism_memory import memlet_wiki
+        from memlet import memlet_wiki
         for n in (0, 1, 2, 3, 4):
             with self.subTest(stale=n), tempfile.TemporaryDirectory() as td:
                 repo = Path(td)
@@ -4015,7 +3560,7 @@ class MemletInitWikiTests(unittest.TestCase):
                     self.assertIn('more stale anchor(s) are quarantined but not listed', cap['formatted'])
 
     def test_instruction_discovery_skips_nested_repos_and_scratch_worktrees(self):
-        from prism_memory import memlet_wiki
+        from memlet import memlet_wiki
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             for rel in ('AGENTS.md', 'docs/sub/CLAUDE.md', '_workspace/wt-1/AGENTS.md', 'vendor/lib/AGENTS.md'):
@@ -4029,15 +3574,15 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertNotIn('vendor/lib/AGENTS.md', found)
 
     def test_memlet_program_name_and_entrypoints(self):
+        impl_root = Path(__file__).resolve().parent
+        self.assertTrue((impl_root / 'action.yml').exists())
+        self.assertTrue((impl_root / '.github/workflows/memlet-check.yml').exists())
+        self.assertTrue((impl_root / 'README.md').exists())
         import memory_cli
         with patch.object(sys, 'argv', ['/usr/local/bin/memlet']):
             self.assertEqual('memlet', memory_cli._program_name())
-        for legacy in ('ieum-memory', 'deltaharness', 'prism-memory'):
-            with patch.object(sys, 'argv', ['/usr/local/bin/' + legacy]):
-                self.assertEqual(legacy, memory_cli._program_name())
         pyproject = (Path(__file__).resolve().parent / 'pyproject.toml').read_text(encoding='utf-8')
-        for line in ('memlet = "memory_cli:cli"', 'memlet-mcp = "prism_memory_mcp:main"', 'ieum-memory = "memory_cli:cli"',
-                     'deltaharness = "memory_cli:cli"', 'prism-memory = "memory_cli:cli"', 'viberescue = ', 'anti-slop = '):
+        for line in ('memlet = "memory_cli:cli"', 'memlet-mcp = "memlet_mcp:main"'):
             self.assertIn(line, pyproject)
         code, out = self._cli('check', '--help')
         self.assertEqual(0, code)
@@ -4047,7 +3592,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertIn(command, out)
         code, out = self._cli('admin', '--help')
         self.assertEqual(0, code)
-        for command in ('wiki', 'import', 'compare-bench', 'pack'):
+        for command in ('wiki', 'import', 'compare-bench'):
             self.assertIn(command, out)
 
 
@@ -4063,7 +3608,7 @@ class HandoverBudgetTests(unittest.TestCase):
         return d
 
     def test_default_budget_is_unchanged(self):
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_wiki import build_handover
         repo = self._repo()
         cap = build_handover(repo)
         self.assertEqual(500, cap['tokenBudget'])
@@ -4075,12 +3620,12 @@ class HandoverBudgetTests(unittest.TestCase):
             self.assertEqual(500, build_handover(repo)['tokenBudget'], junk)
 
     def test_explicit_budget_is_clamped_and_used(self):
-        from prism_memory.memlet_wiki import build_handover, resolve_handover_budget
+        from memlet.memlet_wiki import build_handover, resolve_handover_budget
         repo = self._repo()
         self.assertEqual(2000, resolve_handover_budget(repo, 99999)[0])
         self.assertEqual(500, resolve_handover_budget(repo, 10)[0])
         self.assertEqual((500, 'argument:invalid->default'), resolve_handover_budget(repo, 'lots'))
-        from prism_memory.memlet_wiki import init_project
+        from memlet.memlet_wiki import init_project
         init_project(repo)  # budget comparisons require pinned constraints
         small, big = build_handover(repo), build_handover(repo, budget=1500)
         self.assertLess(big['tokenEstimate'], 1500)
@@ -4088,7 +3633,7 @@ class HandoverBudgetTests(unittest.TestCase):
         self.assertLess(big['omitted']['activeConstraints'], small['omitted']['activeConstraints'])
 
     def test_config_and_auto_budget(self):
-        from prism_memory.memlet_wiki import resolve_handover_budget
+        from memlet.memlet_wiki import resolve_handover_budget
         repo = self._repo(rules=900)
         (repo / '.memlet').mkdir()
         (repo / '.memlet' / 'config.json').write_text(json.dumps({'handover': {'tokenBudget': 1200}}))
@@ -4114,7 +3659,7 @@ class AuditFalsePositiveRound2Tests(unittest.TestCase):
     non-instruction docs; instruction files and lines that say the file is required keep the error."""
 
     def test_round2_rules_downgrade_only_where_intended(self):
-        from prism_memory.audit import audit_repository
+        from memlet.audit import audit_repository
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
@@ -4160,14 +3705,14 @@ class HandoverDigestTests(unittest.TestCase):
         return d
 
     def test_default_capsule_is_unchanged_and_has_no_digest_fields(self):
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_wiki import build_handover
         cap = build_handover(self._repo())
         self.assertNotIn('projectRules', cap)
         self.assertNotIn('mode', cap)
         self.assertNotIn('mode', cap['signedFields'])
 
     def test_digest_ranks_rules_dedupes_and_skips_backup_copies(self):
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_wiki import build_handover
         cap = build_handover(self._repo(), mode='digest', budget=1000)
         rules = [r['rule'] for r in cap['projectRules']]
         self.assertTrue(any('Never push to main' in r for r in rules))
@@ -4179,7 +3724,7 @@ class HandoverDigestTests(unittest.TestCase):
         self.assertIn('### Project rules', build_handover(self._repo(), mode='digest', output_format='markdown')['formatted'])
 
     def test_digest_signature_covers_project_rules_and_budget_holds(self):
-        from prism_memory.memlet_wiki import build_handover, handover_signature
+        from memlet.memlet_wiki import build_handover, handover_signature
         cap = build_handover(self._repo(), mode='digest', budget=500)
         self.assertLess(cap['tokenEstimate'], 500)
         signed = {k: cap[k] for k in cap['signedFields']}
@@ -4189,7 +3734,7 @@ class HandoverDigestTests(unittest.TestCase):
 
     def test_digest_review_counterexamples(self):
         """Codex spec-006 review: stale-symbol prose, memory-note secrets, and cut-off conditions must not slip through."""
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='digest-cx-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'm.py').write_text('def f(x):\n    return x\n')
@@ -4220,7 +3765,7 @@ class HandoverDigestTests(unittest.TestCase):
 
     def test_digest_second_review_counterexamples(self):
         """Codex spec-006 re-review: wiki notes never feed digest rule text; reader-truncated rules are flagged in both lists."""
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='digest-cx2-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'm.py').write_text('def f(x):\n    return x\n')
@@ -4231,7 +3776,7 @@ class HandoverDigestTests(unittest.TestCase):
         (d / '.memlet' / 'wiki').mkdir(parents=True)
         (d / '.memlet' / 'wiki' / 'session-notes.md').write_text(
             '- Always use `m.py::f` with API token SYNTHETIC_WIKI_CANARY_006 for production transfers.\n')
-        from prism_memory.memlet_wiki import init_project
+        from memlet.memlet_wiki import init_project
         init_project(d)  # retain coverage of truncation in the verified and instruction lists
         cap = build_handover(d, mode='digest', budget=2000, output_format='markdown')
         self.assertNotIn('SYNTHETIC_WIKI_CANARY_006', json.dumps(cap, ensure_ascii=False))
@@ -4243,7 +3788,7 @@ class HandoverDigestTests(unittest.TestCase):
         self.assertGreaterEqual(cap['formatted'].count('TRUNCATED — read the source line before acting'), 2)
 
     def test_mode_from_config_and_cli(self):
-        from prism_memory.memlet_wiki import resolve_handover_mode
+        from memlet.memlet_wiki import resolve_handover_mode
         repo = self._repo()
         (repo / '.memlet').mkdir()
         (repo / '.memlet' / 'config.json').write_text(json.dumps({'handover': {'mode': 'digest'}}))
@@ -4284,7 +3829,7 @@ class HandoverBriefTests(unittest.TestCase):
             '- Keep commits small [src: AGENTS.md:5]\n')
 
     def test_build_keeps_only_cited_lines_and_masks_secrets(self):
-        from prism_memory.memlet_brief import build_brief, BRIEF_PAGE
+        from memlet.memlet_brief import build_brief, BRIEF_PAGE
         repo, seen = self._repo(), {}
         rep = build_brief(repo, via='claude', runner=lambda prompt: seen.setdefault('p', prompt) and self.FAKE)
         self.assertTrue(rep['ok'], rep)
@@ -4298,8 +3843,8 @@ class HandoverBriefTests(unittest.TestCase):
         self.assertNotIn('Invented rule', page)
 
     def test_handover_brief_verifies_moves_and_quarantines(self):
-        from prism_memory.memlet_brief import build_brief
-        from prism_memory.memlet_wiki import build_handover, handover_signature
+        from memlet.memlet_brief import build_brief
+        from memlet.memlet_wiki import build_handover, handover_signature
         repo = self._repo()
         build_brief(repo, via='claude', runner=lambda p: self.FAKE)
         cap = build_handover(repo, mode='brief', budget=1000)
@@ -4324,8 +3869,8 @@ class HandoverBriefTests(unittest.TestCase):
         """Codex spec-007 review: forged pins, credential masking, fail-closed runners, no paid-API environment."""
         import hashlib
         from unittest import mock
-        from prism_memory import memlet_brief as mb
-        from prism_memory.memlet_wiki import build_handover
+        from memlet import memlet_brief as mb
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='brief-cx-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         line1 = '- Keep commits small.'
@@ -4360,7 +3905,7 @@ class HandoverBriefTests(unittest.TestCase):
             self.assertNotIn('ANTHROPIC_API_KEY', env)
             self.assertNotIn('ANTHROPIC_BASE_URL', env)
         api = types.SimpleNamespace(returncode=0, stdout=json.dumps({'loggedIn': True, 'authMethod': 'apiKey', 'apiProvider': 'firstParty'}))
-        with mock.patch('prism_memory.memlet_brief.subprocess.run', return_value=api) as run:
+        with mock.patch('memlet.memlet_brief.subprocess.run', return_value=api) as run:
             ok, why = mb.check_runner('claude')
             self.assertFalse(ok)
             self.assertIn('not authenticated by a claude.ai subscription', why)
@@ -4371,8 +3916,8 @@ class HandoverBriefTests(unittest.TestCase):
         self.assertEqual('', mb._claude_argv()[mb._claude_argv().index('--tools') + 1])
 
     def test_brief_mode_without_page_and_default_unchanged(self):
-        from prism_memory.memlet_brief import build_brief
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_brief import build_brief
+        from memlet.memlet_wiki import build_handover
         repo = self._repo()
         cap = build_handover(repo, mode='brief', output_format='markdown')
         self.assertIn('run `memlet brief-build`', cap['formatted'])
@@ -4409,8 +3954,8 @@ class HandoverIndexTests(unittest.TestCase):
         return d
 
     def test_build_and_quote_verbatim(self):
-        from prism_memory.memlet_index import build_index, INDEX_PAGE
-        from prism_memory.memlet_wiki import build_handover, handover_signature
+        from memlet.memlet_index import build_index, INDEX_PAGE
+        from memlet.memlet_wiki import build_handover, handover_signature
         repo, seen = self._repo(), {}
         rep = build_index(repo, runner=lambda p: seen.setdefault('p', p) and self.FAKE)
         self.assertTrue(rep['ok'], rep)
@@ -4429,8 +3974,8 @@ class HandoverIndexTests(unittest.TestCase):
         self.assertNotIn('memlet:index', (repo / INDEX_PAGE).read_text().split('pins=AGENTS.md:5-5=')[0].split('commit size')[0][-5:])
 
     def test_moves_verify_changes_quarantine_and_budget_demotes(self):
-        from prism_memory.memlet_index import build_index
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_index import build_index
+        from memlet.memlet_wiki import build_handover
         repo = self._repo()
         build_index(repo, runner=lambda p: self.FAKE)
         src = list(self.SRC)
@@ -4450,9 +3995,9 @@ class HandoverIndexTests(unittest.TestCase):
         """Codex spec-008 review: PEM body via a narrow quote range, secrets in rejected approaches, brief wiki notes,
         safe-mode runner, nonzero auth exit and settings-supplied API routes."""
         from unittest import mock
-        from prism_memory import memlet_brief as mb
-        from prism_memory.memlet_index import build_index
-        from prism_memory.memlet_wiki import build_handover
+        from memlet import memlet_brief as mb
+        from memlet.memlet_index import build_index
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='index-cx-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'AGENTS.md').write_text('\n'.join([
@@ -4473,10 +4018,10 @@ class HandoverIndexTests(unittest.TestCase):
         ok_json = json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', 'apiProvider': 'firstParty',
                               'subscriptionType': 'max', 'configDirectory': str(d / 'cfg')})
         (d / 'cfg').mkdir()
-        with mock.patch('prism_memory.memlet_brief.subprocess.run',
+        with mock.patch('memlet.memlet_brief.subprocess.run',
                         return_value=types.SimpleNamespace(stdout=ok_json, returncode=1)):
             self.assertFalse(mb.check_runner('claude')[0])          # nonzero exit is never accepted
-        with mock.patch('prism_memory.memlet_brief.subprocess.run',
+        with mock.patch('memlet.memlet_brief.subprocess.run',
                         return_value=types.SimpleNamespace(stdout=ok_json, returncode=0)):
             self.assertTrue(mb.check_runner('claude')[0])
             (d / 'cfg' / 'settings.json').write_text(json.dumps({'apiKeyHelper': '/bin/echo k'}))
@@ -4487,8 +4032,8 @@ class HandoverIndexTests(unittest.TestCase):
             self.assertFalse(mb.check_runner('claude')[0])
 
     def test_default_mode_ignores_index_page(self):
-        from prism_memory.memlet_index import build_index
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_index import build_index
+        from memlet.memlet_wiki import build_handover
         repo = self._repo()
         before = json.dumps(build_handover(repo), sort_keys=True)
         build_index(repo, runner=lambda p: self.FAKE)
@@ -4513,7 +4058,7 @@ class RuleContextRecallTests(unittest.TestCase):
             '- upload credentials | 2 [src: AGENTS.md:7-7]\n- 결제 승인 | 1 [src: AGENTS.md:8-8]\n')
 
     def _repo(self):
-        from prism_memory.memlet_index import build_index
+        from memlet.memlet_index import build_index
         d = Path(tempfile.mkdtemp(prefix='recall-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'AGENTS.md').write_text('\n'.join(self.SRC) + '\n')
@@ -4521,7 +4066,7 @@ class RuleContextRecallTests(unittest.TestCase):
         return d
 
     def test_context_tiers_and_budgets(self):
-        from prism_memory.memlet_recall import build_context
+        from memlet.memlet_recall import build_context
         ctx = build_context(self._repo(), core_budget=600, index_budget=600)
         self.assertEqual(['AGENTS.md:2-2', 'AGENTS.md:3-4', 'AGENTS.md:8-8'], ctx['core'])
         self.assertIn('AGENTS.md:6-6', ctx['index'])
@@ -4532,7 +4077,7 @@ class RuleContextRecallTests(unittest.TestCase):
         self.assertGreater(tiny['omitted'], 0)
 
     def test_recall_is_relevant_deterministic_verbatim_and_masked(self):
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         repo = self._repo()
         a = recall(repo, 'How should a Telegram notification be sent?', k=1)
         self.assertEqual(['AGENTS.md:6-6'], a['spans'])
@@ -4548,9 +4093,9 @@ class RuleContextRecallTests(unittest.TestCase):
 
     def test_recall_review_counterexamples(self):
         """Codex spec-009 review: masked topics, real output budgets, recall guidance and stale status, input bounds."""
-        from prism_memory.memlet_index import build_index
-        from prism_memory.memlet_recall import build_context, recall, MAX_K
-        from prism_memory.memlet_wiki import estimate_tokens
+        from memlet.memlet_index import build_index
+        from memlet.memlet_recall import build_context, recall, MAX_K
+        from memlet.memlet_wiki import estimate_tokens
         repo = self._repo()
         page = repo / '.memlet' / 'wiki' / 'INDEX-RULES.md'
         page.write_text(page.read_text().replace('- push approval →', '- deploy API_TOKEN=abcdefgh1234567890 →'))
@@ -4577,7 +4122,7 @@ class RuleContextRecallTests(unittest.TestCase):
         self.assertNotIn('Keep commits', miss['formatted'])
 
     def test_changed_rule_is_never_quoted(self):
-        from prism_memory.memlet_recall import build_context, recall
+        from memlet.memlet_recall import build_context, recall
         repo = self._repo()
         src = list(self.SRC)
         src[5] = '- Telegram alerts may be sent directly now.'
@@ -4590,7 +4135,7 @@ class RuleRouterTests(unittest.TestCase):
     """spec-010: backup-copy exclusion (opt-in), size-adaptive router, importance-1 safety recall."""
 
     def _repo(self, rules=6, filler=0):
-        from prism_memory.memlet_index import build_index
+        from memlet.memlet_index import build_index
         d = Path(tempfile.mkdtemp(prefix='router-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         lines = ['# Rules'] + [f'- Rule {i}: never skip the approval step {i}.' for i in range(rules)]
@@ -4603,14 +4148,14 @@ class RuleRouterTests(unittest.TestCase):
         return d
 
     def test_discovery_default_unchanged_and_opt_in_exclusion(self):
-        from prism_memory.memlet_wiki import discover_instruction_files
+        from memlet.memlet_wiki import discover_instruction_files
         d = self._repo()
         self.assertIn('runs/old_backup/AGENTS.md', discover_instruction_files(d))
         self.assertNotIn('runs/old_backup/AGENTS.md', discover_instruction_files(d, exclude_snapshots=True))
         self.assertIn('AGENTS.md', discover_instruction_files(d, exclude_snapshots=True))
 
     def test_router_full_below_threshold_tiered_above(self):
-        from prism_memory.memlet_recall import build_context
+        from memlet.memlet_recall import build_context
         small = build_context(self._repo(), auto=True)
         self.assertEqual('full', small['mode'])
         self.assertIn('never skip the approval step 5', small['formatted'])
@@ -4623,8 +4168,8 @@ class RuleRouterTests(unittest.TestCase):
     def test_router_review_counterexamples(self):
         """Codex spec-010 review: current folders named like backups survive; secret-looking file names are masked."""
         from unittest import mock
-        from prism_memory import memlet_recall as mr
-        from prism_memory.memlet_wiki import discover_instruction_files
+        from memlet import memlet_recall as mr
+        from memlet.memlet_wiki import discover_instruction_files
         d = Path(tempfile.mkdtemp(prefix='router-cx-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'AGENTS.md').write_text('- Root rule.\n')
@@ -4640,18 +4185,18 @@ class RuleRouterTests(unittest.TestCase):
         secret = 'sk-' + 'FAKECANARY1234567890' * 2
         files = {f'.github/instructions/{secret}.md': ['Never deploy without approval.']}
         stale = [{'topic': 't', 'source': f'.github/instructions/{secret}.md:1-1', 'importance': 1}]
-        with mock.patch('prism_memory.memlet_brief._source_lines', return_value=files), \
-             mock.patch('prism_memory.memlet_recall.load_verified_index', create=True), \
-             mock.patch('prism_memory.memlet_index.load_verified_index', return_value=([], stale, None)):
+        with mock.patch('memlet.memlet_brief._source_lines', return_value=files), \
+             mock.patch('memlet.memlet_recall.load_verified_index', create=True), \
+             mock.patch('memlet.memlet_index.load_verified_index', return_value=([], stale, None)):
             out = mr.build_context(d, auto=True)['formatted']
         self.assertNotIn(secret, out)
         self.assertIn('Never deploy without approval.', out)
 
     def test_masked_paths_keep_distinct_identities(self):
         """Codex spec-010 re-review: two secret-looking file names must not collapse into one masked identity."""
-        from prism_memory.memlet_index import build_index
-        from prism_memory.memlet_recall import build_context, recall
-        from prism_memory.memlet_wiki import discover_instruction_files
+        from memlet.memlet_index import build_index
+        from memlet.memlet_recall import build_context, recall
+        from memlet.memlet_wiki import discover_instruction_files
         d = Path(tempfile.mkdtemp(prefix='router-id-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         a, b = 'sk-' + 'FAKECANARY1234567890' * 2, 'sk-' + 'OTHERCANARY0987654321' * 2
@@ -4675,7 +4220,7 @@ class RuleRouterTests(unittest.TestCase):
         self.assertNotEqual(first['spanKeys'], excl['spanKeys'])
 
     def test_safety_recall_keeps_every_importance1_reachable(self):
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         d = self._repo(rules=8)
         plain = recall(d, 'step 7 approval', k=1)
         safe = recall(d, 'step 7 approval', k=1, safety=True)
@@ -4691,8 +4236,8 @@ class ConsolidatedReviewTests(unittest.TestCase):
     """Consolidated review: no secret-looking file name in prompts or handovers; hand-written pages keep working."""
 
     def test_secret_file_names_never_leave_in_prompts_or_handovers(self):
-        from prism_memory import memlet_brief, memlet_index
-        from prism_memory.memlet_wiki import build_handover
+        from memlet import memlet_brief, memlet_index
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='cons-names-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         a, b = 'sk-' + 'FAKECANARY1234567890' * 2, 'sk-' + 'OTHERCANARY0987654321' * 2
@@ -4720,9 +4265,9 @@ class ConsolidatedReviewTests(unittest.TestCase):
         self.assertEqual(2, len(idx['quotedRules']) + len(idx['ruleIndex']))  # both rules kept, not collapsed
 
     def test_hand_written_pages_with_reserved_names_are_still_rules(self):
-        from prism_memory.memlet_index import build_index, INDEX_PAGE
-        from prism_memory.memlet_brief import build_brief, BRIEF_PAGE
-        from prism_memory.memlet_wiki import build_handover
+        from memlet.memlet_index import build_index, INDEX_PAGE
+        from memlet.memlet_brief import build_brief, BRIEF_PAGE
+        from memlet.memlet_wiki import build_handover
         d = Path(tempfile.mkdtemp(prefix='cons-pages-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'AGENTS.md').write_text('# Rules\n- Keep commits small.\n')
@@ -4755,7 +4300,7 @@ class SlimPlanTests(unittest.TestCase):
         return d
 
     def test_plan_preserves_every_line_and_writes_only_out(self):
-        from prism_memory.memlet_slim import slim_plan, LOG_REL, RULES_REL
+        from memlet.memlet_slim import slim_plan, LOG_REL, RULES_REL
         d = self._proj()
         before = (d / 'AGENTS.md').read_bytes()
         out = Path(tempfile.mkdtemp(prefix='slim-out-'))
@@ -4788,7 +4333,7 @@ class SlimPlanTests(unittest.TestCase):
     def test_slim_review_counterexamples(self):
         """Codex spec-011 review: no writes via ancestor/linked output, provenance proof catches loss/reorder/dupes,
         generated index titles are masked before truncation."""
-        from prism_memory import memlet_slim as ms
+        from memlet import memlet_slim as ms
         d = self._proj()
         # M1: ancestor output, non-empty output, symlinked output
         self.assertFalse(ms.slim_plan(d, d.parent)['ok'])
@@ -4830,7 +4375,7 @@ class SlimPlanTests(unittest.TestCase):
 
     def test_slim_proof_compares_whole_bytes(self):
         """Codex spec-011b: an extra suffix line or a lost final newline must fail the proof; dangling links collide."""
-        from prism_memory import memlet_slim as ms
+        from memlet import memlet_slim as ms
         d = self._proj()
         lines = (d / 'AGENTS.md').read_text().split('\n')[:-1]
         plan = ms.plan(lines, 2)
@@ -4847,7 +4392,7 @@ class SlimPlanTests(unittest.TestCase):
         self.assertIn(ms.LOG_REL, rep['applyCollisions'])
 
     def test_nothing_to_move_is_reported(self):
-        from prism_memory.memlet_slim import slim_plan
+        from memlet.memlet_slim import slim_plan
         d = Path(tempfile.mkdtemp(prefix='slim-none-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
         (d / 'AGENTS.md').write_text('# Rules\n- Keep commits small.\n')
@@ -4858,7 +4403,7 @@ class DreamOntologyTests(unittest.TestCase):
     """spec-012 rev3: 4 typed ontology edges (GOVERNS, SUPERSEDES, RESOLVES, BLOCKS), dual pins, DAG, canary, and Cortex lineage."""
 
     def _snapshot(self):
-        from prism_memory import memlet_dream as md
+        from memlet import memlet_dream as md
         raw = [
             "2026-10-30T10:00:00Z [claude] Old rule: default handover budget is fixed 400 tokens.",
             "2026-10-30T12:00:00Z [codex] Error: zsh $FILES variable did not split words, producing empty patch. Secret " + md.CANARY_SECRETS[0],
@@ -4870,7 +4415,7 @@ class DreamOntologyTests(unittest.TestCase):
         return {"dream_log.txt": masked}
 
     def test_canary_masking_and_m3_truncation_safety(self):
-        from prism_memory import memlet_dream as md
+        from memlet import memlet_dream as md
         for c in md.CANARY_SECRETS:
             long_str = "prefix " * 20 + c
             trunc = md.safe_truncate_masked(long_str, max_chars=90)
@@ -4879,7 +4424,7 @@ class DreamOntologyTests(unittest.TestCase):
             self.assertNotIn("CANARY", trunc)
 
     def test_dream_pin_4_edges_dual_pin_and_dag_validation(self):
-        from prism_memory import memlet_dream as md
+        from memlet import memlet_dream as md
         snap = self._snapshot()
         cands = [
             {
@@ -4947,7 +4492,7 @@ class DreamOntologyTests(unittest.TestCase):
         self.assertLessEqual(sub["tokenEstimate"], 1500)
 
         # Cortex lineage payload & XSS escaping
-        from prism_memory import memlet_cortex as mc
+        from memlet import memlet_cortex as mc
         lin = md.build_cortex_lineage_payload(graph, sub)
         ws = {"id": "dream-test", "anchors": [], "anchorSummary": {}, "ontologyLineage": lin}
         sec_html = mc.tab_cortex({"workspaces": {"dream-test": ws}})
@@ -4957,8 +4502,8 @@ class DreamOntologyTests(unittest.TestCase):
 
     def test_m1_to_m7_security_and_contract_regressions(self):
         import copy
-        from prism_memory import memlet_dream as md
-        from prism_memory import memlet_cortex as mc
+        from memlet import memlet_dream as md
+        from memlet import memlet_cortex as mc
         snap = self._snapshot()
         # M5: path traversal span rejected with correct argument order + direct parse_span checks
         self.assertIsNone(md.resolve_pin(snap, "../secret.txt:1-1"))
@@ -5239,7 +4784,7 @@ class DreamOntologyTests(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(ws_live_dir, ignore_errors=True))
         (ws_live_dir / ".memlet" / "dream").mkdir(parents=True, exist_ok=True)
         (ws_live_dir / ".memlet" / "dream" / "APPROVAL-QUEUE.json").write_text(json.dumps(g_sub), encoding="utf-8")
-        from prism_memory import memlet_inspector as mi
+        from memlet import memlet_inspector as mi
         live_ws_payload = mi._live_workspace(ws_live_dir, [])
         self.assertIsNotNone(live_ws_payload.get("ontologyLineage"))
         self.assertEqual(1, len(live_ws_payload["ontologyLineage"]["nodes"]))
@@ -5288,8 +4833,8 @@ class DreamOntologyTests(unittest.TestCase):
         md.write_ontology_sqlite(db_dir / "dream.sqlite3", g_sub, snapshot_files=snap_sub)
         self.assertTrue((db_dir / "dream.sqlite3").is_file())
 
-    def test_dream_cli_and_double_routlet_gaps(self):
-        from prism_memory import memlet_dream as md
+    def test_dream_cli_and_queue_gaps(self):
+        from memlet import memlet_dream as md
         import copy
         import sqlite3
         import subprocess
@@ -5333,7 +4878,7 @@ class DreamOntologyTests(unittest.TestCase):
         out_db = tmp / ".memlet" / "dream" / "ontology.sqlite3"
         out_md = tmp / ".memlet" / "dream" / "APPROVAL-QUEUE.md"
 
-        # 1. Direct module CLI: python3 -m prism_memory.memlet_dream dream-build & dream-recall
+        # 1. Direct module CLI: python3 -m memlet.memlet_dream dream-build & dream-recall
         rc_build = md.main([
             "dream-build",
             "--candidates", str(cands_path),

@@ -11,9 +11,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from prism_memory import memlet_bridge as mb, memlet_wiki as mw, memlet_dream as md
-from prism_memory import memlet_recall as mr
-from prism_memory.audit import audit_repository
+from memlet import memlet_bridge as mb, memlet_wiki as mw, memlet_dream as md
+from memlet import memlet_recall as mr
+from memlet.audit import audit_repository
 
 HERE = Path(__file__).resolve().parent
 
@@ -48,8 +48,8 @@ class ClaimsCase(unittest.TestCase):
         (self.repo / 'app/billing.py').write_text('def charge(account_id, amount, currency):\n    return amount\n')
 
     def server(self):
-        from prism_memory_mcp import PrismMemoryMCPServer
-        return PrismMemoryMCPServer(root=self.tmp / 'store', default_task='test/main')
+        from memlet_mcp import MemletMCPServer
+        return MemletMCPServer(root=self.tmp / 'store', default_task='test/main')
 
     def learn(self, lines):
         path = self.repo / 'session.log'
@@ -65,7 +65,7 @@ class ClaimsCase(unittest.TestCase):
 
     def index_fixture(self):
         # Construct a real pinned index without calling index-build (even a fake runner).
-        from prism_memory.memlet_index import parse_index, _render_page, INDEX_PAGE
+        from memlet.memlet_index import parse_index, _render_page, INDEX_PAGE
         lines = (self.repo / 'CLAUDE.md').read_text().splitlines()
         entries, _ = parse_index('- billing charge customer | 1 [src: CLAUDE.md:7-7]', {'CLAUDE.md': lines})
         self.assertEqual(1, len(entries))
@@ -262,9 +262,9 @@ class ClaimsCase(unittest.TestCase):
                 for f in (self.repo / '.memlet').rglob('*'):
                     if f.is_file():
                         self.assertNotIn(secret_value.encode(), f.read_bytes(), str(f))
-        from prism_memory.memlet_brief import SECRET_MASK_FAMILIES
+        from memlet.memlet_brief import SECRET_MASK_FAMILIES
         self.assertTrue(any('Stripe' in f for f in SECRET_MASK_FAMILIES))
-        from prism_memory import memlet_brief as brief
+        from memlet import memlet_brief as brief
         import re
         oracle = re.compile(brief._EXTRA_SECRET_PATTERN, re.I)
         for sample in ('prefix_KEY=value12345 suffix', '한TOKEN=value12345',
@@ -275,7 +275,7 @@ class ClaimsCase(unittest.TestCase):
 
     def test_s5_legacy_capsule_has_distinct_reason(self):
         path = self.repo / 'old.md'
-        path.write_text('# Memlet Handover\n\n## Routlet × Memlet Verified Handover Capsule\n- Signature: old\n')
+        path.write_text('# Memlet Handover\n\n## Memlet Handover Capsule\n- Signature: old\n')
         result = self.cli('handover', '--verify', str(path), '--format', 'json')
         self.assertEqual(1, result.returncode)
         self.assertIn('legacy capsule: no text checksum to verify', json.loads(result.stdout)['reason'])
@@ -290,16 +290,6 @@ class ClaimsCase(unittest.TestCase):
         self.assertNotIn('sarif', doc)
         self.assertEqual('2.1.0', audit_repository(self.repo, output_format='sarif')['sarif']['version'])
 
-    def test_s7_generated_memlet_files_not_scanned(self):
-        from prism_memory.anti_slop import scan_anti_slop
-        from prism_memory.viberescue import build_rescue_bundle
-        before = scan_anti_slop(self.repo)
-        before_rescue = build_rescue_bundle(self.repo)
-        (self.repo / '.memlet/inspector.html').write_text('<div class="gradient glassmorphism">' * 300)
-        (self.repo / '.memlet/fake.py').write_text('password = "unsafe"\n')
-        after = scan_anti_slop(self.repo)
-        self.assertEqual(before['slopScore'], after['slopScore'])
-        self.assertEqual(before_rescue['scannedCodeFiles'], build_rescue_bundle(self.repo)['scannedCodeFiles'])
 
     def test_s8_task_error_is_english(self):
         result = self.cli('--root', str(self.tmp / 'store'), '--task', 'no/such', 'admin', 'brief')
@@ -308,7 +298,7 @@ class ClaimsCase(unittest.TestCase):
         self.assertNotRegex(result.stderr, '[가-힣]')
 
     def test_s9_real_empty_inspector_is_honest(self):
-        from prism_memory.memlet_inspector import build_inspector_payload, render_inspector_html
+        from memlet.memlet_inspector import build_inspector_payload, render_inspector_html
         (self.repo / 'CLAUDE.md').write_text('# Rules\n- Be careful.\n')
         shutil.rmtree(self.repo / '.memlet')
         mw.init_project(self.repo)
@@ -438,9 +428,6 @@ class ClaimsCase(unittest.TestCase):
         self.assertEqual([], result['applied'])
         self.assertEqual(before, q.read_bytes())
 
-
-    def test_s13_no_bundled_persona_canon(self):
-        self.assertFalse((HERE / 'prism_memory/persona-canon.json').exists())
 
     def test_s14_node_approval_digest_binds_all_pin_identity(self):
         ids = self.learn(['RULE: Never charge without review.'])

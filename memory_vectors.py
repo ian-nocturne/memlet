@@ -20,7 +20,7 @@ _cache_misses = 0
 
 def _resolve_model_folder():
     try:
-        from prism_memory.paths import resolve_embedding_model_dir
+        from memlet.paths import resolve_embedding_model_dir
         resolved = resolve_embedding_model_dir(package_root=ROOT)
         if resolved is not None and resolved.is_dir():
             return resolved

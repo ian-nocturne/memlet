@@ -1,4 +1,4 @@
-"""P0 hardening tests for `prism_memory.memlet_dream` (audit P0-6, P0-7 timestamp item, JSONL reader).
+"""P0 hardening tests for `memlet.memlet_dream` (audit P0-6, P0-7 timestamp item, JSONL reader).
 
 Stdlib only; must pass on Python 3.9+.
 """
@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from prism_memory import memlet_dream as md
+from memlet import memlet_dream as md
 
 MODULE_PATH = Path(md.__file__)
 
@@ -613,8 +613,8 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 from unittest import mock  # noqa: E402
 
-from prism_memory import memlet_cortex as mc  # noqa: E402
-from prism_memory import memlet_inspector as mi  # noqa: E402
+from memlet import memlet_cortex as mc  # noqa: E402
+from memlet import memlet_inspector as mi  # noqa: E402
 
 REPO = Path(__file__).resolve().parent
 TWIN_LOG = "2026-11-09T09:00:00Z [user] Never skip tests\n2026-11-09T09:00:00Z [user] Never skip tests\n"

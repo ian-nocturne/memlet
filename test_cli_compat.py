@@ -20,11 +20,11 @@ CLI = HERE / "memory_cli.py"
 GOLDEN = HERE / "testdata" / "cli_golden.json"
 
 LEGACY_COMMANDS = [
-    "schema", "brief", "stats", "scenes", "doctor", "backup", "restore", "repo-benchmark", "audit", "check", "rescue",
-    "viberescue", "anti-slop", "init", "wiki", "import", "slim-plan", "dream-build", "dream", "dream-recall",
+    "schema", "brief", "stats", "scenes", "doctor", "backup", "restore", "repo-benchmark", "audit", "check",
+    "init", "wiki", "import", "slim-plan", "dream-build", "dream", "dream-recall",
     "rule-context", "rule-recall", "index-build", "brief-build", "handover", "compare-bench", "benchmark-compare",
-    "opsec-check", "opsec-fingerprint", "heal-skills", "verify-skill", "preflight", "capsule", "consolidate", "sync-md",
-    "benchmark", "inspector", "ui", "pack", "export", "capture", "recall", "read", "skills", "skill", "cases", "links",
+    "heal-skills", "verify-skill", "preflight", "capsule", "consolidate", "sync-md",
+    "benchmark", "inspector", "ui", "export", "capture", "recall", "read", "skills", "skill", "cases", "links",
     "learn", "feedback", "skill-manage", "skill-sync", "index", "backfill",
 ]
 
@@ -75,7 +75,6 @@ class Sandbox:
         (self.repo / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
         (self.repo / "mod.py").write_text(MOD_PY, encoding="utf-8")
         (self.repo / "api.ts").write_text(API_TS, encoding="utf-8")
-        # A real copy target: anti-slop must not rely on generated .memlet pages as its scan input.
         (self.repo / "PRODUCT.md").write_text("# Billing helper\n\nReview the release before deployment.\n", encoding="utf-8")
         (self.repo / "docs" / "release.md").write_text("# Release\n\nCheck the gate.\n", encoding="utf-8")
         (self.logs / "s1.log").write_text(LOG, encoding="utf-8")
@@ -87,7 +86,7 @@ class Sandbox:
         shutil.rmtree(str(self.tmp), ignore_errors=True)
 
     def run(self, argv, stdin=""):
-        env = {k: v for k, v in os.environ.items() if k not in ("CODEX_THREAD_ID", "PRISM_PARENT_SESSION_ID", "ANTIGRAVITY_AGENT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CODEX_THREAD_ID", "MEMLET_PARENT_SESSION_ID", "ANTIGRAVITY_AGENT")}
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         return subprocess.run([sys.executable, "-B", str(CLI)] + argv, cwd=str(self.repo), input=stdin,
                               capture_output=True, text=True, env=env, timeout=120)
@@ -120,17 +119,10 @@ class Sandbox:
             ("rule-recall-legacy", ["rule-recall", ".", "deploy release"]),
             ("rule-recall-missing-query", ["rule-recall"]),
             ("slim-plan", ["slim-plan", ".", "--out", t + "/slim"]),
-            ("rescue", ["rescue", "."]),
-            ("viberescue-alias", ["viberescue", "."]),
-            ("rescue-markdown", ["rescue", ".", "--format", "markdown"]),
-            ("anti-slop", ["anti-slop", "."]),
-            ("anti-slop-markdown", ["anti-slop", ".", "--format", "markdown"]),
             ("ui", ["ui", ".", "--output", t + "/ui.html"]),
             ("inspector", ["inspector", ".", "--output", t + "/inspector.html"]),
-            ("pack-list", ["pack", "--list"]),
             ("benchmark", ["benchmark", "."]),
             ("compare-bench-markdown", ["compare-bench", "--format", "markdown"]),
-            ("opsec-fingerprint", ["opsec-fingerprint"], "alice\nbob\n"),
             ("dream-build", ["dream-build", "--snapshot", str(self.logs), "--out-json", q]),
             ("dream-alias", ["dream", "--snapshot", str(self.logs), "--out-json", q]),
             ("dream-recall", ["dream-recall", "--graph", q, "--snapshot", str(self.logs), "--query", "git-hooks"]),
