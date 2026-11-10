@@ -38,6 +38,8 @@ def register(sub):
             p.add_argument('--judge', help="Calls a judge model through your own vendor CLI.")
         if name == 'resolve':
             p.add_argument('--resolve', required=True)
+            p.add_argument('--by', required=True)
+            p.add_argument('--reason', required=True)
             p.add_argument('--as', dest='as_status', required=True, choices=('failed', 'done-lost'))
 
 
@@ -51,7 +53,7 @@ def dispatch(args):
         names = {'init': ('dream_until', 'sessions', 'budget', 'hints', 'allow_post_split_memory'),
                  'questions': ('source', 'via', 'count', 'max_calls', 'dry_run'),
                  'run': ('via', 'arms', 'max_calls', 'dry_run'),
-                 'score': ('judge', 'max_calls', 'dry_run'), 'report': (), 'resolve': ('resolve', 'as_status')}[op]
+                 'score': ('judge', 'max_calls', 'dry_run'), 'report': (), 'resolve': ('resolve', 'as_status', 'by', 'reason')}[op]
         options.update({k: values[k] for k in names})
         res = {'init': ev.init_eval, 'questions': ev.seal_questions, 'run': ev.run_eval,
                 'score': ev.score_eval, 'report': ev.report_eval, 'resolve': ev.resolve_call}[op](values['repo'], **options)

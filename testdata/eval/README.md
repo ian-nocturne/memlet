@@ -8,8 +8,10 @@ and print `report --run RUN --format markdown`. `--repo` works before or after t
 They support `--dry-run` and `--max-calls` (per invocation). No model is called by default.
 
 The default protocol is **prospective**. Items, nodes and their edges are admitted only
-when every recorded creation/proposal, verification and approval timestamp is usable
-and at or before the split. An item with no usable timestamp is excluded. Counts by
+when every recorded creation/proposal and approval timestamp is parseable
+and at or before the split. Empty or absent times are unrecorded; an item with no
+recorded decisive timestamp is excluded. Edges also require admitted endpoints;
+unrecorded edge times do not exclude an edge. Counts by
 admission/exclusion reason are reported per context. Undated legacy memory will often
 be excluded. `init --allow-post-split-memory` selects **retrospective**: later-approved
 memory is allowed only when its verified citations lie wholly in the dream window.
@@ -30,7 +32,7 @@ text; native transcripts and other input files have a **2 MiB file limit**.
 
 Questions: 1–200 objects `{id,text,citation:{file,start,end},expectedAny?,forbiddenAny?}`.
 Citations use frozen visible lines starting at 1. Positive keys must have at least three
-characters, occur casefolded in the cited held-out text, and occur in neither the question
+characters, match NFKC-normalised, casefolded token boundaries in the cited held-out text, and occur in neither the question
 nor fixed answer prompt. Literal token-boundary matching avoids substring credit.
 Forbidden-only and keyless questions require a different-vendor judge. Model-authored
 keys still require human review: hostile held-out text can influence their selection.
@@ -40,13 +42,18 @@ is not guaranteed. Judged, deterministic and combined accuracies are shown separ
 First real answering freezes the manifest, sealed set, answering vendor/model and ALL
 question × arm contexts. Resume rebuilds the whole matrix and names differing keys;
 answers use saved contexts. Changed sources, seals, budgets or arms require a new run.
+Saved contexts are verified against their frozen digests immediately before prompting;
+answer/judge blobs are checked against their content addresses on every read.
 Contexts are stored per question and raw call output in bounded blobs, avoiding one
 large contexts/state file. Every answer and score records both seals. A bounded metadata
 projection is checked before a call. Returned raw text is saved before parsing; definite
 failures are retryable and separately counted. Unknown outcomes remain `started` and
 block duplicates. Resolve only after investigating with
-`eval resolve --run RUN --resolve KEY --as failed|done-lost`: this logs an explicit
-resolution; `failed` permits retry, `done-lost` prevents another call for that key.
+`eval resolve --run RUN --resolve KEY --as failed|done-lost --by NAME --reason TEXT`:
+this appends time, previous status, decision, actor and reason to the resolution log.
+`failed` permits retry; `done-lost` is final until another explicit resolution, skips
+that key without blocking other work, and is reported as lost outside all accuracy
+denominators.
 Invalid completed question/judge output is preserved; it never becomes an unknown call.
 
 Every arm shares a context token ceiling and estimator. Rawlog uses cached BM25 over
@@ -68,7 +75,8 @@ protocol, hints, corpus/manifest/question digests, scoring-method accuracies, ca
 failed attempts, unresolved calls and omissions. Digests are not signatures against
 someone able to rewrite all artifacts. Read-only requests for missing runs create nothing.
 
-`eval selftest` runs offline with an injected deterministic vendor, real transcript ingest,
+`eval selftest` runs both prospective and retrospective protocols, asserting one
+admitted real lesson per context in each, and runs offline with an injected deterministic vendor, real transcript ingest,
 keyword proposal and library approval by `selftest` inside a temporary repository.
 The three questions cover a retrievable lesson, a held-out-only leak token and a keyless
 judge case. Every lesson arm succeeds and fails; none misses the lesson; every arm misses

@@ -12,7 +12,7 @@ from memlet import memlet_eval as ev, memlet_wiki as wiki, memlet_bridge as brid
 
 class EvalTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir='/private/tmp')
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.env = patch.dict(os.environ, {'HOME': str(self.root), 'TMPDIR': str(self.root),
@@ -56,6 +56,157 @@ class EvalTests(unittest.TestCase):
 
     def item_provider(self, items):
         return patch.object(bridge, 'dream_items', create=True, return_value={'ok': True, 'items': items})
+
+    def test_round2_real_prospective_and_reasons(self):
+        transcript = self.root / 'sessions/a.jsonl'
+        (self.root / 'sessions/a.json').unlink()
+        transcript.write_text(json.dumps({'type': 'user', 'timestamp': '2025-12-30T12:00:00Z',
+            'message': {'role': 'user', 'content': 'Workaround: cache repair resolved using cedar.'}}) + '\n')
+        learned = bridge.learn_from_transcript(self.root, transcript)
+        self.assertTrue(learned['addedNodeIds'])
+        self.assertTrue(bridge.learn_approve(self.root, learned['addedNodeIds'], approver='tester')['ok'])
+        path = '.memlet/dream/APPROVAL-QUEUE.json'
+        graph = json.loads(wiki.read_managed_text(self.root, path, ev.LIMIT))
+        def date(obj, stamp):
+            if isinstance(obj, dict):
+                if isinstance(obj.get('approval'), dict): obj['approval']['at'] = stamp
+                for v in obj.values(): date(v, stamp)
+            elif isinstance(obj, list):
+                for v in obj: date(v, stamp)
+        self.init(); self.seal()
+        m = ev._manifest(self.root, 'r'); m['budget'] = 1200
+        q = ev._questions(self.root, 'r')[0]
+        for stamp, admitted in [('2025-12-31T00:00:00Z', True), ('2026-02-01T00:00:00Z', False)]:
+            date(graph, stamp)
+            wiki.write_managed_text(self.root, path, json.dumps(graph))
+            built = ev.build_contexts(self.root, m, q)
+            for arm in ('flat', 'graph', 'handover'):
+                self.assertEqual(admitted, 'cedar' in built[arm]['text'], arm)
+                self.assertEqual({'admitted-prospective' if admitted else 'excluded-post-split': 1}, built[arm]['admissionCounts'])
+        # Exercise the graph's independent temporal gate: the provider item
+        # admits, while the graph node is temporally excluded.
+        temporal = ev._temporal
+        def gate(item, manifest, **kw):
+            if 'node' in item:
+                return 'admitted-prospective'
+            return temporal(item, manifest, **kw)
+        with patch.object(ev, '_temporal', side_effect=gate):
+            built = ev.build_contexts(self.root, m, q)
+            self.assertIn('cedar', built['flat']['text'])
+            self.assertNotIn('cedar', built['graph']['text'])
+        m['protocol'] = 'retrospective'
+        self.assertIn('cedar', ev.build_contexts(self.root, m, q)['graph']['text'])
+        self.assertEqual('admitted-prospective', ev._temporal({'approval': {'at': '2026-01-01'}, 'targetTimestamp': ''}, dict(m, protocol='prospective')))
+        self.assertEqual('excluded-missing-timestamp', ev._temporal({'timestamp': ''}, dict(m, protocol='prospective')))
+        for protocol, r in ev.eval_selftest()['protocols'].items():
+            self.assertTrue(r['ok'])
+            for arm in ('flat', 'graph', 'handover'):
+                self.assertEqual({'admitted-' + protocol: 3}, next(x for x in r['report']['arms'] if x['arm'] == arm)['admissionCounts'])
+
+    def test_round2_lost_final_and_explicit_reresolution(self):
+        self.init(); self.seal()
+        with patch.object(ev, '_call', side_effect=RuntimeError('unknown')):
+            with self.assertRaises(RuntimeError): self.run_eval(max_calls=1)
+        ev.resolve_call(self.root, run='r', resolve='q:none', as_status='done-lost', by='tester', reason='lost')
+        self.run_eval()
+        self.assertEqual(4, len(self.calls))
+        self.run_eval()
+        self.assertEqual(4, len(self.calls))
+        ev.score_eval(self.root, run='r')
+        report = ev.report_eval(self.root, run='r')
+        row = report['arms'][0]
+        self.assertEqual((1, 0, 0), (row['lost'], row['n'], report['unresolvedCalls']))
+        self.assertEqual('started', report['resolutions'][0]['previousStatus'])
+        ev.resolve_call(self.root, run='r', resolve='q:none', as_status='failed', by='reviewer', reason='retry approved')
+        self.run_eval()
+        self.assertEqual(5, len(self.calls))
+        log = ev.report_eval(self.root, run='r')['resolutions']
+        self.assertEqual(2, len(log))
+        self.assertEqual(('done-lost', 'reviewer', 'retry approved'), (log[-1]['previousStatus'], log[-1]['by'], log[-1]['reason']))
+
+    def test_round2_context_and_blob_tamper(self):
+        self.init(); self.seal(); self.run_eval(max_calls=1)
+        rel = 'contexts/' + ev.digest('q') + '.json'
+        original = ev._load(self.root, 'r', rel)
+        changed = json.loads(json.dumps(original)); changed['q:flat']['text'] = 'tampered'
+        ev._write(self.root, 'r', rel, changed)
+        with self.assertRaisesRegex(ValueError, 'q:flat'): self.run_eval()
+        with self.assertRaisesRegex(ValueError, 'q:flat'): ev.report_eval(self.root, run='r')
+        ev._write(self.root, 'r', rel, original)
+        raw = ev._load(self.root, 'r', 'state.json')
+        blob = raw['answers']['q:none']['textBlob']
+        ev._write(self.root, 'r', 'blobs/' + blob + '.json', 'pine')
+        with self.assertRaisesRegex(ValueError, 'q:none'): ev.score_eval(self.root, run='r')
+        with self.assertRaisesRegex(ValueError, 'q:none'): ev.report_eval(self.root, run='r')
+
+    def test_round2_saved_contexts_and_projection(self):
+        self.init(); self.seal(); self.run_eval(max_calls=1)
+        original = ev._contexts(self.root, 'r', ev._questions(self.root, 'r'))
+        class Saved(dict):
+            reads = []
+            def __getitem__(self, key):
+                self.reads.append(key)
+                return super().__getitem__(key)
+        saved = Saved(original)
+        dumps = json.dumps
+        def inspect_prompt(obj, *args, **kw):
+            if isinstance(obj, dict) and set(obj) == {'question', 'evidence'}:
+                self.assertIs(obj['evidence'], original['q:handover']['text'])
+            return dumps(obj, *args, **kw)
+        def rebuilt(root, m, q):
+            return json.loads(dumps(self.contexts(root, m, q)))
+        with patch.object(ev, '_contexts', return_value=saved), patch.object(ev.json, 'dumps', side_effect=inspect_prompt):
+            ev.run_eval(self.root, run='r', via='codex', arms=['handover'], max_calls=1, context_builder=rebuilt)
+        self.assertIn('q:handover', saved.reads)
+        state = ev._state(self.root, 'r'); state['padding'] = 'x' * ev.LIMIT
+        with patch.object(ev, '_call') as call:
+            with self.assertRaisesRegex(ValueError, 'before call'):
+                ev._invoke(self.root, 'r', state, 'answer', 'codex', 'prompt', 'key', None)
+            call.assert_not_called()
+
+    def test_round2_judge_forbidden_and_labels(self):
+        self.init(allow_post_split_memory=True)
+        self.put('questions.json', [{'id':'q','text':'What worked?', 'citation':{'file':'sessions/b.json','start':1,'end':1}, 'forbiddenAny':['pine']}])
+        ev.seal_questions(self.root, run='r', source='questions.json')
+        self.run_eval(max_calls=1)
+        self.assertEqual(0, ev.score_eval(self.root, run='r', judge='claude', dry_run=True)['deterministic'])
+        self.output = 'invalid'
+        ev.score_eval(self.root, run='r', judge='claude')
+        score = ev._state(self.root, 'r')['scores']['q:none']
+        self.assertFalse(score['correct'])
+        r = ev.report_eval(self.root, run='r')
+        self.assertEqual(1, r['arms'][0]['invalidJudge'])
+        self.assertIn('memory was selected or approved after the split and may reflect held-out outcomes.', r['formatted'])
+
+    def test_round2_empty_warning_and_judge_blob(self):
+        self.init(); self.seal(False)
+        with self.item_provider([]):
+            ev.run_eval(self.root, run='r', via='codex', max_calls=1)
+        warning = 'no memory was admitted under the prospective protocol; lesson arms are empty by construction'
+        self.assertIn(warning, ev.report_eval(self.root, run='r')['formatted'].splitlines())
+        self.output = '{"correct":true}'
+        ev.score_eval(self.root, run='r', judge='claude')
+        raw = ev._load(self.root, 'r', 'state.json')
+        blob = raw['calls'][-1]['rawBlob']
+        ev._write(self.root, 'r', 'blobs/' + blob + '.json', '{"correct":false}')
+        with self.assertRaisesRegex(ValueError, 'q:none'):
+            ev.report_eval(self.root, run='r')
+
+    def test_round2_fraction_unicode_records_bm25(self):
+        for n in range(1, 10):
+            fraction = '123456789'[:n]
+            self.assertEqual(int(fraction[:6].ljust(6, '0')), ev._stamp('2026-01-01T00:00:00.' + fraction + 'Z').microsecond)
+        self.assertTrue(ev.deterministic_score({'expectedAny':['CAFÉ']}, 'cafe\u0301'))
+        self.assertTrue(ev.deterministic_score({'expectedAny':['ＣＥＤＡＲ']}, 'cedar'))
+        self.init(); m = ev._manifest(self.root, 'r')
+        with self.assertRaises(ValueError):
+            ev._validate_questions([{'id':'q','text':'What worked?', 'citation':{'file':'sessions/b.json','start':1,'end':1},'expectedAny':['ceda']}], m)
+        self.put('sessions/a.json', [5])
+        with self.assertRaisesRegex(ValueError, 'a.json line 1'): ev._sessions(self.root, 'sessions')
+        lines = ['cedar cedar cedar', 'pine', 'cedar pine']
+        docs, df, _, _ = ev._bm25_index(tuple(lines))
+        self.assertEqual(2, df['cedar'])
+        self.assertEqual([lines[0], lines[2], lines[1]], ev._bm25(lines, 'cedar'))
 
     def test_canary_equal_budgets_and_answerer_no_keys(self):
         self.init(); self.seal()
@@ -250,7 +401,7 @@ class EvalTests(unittest.TestCase):
         with patch.object(ev, '_call', side_effect=RuntimeError('unknown')):
             with self.assertRaises(RuntimeError): self.run_eval(max_calls=1)
         key = ev._state(self.root, 'r')['calls'][-1]['key']
-        ev.resolve_call(self.root, run='r', resolve=key, as_status='failed')
+        ev.resolve_call(self.root, run='r', resolve=key, as_status='failed', by='tester', reason='investigated')
         self.run_eval(max_calls=1)
         self.assertTrue(ev._state(self.root, 'r')['calls'][-2]['resolution']['explicit'])
 
@@ -290,7 +441,7 @@ class EvalTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): ev.seal_questions(self.root, run='r', via='claude')
         with self.assertRaisesRegex(ValueError, 'unresolved'):
             ev.seal_questions(self.root, run='r', via='claude')
-        ev.resolve_call(self.root, run='r', resolve='questions', as_status='failed')
+        ev.resolve_call(self.root, run='r', resolve='questions', as_status='failed', by='tester', reason='investigated')
         self.output = 'invalid JSON'
         with self.assertRaises(ValueError): ev.seal_questions(self.root, run='r', via='claude')
         self.assertEqual('invalid JSON', ev._state(self.root, 'r')['calls'][-1]['raw'])
@@ -336,7 +487,7 @@ class EvalTests(unittest.TestCase):
         for item, reason in (({},'missing'), ({'approvedAt':'2026-03-01'},'post-split'), ({'createdAt':'invalid'},'invalid')):
             self.assertIn(reason, ev._temporal(item,m))
         self.assertTrue(ev._temporal({'createdAt':'2026-01-01','approval':{'at':'2026-01-01'}},m).startswith('admitted'))
-        self.assertIn('post-split', ev._temporal({'createdAt':'2026-01-01','edges':[{'createdAt':'2026-03-01'}]},m))
+        self.assertTrue(ev._temporal({'createdAt':'2026-01-01','edges':[{'createdAt':'2026-03-01'}]},m).startswith('admitted'))
         m['protocol']='retrospective'
         self.assertTrue(ev._temporal({'approvedAt':'2026-03-01'},m).startswith('admitted'))
         self.assertEqual('first', ev._clip('first\n' + 'long ' * 200, 5))
