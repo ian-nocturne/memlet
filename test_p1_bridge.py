@@ -798,3 +798,81 @@ class SlimOwnershipFixTests(unittest.TestCase):
         (repo / RULES_REL).write_text(RULES_HEADER + "\n\n- Moved verbatim.\n")
         self.assertEqual(["AGENTS.md", RULES_REL], discover_instruction_files(repo))
         self.assertTrue(is_instruction_path(repo, RULES_REL))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Wave 3 review R2: learn_from_transcript input bounds (unit C1 fix round 1)
+
+import time as _time  # noqa: E402
+from unittest import mock as _mock  # noqa: E402
+
+_LOCKS = {}
+
+
+def setUpModule():
+    _LOCKS["prior"] = os.environ.get("MEMLET_LOCK_DIR")
+    _LOCKS["dir"] = tempfile.mkdtemp(prefix="p1-bridge-locks-")
+    os.environ["MEMLET_LOCK_DIR"] = _LOCKS["dir"]
+
+
+def tearDownModule():
+    if _LOCKS.get("prior") is None:
+        os.environ.pop("MEMLET_LOCK_DIR", None)
+    else:
+        os.environ["MEMLET_LOCK_DIR"] = _LOCKS["prior"]
+    shutil.rmtree(_LOCKS["dir"], ignore_errors=True)
+
+
+class TranscriptBoundsTests(_RepoCase):
+    def snapshot_text(self):
+        d = self.repo / mb.SNAPSHOT_REL
+        return "".join(p.read_text() for p in d.iterdir()) if d.is_dir() else ""
+
+    def test_long_visible_message_is_skipped_whole_and_fast(self):
+        _write_jsonl(self.transcript, _records([{"type": "user", "timestamp": "2026-11-09T10:00:00Z", "message": {
+            "role": "user", "content": "Never call main() in app.py " + "z" * 100000}}]))
+        start = _time.monotonic()
+        res = mb.learn_from_transcript(self.repo, self.transcript)
+        self.assertLess(_time.monotonic() - start, 3.0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, res["skipped"]["overlongMessages"])
+        self.assertNotIn("zzzz", self.snapshot_text())
+        self.assertIn("release branch", self.snapshot_text())  # the ordinary messages are still learned
+        self.assertTrue(any("transcript bounds" in n for n in res["notices"]))
+
+    def test_long_log_lines_and_raw_jsonl_lines_are_skipped_whole(self):
+        log = self.tdir / "session.log"
+        log.write_text("2026-11-09T10:00:00Z RULE: never call main() in app.py\n" + ("z" * 1048576 + "\n") * 3)
+        res = mb.learn_from_transcript(self.repo, log)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(3, res["skipped"]["overlongLines"])
+        self.assertNotIn("zzzz", self.snapshot_text())
+        with _mock.patch.object(mb, "TRANSCRIPT_MAX_LINE_CHARS", 1000):
+            _write_jsonl(self.transcript, _records([{"type": "user", "message": {"role": "user", "content": "Y" * 2000}}]))
+            res = mb.learn_from_transcript(self.repo, self.transcript)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, res["skipped"]["overlongLines"])
+        self.assertNotIn("YYYY", self.snapshot_text())
+
+    def test_size_total_and_work_caps(self):
+        with _mock.patch.object(mb, "TRANSCRIPT_MAX_FILE_BYTES", 100):
+            res = mb.learn_from_transcript(self.repo, self.transcript)
+        self.assertFalse(res["ok"])
+        self.assertEqual(2, res["exitCode"])
+        self.assertEqual(1, res["skipped"]["overSizeFiles"])
+        self.assertFalse((self.repo / mb.SNAPSHOT_REL).exists())
+        second = self.tdir / "second.jsonl"
+        _write_jsonl(second, _records())
+        size = self.transcript.stat().st_size
+        with _mock.patch.object(mb, "TRANSCRIPT_MAX_TOTAL_BYTES", size + 10):
+            res = mb.learn_from_transcript(self.repo, self.tdir)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, res["skipped"]["overTotalSizeFiles"])
+        self.assertEqual(1, len(res["snapshotFiles"]))
+        with _mock.patch.object(mb, "TRANSCRIPT_MAX_WORK_CHARS", 10):
+            third = self.tdir / "third.jsonl"
+            _write_jsonl(third, _records())
+            res = mb.learn_from_transcript(self.repo, third)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, res["skipped"]["overWorkCapFiles"])
+        self.assertEqual([], res["snapshotFiles"])
