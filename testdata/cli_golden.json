@@ -1,0 +1,1310 @@
+{
+ "cases": {
+  "anti-slop": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "byCategory",
+     "cleanlinessScore",
+     "elapsedMs",
+     "exitCode",
+     "findingCount",
+     "findings",
+     "grade",
+     "markdownReport",
+     "ok",
+     "passedChecks",
+     "patchPromptMarkdown",
+     "returnedFindingCount",
+     "scannedFiles",
+     "slopScore",
+     "targetPath",
+     "totalFindingCount",
+     "truncated",
+     "verdict"
+    ],
+    "kind": "json"
+   }
+  },
+  "anti-slop-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "audit": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blastRadius",
+     "commandsChecked",
+     "countsByRule",
+     "elapsedMs",
+     "errorCount",
+     "exitCode",
+     "findingCount",
+     "findings",
+     "findingsCount",
+     "gitDiff",
+     "ok",
+     "referencesChecked",
+     "repoPath",
+     "scannedDocs",
+     "scannedDocsCount",
+     "scannedInstructionFiles",
+     "totalReferencesChecked",
+     "unverifiedDynamicCommandCount",
+     "unverifiedDynamicCommands",
+     "warningCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "audit-exit-zero": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blastRadius",
+     "commandsChecked",
+     "countsByRule",
+     "elapsedMs",
+     "errorCount",
+     "exitCode",
+     "findingCount",
+     "findings",
+     "findingsCount",
+     "gitDiff",
+     "ok",
+     "referencesChecked",
+     "repoPath",
+     "scannedDocs",
+     "scannedDocsCount",
+     "scannedInstructionFiles",
+     "totalReferencesChecked",
+     "unverifiedDynamicCommandCount",
+     "unverifiedDynamicCommands",
+     "warningCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "audit-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "audit-sarif": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blastRadius",
+     "commandsChecked",
+     "countsByRule",
+     "elapsedMs",
+     "errorCount",
+     "exitCode",
+     "findingCount",
+     "findings",
+     "findingsCount",
+     "formatted",
+     "gitDiff",
+     "ok",
+     "referencesChecked",
+     "repoPath",
+     "sarif",
+     "scannedDocs",
+     "scannedDocsCount",
+     "scannedInstructionFiles",
+     "totalReferencesChecked",
+     "unverifiedDynamicCommandCount",
+     "unverifiedDynamicCommands",
+     "warningCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "benchmark": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "benchmark",
+     "command",
+     "exitCode",
+     "externalLlmCalls",
+     "fixture",
+     "modes",
+     "ok",
+     "resultDigest",
+     "scenarios"
+    ],
+    "kind": "json"
+   }
+  },
+  "brief": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "cases",
+     "current",
+     "experiences",
+     "facts",
+     "history",
+     "hypotheses",
+     "indexing",
+     "links",
+     "note",
+     "originals",
+     "owner",
+     "project",
+     "retrieval",
+     "revision",
+     "skillHistory",
+     "skills",
+     "taskId",
+     "version"
+    ],
+    "kind": "json"
+   }
+  },
+  "capsule": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "budgetChars",
+     "capsule",
+     "capsuleChars",
+     "capsuleText",
+     "ok",
+     "preflightStatus",
+     "taskId",
+     "withinBudget",
+     "worker"
+    ],
+    "kind": "json"
+   }
+  },
+  "capture": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "admission",
+     "admissionControl",
+     "admitted",
+     "captureMode",
+     "changes",
+     "contrastiveCase",
+     "detectedKind",
+     "downgradedFrom",
+     "enrichedSkills",
+     "ok",
+     "operationId",
+     "prospectiveCue",
+     "replayed",
+     "revision",
+     "skills",
+     "sourceObservationId",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "cases": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "cases",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "check": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blastRadius",
+     "commandsChecked",
+     "countsByRule",
+     "elapsedMs",
+     "errorCount",
+     "exitCode",
+     "findingCount",
+     "findings",
+     "findingsCount",
+     "gitDiff",
+     "ok",
+     "referencesChecked",
+     "repoPath",
+     "scannedDocs",
+     "scannedDocsCount",
+     "scannedInstructionFiles",
+     "totalReferencesChecked",
+     "unverifiedDynamicCommandCount",
+     "unverifiedDynamicCommands",
+     "warningCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "compare-bench-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "consolidate-dry-run": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "clustersFound",
+     "consolidatedCount",
+     "consolidatedItems",
+     "dryRun",
+     "identityDrift",
+     "ok",
+     "protectedCoreCount",
+     "retractedDraftIds",
+     "revision",
+     "supersededHypothesesCount",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "doctor": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "dataRoot",
+     "dataRootWritable",
+     "dbExists",
+     "dbPath",
+     "embeddingModel",
+     "installedInSitePackages",
+     "ok",
+     "packageAndDataSeparated",
+     "packageRoot",
+     "platform",
+     "pythonVersion",
+     "searchMode",
+     "skillsDir",
+     "sqlite"
+    ],
+    "kind": "json"
+   }
+  },
+  "dream-alias": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "approvalRequired",
+     "candidateCap",
+     "candidatesInputCount",
+     "candidatesOmittedCount",
+     "candidatesTruncated",
+     "command",
+     "contractVerification",
+     "dropped",
+     "droppedCount",
+     "edgeCountsByType",
+     "edgesCount",
+     "extractionMode",
+     "nodesCount",
+     "ok",
+     "outDbPath",
+     "outDbSha256",
+     "outJsonPath",
+     "outJsonSha256",
+     "pendingEdgeCount",
+     "pendingNodeCount",
+     "redactionCountsByType",
+     "snapshotFilesCount",
+     "snapshotReport"
+    ],
+    "kind": "json"
+   }
+  },
+  "dream-build": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "approvalRequired",
+     "candidateCap",
+     "candidatesInputCount",
+     "candidatesOmittedCount",
+     "candidatesTruncated",
+     "command",
+     "contractVerification",
+     "dropped",
+     "droppedCount",
+     "edgeCountsByType",
+     "edgesCount",
+     "extractionMode",
+     "nodesCount",
+     "ok",
+     "outDbPath",
+     "outDbSha256",
+     "outJsonPath",
+     "outJsonSha256",
+     "pendingEdgeCount",
+     "pendingNodeCount",
+     "redactionCountsByType",
+     "snapshotFilesCount",
+     "snapshotReport"
+    ],
+    "kind": "json"
+   }
+  },
+  "dream-recall": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "approvalBoundary",
+     "approvalRequired",
+     "counts",
+     "duplicateIds",
+     "excludedUndecidedOrRejected",
+     "formatted",
+     "includedNodeIds",
+     "ok",
+     "pinVerification",
+     "reviewState",
+     "snapshotSource",
+     "tokenBudget",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "dream-recall-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "dream-recall-no-snapshot-arg": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "approvalBoundary",
+     "approvalRequired",
+     "counts",
+     "duplicateIds",
+     "excludedUndecidedOrRejected",
+     "formatted",
+     "includedNodeIds",
+     "ok",
+     "pinVerification",
+     "reviewState",
+     "snapshotSource",
+     "tokenBudget",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "dream-recall-tiny-budget": {
+   "exit": 2,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "approvalBoundary",
+     "approvalRequired",
+     "budgetTooSmall",
+     "counts",
+     "duplicateIds",
+     "error",
+     "excludedUndecidedOrRejected",
+     "exitCode",
+     "formatted",
+     "includedNodeIds",
+     "minimumBudget",
+     "ok",
+     "pinVerification",
+     "reviewState",
+     "snapshotSource",
+     "tokenBudget",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "export-dry": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "exports",
+     "lang",
+     "mcpConfig",
+     "ok",
+     "revision",
+     "targets",
+     "taskId",
+     "writtenFiles"
+    ],
+    "kind": "json"
+   }
+  },
+  "handover": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "activeConstraints",
+     "authorityBoundary",
+     "budgetExceeded",
+     "capsuleSignature",
+     "checksum",
+     "command",
+     "executionProof",
+     "exitCode",
+     "lexicalConstraints",
+     "markdownChecksum",
+     "nextAction",
+     "ok",
+     "omitted",
+     "pathExistsAnchors",
+     "quarantinedStaleAnchors",
+     "rejectedApproaches",
+     "repoHead",
+     "repoPath",
+     "reverifyBeforeUse",
+     "schema",
+     "signedFields",
+     "tokenBudget",
+     "tokenEstimate",
+     "unpinnedAnchors",
+     "written"
+    ],
+    "kind": "json"
+   }
+  },
+  "handover-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "handover-next-step": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "activeConstraints",
+     "authorityBoundary",
+     "budgetExceeded",
+     "capsuleSignature",
+     "checksum",
+     "command",
+     "executionProof",
+     "exitCode",
+     "lexicalConstraints",
+     "markdownChecksum",
+     "nextAction",
+     "ok",
+     "omitted",
+     "pathExistsAnchors",
+     "quarantinedStaleAnchors",
+     "rejectedApproaches",
+     "repoHead",
+     "repoPath",
+     "reverifyBeforeUse",
+     "schema",
+     "signedFields",
+     "tokenBudget",
+     "tokenEstimate",
+     "unpinnedAnchors",
+     "written"
+    ],
+    "kind": "json"
+   }
+  },
+  "heal-skills-dry-run": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blockedBreakingCount",
+     "blockedBreakingSkills",
+     "dryRun",
+     "healedCount",
+     "healedSkills",
+     "ok",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "import": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "activeCount",
+     "anchorSummary",
+     "anchors",
+     "baselineNotice",
+     "brokenPaths",
+     "brokenPathsCount",
+     "command",
+     "compatibleUnverifiedCount",
+     "dryRun",
+     "exitCode",
+     "from",
+     "importedCount",
+     "next",
+     "ok",
+     "page",
+     "pathExistsCount",
+     "repoHead",
+     "repoPath",
+     "rules",
+     "sourcesScanned",
+     "sourcesScannedCount",
+     "staleCount",
+     "unanchoredCount",
+     "unpinnedCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "import-dry-run": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "activeCount",
+     "anchorSummary",
+     "anchors",
+     "baselineNotice",
+     "brokenPaths",
+     "brokenPathsCount",
+     "command",
+     "compatibleUnverifiedCount",
+     "dryRun",
+     "exitCode",
+     "from",
+     "importedCount",
+     "next",
+     "ok",
+     "page",
+     "pathExistsCount",
+     "repoHead",
+     "repoPath",
+     "rules",
+     "sourcesScanned",
+     "sourcesScannedCount",
+     "staleCount",
+     "unanchoredCount",
+     "unpinnedCount"
+    ],
+    "kind": "json"
+   }
+  },
+  "index": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "enabled",
+     "indexedItems"
+    ],
+    "kind": "json"
+   }
+  },
+  "init": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "audit",
+     "baselineNotice",
+     "command",
+     "config",
+     "dryRun",
+     "exitCode",
+     "instructionFiles",
+     "next",
+     "ok",
+     "repoHead",
+     "repoPath",
+     "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-again-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "init-dry-run": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "audit",
+     "baselineNotice",
+     "command",
+     "config",
+     "dryRun",
+     "exitCode",
+     "instructionFiles",
+     "next",
+     "ok",
+     "repoHead",
+     "repoPath",
+     "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "inspector": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "anchorSummary",
+     "benchmarkDigest",
+     "bytesWritten",
+     "command",
+     "defaultWorkspace",
+     "errors",
+     "exitCode",
+     "externalNetworkCalls",
+     "htmlBytes",
+     "ok",
+     "outputPath",
+     "showcaseAnchorSummary",
+     "written"
+    ],
+    "kind": "json"
+   }
+  },
+  "links": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "links",
+     "nodeId",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "no-command": {
+   "exit": 2,
+   "stderr": {
+    "kind": "text"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "opsec-fingerprint": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "exitCode",
+     "fingerprints",
+     "normalization",
+     "ok"
+    ],
+    "kind": "json"
+   }
+  },
+  "pack-list": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "exitCode",
+     "ok",
+     "packs",
+     "product",
+     "stacks",
+     "version"
+    ],
+    "kind": "json"
+   }
+  },
+  "preflight": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actionType",
+     "files",
+     "ok",
+     "plan",
+     "prospectiveReminders",
+     "requiredChecklist",
+     "status",
+     "taskId",
+     "triggeredCases",
+     "unsatisfiedDependencies",
+     "violatedConstraints"
+    ],
+    "kind": "json"
+   }
+  },
+  "read-missing": {
+   "exit": 1,
+   "stderr": {
+    "keys": [
+     "error",
+     "ok",
+     "type"
+    ],
+    "kind": "json"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "recall": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "cases",
+     "current",
+     "experiences",
+     "facts",
+     "history",
+     "hypotheses",
+     "indexing",
+     "links",
+     "recallId",
+     "retrieval",
+     "revision",
+     "skillHistory",
+     "skills",
+     "taskId",
+     "version"
+    ],
+    "kind": "json"
+   }
+  },
+  "recall-without-task": {
+   "exit": 1,
+   "stderr": {
+    "keys": [
+     "error",
+     "ok",
+     "type"
+    ],
+    "kind": "json"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "rescue": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blockers",
+     "bundleId",
+     "deployConfigs",
+     "elapsedMs",
+     "envAudit",
+     "exitCode",
+     "git",
+     "jsAnalysis",
+     "ok",
+     "onePromptRescueMarkdown",
+     "presentLockfiles",
+     "readiness",
+     "repoName",
+     "repoPath",
+     "rescueBriefMarkdown",
+     "scannedCodeFiles",
+     "scannedSqlFiles",
+     "secretSafety",
+     "stack",
+     "summary",
+     "unverified"
+    ],
+    "kind": "json"
+   }
+  },
+  "rescue-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "rule-context": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "command",
+     "core",
+     "coreKeys",
+     "formatted",
+     "index",
+     "indexKeys",
+     "ok",
+     "omitted",
+     "repoPath",
+     "stale",
+     "tokenBudget",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "rule-recall-legacy": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "command",
+     "formatted",
+     "k",
+     "ok",
+     "repoPath",
+     "scores",
+     "spanKeys",
+     "spans",
+     "stale",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "rule-recall-missing-query": {
+   "exit": 2,
+   "stderr": {
+    "kind": "text"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "rule-recall-query": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "command",
+     "formatted",
+     "k",
+     "ok",
+     "repoPath",
+     "scores",
+     "spanKeys",
+     "spans",
+     "stale",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "scenes": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "hierarchyTree",
+     "memTree",
+     "sceneCount",
+     "scenes",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "schema": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "backup",
+     "benchmark",
+     "capture",
+     "case",
+     "consolidate",
+     "doctor",
+     "experience",
+     "export",
+     "feedback",
+     "inspector",
+     "kinds",
+     "learn",
+     "ops",
+     "optionalEntryFields",
+     "preflight",
+     "repoBenchmark",
+     "restore",
+     "rules",
+     "scenes",
+     "skillManage",
+     "syncMd",
+     "verifySkill"
+    ],
+    "kind": "json"
+   }
+  },
+  "skills": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "history",
+     "retrieval",
+     "revision",
+     "skills",
+     "taskId"
+    ],
+    "kind": "json"
+   }
+  },
+  "slim-plan": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "command",
+     "exitCode",
+     "ok",
+     "why"
+    ],
+    "kind": "json"
+   }
+  },
+  "stats": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "avgPromptChars",
+     "avgRetrievalElapsedMs",
+     "caseCount",
+     "consolidatedSkillCount",
+     "feedback",
+     "linkCount",
+     "linksByRelation",
+     "maxPromptChars",
+     "overallAdoptionRate",
+     "overallErrorRate",
+     "overallHelpfulRate",
+     "perSkill",
+     "recalls",
+     "reuseIntensity",
+     "semantic",
+     "settings",
+     "skillEvents",
+     "skills",
+     "skillsByEvidenceState",
+     "staleSkillCount",
+     "taskId",
+     "totalSkillImpressions",
+     "turnPrompts"
+    ],
+    "kind": "json"
+   }
+  },
+  "ui": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "anchorSummary",
+     "benchmarkDigest",
+     "bytesWritten",
+     "command",
+     "defaultWorkspace",
+     "errors",
+     "exitCode",
+     "externalNetworkCalls",
+     "htmlBytes",
+     "ok",
+     "outputPath",
+     "showcaseAnchorSummary",
+     "written"
+    ],
+    "kind": "json"
+   }
+  },
+  "unknown-command": {
+   "exit": 2,
+   "stderr": {
+    "kind": "text"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "version": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "viberescue-alias": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "blockers",
+     "bundleId",
+     "deployConfigs",
+     "elapsedMs",
+     "envAudit",
+     "exitCode",
+     "git",
+     "jsAnalysis",
+     "ok",
+     "onePromptRescueMarkdown",
+     "presentLockfiles",
+     "readiness",
+     "repoName",
+     "repoPath",
+     "rescueBriefMarkdown",
+     "scannedCodeFiles",
+     "scannedSqlFiles",
+     "secretSafety",
+     "stack",
+     "summary",
+     "unverified"
+    ],
+    "kind": "json"
+   }
+  },
+  "wiki": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "command",
+     "dryRun",
+     "exitCode",
+     "initialized",
+     "ledgerSynced",
+     "ok",
+     "pageSummaries",
+     "pages",
+     "repoHead",
+     "repoPath",
+     "userEditedPages",
+     "wikiDir"
+    ],
+    "kind": "json"
+   }
+  },
+  "wiki-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  }
+ },
+ "help": {
+  "anti-slop": 0,
+  "audit": 0,
+  "backfill": 0,
+  "backup": 0,
+  "benchmark": 0,
+  "benchmark-compare": 0,
+  "brief": 0,
+  "brief-build": 0,
+  "capsule": 0,
+  "capture": 0,
+  "cases": 0,
+  "check": 0,
+  "compare-bench": 0,
+  "consolidate": 0,
+  "doctor": 0,
+  "dream": 0,
+  "dream-build": 0,
+  "dream-recall": 0,
+  "export": 0,
+  "feedback": 0,
+  "handover": 0,
+  "heal-skills": 0,
+  "import": 0,
+  "index": 0,
+  "index-build": 0,
+  "init": 0,
+  "inspector": 0,
+  "learn": 0,
+  "links": 0,
+  "opsec-check": 0,
+  "opsec-fingerprint": 0,
+  "pack": 0,
+  "preflight": 0,
+  "read": 0,
+  "recall": 0,
+  "repo-benchmark": 0,
+  "rescue": 0,
+  "restore": 0,
+  "rule-context": 0,
+  "rule-recall": 0,
+  "scenes": 0,
+  "schema": 0,
+  "skill": 0,
+  "skill-manage": 0,
+  "skill-sync": 0,
+  "skills": 0,
+  "slim-plan": 0,
+  "stats": 0,
+  "sync-md": 0,
+  "ui": 0,
+  "verify-skill": 0,
+  "viberescue": 0,
+  "wiki": 0
+ }
+}
