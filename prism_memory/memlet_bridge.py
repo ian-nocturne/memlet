@@ -54,6 +54,13 @@ _MEMLET_PAGE_EVENTS = ("dream_promote", "anchor_accept", "pin_migration")
 _LESSON_HEADING = "## Approved lessons"
 _DEAD_END_HEADING = "## Dead-ends (approved Dream pitfalls with no code anchor; do not retry)"
 _TRANSCRIPT_SUFFIXES = (".jsonl", ".log")
+# Input bounds of `learn_from_transcript`, so every caller (CLI, hooks, MCP) does bounded work on any input. Anything
+# over a bound is skipped whole and counted in the result's `skipped`; nothing is ever stored partially.
+TRANSCRIPT_MAX_FILE_BYTES = 16 * 1024 * 1024   # a larger file is not read at all
+TRANSCRIPT_MAX_TOTAL_BYTES = 64 * 1024 * 1024  # all files of one call together; later files are skipped
+TRANSCRIPT_MAX_LINE_CHARS = 4 * 1024 * 1024    # one physical transcript line (a `.jsonl` record): never parsed
+TRANSCRIPT_MAX_TEXT_CHARS = 16 * 1024          # one visible message / `.log` line: becomes an empty line
+TRANSCRIPT_MAX_WORK_CHARS = 8 * 1024 * 1024    # visible text kept from all files of one call; later files skipped
 _MAX_TRANSCRIPT_FILES = 200
 _MAX_BASENAME_WALK = 20000
 _SPLITLINES_CHARS_RE = re.compile("[\r\n\x0b\x0c\x1c\x1d\x1e\x85  ]")
@@ -191,14 +198,41 @@ def _transcript_files(src: Path) -> Tuple[List[Path], Dict[str, int]]:
 def _transcript_lines(f: Path) -> Tuple[List[str], Dict[str, int]]:
     """Line N of the result is line N of the transcript (`.jsonl`: visible user/assistant text only, via
     `memlet_dream.read_jsonl_transcript`). Characters `str.splitlines` would split on are folded to spaces so the
-    stored snapshot reads back with the same numbering; every line is secret-masked before it is stored."""
+    stored snapshot reads back with the same numbering; every line is secret-masked before it is stored. Lines and
+    messages over the bounds above become empty lines (counted), so no part of them is stored."""
     if f.suffix == ".jsonl":
-        lines, stats = md.read_jsonl_transcript(f)  # one record per line: a key block is folded into its own line
+        lines, stats = md.read_jsonl_transcript(f, max_line_chars=TRANSCRIPT_MAX_LINE_CHARS,
+                                                max_text_chars=TRANSCRIPT_MAX_TEXT_CHARS)
     else:
         # whole-text redaction BEFORE splitting: a key body between its markers is on lines with no marker of its own
         lines = md.redact_secret_blocks(f.read_text(encoding="utf-8", errors="replace")).splitlines()
-        stats = {}
+        stats = {"overlongLines": sum(1 for ln in lines if len(ln) > TRANSCRIPT_MAX_TEXT_CHARS)}
+        if stats["overlongLines"]:
+            lines = ["" if len(ln) > TRANSCRIPT_MAX_TEXT_CHARS else ln for ln in lines]
     return [md.mask_secrets(_SPLITLINES_CHARS_RE.sub(" ", ln)) for ln in lines], stats
+
+
+def _bounded_files(files: List[Path], skipped: Dict[str, Any]) -> List[Path]:
+    """Drop files over the per-file size bound, and every file once the total bound is reached (counted)."""
+    kept: List[Path] = []
+    total = 0
+    skipped.setdefault("overSizeFiles", 0)
+    skipped.setdefault("overTotalSizeFiles", 0)
+    for f in files:
+        try:
+            size = f.stat().st_size
+        except OSError:
+            skipped["unsupported"] = skipped.get("unsupported", 0) + 1
+            continue
+        if size > TRANSCRIPT_MAX_FILE_BYTES:
+            skipped["overSizeFiles"] += 1
+            continue
+        if total + size > TRANSCRIPT_MAX_TOTAL_BYTES:
+            skipped["overTotalSizeFiles"] += 1
+            continue
+        total += size
+        kept.append(f)
+    return kept
 
 
 def _write_text_atomic(target: Path, text: str) -> None:
@@ -329,6 +363,10 @@ def learn_from_transcript(repo_path=".", transcript_path=None, *, vendor="autono
     files, skipped = _transcript_files(src)
     if not files:
         return _fail("no .jsonl or .log transcript found (symlinked files are skipped)", 2, skipped=skipped)
+    files = _bounded_files(files, skipped)
+    if not files:
+        return _fail(f"every transcript is over the size bound ({TRANSCRIPT_MAX_FILE_BYTES} bytes per file, "
+                     f"{TRANSCRIPT_MAX_TOTAL_BYTES} in total); nothing was read", 2, skipped=skipped)
     q_path = root / QUEUE_REL
     notices: List[str] = []
     try:
@@ -351,9 +389,19 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
             return _fail("the existing .memlet/dream/APPROVAL-QUEUE.json was not built by `learn` (it cites "
                          "another snapshot); move it aside before learning into this repository", 1)
     snap_dir.mkdir(parents=True, exist_ok=True)
-    stored, reader = [], {"messages": 0, "malformedLines": 0, "nonMessageLines": 0}
+    stored, reader = [], {"messages": 0, "malformedLines": 0, "nonMessageLines": 0, "overlongLines": 0,
+                          "overlongMessages": 0}
+    work, over_work = 0, 0
     for f in files:
+        if work >= TRANSCRIPT_MAX_WORK_CHARS:
+            over_work += 1
+            continue
         lines, st = _transcript_lines(f)
+        size = sum(len(ln) for ln in lines)
+        if work + size > TRANSCRIPT_MAX_WORK_CHARS:
+            over_work += 1  # never stored partially
+            continue
+        work += size
         for k in reader:
             reader[k] += int(st.get(k, 0))
         fid, op = _store_snapshot(snap_dir, f, lines)
@@ -389,11 +437,18 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
             notices.append(f"promoted page not refreshed: {prom.get('error')}")
         elif prom.get("removed"):
             notices.append("removed from the promoted page (no longer verifies): " + ", ".join(prom["removed"][:5]))
-    skipped.update({"transcriptMalformedLines": reader["malformedLines"],
+    skipped.update({"overlongLines": reader["overlongLines"], "overlongMessages": reader["overlongMessages"],
+                    "overWorkCapFiles": over_work,
+                    "transcriptMalformedLines": reader["malformedLines"],
                     "transcriptNonMessageLines": reader["nonMessageLines"],
                     "droppedCandidates": len(receipt.get("dropped") or []),
                     "truncatedFiles": cap["truncatedFiles"], "omittedCandidates": cap["omittedCandidates"],
                     "replacedChanged": info["replacedChanged"], "droppedUnverifiable": info["droppedUnverifiable"]})
+    bounded = {k: skipped.get(k, 0) for k in ("overSizeFiles", "overTotalSizeFiles", "overWorkCapFiles",
+                                              "overlongLines", "overlongMessages") if skipped.get(k)}
+    if bounded:
+        notices.append("input over the transcript bounds was skipped whole (never stored in part): "
+                       + ", ".join(f"{k}={v}" for k, v in bounded.items()))
     res = {
         "ok": True, "exitCode": 0, "command": "learn", "repoPath": str(root), "queuePath": str(q_path),
         "dbPath": str(db_path), "snapshotDir": str(snap_dir), "snapshotFiles": stored, "written": not unchanged,

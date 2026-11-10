@@ -819,7 +819,7 @@ def _build_parser():
     for child in set(sub.choices.values()):
         _reserve_legacy_prefixes(child)
     hooks_mode=init_p.add_mutually_exclusive_group()
-    hooks_mode.add_argument('--hooks',action='store_true',help='Opt-in: also install Memlet hooks for Claude Code (merged into .claude settings, never replacing them)')
+    hooks_mode.add_argument('--hooks',action='store_true',help='Opt-in: also install Memlet hooks for Claude Code (merged into .claude settings, never replacing them; all-or-nothing, with a compare-and-swap check before each write. A program that replaces the same file at that very instant cannot be excluded without a shared lock)')
     hooks_mode.add_argument('--hooks-remove',action='store_true',help='Remove only the hook entries Memlet installed')
     init_p.add_argument('--hooks-scope',choices=['local','project'],default=None,help='local (default): .claude/settings.local.json; project: shared .claude/settings.json (needs memlet on PATH)')
     init_p.add_argument('--git-hooks',action='store_true',help='With --hooks / --hooks-remove: also the git pre-commit (warn only) and post-merge hooks')

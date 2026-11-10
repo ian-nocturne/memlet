@@ -8,9 +8,16 @@ Installer
     `.memlet/config.json`, so a second run changes nothing and `--hooks-remove` removes exactly Memlet's entries.
     Malformed settings, symlinked `.claude` / settings files and non-object JSON are refused without any write. A
     backup `<name>.bak-<UTC timestamp>` is written before the first change to a file whose bytes Memlet did not
-    write itself; writes are atomic. `--git-hooks` additionally writes `pre-commit` (warn only) and `post-merge`
-    (one-line re-check) into the hooks directory git uses (`core.hooksPath` honoured); a hook file Memlet did not
-    write is never touched.
+    write itself. A run is all-or-nothing: every destination is checked before the first write, and a later failure
+    undoes exactly this run's writes (including what the implicit `init` created) unless another program changed
+    them meanwhile, which is reported instead. Each replace is compare-and-swap: the new bytes are written and
+    fsynced first, then the target is re-read and compared right before the rename, and an in-place edit made in
+    the remaining gap is detected and put back. A program that itself *renames* a new file over the target inside
+    that last gap cannot be excluded without a lock both sides honour; Memlet does not claim that guarantee.
+    `--git-hooks` additionally writes `pre-commit` (warn only) and `post-merge` (one-line re-check) into the hooks
+    directory git uses (`core.hooksPath` honoured). A git hook is Memlet's only when it is an unmodified generated
+    script (exact marker line with the SHA-256 of its body) AND listed with those bytes in the install record;
+    anything else is reported and never overwritten or deleted.
 
 Runtime
     Reads the hook payload (JSON) on stdin and writes at most one JSON object on stdout. It never blocks or breaks a
@@ -32,6 +39,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -56,7 +64,7 @@ GIT_HOOKS: Tuple[Tuple[str, str], ...] = (("pre-commit", "git-pre-commit"), ("po
 GIT_EVENTS = tuple(g[1] for g in GIT_HOOKS)
 SCOPES = {"local": ".claude/settings.local.json", "project": ".claude/settings.json"}
 PROGRAM_NAMES = ("memlet", "ieum-memory", "prism-memory", "deltaharness")
-GIT_MARKER = "# memlet-managed-hook v1"
+GIT_MARKER = "# memlet-managed-hook v2"
 # Appended to every written command: whatever the installed `memlet` does (an older release without this entry exits
 # 2 from argparse, which a Stop hook would treat as "block"), the shell reports success to Claude Code.
 NEVER_FAIL_SUFFIX = " || true"
@@ -66,8 +74,10 @@ DEFAULT_SESSION_TOKENS = 400
 DEFAULT_MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDIN_BYTES = 16 * 1024 * 1024
 # Self-imposed deadlines, below the timeouts written into settings (10 s / 20 s) and below git's patience.
+# git-pre-commit runs while someone waits for `git commit`: well under two seconds including interpreter start-up;
+# on overrun it prints nothing and exits 0.
 DEADLINES = {"session-start": 7.0, "post-tool-use": 7.0, "stop": 16.0, "pre-compact": 16.0,
-             "git-pre-commit": 20.0, "git-post-merge": 20.0}
+             "git-pre-commit": 1.0, "git-post-merge": 5.0}
 LOG_REL = ".memlet/hooks.log"
 LOG_CAP_BYTES = 64 * 1024
 _EVENT_NAMES = {e[1]: e[0] for e in CLAUDE_EVENTS}
@@ -134,10 +144,6 @@ def _strict_json(raw: bytes) -> Any:
         raise ValueError(f"non-standard JSON constant {name}")
 
     return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
-
-
-def _dump_settings(doc: Dict[str, Any]) -> bytes:
-    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _same_doc(a: Any, b: Any) -> bool:
@@ -264,13 +270,6 @@ def _read_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     return (cfg, None) if isinstance(cfg, dict) else (None, ".memlet/config.json is not an object")
 
 
-def _write_config(root: Path, cfg: Dict[str, Any]) -> None:
-    p = root / ".memlet" / "config.json"
-    data = (json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    mode = stat.S_IMODE(p.stat().st_mode) if p.is_file() else _umask_mode(0o666)
-    _atomic_write(p, data, mode)
-
-
 def _installed(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     hooks = (cfg or {}).get(CONFIG_KEY)
     inst = hooks.get("installed") if isinstance(hooks, dict) else None
@@ -320,6 +319,250 @@ def _set_record(cfg: Dict[str, Any], kind: str, key: Optional[str], value: Optio
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# transactional writes: compare-and-swap replace, rollback of exactly this run's writes
+
+
+def _read_regular(path: Path, limit: Optional[int] = None) -> Optional[bytes]:
+    """Bytes of a regular file (None when absent); never follows a symlink, never opens a FIFO or device."""
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused(f"{path} is not a regular file")
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused(f"{path} is not a regular file")
+        chunks, left = [], (limit if limit is not None else -1)
+        while True:
+            chunk = os.read(fd, 1 << 20 if left < 0 else min(1 << 20, left))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if left >= 0:
+                left -= len(chunk)
+                if left <= 0:
+                    break
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _mode_of(path: Path) -> Optional[int]:
+    try:
+        return stat.S_IMODE(os.lstat(str(path)).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+class _Txn:
+    """The writes of one install/removal run, so a later failure undoes exactly them (newest first). A path whose
+    bytes changed after Memlet wrote it is left alone and reported: an intervening edit is never overwritten."""
+
+    def __init__(self) -> None:
+        self.steps: List[Tuple[str, Path, Any, Any, Any]] = []
+
+    def file(self, path: Path, prior: Optional[bytes], prior_mode: Optional[int], now: Optional[bytes]) -> None:
+        self.steps.append(("file", path, prior, prior_mode, None if now is None else _sha(now)))
+
+    def mode(self, path: Path, prior_mode: int, content: bytes) -> None:
+        self.steps.append(("mode", path, prior_mode, _sha(content), None))
+
+    def made_dir(self, path: Path) -> None:
+        self.steps.append(("dir", path, None, None, None))
+
+    def made_tree(self, path: Path, digest: Dict[str, Any]) -> None:
+        self.steps.append(("tree", path, digest, None, None))
+
+    def rollback(self) -> List[str]:
+        left: List[str] = []
+        for kind, path, a, b, c in reversed(self.steps):
+            try:
+                if kind == "file":
+                    prior, prior_mode, written = a, b, c
+                    try:
+                        cur = _read_regular(path)
+                    except Refused:
+                        cur = b"\0not-regular"
+                    if (cur is None and written is None) or (cur is not None and written and _sha(cur) == written):
+                        if prior is None:
+                            if cur is not None:
+                                os.unlink(str(path))
+                        else:
+                            _atomic_write(path, prior, prior_mode if prior_mode is not None else 0o644)
+                    else:
+                        left.append(f"{path}: changed by another writer after Memlet wrote it; left as it is now")
+                elif kind == "mode":
+                    cur = _read_regular(path)
+                    if cur is not None and _sha(cur) == b:
+                        os.chmod(str(path), a)
+                    else:
+                        left.append(f"{path}: changed after Memlet restored its executable bit; left as it is now")
+                elif kind == "dir":
+                    if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                        path.rmdir()
+                    elif path.exists():
+                        left.append(f"{path}/: created by this run but no longer empty; left in place")
+                elif kind == "tree":
+                    if _tree_digest(path) == a:
+                        shutil.rmtree(str(path))
+                    elif path.exists():
+                        left.append(f"{path}/: created by this run's `init` but changed since; left in place")
+            except (OSError, Refused) as exc:
+                left.append(f"{path}: could not be rolled back ({exc})")
+        self.steps = []
+        return left
+
+
+def _tree_digest(path: Path) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not path.is_dir() or path.is_symlink():
+        return out
+    for dirpath, dirnames, filenames in os.walk(str(path)):
+        for name in sorted(dirnames + filenames):
+            p = Path(dirpath) / name
+            rel = str(p.relative_to(path))
+            if p.is_symlink() or not p.is_file():
+                out[rel] = "dir" if p.is_dir() and not p.is_symlink() else "other"
+            else:
+                out[rel] = _sha(p.read_bytes())
+    return out
+
+
+_INIT_FILES_GLOBS = ("*", "wiki/**/*")
+
+
+def _memlet_files(root: Path) -> Dict[Path, Tuple[Optional[bytes], Optional[int]]]:
+    """Files `init` may write inside an existing `.memlet/` (config, ledger, wiki pages), with bytes and mode."""
+    m = root / ".memlet"
+    out: Dict[Path, Tuple[Optional[bytes], Optional[int]]] = {}
+    if not m.is_dir() or m.is_symlink():
+        return out
+    for pat in _INIT_FILES_GLOBS:
+        for p in m.glob(pat):
+            if p.is_file() and not p.is_symlink() and (pat != "*" or p.suffix != ".log"):
+                out[p] = (p.read_bytes(), _mode_of(p))
+    return out
+
+
+def _cas_write(path: Path, data: bytes, mode: int, expected: Optional[bytes], txn: _Txn, what: str) -> None:
+    """Replace `path` with `data` only if it still holds `expected` (None: only if it is still absent).
+
+    Order: the new bytes are written and fsynced to a temp file first; then the current file is hard-linked to a
+    recovery name (keeping its inode), re-read and compared; then the temp file is renamed over it. A writer that
+    rewrites the file in place inside the remaining gap writes into the recovery inode: that is detected after the
+    rename and their bytes are put back. A writer that itself *replaces* the file (rename) inside the last
+    check-to-rename gap cannot be excluded without a lock both sides honour: Memlet does not claim that guarantee."""
+    if path.is_symlink():
+        raise Refused(f"refusing to write through a symlink: {path}")
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".memlet-", dir=str(path.parent))
+    recovery: Optional[Path] = None
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        prior_mode = _mode_of(path)
+        if expected is None:
+            try:
+                os.link(tmp, str(path))  # atomic create-if-absent
+            except FileExistsError:
+                raise Refused(f"{what} appeared while Memlet was preparing it; nothing was written to it")
+            except OSError:  # no hard links here: the closest check-then-rename
+                if path.exists() or path.is_symlink():
+                    raise Refused(f"{what} appeared while Memlet was preparing it; nothing was written to it")
+                os.replace(tmp, str(path))
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            txn.file(path, None, None, data)
+            return
+        recovery = path.with_name(f"{path.name}.memlet-recovery-{_utc_stamp()}")
+        try:
+            os.link(str(path), str(recovery))
+            linked = True
+        except FileNotFoundError:
+            raise Refused(f"{what} was removed while Memlet was preparing the update; nothing was written to it")
+        except OSError:  # no hard links on this file system: keep a byte copy instead
+            current = _read_regular(path)
+            with open(str(recovery), "xb") as fh:
+                fh.write(current or b"")
+            linked = False
+        current = _read_regular(path)
+        same_inode = (not linked) or (os.lstat(str(path)).st_ino == os.lstat(str(recovery)).st_ino)
+        if current != expected or not same_inode:
+            raise Refused(f"{what} changed while Memlet was preparing the update; nothing was written to it, run the "
+                          "command again")
+        os.replace(tmp, str(path))
+        txn.file(path, expected, prior_mode, data)
+        late = _read_regular(recovery) if linked else expected
+        if late != expected:  # rewritten in place between the check and the rename: their bytes win
+            if _read_regular(path) == data:
+                _atomic_write(path, late, prior_mode if prior_mode is not None else mode)
+                txn.steps.pop()
+                raise Refused(f"{what} was edited by another program during the update; its edit was put back and "
+                              "nothing was installed in it")
+            keep = recovery
+            recovery = None
+            raise Refused(f"{what} was edited by another program during the update; that edit is preserved in "
+                          f"{keep.name}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        if recovery is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(str(recovery))
+
+
+def _cas_delete(path: Path, expected: bytes, txn: _Txn, what: str) -> None:
+    """Delete `path` only if it still holds `expected`; an in-place edit inside the gap is restored."""
+    recovery = path.with_name(f"{path.name}.memlet-recovery-{_utc_stamp()}")
+    prior_mode = _mode_of(path)
+    try:
+        os.link(str(path), str(recovery))
+    except FileNotFoundError:
+        raise Refused(f"{what} was removed by another program; nothing to delete")
+    try:
+        if _read_regular(path) != expected or os.lstat(str(path)).st_ino != os.lstat(str(recovery)).st_ino:
+            raise Refused(f"{what} changed while Memlet was preparing its removal; it was left as it is")
+        os.unlink(str(path))
+        txn.file(path, expected, prior_mode, None)
+        late = _read_regular(recovery)
+        if late != expected:
+            if not path.exists():
+                os.link(str(recovery), str(path))
+            txn.steps.pop()
+            raise Refused(f"{what} was edited by another program during its removal; the edit was kept")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(str(recovery))
+
+
+def _make_dirs(d: Path, txn: _Txn) -> None:
+    missing = []
+    cur = d
+    while not cur.exists() and not cur.is_symlink():
+        missing.append(cur)
+        cur = cur.parent
+    for p in reversed(missing):
+        p.mkdir()
+        txn.made_dir(p)
+
+
+def _writable(d: Path) -> Optional[str]:
+    """None when files can be created and renamed in `d` (or in the nearest existing ancestor that will hold it)."""
+    cur = d
+    while not cur.exists() and not cur.is_symlink():
+        cur = cur.parent
+    if cur.is_symlink() or not cur.is_dir():
+        return f"{cur} is not a directory"
+    if not os.access(str(cur), os.W_OK | os.X_OK):
+        return f"{cur} is not writable"
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Claude Code settings: plan, then apply
 
 
@@ -334,17 +577,46 @@ def _load_settings(root: Path, rel: str) -> Tuple[Path, Optional[bytes], Dict[st
         raise Refused(f"{rel} is a symlink; refusing to write through it (nothing changed)")
     if not path.exists():
         return path, None, {}
-    if not path.is_file():
-        raise Refused(f"{rel} is not a regular file (nothing changed)")
-    raw = path.read_bytes()
     try:
-        doc = _strict_json(raw)
-    except (ValueError, UnicodeDecodeError) as exc:
+        raw = _read_regular(path)
+    except Refused:
+        raise Refused(f"{rel} is not a regular file (nothing changed)")
+    try:
+        doc = _strict_json(raw or b"")
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise Refused(f"{rel} is not valid JSON ({exc}); nothing changed. A broken settings file disables every "
                       "setting in it, so Memlet never writes one: fix the file first.")
     if not isinstance(doc, dict):
         raise Refused(f"{rel} must hold a JSON object, found {type(doc).__name__}; nothing changed")
     return path, raw, doc
+
+
+def _settings_style(raw: Optional[bytes]) -> Dict[str, Any]:
+    """Indentation, line ending, final newline and separators of the existing file, so a merged file keeps them."""
+    if raw is None:
+        return {"indent": 2, "nl": "\n", "final": True, "lead": "", "sep": None, "ascii": False}
+    text = raw.decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lead = text[:len(text) - len(text.lstrip())]
+    body = text.strip()
+    style: Dict[str, Any] = {"nl": nl, "final": text.endswith("\n"), "lead": lead, "sep": None, "indent": None,
+                             "ascii": bool(re.search(r"\\u[0-9a-fA-F]{4}", text)) and all(ord(c) < 128 for c in text)}
+    if "\n" in body:
+        m = re.search(r"\n([ \t]+)\S", body)
+        style["indent"] = ("\t" if m.group(1).startswith("\t") else len(m.group(1))) if m else 2
+    else:  # a one-line file stays one line
+        style["sep"] = ("," + (" " if re.search(r",\s", body) else ""), ":" + (" " if re.search(r'":\s', body) else ""))
+    return style
+
+
+def _dump_settings(doc: Dict[str, Any], style: Optional[Dict[str, Any]] = None) -> bytes:
+    style = style or _settings_style(None)
+    if style["sep"] is not None:
+        text = json.dumps(doc, ensure_ascii=style["ascii"], separators=style["sep"])
+    else:
+        text = json.dumps(doc, ensure_ascii=style["ascii"], indent=style["indent"])
+    text = style["lead"] + text.replace("\n", style["nl"]) + (style["nl"] if style["final"] else "")
+    return text.encode("utf-8")
 
 
 def _settings_backups(path: Path, rec: Dict[str, Any]) -> List[Path]:
@@ -362,16 +634,49 @@ def _settings_backups(path: Path, rec: Dict[str, Any]) -> List[Path]:
     return [p for p in out if p.is_file() and not p.is_symlink()]
 
 
+def _in_shape(group: Any, matcher: Optional[str]) -> bool:
+    """Is this hook group where Memlet installs its entry for the event (same matcher)?"""
+    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+        return False
+    if matcher is None:
+        return group.get("matcher") in (None, "", "*")
+    return group.get("matcher") == matcher
+
+
+def _shape_of(event: str) -> Tuple[Optional[str], Optional[str], int]:
+    for ev, cli_event, timeout, matcher in CLAUDE_EVENTS:
+        if ev == event:
+            return cli_event, matcher, timeout
+    return None, None, 0
+
+
 def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
                 cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pure: what installing (or removing) Memlet's entries would do. Raises Refused."""
+    """Pure: what installing (or removing) Memlet's entries would do. Raises Refused.
+
+    Memlet's entry for an event is a recognised command (`memlet_hook_event`) for that event, inside a group with
+    the event's matcher (`Write|Edit` for PostToolUse, none otherwise). A Memlet-looking command anywhere else is the
+    user's customisation: left alone on install and on removal, and listed in `leftAlone`."""
     rel = SCOPES[scope]
     path, raw, doc = _load_settings(root, rel)
     rec = _record(cfg, "claude", scope)
     hooks_val = doc.get("hooks")
+    left_alone: List[str] = []
+    if isinstance(hooks_val, dict):
+        for event, arr in hooks_val.items():
+            want_cli, matcher, _t = _shape_of(event)
+            for g in arr if isinstance(arr, list) else []:
+                if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
+                    continue
+                for h in g["hooks"]:
+                    ev = memlet_hook_event(h)
+                    if ev and not (ev == want_cli and _in_shape(g, matcher)):
+                        left_alone.append(f"hooks.{event}" + (f" (matcher {g.get('matcher')!r})" if "matcher" in g
+                                                              else "") + f": `{h.get('command')}`")
     if "hooks" in doc and not isinstance(hooks_val, dict):
         if remove:
-            return {"path": rel, "op": "unchanged", "before": raw, "after": raw, "record": None, "events": []}
+            return {"path": rel, "op": "unchanged", "before": raw, "after": raw, "record": None, "events": [],
+                    "leftAlone": left_alone}
         raise Refused(f"{rel}: `hooks` must be a JSON object, found {type(hooks_val).__name__}; nothing changed")
     new = copy.deepcopy(doc)
     created_events: List[str] = []
@@ -389,7 +694,7 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
                 hooks[event] = []
                 created_events.append(event)
             arr = hooks[event]
-            found = [(g, i) for g in arr if isinstance(g, dict) and isinstance(g.get("hooks"), list)
+            found = [(g, i) for g in arr if _in_shape(g, matcher)
                      for i, h in enumerate(g["hooks"]) if memlet_hook_event(h) == cli_event]
             if found:
                 group, idx = found[0]
@@ -407,7 +712,7 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
                 arr.append(group)
                 touched.append(event)
         if not touched:
-            new = doc  # byte-identical: nothing to do
+            new = doc  # nothing to do: the file is not touched at all
         prior_events = [e for e in rec.get("createdEvents") or [] if isinstance(e, str)]
         record = {
             "settings": rel,
@@ -427,18 +732,19 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
         if isinstance(hooks, dict):
             for event in list(hooks):
                 arr = hooks[event]
-                if not isinstance(arr, list):
+                cli_event, matcher, _t = _shape_of(event)
+                if not isinstance(arr, list) or cli_event is None:
                     continue
                 emptied_by_us = False
                 for g in list(arr):
-                    if not (isinstance(g, dict) and isinstance(g.get("hooks"), list)):
+                    if not _in_shape(g, matcher):
                         continue
-                    mine = [h for h in g["hooks"] if memlet_hook_event(h)]
+                    mine = [h for h in g["hooks"] if memlet_hook_event(h) == cli_event]
                     if not mine:
                         continue
                     removed_any = True
                     touched.append(event)
-                    g["hooks"] = [h for h in g["hooks"] if not memlet_hook_event(h)]
+                    g["hooks"] = [h for h in g["hooks"] if memlet_hook_event(h) != cli_event]
                     if not g["hooks"]:
                         arr[:] = [x for x in arr if x is not g]
                         emptied_by_us = True
@@ -451,16 +757,17 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
         if not removed_any:
             new = doc
         record = None
-    plan: Dict[str, Any] = {"path": rel, "before": raw, "record": record, "events": sorted(set(touched))}
+    plan: Dict[str, Any] = {"path": rel, "before": raw, "record": record, "events": sorted(set(touched)),
+                            "leftAlone": left_alone}
     if new is doc:
         plan.update(op="unchanged", after=raw)
         return plan
-    after: Optional[bytes] = _dump_settings(new)
+    after: Optional[bytes] = _dump_settings(new, _settings_style(raw))
     op = "create" if raw is None else "update"
     if remove:
         restore = next((p for p in _settings_backups(path, rec) if _parsed_equal(p, new)), None)
         if restore is not None:
-            after, op = restore.read_bytes(), "restore"
+            after, op = _read_regular(restore), "restore"
             plan["restoredFrom"] = restore.name
         we_created = bool(rec.get("createdFile")) if rec else not _settings_backups(path, rec)
         if not new and we_created:
@@ -471,8 +778,8 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
 
 def _parsed_equal(p: Path, doc: Dict[str, Any]) -> bool:
     try:
-        return _same_doc(_strict_json(p.read_bytes()), doc)
-    except (OSError, ValueError, UnicodeDecodeError):
+        return _same_doc(_strict_json(_read_regular(p, 64 << 20) or b""), doc)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError, Refused):
         return False
 
 
@@ -491,8 +798,18 @@ def needs_backup(before: Optional[bytes], cfg_rec: Dict[str, Any]) -> bool:
     return _sha(before) not in known
 
 
-def apply_claude(root: Path, scope: str, plan: Dict[str, Any], cfg_rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Write the planned settings change. Returns the new install record (or None when removed)."""
+def apply_claude(root: Path, scope: str, plan: Dict[str, Any], cfg_rec: Dict[str, Any],
+                 txn: Optional[_Txn] = None) -> Dict[str, Any]:
+    """Write the planned settings change (compare-and-swap against the planned bytes, see `_cas_write`). Returns
+    the new install record (None when removed). Every write is registered in `txn` for rollback (without a `txn`,
+    a failure rolls back this call's own writes before re-raising)."""
+    if txn is None:
+        own = _Txn()
+        try:
+            return apply_claude(root, scope, plan, cfg_rec, own)
+        except BaseException:
+            own.rollback()
+            raise
     rel = plan["path"]
     path = root / rel
     actions: List[Dict[str, str]] = []
@@ -500,29 +817,18 @@ def apply_claude(root: Path, scope: str, plan: Dict[str, Any], cfg_rec: Dict[str
     if plan["op"] == "unchanged":
         actions.append({"op": "unchanged", "path": rel})
         return {"actions": actions, "record": record, "backup": None}
-    # Re-check right before writing: a symlink could have appeared, or Claude Code itself may have rewritten the file
-    # (it stores "always allow" permissions in settings.local.json); never overwrite a change made since planning.
-    _path, current, _doc = _load_settings(root, rel)
-    if current != plan["before"]:
-        raise Refused(f"{rel} changed while Memlet was preparing the update; nothing was written to it, run the "
-                      "command again")
+    _load_settings(root, rel)  # symlink / type checks again right before writing
     backup = None
     before = plan["before"]
     if needs_backup(before, cfg_rec):
         backup = path.with_name(f"{path.name}.bak-{_utc_stamp()}")
-        n = 0
-        while backup.exists() or backup.is_symlink():
-            n += 1
-            backup = path.with_name(f"{path.name}.bak-{_utc_stamp()}-{n}")
-        with open(str(backup), "xb") as fh:
-            fh.write(before)
-        os.chmod(str(backup), stat.S_IMODE(path.stat().st_mode))
+        mode = _mode_of(path) or 0o600
+        _cas_write(backup, before, mode, None, txn, f"backup {backup.name}")
         actions.append({"op": "backup", "path": str(backup.relative_to(root))})
         if record is not None:
-            record["backups"] = list(record.get("backups") or []) + [
-                {"path": backup.name, "sha256": _sha(before)}]
+            record["backups"] = list(record.get("backups") or []) + [{"path": backup.name, "sha256": _sha(before)}]
     if plan["after"] is None:
-        path.unlink()
+        _cas_delete(path, before, txn, rel)
         actions.append({"op": "delete", "path": rel})
         claude_dir = root / ".claude"
         if cfg_rec.get("createdDir") and claude_dir.is_dir() and not any(claude_dir.iterdir()):
@@ -530,10 +836,10 @@ def apply_claude(root: Path, scope: str, plan: Dict[str, Any], cfg_rec: Dict[str
             actions.append({"op": "delete", "path": ".claude/"})
     else:
         if not path.parent.exists():
-            path.parent.mkdir(parents=True)
+            _make_dirs(path.parent, txn)
             actions.append({"op": "create", "path": ".claude/"})
-        mode = stat.S_IMODE(path.stat().st_mode) if path.is_file() else _umask_mode(0o666)
-        _atomic_write(path, plan["after"], mode)
+        mode = _mode_of(path) if before is not None else None
+        _cas_write(path, plan["after"], mode if mode is not None else _umask_mode(0o666), before, txn, rel)
         actions.append({"op": plan["op"], "path": rel})
     if record is not None:
         record["writtenSha256"] = _sha(plan["after"] or b"")
@@ -569,26 +875,57 @@ def git_hooks_dir(root: Path) -> Tuple[Optional[Path], Optional[str]]:
     return (p if p.is_absolute() else root / p), None
 
 
+_GIT_MARKER_RE = re.compile(r"^# memlet-managed-hook v2 (?P<name>[a-z-]{1,32}) sha256=(?P<digest>[0-9a-f]{64})$")
+_GIT_HOOK_MAX_BYTES = 64 * 1024
+
+
 def git_hook_script(prefix: str, name: str, event: str) -> str:
-    return ("#!/bin/sh\n"
-            f"{GIT_MARKER} ({name}): written by `memlet init --hooks --git-hooks`; "
-            "`memlet init --hooks-remove --git-hooks` deletes it.\n"
+    """Line 1 shebang, line 2 the exact marker with the SHA-256 of everything after it."""
+    body = ("# Written by `memlet init --hooks --git-hooks`; `memlet init --hooks-remove --git-hooks` deletes it. "
+            "Edit it and it becomes yours.\n"
             "# Warns about code-anchored rules touched by this change; it never blocks.\n"
             f"{prefix} admin hook {event} </dev/null{NEVER_FAIL_SUFFIX}\n"
             "exit 0\n")
+    return f"#!/bin/sh\n{GIT_MARKER} {name} sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()}\n{body}"
 
 
-def _is_memlet_git_hook(p: Path) -> bool:
+def _git_hook_state(p: Path, name: str, rec_files: Dict[str, Any]) -> Tuple[str, Optional[bytes]]:
+    """('absent' | 'owned' | 'foreign', bytes). Owned = an unmodified script Memlet generated (exact marker line
+    whose SHA-256 matches the rest) AND listed with exactly these bytes in the install record. A file that merely
+    contains the marker text, an edited script or an unrecorded copy is foreign."""
+    if not p.exists() and not p.is_symlink():
+        return "absent", None
     if p.is_symlink() or not p.is_file():
-        return False
+        return "foreign", None
     try:
-        head = p.read_bytes()[:4096].decode("utf-8", "replace").splitlines()[:5]
-    except OSError:
-        return False
-    return any(line.startswith(GIT_MARKER) for line in head)
+        if p.stat().st_size > _GIT_HOOK_MAX_BYTES:
+            return "foreign", None
+        data = _read_regular(p, _GIT_HOOK_MAX_BYTES + 1)
+    except (OSError, Refused):
+        return "foreign", None
+    if data is None:
+        return "absent", None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "foreign", data
+    parts = text.split("\n", 2)
+    if len(parts) < 3 or parts[0] != "#!/bin/sh":
+        return "foreign", data
+    m = _GIT_MARKER_RE.match(parts[1])
+    if not m or m.group("name") != name or hashlib.sha256(parts[2].encode("utf-8")).hexdigest() != m.group("digest"):
+        return "foreign", data
+    if rec_files.get(name) != _sha(data):
+        return "foreign", data
+    return "owned", data
 
 
-def plan_git(root: Path, prefix: Optional[str], *, remove: bool) -> Dict[str, Any]:
+def _git_record_files(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    files = _record(cfg, "git").get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def plan_git(root: Path, prefix: Optional[str], *, remove: bool, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hooks_dir, why = git_hooks_dir(root)
     plan: Dict[str, Any] = {"hooksDir": str(hooks_dir) if hooks_dir else None, "items": [], "notices": []}
     if hooks_dir is None:
@@ -601,30 +938,36 @@ def plan_git(root: Path, prefix: Optional[str], *, remove: bool) -> Dict[str, An
                                    "Memlet's hook files there could be committed.")
     except ValueError:
         pass
+    rec_files = _git_record_files(cfg)
     for name, event in GIT_HOOKS:
         p = hooks_dir / name
         item: Dict[str, Any] = {"hook": name, "path": str(p)}
-        exists = p.exists() or p.is_symlink()
-        mine = _is_memlet_git_hook(p)
+        state, data = _git_hook_state(p, name, rec_files)
+        item["before"] = data
         if remove:
-            item["op"] = "delete" if mine else ("absent" if not exists else "kept")
-            if exists and not mine:
-                item["reason"] = "not written by Memlet; left untouched"
+            item["op"] = {"owned": "delete", "absent": "absent"}.get(state, "kept")
+            if state == "foreign":
+                item["reason"] = "not a Memlet-written hook recorded in this repository's install record; left untouched"
         else:
             text = git_hook_script(prefix or "memlet", name, event)
-            if exists and not mine:
-                item.update(op="skipped", reason="an existing hook not written by Memlet; left untouched (add "
+            if state == "foreign":
+                item.update(op="skipped", reason="an existing hook that Memlet did not write (or that was edited "
+                                                 "since); left untouched (add "
                                                  f"`{prefix or 'memlet'} admin hook {event}` to it yourself)")
-            elif mine and p.read_text(encoding="utf-8", errors="replace") == text:
-                item["op"] = "unchanged"
+            elif state == "owned" and data == text.encode("utf-8"):
+                mode = _mode_of(p) or 0
+                if mode & 0o100:
+                    item["op"] = "unchanged"
+                else:
+                    item.update(op="chmod", reason="was not executable; the executable bit is restored")
             else:
-                item.update(op="update" if mine else "create", content=text)
+                item.update(op="update" if state == "owned" else "create", content=text)
         plan["items"].append(item)
-    plan["createDir"] = not hooks_dir.exists()
     return plan
 
 
-def apply_git(plan: Dict[str, Any]) -> List[Dict[str, str]]:
+def apply_git(plan: Dict[str, Any], txn: Optional[_Txn] = None) -> List[Dict[str, str]]:
+    txn = txn if txn is not None else _Txn()
     actions: List[Dict[str, str]] = []
     if not plan.get("hooksDir"):
         return actions
@@ -632,16 +975,21 @@ def apply_git(plan: Dict[str, Any]) -> List[Dict[str, str]]:
     for item in plan["items"]:
         p = Path(item["path"])
         if item["op"] in ("create", "update"):
-            d.mkdir(parents=True, exist_ok=True)
-            if p.exists() and not _is_memlet_git_hook(p):  # appeared since planning: never overwrite
-                actions.append({"op": "skipped", "path": str(p)})
-                continue
-            _atomic_write(p, item["content"].encode("utf-8"), 0o755)
+            if not d.exists():
+                _make_dirs(d, txn)
+            _cas_write(p, item["content"].encode("utf-8"), 0o755, item.get("before"), txn, f"git hook {p}")
             actions.append({"op": item["op"], "path": str(p)})
+        elif item["op"] == "chmod":
+            data = _read_regular(p, _GIT_HOOK_MAX_BYTES + 1)
+            if data != item.get("before"):
+                raise Refused(f"git hook {p} changed while Memlet was preparing it; left as it is")
+            prior = _mode_of(p) or 0o644
+            os.chmod(str(p), prior | 0o755)
+            txn.mode(p, prior, data)
+            actions.append({"op": "chmod", "path": str(p)})
         elif item["op"] == "delete":
-            if _is_memlet_git_hook(p):
-                p.unlink()
-                actions.append({"op": "delete", "path": str(p)})
+            _cas_delete(p, item["before"], txn, f"git hook {p}")
+            actions.append({"op": "delete", "path": str(p)})
         else:
             actions.append({"op": item["op"], "path": str(p)})
     return actions
@@ -651,11 +999,17 @@ def apply_git(plan: Dict[str, Any]) -> List[Dict[str, str]]:
 # installer entry (`memlet init --hooks` / `--hooks-remove`)
 
 
+FORMAT_NOTICE = ("the merged settings keep the file's indentation, line endings and final newline, but other "
+                 "whitespace inside it may be normalised; the exact previous bytes are in the backup")
+
+
 def _render(rep: Dict[str, Any]) -> str:
     title = "Memlet hooks" + (" removal" if rep.get("remove") else "") + (" (dry run)" if rep.get("dryRun") else "")
     lines = [f"## {title}", ""]
     if not rep.get("ok"):
         lines.append(f"- ERROR: {rep.get('error')}")
+        for item in rep.get("leftBehind") or []:
+            lines.append(f"- LEFT BEHIND: {item}")
         return "\n".join(lines) + "\n"
     claude = rep.get("claude") or {}
     lines.append(f"- Claude Code ({rep.get('scope')}): `{claude.get('path')}` → {claude.get('op')}")
@@ -664,6 +1018,8 @@ def _render(rep: Dict[str, Any]) -> str:
         lines.append(f"- Example: `{hook_command(rep['hookCommand']['prefix'], 'session-start')}`")
     for a in rep.get("actions") or []:
         lines.append(f"- {a['op']}: `{a['path']}`")
+    for item in claude.get("leftAlone") or []:
+        lines.append(f"- LEFT ALONE (not Memlet's install shape): {item}")
     git = rep.get("gitHooks")
     if git:
         if git.get("skipped"):
@@ -678,58 +1034,118 @@ def _render(rep: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _preflight(root: Path, cplan: Dict[str, Any], gplan: Optional[Dict[str, Any]], *, init_runs: bool,
+               record_changes: bool) -> List[str]:
+    """Every destination this run may write, checked before the first write (rollback covers what this misses)."""
+    problems: List[str] = []
+
+    def check(d: Path, why: str) -> None:
+        err = _writable(d)
+        if err:
+            problems.append(f"{why}: {err}")
+
+    if cplan["op"] != "unchanged":
+        check((root / cplan["path"]).parent, f"{cplan['path']} (and its backup)")
+    if gplan is not None and gplan.get("hooksDir"):
+        if any(it["op"] in ("create", "update", "delete") for it in gplan["items"]):
+            check(Path(gplan["hooksDir"]), "git hooks")
+    memlet = root / ".memlet"
+    if init_runs or record_changes:
+        if memlet.is_symlink():
+            problems.append(".memlet is a symlink")
+        elif not memlet.exists():
+            if init_runs:
+                check(root, ".memlet/ (created by init)")
+        else:
+            check(memlet, ".memlet/ (config and install record)")
+            if init_runs:
+                for sub in ("wiki",):
+                    if (memlet / sub).is_dir():
+                        check(memlet / sub, f".memlet/{sub}/")
+                for f in ("config.json", "ledger.sqlite3", "wiki/INDEX.md"):
+                    p = memlet / f
+                    if p.is_file() and not os.access(str(p), os.W_OK):
+                        problems.append(f".memlet/{f} is not writable")
+    return problems
+
+
 def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                   dry_run: bool = False, which: Callable[[str], Optional[str]] = shutil.which,
                   interpreter: Optional[str] = None, cli_path: Optional[str] = None,
-                  before_apply: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
-    """Install or remove Memlet's hooks. `before_apply` (used by `init --hooks`) runs after every check passed and
-    before the first write; returning a failed report stops the installer without writing."""
+                  run_init: Optional[Callable[[], Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Install or remove Memlet's hooks as one transaction. Every destination is checked before the first write;
+    when a later write fails, exactly this run's writes are undone (including what `run_init`, the implicit
+    `memlet init` of `init --hooks`, created), unless another program changed them meanwhile; whatever had to be
+    left is listed in `leftBehind`."""
     from prism_memory import memlet_wiki as mw
     rep: Dict[str, Any] = {"ok": True, "exitCode": 0, "command": "init --hooks-remove" if remove else "init --hooks",
                            "dryRun": bool(dry_run), "remove": bool(remove), "scope": scope, "notices": []}
-    if scope not in SCOPES:
-        rep.update(ok=False, exitCode=2, error=f"unknown hooks scope {scope!r} (use local or project)")
+
+    def fail(code: int, error: str) -> Dict[str, Any]:
+        rep.update(ok=False, exitCode=code, error=error)
         rep["formatted"] = _render(rep)
         return rep
+
+    if scope not in SCOPES:
+        return fail(2, f"unknown hooks scope {scope!r} (use local or project)")
     try:
         root = mw._resolve_root(repo_path)
         cfg, cfg_problem = _read_config(root)
         if cfg_problem:
             rep["notices"].append(cfg_problem + "; the install record is not used")
         cmd = None
+        git_prefix = None
         if not remove:
             cmd = resolve_command(scope, root, which=which, interpreter=interpreter, cli_path=cli_path)
             rep["hookCommand"] = cmd
-        cplan = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg)
-        gplan = None
-        if git_hooks:
-            git_prefix = cmd["prefix"] if cmd else None
-            if cmd and scope == "project":  # git hooks are personal: same choice as the local scope
+            git_prefix = cmd["prefix"]
+            if git_hooks and scope == "project":  # git hooks are personal: same choice as the local scope
                 git_prefix = resolve_command("local", root, which=which, interpreter=interpreter,
                                              cli_path=cli_path)["prefix"]
-            gplan = plan_git(root, git_prefix, remove=remove)
+
+        def plan_all(cfg_now: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+            c = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg_now)
+            g = plan_git(root, git_prefix, remove=remove, cfg=cfg_now) if git_hooks else None
+            return c, g
+
+        cplan, gplan = plan_all(cfg)
+        git_changes = gplan is not None and any(it["op"] in ("create", "update", "delete", "chmod")
+                                                for it in gplan["items"])
+        problems = _preflight(root, cplan, gplan, init_runs=run_init is not None,
+                              record_changes=(cplan["op"] != "unchanged" or git_changes)
+                              and (cfg is not None or run_init is not None))
+        if problems:
+            raise Refused("cannot install safely, nothing was changed: " + "; ".join(problems))
     except Refused as exc:
-        rep.update(ok=False, exitCode=2, error=str(exc))
-        rep["formatted"] = _render(rep)
-        return rep
+        return fail(2, str(exc))
     rep["repoPath"] = str(root)
-    rep["claude"] = {"path": cplan["path"], "op": cplan["op"], "events": cplan["events"]}
-    if cplan.get("restoredFrom"):
-        rep["claude"]["restoredFrom"] = cplan["restoredFrom"]
-    rep["diff"] = _diff(cplan["path"], cplan["before"], cplan["after"]) if cplan["op"] != "unchanged" else ""
+
+    def describe(c: Dict[str, Any], g: Optional[Dict[str, Any]]) -> None:
+        rep["claude"] = {"path": c["path"], "op": c["op"], "events": c["events"], "leftAlone": c["leftAlone"]}
+        if c.get("restoredFrom"):
+            rep["claude"]["restoredFrom"] = c["restoredFrom"]
+        rep["diff"] = _diff(c["path"], c["before"], c["after"]) if c["op"] != "unchanged" else ""
+        if g is not None:
+            rep["gitHooks"] = {k: v for k, v in g.items() if k not in ("items", "notices")}
+            rep["gitHooks"]["items"] = [{k: v for k, v in it.items() if k not in ("content", "before")}
+                                        for it in g["items"]]
+
+    describe(cplan, gplan)
     if gplan is not None:
-        rep["gitHooks"] = {k: v for k, v in gplan.items() if k != "items"}
-        rep["gitHooks"]["items"] = [{k: v for k, v in it.items() if k != "content"} for it in gplan["items"]]
         rep["notices"] += gplan.get("notices") or []
     elif remove:
         hooks_dir, _why = git_hooks_dir(root)
-        left = [n for n, _e in GIT_HOOKS if hooks_dir and _is_memlet_git_hook(hooks_dir / n)]
+        recorded = _git_record_files(cfg)
+        left = [n for n, _e in GIT_HOOKS if hooks_dir and _git_hook_state(hooks_dir / n, n, recorded)[0] == "owned"]
         if left:
             rep["notices"].append("Memlet git hooks remain (" + ", ".join(left) + "); add --git-hooks to remove them")
-    if not remove and scope == "local" and cplan["before"] is None:
-        note = _gitignore_notice(root, cplan["path"])
-        if note:
-            rep["notices"].append(note)
+    if not remove and cplan["op"] in ("create", "update"):
+        if scope == "local" and cplan["before"] is None:
+            note = _gitignore_notice(root, cplan["path"])
+            if note:
+                rep["notices"].append(note)
+        if cplan["before"] is not None:
+            rep["notices"].append(FORMAT_NOTICE)
     if dry_run:
         changes = cplan["op"] != "unchanged"
         rep["actions"] = []
@@ -737,53 +1153,85 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             rep["actions"].append({"op": "would-backup", "path": cplan["path"] + ".bak-<UTC timestamp>"})
         rep["actions"].append({"op": "would-" + cplan["op"] if changes else "unchanged", "path": cplan["path"]})
         if gplan is not None:
-            rep["actions"] += [{"op": "would-" + it["op"] if it["op"] in ("create", "update", "delete") else it["op"],
-                                "path": it["path"]} for it in gplan["items"]]
-            changes = changes or any(it["op"] in ("create", "update", "delete") for it in gplan["items"])
+            rep["actions"] += [{"op": "would-" + it["op"] if it["op"] in ("create", "update", "delete", "chmod")
+                                else it["op"], "path": it["path"]} for it in gplan["items"]]
+            changes = changes or git_changes
         if changes and cfg is not None and not cfg_problem:
             rep["actions"].append({"op": "would-update", "path": ".memlet/config.json"})
         rep["formatted"] = _render(rep)
         return rep
-    if before_apply is not None:
-        stop = before_apply()
-        if stop is not None:
-            return stop
-        cfg, cfg_problem = _read_config(root)
-        try:  # init may have created .memlet/config.json: plan again with the record now available
-            cplan = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg)
-        except Refused as exc:
-            rep.update(ok=False, exitCode=2, error=str(exc))
-            rep["formatted"] = _render(rep)
-            return rep
+
+    txn = _Txn()
     actions: List[Dict[str, str]] = []
     try:
-        res = apply_claude(root, scope, cplan, _record(cfg, "claude", scope))
+        if run_init is not None:
+            memlet = root / ".memlet"
+            existed = memlet.exists()
+            before = _memlet_files(root)
+
+            def track_init() -> None:  # whatever init wrote becomes part of this run's transaction
+                if not existed and memlet.is_dir() and not memlet.is_symlink():
+                    txn.made_tree(memlet, _tree_digest(memlet))
+                elif existed:
+                    after = _memlet_files(root)
+                    for p in set(before) | set(after):
+                        old, new_ = before.get(p, (None, None)), after.get(p, (None, None))
+                        if old[0] != new_[0]:
+                            txn.file(p, old[0], old[1], new_[0])
+
+            try:
+                init_rep = run_init()
+            finally:
+                track_init()
+            if not init_rep.get("ok"):
+                left = txn.rollback()
+                rep["init"] = init_rep
+                return fail(int(init_rep.get("exitCode") or 1), "init failed; no hook was installed"
+                            + ("" if not left else "; left behind: " + "; ".join(left)))
+            cfg, cfg_problem = _read_config(root)  # init created or refreshed the record's home
+            cplan, gplan = plan_all(cfg)
+            describe(cplan, gplan)
+        res = apply_claude(root, scope, cplan, _record(cfg, "claude", scope), txn)
         actions += res["actions"]
         if res["backup"]:
             rep["notices"].append(f"backup of the previous file: `{Path(res['backup']).name}` (not meant for git)")
-        git_actions: List[Dict[str, str]] = []
         if gplan is not None:
-            git_actions = apply_git(gplan)
-            actions += git_actions
+            actions += apply_git(gplan, txn)
         if cfg is not None and not cfg_problem:
             new_cfg = copy.deepcopy(cfg)
             if remove:
                 _set_record(new_cfg, "claude", scope, None)
                 if gplan is not None:
-                    _set_record(new_cfg, "git", None, None)
+                    remaining = {n: h for n, h in _git_record_files(cfg).items()
+                                 if not any(it["hook"] == n and it["op"] == "delete" for it in gplan["items"])}
+                    _set_record(new_cfg, "git", None, {"files": remaining} if remaining else None)
             else:
                 _set_record(new_cfg, "claude", scope, res["record"])
                 if gplan is not None and gplan.get("hooksDir"):
-                    files = sorted(it["hook"] for it in gplan["items"] if it["op"] in ("create", "update", "unchanged"))
+                    files = dict(_git_record_files(cfg))
+                    for it in gplan["items"]:
+                        p = Path(it["path"])
+                        if it["op"] in ("create", "update", "unchanged", "chmod"):
+                            data = _read_regular(p, _GIT_HOOK_MAX_BYTES + 1)
+                            if data is not None:
+                                files[it["hook"]] = _sha(data)
                     _set_record(new_cfg, "git", None, {"files": files} if files else None)
             if new_cfg != cfg:
-                _write_config(root, new_cfg)
+                cfg_path = root / ".memlet" / "config.json"
+                current = _read_regular(cfg_path)
+                data = (json.dumps(new_cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                if current is None or json.loads(current.decode("utf-8")) != cfg:
+                    raise Refused(".memlet/config.json changed while hooks were being installed")
+                _cas_write(cfg_path, data, _mode_of(cfg_path) or 0o644, current, txn, ".memlet/config.json")
                 actions.append({"op": "update", "path": ".memlet/config.json"})
         elif not remove:
-            rep["notices"].append("no readable .memlet/config.json: the install record was not written (run "
-                                  "`memlet init` first)")
-    except (OSError, Refused) as exc:
-        rep.update(ok=False, exitCode=1, error=f"hook installation failed part-way: {exc}")
+            raise Refused("no readable .memlet/config.json for the install record (run `memlet init` first)")
+    except Exception as exc:  # any failure: undo this run's writes, then report (never a half-installed state)
+        left = txn.rollback()
+        rep["leftBehind"] = left
+        rep["actions"] = actions
+        return fail(1, "hook installation failed and this run's changes were rolled back"
+                    + (" (except what is listed in leftBehind)" if left else "") + f": {exc}")
     rep["actions"] = actions
     rep["formatted"] = _render(rep)
     return rep
@@ -792,8 +1240,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
 def init_hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                        dry_run: bool = False, force: bool = False, output_format: str = "json",
                        **kw: Any) -> Dict[str, Any]:
-    """`memlet init --hooks`: the normal `init`, then the hooks. `--hooks-remove`: only the removal. Every hook check
-    runs before `init` writes anything; `--dry-run` writes nothing at all."""
+    """`memlet init --hooks`: the normal `init`, then the hooks, as one all-or-nothing run (see `hooks_command`).
+    `--hooks-remove`: only the removal. `--dry-run` writes nothing at all."""
     from prism_memory.memlet_wiki import init_project
     if remove:
         rep = hooks_command(repo_path, remove=True, scope=scope, git_hooks=git_hooks, dry_run=dry_run, **kw)
@@ -802,31 +1250,29 @@ def init_hooks_command(repo_path=".", *, remove: bool = False, scope: str = "loc
         return rep
     holder: Dict[str, Any] = {}
 
-    def run_init() -> Optional[Dict[str, Any]]:
+    def run_init() -> Dict[str, Any]:
         holder["init"] = init_project(repo_path, dry_run=dry_run, force=force, output_format=output_format)
-        if not holder["init"].get("ok"):
-            holder["init"]["hooks"] = {"ok": False, "error": "init failed; no hook was installed"}
-            return holder["init"]
-        return None
+        return holder["init"]
 
     if dry_run:
         hooks = hooks_command(repo_path, scope=scope, git_hooks=git_hooks, dry_run=True, **kw)
         if not hooks.get("ok"):
             return _hooks_failure(hooks, output_format)
-        stop = run_init()
-        if stop is not None:
-            return stop
+        run_init()
+        if not holder["init"].get("ok"):
+            return holder["init"]
     else:
-        hooks = hooks_command(repo_path, scope=scope, git_hooks=git_hooks, before_apply=run_init, **kw)
+        hooks = hooks_command(repo_path, scope=scope, git_hooks=git_hooks, run_init=run_init, **kw)
         if "init" not in holder:
             return _hooks_failure(hooks, output_format)
-        if hooks is holder["init"]:
-            return hooks
+        if not holder["init"].get("ok"):
+            holder["init"]["hooks"] = {k: v for k, v in hooks.items() if k not in ("formatted", "init")}
+            return holder["init"]
     report = holder["init"]
+    if not hooks.get("ok"):  # init's own writes were rolled back together with the hooks
+        hooks.pop("init", None)
+        return _hooks_failure(hooks, output_format)
     report["hooks"] = {k: v for k, v in hooks.items() if k != "formatted"}
-    if not hooks.get("ok"):
-        report["ok"] = False
-        report["exitCode"] = hooks.get("exitCode", 1)
     if output_format == "markdown":
         report["formatted"] = (report.get("formatted") or "").rstrip("\n") + "\n\n" + hooks["formatted"]
     return report
@@ -952,7 +1398,8 @@ def _hook_settings(root: Path) -> Dict[str, Any]:
 
 def _log(root: Optional[Path], event: str, message: str) -> None:
     """One line in `.memlet/hooks.log` (kept under LOG_CAP_BYTES). Only fixed words and numbers, never payload or
-    transcript text. Never creates `.memlet/`; never follows a symlink."""
+    transcript text. Never creates `.memlet/`; never follows a symlink; never opens anything but a regular file; a
+    rotation reads only the kept tail."""
     if root is None:
         return
     with contextlib.suppress(Exception):
@@ -960,17 +1407,23 @@ def _log(root: Optional[Path], event: str, message: str) -> None:
         if not d.is_dir() or d.is_symlink():
             return
         p = root / LOG_REL
-        if p.is_symlink():
+        if p.is_symlink() or (p.exists() and not p.is_file()):
             return
         safe = re.sub(r"[^A-Za-z0-9 _.,:=/()<>+-]", "?", message)[:240]
         line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {event} {safe}\n".encode("ascii", "replace")
-        if p.is_file() and p.stat().st_size + len(line) > LOG_CAP_BYTES:
-            tail = p.read_bytes()[-(LOG_CAP_BYTES // 2):]
-            tail = tail[tail.find(b"\n") + 1:] if b"\n" in tail else b""
-            _atomic_write(p, tail, 0o600)
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         fd = os.open(str(p), flags, 0o600)
         try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return
+            if st.st_size + len(line) > LOG_CAP_BYTES:
+                keep = LOG_CAP_BYTES // 2
+                os.lseek(fd, max(0, st.st_size - keep), os.SEEK_SET)
+                tail = os.read(fd, keep)
+                tail = tail[tail.find(b"\n") + 1:] if b"\n" in tail else b""
+                _atomic_write(p, tail + line, 0o600)
+                return
             os.write(fd, line)
         finally:
             os.close(fd)
@@ -1005,12 +1458,18 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     reverify = int(health.get("compatible-unverified") or 0)
     omitted = int((cap.get("omitted") or {}).get("activeConstraints") or 0)
     pend = mb.learn_pending(root)
-    pending = int(((pend.get("counts") or {}).get("pendingNodes") or 0)) if pend.get("ok") else 0
+    pending: Optional[int] = None
+    if isinstance(pend, dict) and pend.get("ok") and isinstance(pend.get("counts"), dict):
+        pending = int(pend["counts"].get("pendingNodes") or 0)
+    else:  # unknown is not zero: the count is left out, never printed as 0
+        _log(root, "session-start", "pending lessons unavailable: queue not readable")
     if not active and not stale and not reverify and not pending:
         return None
     head = "Memlet verified rules (code anchors match; source cited):"
-    status = (f"Not verified, do not rely on: {stale} stale anchor(s), {reverify} to re-verify, {pending} lesson(s) "
-              "pending human approval (`memlet learn --pending`); see `memlet check`.")
+    pending_part = ("" if pending is None else
+                    f", {pending} lesson(s) pending human approval (`memlet learn --pending`)")
+    status = (f"Not verified, do not rely on: {stale} stale anchor(s), {reverify} to re-verify{pending_part}; "
+              "see `memlet check`.")
     items = [f"- {_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
 
     def render(n: int) -> str:
@@ -1087,7 +1546,12 @@ def _learn(root: Path, payload: Dict[str, Any], st: Dict[str, Any], event: str) 
     if tp is None or not os.path.isabs(tp):
         return None
     p = Path(tp)
-    if p.is_symlink() or not p.is_file() or p.suffix != ".jsonl" or p.name.startswith(".env"):
+    if p.suffix != ".jsonl" or p.name.startswith(".env"):
+        return None
+    if any(q.is_symlink() for q in (p,) + tuple(p.parents)):  # same rule as the MCP tool: no symlink anywhere
+        _log(root, event, "skip: a symlink in the transcript path")
+        return None
+    if not p.is_file():
         return None
     if not os.access(str(p), os.R_OK):
         return None
