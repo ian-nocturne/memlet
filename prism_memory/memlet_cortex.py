@@ -50,12 +50,10 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
             if chk_p.is_symlink():
                 return None
         if q_file.is_file() and q_file.stat().st_size <= 2_000_000:
-            from prism_memory.memlet_dream import approved_view, build_cortex_lineage_payload, recall_subgraph
+            from prism_memory.memlet_dream import build_cortex_lineage_payload, recall_subgraph
             g = json.loads(q_file.read_text(encoding="utf-8"))
             if not isinstance(g, dict):
                 return None
-            # Only human-approved items are shown; a queue auto-promoted by an older build stays hidden.
-            g = approved_view(g)[0]
             return build_cortex_lineage_payload(g, recall_subgraph(g, query_text="", budget_tokens=1500))
     except Exception:
         return None
