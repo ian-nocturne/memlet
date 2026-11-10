@@ -3398,7 +3398,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(['AGENTS.md', 'CLAUDE.md'], data['instructionFiles'])
             self.assertRegex(data['repoHead'], r'^[0-9a-f]{40}$')
             self.assertEqual({'would-create'}, {a['op'] for a in data['actions']})
-            self.assertEqual({'active': 3, 'compatible-unverified': 0, 'stale': 1, 'total': 4}, data['anchorSummary'])
+            self.assertEqual({'active': 0, 'compatible-unverified': 0, 'stale': 1, 'path-exists': 0, 'unpinned': 3, 'total': 4}, data['anchorSummary'])
             self.assertNotIn('memlet-canary-do-not-read', out)
             code2, out2 = self._cli('init', str(repo), '--dry-run')
             self.assertEqual(out, out2)  # deterministic
@@ -3589,8 +3589,8 @@ class MemletInitWikiTests(unittest.TestCase):
             data = json.loads(out)
             self.assertFalse((repo / '.memlet').exists())
             self.assertEqual(['.ai-memory/notes/auth.md', '.cursor/rules/api.mdc', '.cursorrules', 'CLAUDE.md'], data['sourcesScanned'])
-            self.assertEqual((7, 4, 0, 2, 1), (data['importedCount'], data['activeCount'], data['compatibleUnverifiedCount'],
-                                               data['staleCount'], data['unanchoredCount']))
+            self.assertEqual((7, 0, 0, 2, 1, 4), (data['importedCount'], data['activeCount'], data['compatibleUnverifiedCount'],
+                                               data['staleCount'], data['unanchoredCount'], data['unpinnedCount']))
             self.assertEqual(1, data['brokenPathsCount'])  # `mod.py::mint_token` is a missing symbol, not a broken path
             self.assertEqual(['legacy_auth.py'], data['brokenPaths'])
             by_text = {r['text']: r for r in data['rules']}
@@ -3598,7 +3598,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual([{'anchor': 'legacy_auth.py', 'status': 'stale', 'reason': 'missing_path'}],
                              by_text['Sessions live in `legacy_auth.py`.']['anchors'])
             self.assertEqual('stale', by_text['Tokens are minted in `mod.py::mint_token`.']['status'])
-            self.assertEqual('active', by_text['Handlers call `mod.py::real`.']['status'])  # .mdc front matter skipped
+            self.assertEqual('unpinned', by_text['Handlers call `mod.py::real`.']['status'])  # .mdc front matter skipped
             self.assertEqual(5, by_text['Handlers call `mod.py::real`.']['line'])
             self.assertEqual('unanchored', by_text['Keep commits small.']['status'])
             self.assertNotIn('memlet-canary-do-not-read', out)
@@ -3669,7 +3669,7 @@ class MemletInitWikiTests(unittest.TestCase):
                               'Mocking the gateway hid the idempotency bug.'], [r['approach'] for r in cap['rejectedApproaches']])
             self.assertEqual('Wire refunds through mod.py', cap['nextAction'])
             self.assertEqual(1, cap['executionProof']['modifiedFilesCount'])
-            self.assertEqual({'active': 1, 'compatible-unverified': 1, 'stale': 3, 'total': 5}, cap['executionProof']['anchorHealth'])
+            self.assertEqual({'active': 1, 'compatible-unverified': 1, 'stale': 3, 'path-exists': 0, 'unpinned': 0, 'total': 5}, cap['executionProof']['anchorHealth'])
             self.assertLess(cap['tokenEstimate'], 500)
             self.assertFalse((repo / '.memlet' / 'wiki' / 'HANDOVER.md').exists())
             self.assertEqual(cap, build_handover(repo, next_step='Wire refunds through mod.py', rejected=['Do not vendor the SDK']))
@@ -3701,6 +3701,8 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(0, again['executionProof']['modifiedFilesCount'])
             # Many rules still fit the budget; trimmed items are counted, never silently dropped.
             (repo / 'AGENTS.md').write_text('# Rules\n' + ''.join(f'- Rule {i} keeps `mod.py::real` stable for caller group {i}.\n' for i in range(60)), encoding='utf-8')
+            from prism_memory.memlet_wiki import init_project
+            init_project(repo)  # explicit baseline before testing verified-rule budget trimming
             big = build_handover(repo, rejected=['No retries in webhooks'])
             self.assertLess(big['tokenEstimate'], 500)
             self.assertGreater(big['omitted']['activeConstraints'], 0)
@@ -3926,6 +3928,7 @@ class MemletInitWikiTests(unittest.TestCase):
             rules = [f'- Always route request type {i} through `mod.py::keep_{i}` with full validation.' for i in range(40)]
             rules += [f'- Legacy flow {i} must use `gone_{i}.py::old_{i}` before retrying.' for i in range(12)]
             (repo / 'AGENTS.md').write_text('# Rules\n' + '\n'.join(rules) + '\n', encoding='utf-8')
+            memlet_wiki.init_project(repo)  # explicit baseline before testing quarantine under budget pressure
             cap = memlet_wiki.build_handover(str(repo), output_format='markdown')
         self.assertLess(cap['tokenEstimate'], cap['tokenBudget'])
         # Stale anchors survive budget trimming (floor), and anything hidden is announced inside the signed text.
@@ -4074,6 +4077,8 @@ class HandoverBudgetTests(unittest.TestCase):
         self.assertEqual(2000, resolve_handover_budget(repo, 99999)[0])
         self.assertEqual(500, resolve_handover_budget(repo, 10)[0])
         self.assertEqual((500, 'argument:invalid->default'), resolve_handover_budget(repo, 'lots'))
+        from prism_memory.memlet_wiki import init_project
+        init_project(repo)  # budget comparisons require pinned constraints
         small, big = build_handover(repo), build_handover(repo, budget=1500)
         self.assertLess(big['tokenEstimate'], 1500)
         self.assertGreater(len(big['activeConstraints']), len(small['activeConstraints']))
@@ -4223,6 +4228,8 @@ class HandoverDigestTests(unittest.TestCase):
         (d / '.memlet' / 'wiki').mkdir(parents=True)
         (d / '.memlet' / 'wiki' / 'session-notes.md').write_text(
             '- Always use `m.py::f` with API token SYNTHETIC_WIKI_CANARY_006 for production transfers.\n')
+        from prism_memory.memlet_wiki import init_project
+        init_project(d)  # retain coverage of truncation in the verified and instruction lists
         cap = build_handover(d, mode='digest', budget=2000, output_format='markdown')
         self.assertNotIn('SYNTHETIC_WIKI_CANARY_006', json.dumps(cap, ensure_ascii=False))
         carried = cap['activeConstraints'] + cap['projectRules']
@@ -4721,7 +4728,8 @@ class ConsolidatedReviewTests(unittest.TestCase):
         for page in (BRIEF_PAGE, INDEX_PAGE):
             (d / page).write_text('# Notes\n- Never deploy before reading `release-gate.md`.\n')
             cap = build_handover(d)
-            self.assertTrue(any('release-gate.md' in r['rule'] for r in cap['activeConstraints']), page)
+            self.assertEqual([{'anchor': 'release-gate.md', 'reason': 'path_exists'}], cap['pathExistsAnchors'], page)
+            self.assertEqual([], cap['activeConstraints'])
             (d / page).unlink()
         (d / INDEX_PAGE).write_text('# Notes\n- Mine.\n')
         rep = build_index(d, runner=lambda p: '- commits | 2 [src: AGENTS.md:2-2]\n')

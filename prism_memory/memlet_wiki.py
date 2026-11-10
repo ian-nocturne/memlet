@@ -11,14 +11,16 @@ included), re-resolves each anchor against the current code, rewrites the genera
 changed since the last recorded hash as `user_edit` events in the ledger. Anchor states:
 
 - `active`: symbol resolves and its pinned AST hash still matches.
-- `compatible-unverified`: symbol resolves, but it is unpinned, its body changed while the pinned
+- `unpinned`: symbol resolves, but no stored baseline exists.
+- `path-exists`: the referenced path exists; no symbol hash was compared.
+- `compatible-unverified`: the scanner is approximate, or the body changed while the pinned
   call signature is unchanged, only optional parameters were added (required signature unchanged),
   or its language has no structural extractor.
 - `stale`: file or symbol is gone, the file no longer parses, or the required signature changed.
 
 `memlet import [path] [--from auto|claude-md|cursorrules|ai-memory|claude-mem] [--dry-run]` pulls rules
 from existing instruction / memory files into `.memlet/wiki/imported-rules.md`, tagging every rule with
-the live state of the code it references. `memlet handover` builds a signed, budgeted (<500 token)
+the live state of the code it references. `memlet handover` builds a checksummed, budgeted (<500 token)
 handover capsule that carries only verified constraints and recorded dead-ends to the next model.
 `run_refactoring_comparison_benchmark()` (`memlet benchmark`) replays four refactoring scenarios in a
 temporary directory and compares raw Markdown, an unverified wiki, and Memlet.
@@ -52,7 +54,7 @@ WIKI_DIR = ".memlet/wiki"
 CONFIG_PATH = ".memlet/config.json"
 INDEX_PATH = ".memlet/wiki/INDEX.md"
 LEDGER_PATH = ".memlet/ledger.sqlite3"
-ANCHOR_STATES = ("active", "compatible-unverified", "stale")
+ANCHOR_STATES = ("active", "compatible-unverified", "stale", "path-exists", "unpinned")
 
 STATUS_BEGIN = "<!-- memlet:status:begin -->"
 STATUS_END = "<!-- memlet:status:end -->"
@@ -219,6 +221,8 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str) -> Dict[str, An
     ast_hash = (extract_file_symbol_hashes(target).get(symbol) or sig.get("normAstHash") or sig.get("sigHash") or "")
     return {
         "resolution": "exact",
+        "hashExact": sig_info.get("__language__") not in ("typescript", "javascript"),
+        "hashReason": "ts_js_lexical_scan_unverified",
         "ast": ast_hash[:_HASH_LEN],
         "sig": (sig.get("sigHash") or "")[:_HASH_LEN],
         "req": _req_sig_hash(sig),
@@ -233,14 +237,21 @@ def _same_hash(a: Optional[str], b: Optional[str]) -> bool:
 def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
     cur = _current_fingerprint(root, anchor["path"], anchor["symbol"])
     pin = anchor.get("pin")
+    legacy_match = False
+    if pin and cur.get("ast") and not _same_hash(cur["ast"], pin.get("ast")) and Path(anchor["path"]).suffix.lower() == ".py":
+        legacy_hash = extract_file_symbol_hashes(root / anchor["path"], legacy=True).get(anchor["symbol"])
+        legacy_match = _same_hash(legacy_hash, pin.get("ast"))
     if cur["resolution"] in ("missing", "parse_error", "rejected"):
         status, reason = "stale", cur["reason"]
     elif cur["resolution"] != "exact":
         status, reason = "compatible-unverified", cur["reason"]
-    elif not pin:
-        status, reason = "compatible-unverified", "unpinned"
-    elif _same_hash(cur["ast"], pin["ast"]):
-        status, reason = "active", "ast_hash_match"
+    elif not pin or not pin.get("ast"):
+        status, reason = "unpinned", "no_stored_pin"
+    elif _same_hash(cur["ast"], pin.get("ast")) or legacy_match:
+        if cur.get("hashExact", True):
+            status, reason = "active", "legacy_ast_hash_match" if legacy_match else "ast_hash_match"
+        else:
+            status, reason = "compatible-unverified", cur["hashReason"]
     elif not (pin.get("sig") and cur["sig"]) or _same_hash(cur["sig"], pin["sig"]):
         status, reason = "compatible-unverified", "body_changed_signature_compatible"
     elif pin.get("req") and _same_hash(cur.get("req"), pin["req"]):
@@ -269,6 +280,20 @@ def _summarize(anchors: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def _migrate_legacy_comments(root: Path, text: str) -> str:
+    """Rewrite only Python pins that still match the legacy AST basis."""
+    def replace(m):
+        anchor = {"path": m.group("path"), "symbol": m.group("symbol"),
+                  "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req")}}
+        result = classify_anchor(root, anchor)
+        if result["reason"] != "legacy_ast_hash_match":
+            return m.group(0)
+        sig = f" sig={result['currentSigHash']}" if result.get("currentSigHash") else ""
+        req = f" req={result['currentReqSigHash']}" if result.get("currentReqSigHash") else ""
+        return f"<!-- memlet:anchor {result['anchor']} ast={result['currentAstHash']}{sig}{req} -->"
+    return PIN_RE.sub(replace, text)
+
+
 def _audit_summary(root: Path) -> Dict[str, Any]:
     try:
         rep = audit_repository(root)
@@ -290,6 +315,7 @@ def _status_block(anchors: List[Dict[str, Any]], summary: Dict[str, int]) -> str
         "## Anchor health",
         "",
         f"- active: {summary['active']} · compatible-unverified: {summary['compatible-unverified']} · stale: {summary['stale']} (total {summary['total']})",
+        f"- Unverified observations: {summary['path-exists']} path-exists · {summary['unpinned']} unpinned",
         "",
     ]
     if anchors:
@@ -334,9 +360,11 @@ def _render_index(head: Optional[str], instruction_files: List[str], anchors: Li
 
 
 def _page_header(counts: Dict[str, int]) -> str:
+    observations = (f", path-exists={counts['path-exists']}, unpinned={counts['unpinned']}"
+                    if counts.get("path-exists") or counts.get("unpinned") else "")
     return "\n".join([
         PAGE_STATUS_BEGIN,
-        f"> **Memlet AST Status**: active={counts['active']}, compatible-unverified={counts['compatible-unverified']}, stale={counts['stale']}",
+        f"> **Memlet AST Status**: active={counts['active']}, compatible-unverified={counts['compatible-unverified']}, stale={counts['stale']}{observations}",
         PAGE_STATUS_END,
     ])
 
@@ -424,6 +452,8 @@ def _format_markdown(title: str, report: Dict[str, Any]) -> str:
         f"- **Repository**: `{report['repoPath']}`",
         f"- **Head**: `{report.get('repoHead') or 'n/a'}`",
         f"- **Anchors**: {s['active']} active · {s['compatible-unverified']} compatible-unverified · {s['stale']} stale",
+        f"- Unverified observations: {s['path-exists']} path-exists · {s['unpinned']} unpinned",
+        "- New pins record the current baseline; they do not verify the rule's meaning.",
     ]
     if "instructionFiles" in report:
         lines.append("- **Instruction files**: " + (", ".join(f"`{f}`" for f in report["instructionFiles"]) or "(none)"))
@@ -469,26 +499,80 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
     raw: List[Dict[str, Any]] = []
     for rel in instruction_files:
         raw.extend(_extract_anchors(_read_text(root / rel), rel))
+    config_path = root / CONFIG_PATH
+    config = _base_config(head, instruction_files)
+    if config_path.is_file():
+        # Refuse to erase a malformed config, including settings owned by other commands.
+        existing = json.loads(_read_text(config_path))
+        if not isinstance(existing, dict):
+            raise ValueError("memlet config must be a JSON object")
+        config.update(existing)
+    config.update(repoHead=head, instructionFiles=instruction_files, anchorStates=list(ANCHOR_STATES))
+    stored = dict(config.get("pinnedAnchors") or {})
+    page_pins = {}
+    wiki_dir = root / WIKI_DIR
+    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
+        for page in sorted(wiki_dir.rglob("*.md")):
+            if page.is_symlink() or not page.is_file():
+                continue
+            for a in _extract_anchors(_read_text(page), _rel(root, page)):
+                if a["pin"]:
+                    page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
+                    raw.append(a)
+    for key in stored:
+        if "::" in key:
+            path, symbol = key.rsplit("::", 1)
+            raw.append({"path": path, "symbol": symbol, "pin": None, "source": CONFIG_PATH, "line": 1})
     anchors = []
+    pinned_now = set()
     for a in _merge_anchors(raw):
-        # Pin every resolvable anchor to the AST/signature hash it has right now.
+        key = f"{a['path']}::{a['symbol']}"
+        cp = stored.get(key) or {}
+        pin = page_pins.get(key) or a.get("pin") or (
+            {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")} if cp.get("astHash") else None)
         cur = _current_fingerprint(root, a["path"], a["symbol"])
-        pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]}
-               if cur["resolution"] == "exact" and cur["ast"] else None)
+        if (force or not pin) and not dry_run:
+            pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]}
+                   if cur["resolution"] == "exact" and cur.get("ast") else None)
+            if pin:
+                pinned_now.add(key)
+        elif classify_anchor(root, dict(a, pin=pin))["reason"] == "legacy_ast_hash_match":
+            pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]}
         anchors.append(dict(a, pin=pin))
-    classified = [classify_anchor(root, a) for a in anchors]
+        if pin and (key not in stored or force):
+            stored[key] = dict(cp, astHash=pin["ast"], sigHash=pin.get("sig"), reqSigHash=pin.get("req"))
+        elif force:
+            stored.pop(key, None)
+        elif cp.get("astHash"):
+            stored_pin = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}
+            if classify_anchor(root, dict(a, pin=stored_pin))["reason"] == "legacy_ast_hash_match":
+                stored[key] = dict(cp, astHash=cur["ast"], sigHash=cur["sig"], reqSigHash=cur["req"])
+    classified = [dict(classify_anchor(root, a), pinnedNow=f"{a['path']}::{a['symbol']}" in pinned_now) for a in anchors]
     summary = _summarize(classified)
     audit = _audit_summary(root)
-    config = _base_config(head, instruction_files)
-    config["pinnedAnchors"] = {
-        f"{a['path']}::{a['symbol']}": {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"]}
-        for a in anchors if a["pin"]
-    }
+    config["pinnedAnchors"] = stored
     index_text = _render_index(head, instruction_files, anchors, classified, summary, audit)
+    index_additions = False
+    if not force and (root / INDEX_PATH).is_file():
+        old_index = _read_text(root / INDEX_PATH)
+        known = {(a["path"], a["symbol"]) for a in _extract_anchors(old_index, INDEX_PATH)}
+        added = [a for a in anchors if (a["path"], a["symbol"]) not in known]
+        if added:
+            lines = ["", "## Additional code anchors", ""]
+            for a in added:
+                key = f"{a['path']}::{a['symbol']}"
+                lines.append(f"- `{key}`")
+                pin = a.get("pin")
+                if pin:
+                    sig = f" sig={pin['sig']}" if pin.get("sig") else ""
+                    req = f" req={pin['req']}" if pin.get("req") else ""
+                    lines.append(f"  <!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} -->")
+            index_text = old_index.rstrip() + "\n" + "\n".join(lines) + "\n"
+            index_additions = True
     config_text = json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     actions: List[Dict[str, str]] = []
-    plan = [(CONFIG_PATH, config_text, True), (INDEX_PATH, index_text, force)]
+    plan = [(CONFIG_PATH, config_text, True), (INDEX_PATH, index_text, force or index_additions)]
     for rel, text, overwrite in plan:
         target = root / rel
         exists = target.is_file()
@@ -505,8 +589,27 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
             op = "would-" + op
         actions.append({"op": op, "path": rel})
 
+    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
+        for page in sorted(wiki_dir.rglob("*.md")):
+            if page.is_symlink() or not page.is_file():
+                continue
+            old = _read_text(page)
+            def migrate(m):
+                key = f"{m.group('path')}::{m.group('symbol')}"
+                cp = stored.get(key)
+                if not cp:
+                    return m.group(0)
+                sig = f" sig={cp['sigHash']}" if cp.get("sigHash") else ""
+                req = f" req={cp['reqSigHash']}" if cp.get("reqSigHash") else ""
+                return f"<!-- memlet:anchor {key} ast={cp['astHash']}{sig}{req} -->"
+            new = PIN_RE.sub(migrate, old) if force else _migrate_legacy_comments(root, old)
+            if new != old:
+                if not dry_run:
+                    page.write_text(new, encoding="utf-8")
+                actions.append({"op": "would-update" if dry_run else "update", "path": _rel(root, page)})
+
     ledger = root / LEDGER_PATH
-    index_written = actions[-1]["op"] in ("create", "update")
+    index_written = any(a["path"] == INDEX_PATH and a["op"] in ("create", "update") for a in actions)
     if ledger.is_symlink():
         op = "kept"
     elif dry_run:
@@ -540,6 +643,7 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
         "config": config,
         "actions": actions,
         "anchorSummary": summary,
+        "baselineNotice": "New pins record the current baseline; they do not verify the rule's meaning.",
         "anchors": classified,
         "audit": audit,
         "next": ["memlet wiki", "memlet check"],
@@ -576,6 +680,8 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         config_pins = _load_config_pins(root)
         for a in merged:
             cp = config_pins.get(f"{a['path']}::{a['symbol']}")
+            if not a["pin"] and isinstance(cp, dict) and cp.get("astHash"):
+                a["pin"] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}
             if a["pin"] and not a["pin"].get("req") and isinstance(cp, dict) and _same_hash(a["pin"]["ast"], cp.get("astHash")):
                 a["pin"] = dict(a["pin"], req=cp.get("reqSigHash"))
     classified = [classify_anchor(root, a) for a in merged]
@@ -587,6 +693,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         old = _read_text(index)
         block = _status_block(classified, summary)
         new = _STATUS_BLOCK_RE.sub(lambda _m: block, old) if _STATUS_BLOCK_RE.search(old) else old.rstrip("\n") + "\n\n" + block + "\n"
+        new = _migrate_legacy_comments(root, new)
         if new == old:
             actions.append({"op": "unchanged", "path": INDEX_PATH})
         elif dry_run:
@@ -607,6 +714,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
             continue
         old = texts[rel]
         new = _with_page_header(old, page_summaries.get(rel) or {s: 0 for s in ANCHOR_STATES})
+        new = _migrate_legacy_comments(root, new)
         if new == old:
             actions.append({"op": "unchanged", "path": rel})
         elif dry_run:
@@ -615,6 +723,29 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
             (root / rel).write_text(new, encoding="utf-8")
             texts[rel] = new
             actions.append({"op": "update", "path": rel})
+
+    config_path = root / CONFIG_PATH
+    if initialized and config_path.is_file() and not config_path.is_symlink():
+        try:
+            config = json.loads(_read_text(config_path))
+        except (ValueError, OSError):
+            config = None
+        pins = config.get("pinnedAnchors") if isinstance(config, dict) else None
+        migrated = False
+        for key, cp in list(pins.items()) if isinstance(pins, dict) else []:
+            if not isinstance(cp, dict) or "::" not in key:
+                continue
+            path, symbol = key.rsplit("::", 1)
+            result = classify_anchor(root, {"path": path, "symbol": symbol,
+                                            "pin": {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}})
+            if result["reason"] == "legacy_ast_hash_match":
+                pins[key] = dict(cp, astHash=result["currentAstHash"], sigHash=result["currentSigHash"],
+                                 reqSigHash=result["currentReqSigHash"])
+                migrated = True
+        if migrated:
+            if not dry_run:
+                config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            actions.append({"op": "would-update" if dry_run else "update", "path": CONFIG_PATH})
 
     # Bi-directional sync: a page body that differs from its last recorded hash is a human edit.
     ledger = root / LEDGER_PATH
@@ -829,7 +960,7 @@ def _classify_path(root: Path, path: str) -> Dict[str, Any]:
             exists = (root / path).exists()
         except (OSError, ValueError):
             exists = False
-        status, reason = ("active", "path_exists") if exists else ("stale", "missing_path")
+        status, reason = ("path-exists", "path_exists") if exists else ("stale", "missing_path")
     return {"anchor": path, "path": path, "symbol": None, "status": status, "reason": reason, "pinned": False,
             "pinSource": None, "currentAstHash": None, "currentSigHash": None, "currentReqSigHash": None}
 
@@ -846,8 +977,7 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
                   pin_source: str = "config") -> List[Dict[str, Any]]:
     """Classify each referenced anchor once and tag every rule with its worst anchor state.
 
-    Unpinned symbol anchors are pinned to the hash they have right now (as `memlet init` does), so a
-    later drift is only detectable once a pin has been recorded in `.memlet/`."""
+    Observing a symbol does not establish a baseline; only stored pins are compared."""
     cache: Dict[str, Dict[str, Any]] = {}
     for r in rules:
         keys: List[str] = []
@@ -857,13 +987,10 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
             if key not in cache:
                 if symbol:
                     pin, src = pins.get(key), pin_source
-                    if pin is None:
-                        cur = _current_fingerprint(root, path, symbol)
-                        ok = cur["resolution"] == "exact" and cur.get("ast")
-                        pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]} if ok else None
-                        src = "current" if ok else None
                     entry = classify_anchor(root, {"path": path, "symbol": symbol, "pin": pin})
-                    entry.update(pin=pin, pinSource=src)
+                    if entry["reason"] == "legacy_ast_hash_match":
+                        pin = {"ast": entry["currentAstHash"], "sig": entry["currentSigHash"], "req": entry["currentReqSigHash"]}
+                    entry.update(pin=pin, pinSource=src if pin else None)
                 else:
                     entry = _classify_path(root, path)
                 entry["sources"] = []
@@ -875,7 +1002,7 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
                 keys.append(key)
         states = {cache[k]["status"] for k in keys}
         r["anchors"] = keys
-        r["status"] = next((s for s in ("stale", "compatible-unverified", "active") if s in states), "unanchored")
+        r["status"] = next((s for s in ("stale", "compatible-unverified", "unpinned", "path-exists", "active") if s in states), "unanchored")
         r["id"] = "rule-" + hashlib.sha256(f"{r['source']}\n{r['text']}".encode("utf-8")).hexdigest()[:12]
     return [cache[k] for k in sorted(cache)]
 
@@ -908,7 +1035,8 @@ def _render_import_page(files: List[str], rules: List[Dict[str, Any]], by_key: D
         "",
         "- Sources: " + (", ".join(f"`{f}`" for f in files) if files else "(none found)"),
         f"- Rules: {len(rules)} imported · {counts['active']} active · {counts['compatible-unverified']} compatible-unverified"
-        f" · {counts['stale']} stale · {counts['unanchored']} unanchored",
+        f" · {counts['stale']} stale · {counts['path-exists']} path-exists · {counts['unpinned']} unpinned · {counts['unanchored']} unanchored",
+        "- Baselines: explicit init/import records current hashes; it does not verify the rule's meaning.",
         "- Broken paths: " + (", ".join(f"`{b}`" for b in broken) if broken else "none"),
     ]
     pinned_here = set()
@@ -958,7 +1086,25 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
     head = _git_head(root)
     files = import_source_files(root, source)
     rules = _rules_from_files(root, files)
-    anchors = _verify_rules(root, rules, _config_pins(root))
+    pins = _config_pins(root)
+    pinned_now = set()
+    if not dry_run:
+        # Import is an explicit baseline-recording event, like init. Never heal an existing pin.
+        for r in rules:
+            for raw_path, symbol in r["refs"]:
+                if not symbol:
+                    continue
+                path = _resolve_ref_path(root, r["source"], raw_path)
+                key = f"{path}::{symbol}"
+                if key in pins:
+                    continue
+                cur = _current_fingerprint(root, path, symbol)
+                if cur["resolution"] == "exact" and cur.get("ast"):
+                    pins[key] = {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"]}
+                    pinned_now.add(key)
+    anchors = _verify_rules(root, rules, pins)
+    for a in anchors:
+        a["pinnedNow"] = a["anchor"] in pinned_now
     by_key = {a["anchor"]: a for a in anchors}
     counts = _rule_counts(rules)
     broken = sorted({a["path"] for a in anchors if a["reason"] in ("missing_path", "missing_file")})
@@ -979,8 +1125,8 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
         config = config if existed else _base_config(head, discover_instruction_files(root))
         pinned = dict(config.get("pinnedAnchors") or {})
         for a in anchors:
-            # Existing pins are never auto-healed; only newly seen, currently active anchors are pinned.
-            if a["symbol"] and a["status"] == "active" and a.get("pin") and a["anchor"] not in pinned:
+            # Store newly recorded baselines, including lexical TS/JS pins; migrate proven legacy matches.
+            if a["symbol"] and a.get("pin") and (a["anchor"] not in pinned or a["reason"] == "legacy_ast_hash_match"):
                 pinned[a["anchor"]] = {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"]}
         config["pinnedAnchors"] = dict(sorted(pinned.items()))
         config["imports"] = {"from": source, "page": IMPORT_PAGE, "sourceFiles": files}
@@ -1027,6 +1173,9 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
         "sourcesScannedCount": len(files),
         "importedCount": len(rules),
         "activeCount": counts["active"],
+        "pathExistsCount": counts["path-exists"],
+        "unpinnedCount": counts["unpinned"],
+        "baselineNotice": "New pins record the current baseline; they do not verify the rule's meaning.",
         "compatibleUnverifiedCount": counts["compatible-unverified"],
         "staleCount": counts["stale"],
         "unanchoredCount": counts["unanchored"],
@@ -1045,6 +1194,7 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
             f"- **Repository**: `{root}`",
             f"- **Head**: `{head or 'n/a'}`",
             f"- **Sources scanned**: {len(files)}" + (" (" + ", ".join(f"`{f}`" for f in files) + ")" if files else ""),
+            "- New pins record the current baseline; they do not verify the rule's meaning.",
             f"- **Rules**: {len(rules)} imported · {counts['active']} active · {counts['compatible-unverified']} compatible-unverified"
             f" · {counts['stale']} stale · {counts['unanchored']} unanchored · {len(broken)} broken paths",
             "",
@@ -1059,7 +1209,7 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
 
 
 # ---------------------------------------------------------------------------
-# `memlet handover`: a signed capsule that only carries context Memlet could verify.
+# `memlet handover`: a checksummed capsule that only carries context Memlet could verify.
 
 HANDOVER_SCHEMA = "routlet-memlet-handover/v1"
 HANDOVER_TOKEN_BUDGET = 500  # default; per call (`--budget`) or per repo (`config.json` handover.tokenBudget)
@@ -1126,14 +1276,41 @@ def estimate_tokens(text: str) -> int:
 def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
     # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
     extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
-    return HANDOVER_SIGNED_FIELDS + extra
+    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints") if k in capsule)
+    return HANDOVER_SIGNED_FIELDS + extra + observations
 
 
 def handover_signature(capsule: Dict[str, Any]) -> str:
-    """SHA-256 over the canonical JSON of the signed capsule fields."""
+    """Compatibility name for the unkeyed SHA-256 checksum of capsule content."""
     payload = {k: capsule.get(k) for k in _signed_fields(capsule)}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_handover_checksum(capsule: Dict[str, Any]) -> bool:
+    """Pure integrity check of capsule content, not authentication or code verification.
+
+    Both checksum aliases must agree when present. Legacy capsules containing
+    only capsuleSignature remain verifiable. Presentation/CLI metadata is outside
+    the checksum; the canonical field list is selected here, never by the input.
+    """
+    if not isinstance(capsule, dict):
+        return False
+    if capsule.get("mode") not in (None,) + HANDOVER_MODES:
+        return False
+    expected = capsule.get("checksum", capsule.get("capsuleSignature"))
+    if not isinstance(expected, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected):
+        return False
+    if "capsuleSignature" in capsule and capsule["capsuleSignature"] != expected:
+        return False
+    if any(k not in capsule for k in _signed_fields(capsule)):
+        return False
+    if "signedFields" in capsule and capsule["signedFields"] != list(_signed_fields(capsule)):
+        return False
+    try:
+        return expected == handover_signature(capsule)
+    except (TypeError, ValueError):
+        return False
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1172,13 +1349,16 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         "## Routlet × Memlet Verified Handover Capsule",
         "",
         f"- Repo head: `{c['repoHead'] or 'n/a'}`",
-        f"- Signature: `{signature}`",
+        f"- Checksum: `{signature}`",
         f"- Authority: {c['authorityBoundary']}",
         "",
-        "### Active constraints (AST-verified)",
+        "### Active constraints (anchored symbols unchanged since pinning)",
     ]
     lines += [f"- {a['rule']} (`{a['source']}`" + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "")
               + ")" for a in c["activeConstraints"]] or ["- (none)"]
+    if c.get("lexicalConstraints"):
+        lines += ["", "### TS/JS constraints (lexical hash match only; re-check before use)"]
+        lines += [f"- {a['rule']} (`{a['source']}`)" for a in c["lexicalConstraints"]]
     if c.get("mode") == "index":
         src = c.get("indexSource") or {}
         lines += ["", "### Key rules (quoted verbatim from the instruction files; source unchanged since the index was built)"]
@@ -1220,6 +1400,11 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         if c["omitted"].get("projectRules"):
             lines.append(f"- {c['omitted']['projectRules']} lower-priority rule(s) omitted for the token budget; read the "
                          "project instructions for anything not listed here")
+    for key, label in (("pathExistsAnchors", "Paths exist (not verified)"),
+                       ("unpinnedAnchors", "Unpinned symbols (not verified)")):
+        if c.get(key):
+            lines += ["", "### " + label]
+            lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c[key]]
     if c["reverifyBeforeUse"]:
         lines += ["", "### Re-verify before use (compatible-unverified)"]
         lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["reverifyBeforeUse"]]
@@ -1399,7 +1584,7 @@ def _digest_rules(constraints: List[Dict[str, Any]], skip_sources: set, anchor_b
 
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
                    output_format: str = "json", write: bool = False, budget=None, mode=None) -> Dict[str, Any]:
-    """`memlet handover`: deterministic, signed (<500 token) Routlet × Memlet handover capsule.
+    """`memlet handover`: deterministic, checksummed (<500 token) Routlet × Memlet handover capsule.
 
     Only rules whose anchors are all `active` are carried as constraints; `stale` anchors are quarantined
     and `compatible-unverified` ones are listed for re-verification. Recorded dead-ends (bullets under a
@@ -1438,8 +1623,8 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
             continue
         seen.add(norm)
         constraints.append(r)
-    pins = dict(page_pins)
-    pins.update(_config_pins(root))
+    pins = _config_pins(root)
+    pins.update(page_pins)
     anchors = _verify_rules(root, constraints, pins, pin_source="pinned")
     by_key = {a["anchor"]: a for a in anchors}
     def _active(r):
@@ -1452,10 +1637,18 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         return item
     lists: Dict[str, List[Dict[str, Any]]] = {
         "activeConstraints": [_active(r) for r in constraints if r["status"] == "active"],
+        "lexicalConstraints": [_active(r) for r in constraints
+                               if r["anchors"] and any(by_key[k]["reason"] == "ts_js_lexical_scan_unverified" for k in r["anchors"])
+                               and all(by_key[k]["status"] == "active" or by_key[k]["reason"] == "ts_js_lexical_scan_unverified"
+                                       for k in r["anchors"])],
         "reverifyBeforeUse": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
                               for a in anchors if a["status"] == "compatible-unverified"],
         "quarantinedStaleAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
                                     for a in anchors if a["status"] == "stale"],
+        "pathExistsAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
+                              for a in anchors if a["status"] == "path-exists"],
+        "unpinnedAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
+                            for a in anchors if a["status"] == "unpinned"],
         "rejectedApproaches": [],
     }
     seen_rejected = set()
@@ -1545,6 +1738,7 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         drop_order = ("reverifyBeforeUse", "projectRules", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
     else:
         drop_order = ("reverifyBeforeUse", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
+    drop_order = ("lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
     floors = {"quarantinedStaleAnchors": min(_HANDOVER_QUARANTINE_FLOOR, caps["quarantinedStaleAnchors"])}
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
@@ -1606,6 +1800,7 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         "repoPath": str(root),
         **capsule,
         "capsuleSignature": signature,
+        "checksum": signature,
         "signedFields": list(_signed_fields(capsule)),
         "tokenEstimate": tokens,
         "tokenBudget": token_budget,

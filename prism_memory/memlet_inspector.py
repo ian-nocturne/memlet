@@ -122,7 +122,7 @@ def _audit_block(root: Path) -> Dict[str, Any]:
 def _handover_block(capsule: Dict[str, Any]) -> Dict[str, Any]:
     keep = ("schema", "repoHead", "activeConstraints", "reverifyBeforeUse", "quarantinedStaleAnchors",
             "rejectedApproaches", "executionProof", "nextAction", "authorityBoundary", "omitted",
-            "capsuleSignature", "tokenEstimate", "tokenBudget")
+            "capsuleSignature", "checksum", "pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "tokenEstimate", "tokenBudget")
     out = {k: capsule.get(k) for k in keep}
     out["markdown"] = capsule.get("formatted") or ""
     return out
@@ -438,7 +438,7 @@ white-space:nowrap}.tabs button[aria-selected=true]{color:var(--fg);border-botto
 .lbl{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
 .ringbox{display:flex;gap:18px;align-items:center}.legend{display:grid;gap:8px;font-size:13px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
-.d-active{background:var(--ok)}.d-compatible-unverified{background:var(--warn)}.d-stale{background:var(--bad)}
+.d-active{background:var(--ok)}.d-path-exists,.d-unpinned,.d-compatible-unverified{background:var(--warn)}.d-stale{background:var(--bad)}
 .stack{display:flex;height:8px;border-radius:99px;overflow:hidden;background:rgba(255,255,255,.05);margin-top:14px}
 .stack span{display:block;height:100%}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -447,7 +447,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}.tablewrap{overflow-x:auto}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;font-size:12px;font-family:var(--mono);
 white-space:nowrap;border:1px solid}
 .b-active{color:var(--ok);border-color:rgba(16,185,129,.35);background:rgba(16,185,129,.08)}
-.b-compatible-unverified{color:var(--warn);border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08)}
+.b-path-exists,.b-unpinned,.b-compatible-unverified{color:var(--warn);border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08)}
 .b-stale{color:var(--bad);border-color:rgba(244,63,94,.35);background:rgba(244,63,94,.08)}
 .b-neutral{color:#C7C9FF;border-color:rgba(99,102,241,.35);background:rgba(99,102,241,.08)}
 .hash{color:var(--mut)}.empty{color:var(--dim);text-align:center;padding:26px}
@@ -538,7 +538,7 @@ def _status(value: Any) -> str:
 
 
 def _badge(status: str, text: Optional[str] = None) -> str:
-    icon = {"active": "●", "compatible-unverified": "◐", "stale": "○"}.get(status, "●")
+    icon = {"active": "●", "compatible-unverified": "◐", "stale": "○", "path-exists": "◐", "unpinned": "◐"}.get(status, "●")
     return f'<span class="badge b-{_e(status)}">{icon} {_e(text or status)}</span>'
 
 
@@ -555,7 +555,7 @@ def _health_card(ws: Dict[str, Any]) -> str:
     r = 52
     circ = 2 * math.pi * r
     arcs, offset = [], 0.0
-    colors = {"active": "#10B981", "compatible-unverified": "#F59E0B", "stale": "#F43F5E"}
+    colors = {"active": "#10B981", "compatible-unverified": "#F59E0B", "stale": "#F43F5E", "path-exists": "#F59E0B", "unpinned": "#F59E0B"}
     for st in _STATES:
         n = int(s.get(st) or 0)
         if total and n:
@@ -753,7 +753,13 @@ def _tab_handover(payload: Dict[str, Any]) -> str:
             + (f'<p class="sub" style="margin:10px 0 0">Next action: {_e(h.get("nextAction"))}</p>' if h.get("nextAction") else "") +
             f'</div><div class="grid g2">'
             f'<div class="card"><h3>{_badge("active", "Active Verified Constraints")}</h3><p class="sub">Carried to the next model — every anchor is <code>active</code>.</p>'
-            f'{_items(h.get("activeConstraints") or [], "rule", "source", "No fully verified constraints.", "verified")}</div>'
+            f'{_items(h.get("activeConstraints") or [], "rule", "source", "No fully verified constraints.", "verified")}'
+            f'<h3>TS/JS lexical matches — re-check before use</h3>'
+            f'{_items(h.get("lexicalConstraints") or [], "rule", "source", "None.", "")}'
+            f'<h3>Paths exist — not verified</h3>'
+            f'{_items(h.get("pathExistsAnchors") or [], "anchor", "reason", "None.", "")}'
+            f'<h3>Unpinned symbols — not verified</h3>'
+            f'{_items(h.get("unpinnedAnchors") or [], "anchor", "reason", "None.", "")}</div>'
             f'<div class="card"><h3>{_badge("stale", "Quarantined Stale Anchors (Blocked)")}</h3><p class="sub">Never injected; the receiving model must not follow them.</p>'
             f'{_items(h.get("quarantinedStaleAnchors") or [], "anchor", "reason", _omitted_note(h, "quarantinedStaleAnchors", "Nothing quarantined."), "blocked")}'
             f'<h3 style="margin-top:16px">{_badge("compatible-unverified", "Re-verify before use")}</h3>'
@@ -819,7 +825,7 @@ def render_inspector_html(payload: Dict[str, Any]) -> str:
     filters = "".join(
         f'<button type="button" data-value="{v}" aria-pressed="{"true" if v == "all" else "false"}">{_e(label)}</button>'
         for v, label in (("all", "All"), ("active", "🟢 Active"), ("compatible-unverified", "🟡 Compatible-Unverified"),
-                         ("stale", "🔴 Stale")))
+                         ("stale", "🔴 Stale"), ("path-exists", "Path exists (unverified)"), ("unpinned", "Unpinned")))
     notice = f'<p class="notice">{_e(payload.get("showcaseReason"))}</p>' if payload.get("showcaseReason") else ""
     errs = payload.get("errors") or []
     err_html = f'<p class="notice" style="border-color:rgba(244,63,94,.35);color:#FDA4AF">Some probes failed: {_e("; ".join(errs))}</p>' if errs else ""
