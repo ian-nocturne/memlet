@@ -42,13 +42,95 @@ def _tokens(text: str) -> List[str]:
 MAX_PROMOTED = 100  # approved Dream lessons promoted to `.memlet/wiki/dream-approved.md` (memlet_bridge)
 
 
-def _entries_meta(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+MAX_PARSED = 600        # parsed-fallback rule spans considered per call
+MAX_PARSED_SPAN = 12    # same span bound as index-build
+
+
+def _rule_spans(lines: List[str]) -> List[Tuple[int, int, str]]:
+    """Complete rule spans of one Markdown file as (first, last, section), 1-based inclusive: a list item with its
+    continuation lines, or a paragraph; headings, code fences, tables, HTML comments and front matter are not rules.
+    Deterministic; a span is cut at MAX_PARSED_SPAN lines."""
+    from prism_memory.memlet_wiki import _BULLET_RE, _FENCE_RE, _HEADING_RE
+    spans: List[Tuple[int, int, str]] = []
+    section, in_fence, cur = "", False, None
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, min(len(lines), 60)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+
+    def close():
+        if cur:
+            spans.append((cur[0], cur[1], cur[2]))
+
+    for idx in range(start, len(lines)):
+        no, line = idx + 1, lines[idx]
+        stripped = line.strip()
+        if _FENCE_RE.match(line):
+            close()
+            cur, in_fence = None, not in_fence
+            continue
+        if in_fence:
+            continue
+        h = _HEADING_RE.match(line)
+        if h or not stripped or stripped.startswith(("<!--", "|")):
+            close()
+            cur = None
+            if h:
+                section = h.group("title").strip()
+            continue
+        if _BULLET_RE.match(line) or cur is None or cur[1] - cur[0] + 1 >= MAX_PARSED_SPAN:
+            close()
+            cur = [no, no, section]
+        else:
+            cur[1] = no  # continuation of the item or paragraph
+    close()
+    return spans
+
+
+def parsed_rule_entries(root: Path) -> List[Dict[str, Any]]:
+    """Deterministic fallback when no rule index exists (never a model call): every discovered instruction file and
+    hand-written wiki page split into complete rule spans, each cited `file:first-last` with the SHA-256 of its
+    current text, quoted from the secret-masked file. Not reviewed or ranked by importance: `importance` is 2 for all."""
+    from prism_memory.memlet_brief import _mask, _sha, _source_lines
+    from prism_memory import memlet_wiki as mw
+    files = dict(_source_lines(root))
+    wiki = root / mw.WIKI_DIR
+    if wiki.is_dir() and not wiki.is_symlink() and not (root / mw.MEMLET_DIR).is_symlink():
+        for p in sorted(wiki.rglob("*.md")):
+            if p.is_symlink() or not p.is_file():
+                continue
+            rel = mw._rel(root, p)
+            text = mw._read_text(p)
+            if mw._is_generated_page(rel, text) or rel == mw.DREAM_PROMOTED_PAGE or rel in mw._MARKED_GENERATED_PAGES:
+                continue
+            body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
+            files[rel] = body.splitlines()
+    out: List[Dict[str, Any]] = []
+    for rel in sorted(files):
+        lines = files[rel]
+        masked = _mask("\n".join(lines)).split("\n")
+        for a, b, section in _rule_spans(lines):
+            raw = "\n".join(lines[a - 1:b])
+            out.append({"topic": section or rel.rsplit("/", 1)[-1], "importance": 2, "source": f"{rel}:{a}-{b}",
+                        "quote": "\n".join(masked[a - 1:b]), "lines": b - a + 1, "sha256": _sha(raw), "parsed": True})
+            if len(out) >= MAX_PARSED:
+                return out
+    return out
+
+
+def _entries_meta(root: Path, fallback: bool = False
+                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Verified index entries plus promoted Dream lessons (each re-verified on every call by `memlet_bridge`:
-    unedited line, still approved for the same content, transcript citation unchanged), and the index meta."""
+    unedited line, still approved for the same content, transcript citation unchanged), and the index meta.
+    `fallback=True` and no index page: the parsed instruction spans (`parsed_rule_entries`) stand in for the index."""
     from prism_memory.memlet_brief import _mask
-    from prism_memory.memlet_index import load_verified_index
+    from prism_memory.memlet_index import INDEX_PAGE, load_verified_index
     fresh, stale, meta = load_verified_index(root)
     fresh, stale = fresh[:MAX_ENTRIES], stale[:MAX_ENTRIES]
+    if fallback and not (root / INDEX_PAGE).is_file():
+        fresh = parsed_rule_entries(root)
     from prism_memory.memlet_bridge import promoted_rule_entries
     p_fresh, p_stale = promoted_rule_entries(root)
     fresh, stale = fresh + p_fresh[:MAX_PROMOTED], stale + p_stale[:MAX_PROMOTED]
@@ -191,17 +273,19 @@ def recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str]
 
 
 def recall_items(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str] = (),
-                 safety: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """`recall` plus the picked entries as items (key, source, topic, quote, importance[, dreamId]) for callers that
-    lay out their own budget (`memlet_bridge.unified_recall`). The `recall` result itself is unchanged."""
-    return _recall(repo_path, query, k=k, exclude=exclude, safety=safety, with_items=True)
+                 safety: bool = False, fallback: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """`recall` plus the picked entries as items (key, source, topic, quote, importance, match[, dreamId, sha256,
+    parsed]) for callers that lay out their own budget (`memlet_bridge.unified_recall`). `match` is True for a query
+    match and False for an always-on importance-1 rule added by `safety`. `fallback=True`: without a rule index, rank
+    the parsed instruction spans instead (`parsed_rule_entries`). The `recall` result itself is unchanged."""
+    return _recall(repo_path, query, k=k, exclude=exclude, safety=safety, with_items=True, fallback=fallback)
 
 
 def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str] = (), safety: bool = False,
-            with_items: bool = False):
+            with_items: bool = False, fallback: bool = False):
     from prism_memory.memlet_wiki import _resolve_root, estimate_tokens
     root = _resolve_root(repo_path)
-    fresh, stale, meta = _entries_meta(root)
+    fresh, stale, meta = _entries_meta(root, fallback=fallback)
     k = max(0, min(int(k), MAX_K))
     skip = set(exclude)  # verified citations or opaque keys (never masked display strings, which can collide)
     out_of = lambda e: e["id"] in skip or e["key"] in skip
@@ -224,6 +308,7 @@ def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str
             scored.append((-round(s, 9), rank, e))
     scored.sort(key=lambda x: (x[0], x[1]))
     picked = [e for _, _, e in scored[:k]]
+    matched = {e["id"] for e in picked}
     if safety:  # every importance-1 rule stays reachable: those not already shown are added regardless of score
         shown = {e["id"] for e in picked}
         forced = [e for e in fresh if e["importance"] == 1 and not out_of(e) and e["id"] not in shown]
@@ -246,9 +331,10 @@ def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str
         items = []
         for e in picked:
             item = {"key": e["key"], "source": e["source"], "topic": e["topic"], "quote": e["quote"],
-                    "importance": e["importance"]}
-            if e.get("dreamId"):
-                item["dreamId"] = e["dreamId"]
+                    "importance": e["importance"], "match": e["id"] in matched}
+            for extra in ("dreamId", "sha256", "parsed"):
+                if e.get(extra):
+                    item[extra] = e[extra]
             items.append(item)
         return res, items
     return res

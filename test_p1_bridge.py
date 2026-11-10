@@ -520,3 +520,281 @@ class InspectorAuditKeyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Fix round 1 (independent Wave 2 review): one regression group per finding, from the reviewer's inputs.
+
+PEM_B64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="  # synthetic payload from the review, not a real key
+
+
+def _git(repo, *args):
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_AUTHOR_NAME="t",
+               GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    return subprocess.run(["git"] + list(args), cwd=str(repo), check=True, capture_output=True, env=env)
+
+
+class ConcurrencyFixTests(_RepoCase):
+    """Finding 1: two concurrent successful approvals must never lose one decision."""
+
+    def test_concurrent_approvals_keep_both_decisions_and_promotion(self):
+        import threading
+        from unittest import mock
+        self.learn()
+        ids = self.ids_by_title()
+        a, b = self.pick(ids, "main()"), self.pick(ids, "release")
+        inside, guard = [0], threading.Lock()
+        both_in = threading.Event()
+        orig = md._assert_db_replaceable
+
+        def held_open(*args, **kw):  # the reviewer's window: after the generation check, before the write
+            orig(*args, **kw)
+            with guard:
+                inside[0] += 1
+                if inside[0] >= 2:
+                    both_in.set()
+            both_in.wait(timeout=1.0)  # without the queue lock the other writer arrives here and both proceed
+            with guard:
+                inside[0] -= 1
+
+        results = {}
+        with mock.patch.object(md, "_assert_db_replaceable", held_open):
+            ts = [threading.Thread(target=lambda i=i: results.__setitem__(i, mb.learn_approve(self.repo, [i], approver="Reviewer")))
+                  for i in (a, b)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+        self.assertFalse(both_in.is_set(), "two writers were inside the queue critical section at once")
+        self.assertTrue(results[a]["ok"] and results[b]["ok"], results)
+        nodes = {n["id"]: n for n in self.queue()["nodes"]}
+        self.assertEqual("approved", md.approval_state(nodes[a], "node"))
+        self.assertEqual("approved", md.approval_state(nodes[b], "node"))
+        self.assertTrue(md.queue_db_in_sync(self.repo / mb.QUEUE_REL, self.repo / mb.DB_REL))
+        page = (self.repo / mb.PROMOTED_PAGE).read_text()
+        self.assertIn(a, page)
+        self.assertIn(b, page)  # the page does not lag the last committed queue
+
+    def test_queue_lock_excludes_another_process(self):
+        import sys
+        q = self.repo / mb.QUEUE_REL
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from prism_memory import memlet_dream as md\n"
+                "with md.queue_lock(sys.argv[2]):\n    print('locked', flush=True)\n    sys.stdin.readline()\n")
+        child = subprocess.Popen([sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(q)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual("locked", child.stdout.readline().strip())
+            with self.assertRaises(TimeoutError):
+                with md.queue_lock(q, timeout=0.3):
+                    pass
+            from unittest import mock
+            with mock.patch.object(md, "QUEUE_LOCK_TIMEOUT", 0.3):
+                blocked = mb.learn_from_transcript(self.repo, self.transcript)
+        finally:
+            child.stdin.write("\n")
+            child.stdin.flush()
+            child.wait(10)
+        self.assertFalse(blocked["ok"])  # a writer never proceeds while another process holds the queue
+        self.assertIn("Dream queue lock", blocked["error"])
+        self.assertFalse((self.repo / mb.QUEUE_REL).exists())
+        with md.queue_lock(q, timeout=5):
+            pass
+        self.learn()  # the holder is gone: the lock is free again
+
+
+class PrivateKeyFixTests(_RepoCase):
+    """Finding 2: no private-key material reaches snapshot, queue, DB, promoted page, recall or handover."""
+
+    def _assert_clean(self):
+        blobs = [p.read_bytes() for p in (self.repo / ".memlet").rglob("*") if p.is_file()]
+        u = mb.unified_recall(self.repo, "expose credentials key", budget=2000)
+        cap = build_handover(self.repo, output_format="markdown")
+        for text in [b.decode("utf-8", "replace") for b in blobs] + [u["formatted"], json.dumps(u), cap["formatted"]]:
+            self.assertNotIn(PEM_B64[:20], text)
+            self.assertNotIn("PRIVATE KEY", text)
+
+    def test_jsonl_pkcs8_block_in_a_real_envelope(self):
+        _write_jsonl(self.transcript, _records([
+            {"type": "user", "timestamp": "2026-11-09T11:00:00Z", "message": {"role": "user", "content":
+             "Never expose credentials -----BEGIN PRIVATE KEY-----\n" + PEM_B64 + "\n-----END PRIVATE KEY-----"}}]))
+        self.learn()
+        nid = self.pick(self.ids_by_title(), "Never expose credentials")
+        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="ray")["ok"])
+        self.assertIn("Never expose credentials [REDACTED_SECRET_BLOCK]", self.snapshot_file().read_text())
+        self._assert_clean()
+
+    def test_log_multiline_keys_keep_line_numbers(self):
+        log = self.tdir / "rsa.log"
+        log.write_text("2026-11-09T09:00:00Z [user] Never expose -----BEGIN RSA PRIVATE KEY-----\n" + PEM_B64 + "\n"
+                       "-----END RSA PRIVATE KEY-----\n"
+                       "2026-11-09T09:01:00Z [user] -----BEGIN OPENSSH PRIVATE KEY-----\n" + PEM_B64 + "\n" + PEM_B64 + "\n"
+                       "-----END OPENSSH PRIVATE KEY-----\n"
+                       "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n" + PEM_B64 + "\n-----END PGP PRIVATE KEY BLOCK-----\n"
+                       "2026-11-09T09:02:00Z [user] Never run the migration twice\n")
+        res = mb.learn_from_transcript(self.repo, log)
+        self.assertTrue(res["ok"], res)
+        stored = (self.repo / res["snapshotFiles"][0]["snapshotFile"]).read_text().splitlines()
+        self.assertEqual(len(log.read_text().splitlines()), len(stored))
+        self.assertEqual("2026-11-09T09:02:00Z [user] Never run the migration twice", stored[-1])
+        nid = self.pick(self.ids_by_title(), "migration twice")
+        span = next(n for n in self.queue()["nodes"] if n["id"] == nid)["primaryPin"]["span"]
+        self.assertTrue(span.endswith(f":{len(stored)}"), span)  # pins still address the original line
+        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="ray")["ok"])
+        self._assert_clean()
+
+
+class ChangedCheckFixTests(unittest.TestCase):
+    """Findings 3, 4, 9: rename ends, new nested instruction files, Memlet's own state."""
+
+    def setUp(self):
+        self.repo = _tmp(self, "p1-fix-changed-")
+        (self.repo / "mod.py").write_text("def charge(x):\n    return x * 2\n")
+        (self.repo / "AGENTS.md").write_text("# Rules\n- Always call `mod.py::charge` safely.\n")
+        self.assertTrue(init_project(self.repo)["ok"])
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_rename_reports_the_old_path_stale(self):
+        _git(self.repo, "init", "-q")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base")
+        _git(self.repo, "mv", "mod.py", "renamed é.py")
+        res = mb.changed_check(self.repo)
+        self.assertEqual(sorted(["mod.py", "renamed é.py"]), sorted(res["changedFiles"]))  # both ends, literal names
+        self.assertEqual(1, res["exitCode"], res)
+        self.assertEqual([("mod.py::charge", "stale")], [(a["anchor"], a["status"]) for a in res["affected"]])
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_deleted_file_and_memlet_state_in_git(self):
+        _git(self.repo, "init", "-q")
+        _git(self.repo, "add", "AGENTS.md", "mod.py")
+        _git(self.repo, "commit", "-qm", "base")
+        tr = self.repo.parent / (self.repo.name + "-t.jsonl")
+        self.addCleanup(lambda: tr.unlink() if tr.exists() else None)
+        _write_jsonl(tr, _records())
+        self.assertTrue(mb.learn_from_transcript(self.repo, tr)["ok"])
+        res = mb.changed_check(self.repo)  # only Memlet's own untracked state changed
+        self.assertEqual([], res["changedFiles"])
+        self.assertTrue(any(f.startswith(".memlet/dream/") for f in res["ignoredFiles"]))
+        self.assertIn(".memlet/config.json", res["ignoredFiles"])
+        self.assertEqual((0, ""), (res["exitCode"], res["formatted"]))
+        (self.repo / ".memlet" / "wiki" / "notes.md").write_text("# Notes\n\n- Keep `mod.py::charge` pure.\n")
+        (self.repo / "mod.py").unlink()
+        res = mb.changed_check(self.repo)
+        self.assertIn(".memlet/wiki/notes.md", res["changedFiles"])  # hand-written wiki pages are rule sources
+        self.assertIn("mod.py", res["changedFiles"])                 # deletion
+        stale = sorted(a["source"] for a in res["affected"] if a["status"] == "stale")
+        self.assertEqual([".memlet/wiki/notes.md:3", "AGENTS.md:2"], stale)
+
+    def test_new_nested_instruction_file_and_removed_one(self):
+        nested = self.repo / "sub" / "AGENTS.md"
+        nested.parent.mkdir()
+        nested.write_text("# Rules\n- Never call `../mod.py::charge` without retry.\n")  # the reviewer's input
+        (self.repo / "mod.py").write_text("def charge(x):\n    return x * 3\n")
+        res = mb.changed_check(self.repo, files=["sub/AGENTS.md"])
+        self.assertEqual(["sub/AGENTS.md:2"], [a["source"] for a in res["affected"]])
+        self.assertEqual(1, res["exitCode"])  # `../mod.py` leaves the repository: stale, never silently clean
+        nested.write_text("# Rules\n- Never call `mod.py::nope` without retry.\n")
+        res = mb.changed_check(self.repo, files=["sub/AGENTS.md"])
+        self.assertEqual([("mod.py::nope", "stale")], [(a["anchor"], a["status"]) for a in res["affected"]])
+        # not an instruction file for discovery, so not one here either
+        for rel in ("node_modules/x/AGENTS.md", "a/b/c/d/AGENTS.md"):
+            p = self.repo / rel
+            p.parent.mkdir(parents=True)
+            p.write_text("- Never call `mod.py::nope`.\n")
+            self.assertEqual([], mb.changed_check(self.repo, files=[rel])["affected"], rel)
+        nested.unlink()
+        res = mb.changed_check(self.repo, files=["sub/AGENTS.md"])
+        self.assertEqual(["sub/AGENTS.md"], res["removedInstructionFiles"])
+        self.assertEqual((0, []), (res["exitCode"], res["affected"]))
+        self.assertIn("REMOVED instruction file `sub/AGENTS.md`", res["formatted"])
+
+
+class BlankApproverFixTests(_RepoCase):
+    """Finding 6: an empty or whitespace approver is refused with no mutation."""
+
+    def test_blank_approver_refused_without_mutation(self):
+        self.learn()
+        nid = self.pick(self.ids_by_title(), "main()")
+        before = {p: p.read_bytes() for p in (self.repo / ".memlet").rglob("*") if p.is_file()}
+        for who in ("", "   ", None):
+            for call in (mb.learn_approve, mb.learn_reject):
+                res = call(self.repo, [nid], approver=who)
+                self.assertFalse(res["ok"])
+                self.assertEqual(2, res["exitCode"])
+                self.assertIn("approver", res["error"])
+                self.assertNotIn("approverDefaulted", res)
+        after = {p: p.read_bytes() for p in (self.repo / ".memlet").rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertFalse((self.repo / mb.PROMOTED_PAGE).exists())
+        self.assertEqual([], mb.unified_recall(self.repo, "main test suite")["sections"]["dream"])
+
+
+class RecallFixTests(unittest.TestCase):
+    """Finding 8 (zero-match queries) and lead finding A (deterministic rules without an index)."""
+
+    def setUp(self):
+        self.repo = _tmp(self, "p1-fix-recall-")
+        (self.repo / "AGENTS.md").write_text(
+            "# Rules\n\n- Always run the unit tests before committing,\n  including the slow integration suite.\n"
+            "- Sales must approve before any deploy.\n- Telegram notifications go through scripts/notify.sh.\n\n"
+            "## Secrets\n\n- Never paste API_TOKEN=abcdefgh1234567890 into chat.\n")
+
+    def test_zero_match_query_returns_no_rule_matches_only_labelled_safety(self):
+        from prism_memory.memlet_index import build_index
+        build_index(self.repo, runner=lambda p: "- tests before commit | 1 [src: AGENTS.md:3-4]\n"
+                                                "- sales approval | 1 [src: AGENTS.md:5-5]\n")
+        u = mb.unified_recall(self.repo, "platypusquantum")
+        self.assertEqual([], u["sections"]["rules"])
+        self.assertEqual("no rule matches the query", u["sources"]["rules"]["reason"])
+        self.assertEqual(sorted(["AGENTS.md:3-4", "AGENTS.md:5-5"]), sorted(i["source"] for i in u["sections"]["safety"]))
+        self.assertIn("Always-on safety rules", u["formatted"])
+        self.assertNotIn("matching the query", u["formatted"])
+        hit = mb.unified_recall(self.repo, "sales deploy approval")
+        self.assertEqual(["AGENTS.md:5-5"], [i["source"] for i in hit["sections"]["rules"]])
+        self.assertEqual(["AGENTS.md:3-4"], [i["source"] for i in hit["sections"]["safety"]])
+
+    def test_plain_init_gives_parsed_rules_without_any_model_call(self):
+        from prism_memory.memlet_recall import recall
+        self.assertTrue(init_project(self.repo)["ok"])
+        u = mb.unified_recall(self.repo, "unit tests integration suite")
+        self.assertTrue(u["sources"]["rules"]["available"], u["sources"])
+        self.assertEqual("parsed", u["sources"]["rules"]["mode"])
+        first = u["sections"]["rules"][0]
+        self.assertEqual("AGENTS.md:3-4", first["source"])  # the whole item, continuation line included
+        import hashlib
+        lines = (self.repo / "AGENTS.md").read_text().splitlines()
+        self.assertEqual(hashlib.sha256("\n".join(lines[2:4]).encode()).hexdigest(), first["sha256"])
+        self.assertIn("parsed from instruction files; not an indexed/reviewed rule index", u["formatted"])
+        self.assertEqual([], u["sections"]["safety"])
+        self.assertFalse(u["sources"]["safety"]["available"])
+        secret = mb.unified_recall(self.repo, "paste token chat")
+        self.assertEqual(["AGENTS.md:10-10"], [i["source"] for i in secret["sections"]["rules"]])
+        self.assertNotIn("abcdefgh1234567890", json.dumps(secret))
+        for budget in (40, 60, 90):
+            self.assertLessEqual(mb.unified_recall(self.repo, "unit tests", budget=budget)["tokenEstimate"], budget)
+        self.assertEqual([], mb.unified_recall(self.repo, "platypusquantum")["sections"]["rules"])
+        # the CLI's rule-recall keeps its index-only behaviour and key set
+        r = recall(self.repo, "unit tests", k=3)
+        self.assertEqual([], r["spans"])
+        self.assertEqual({"ok", "command", "repoPath", "k", "stale", "spans", "spanKeys", "scores", "tokenEstimate",
+                          "formatted"}, set(r))
+
+
+class SlimOwnershipFixTests(unittest.TestCase):
+    """Lead finding B: only files `memlet slim-plan` produced count as instructions."""
+
+    def test_foreign_management_files_are_not_instructions(self):
+        from prism_memory.memlet_slim import RULES_HEADER, RULES_REL
+        from prism_memory.memlet_wiki import discover_instruction_files, is_instruction_path
+        repo = _tmp(self, "p1-fix-slim-")
+        (repo / "AGENTS.md").write_text("# Rules\n\n- Keep it simple.\n")
+        (repo / "management").mkdir()
+        (repo / "management" / "agent-sales.md").write_text("# Sales notes 2024\n\n- Never discount below 10%.\n")
+        (repo / RULES_REL).write_text("# Our own agent rules\n\n- Not written by slim.\n")
+        self.assertEqual(["AGENTS.md"], discover_instruction_files(repo))
+        self.assertEqual(["AGENTS.md"], init_project(repo)["instructionFiles"])
+        self.assertFalse(is_instruction_path(repo, "management/agent-sales.md"))
+        self.assertFalse(is_instruction_path(repo, RULES_REL))
+        (repo / RULES_REL).write_text(RULES_HEADER + "\n\n- Moved verbatim.\n")
+        self.assertEqual(["AGENTS.md", RULES_REL], discover_instruction_files(repo))
+        self.assertTrue(is_instruction_path(repo, RULES_REL))

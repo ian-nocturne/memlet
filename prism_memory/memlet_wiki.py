@@ -32,6 +32,7 @@ starts a daemon, calls a network or LLM, or opens `.env*` files or other secret 
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import hashlib
 import json
 import os
@@ -84,11 +85,82 @@ TOP_INSTRUCTION_FILES = (
     ".clinerules",
     ".github/copilot-instructions.md",
 )
-# `management/agent-*.md`: where `memlet slim-plan` moves directives and standing rules out of AGENTS.md
-# (memlet_slim.LOG_REL / RULES_REL); following them keeps moved rules indexed, recalled and handed over.
-INSTRUCTION_GLOBS = (".cursor/rules/*.md", ".cursor/rules/*.mdc", ".github/instructions/*.md", "management/agent-*.md")
+INSTRUCTION_GLOBS = (".cursor/rules/*.md", ".cursor/rules/*.mdc", ".github/instructions/*.md")
 NESTED_INSTRUCTION_NAMES = ("CLAUDE.md", "AGENTS.md", "SKILL.md")
 _SCRATCH_DIRS = {"_workspace", "worktrees", ".worktrees"}
+_NESTED_MAX_DIRS = 3  # nested instruction files at most 3 directories below the root
+
+
+def slim_output_files(root: Path) -> List[str]:
+    """`management/agent-*.md` files that `memlet slim-plan` produced (exact name + its generated first line), so rules
+    it moved out of AGENTS.md stay indexed, recalled and handed over. Any other `management/agent-*.md` is ignored."""
+    from .memlet_slim import SLIM_OUTPUTS
+    out = []
+    for rel, header in sorted(SLIM_OUTPUTS.items()):
+        p = root / rel
+        if p.is_symlink() or not p.is_file() or any(q.is_symlink() for q in p.parents if root in q.parents):
+            continue
+        try:
+            with p.open("r", encoding="utf-8", errors="ignore") as fh:
+                first = fh.readline().rstrip("\r\n")
+        except OSError:
+            continue
+        if first == header:
+            out.append(rel)
+    return out
+
+
+def instruction_path_shape(rel: str) -> bool:
+    """Would `discover_instruction_files` accept a file at `rel` (by path alone: names, globs, depth, excluded and
+    scratch folders, secrets)? Existence, symlinks, nested repositories and slim ownership are checked by
+    `is_instruction_path`."""
+    rel = rel.replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or ".." in parts or "" in parts or _is_secret_path(rel):
+        return False
+    if rel in TOP_INSTRUCTION_FILES:
+        return True
+    for pat in INSTRUCTION_GLOBS:
+        pp = pat.split("/")
+        if len(pp) == len(parts) and all(fnmatch.fnmatchcase(a, b) for a, b in zip(parts, pp)):
+            return True
+    from .memlet_slim import SLIM_OUTPUTS
+    if rel in SLIM_OUTPUTS:
+        return True
+    dirs = parts[:-1]
+    return (parts[-1] in NESTED_INSTRUCTION_NAMES and len(dirs) <= _NESTED_MAX_DIRS
+            and not any(d in EXCLUDED_DIRS or d == MEMLET_DIR or d in _SCRATCH_DIRS for d in dirs))
+
+
+def is_instruction_path(root: Path, rel: str) -> bool:
+    """`discover_instruction_files(root)` membership for one path without walking the tree (for fast hooks)."""
+    rel = rel.replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    if not instruction_path_shape(rel):
+        return False
+    p = root / rel
+    try:
+        if p.is_symlink() or not p.is_file():
+            return False
+        p.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return False
+    from .memlet_slim import SLIM_OUTPUTS
+    if rel in SLIM_OUTPUTS:
+        return rel in slim_output_files(root)
+    parts = rel.split("/")
+    if rel not in TOP_INSTRUCTION_FILES and not any(
+            len(pat.split("/")) == len(parts) and all(fnmatch.fnmatchcase(a, b) for a, b in zip(parts, pat.split("/")))
+            for pat in INSTRUCTION_GLOBS):
+        cur = root
+        for d in parts[:-1]:  # discovery never descends into symlinked folders or nested repositories
+            cur = cur / d
+            if cur.is_symlink() or (cur / ".git").exists():
+                return False
+    return True
 
 
 def _is_secret_path(rel: str) -> bool:
@@ -136,6 +208,8 @@ def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> L
     for pat in INSTRUCTION_GLOBS:
         for p in root.glob(pat):
             _add(p)
+    for rel in slim_output_files(root):  # only files `memlet slim-plan` produced, never any management/agent-*.md
+        _add(root / rel)
     # Walk with pruning instead of rglob: skip excluded dirs, scratch worktree folders, and any nested git
     # repository/worktree (a sub-directory holding its own `.git`), whose instructions belong to that repo.
     names = set(NESTED_INSTRUCTION_NAMES)

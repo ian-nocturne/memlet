@@ -58,7 +58,7 @@ _MAX_TRANSCRIPT_FILES = 200
 _MAX_BASENAME_WALK = 20000
 _SPLITLINES_CHARS_RE = re.compile("[\r\n\x0b\x0c\x1c\x1d\x1e\x85  ]")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
-_SECTIONS = ("rules", "dream", "memory")
+_SECTIONS = ("rules", "safety", "dream", "memory")
 _STATUS_ORDER = ("stale", "compatible-unverified", "unpinned", "path-exists", "active")
 
 
@@ -97,18 +97,6 @@ def _ids(ids: Any) -> List[str]:
         if s and s not in out:
             out.append(s)
     return out
-
-
-def _approver(approver: Any) -> Tuple[str, bool]:
-    who = str(approver or "").strip()
-    if who:
-        return who, False
-    try:
-        import getpass
-        who = getpass.getuser()
-    except Exception:  # pragma: no cover - getpass raises several platform-specific errors
-        who = ""
-    return (who.strip() or "local-user"), True
 
 
 def _gitignore_notice(root: Path) -> Optional[str]:
@@ -205,9 +193,11 @@ def _transcript_lines(f: Path) -> Tuple[List[str], Dict[str, int]]:
     `memlet_dream.read_jsonl_transcript`). Characters `str.splitlines` would split on are folded to spaces so the
     stored snapshot reads back with the same numbering; every line is secret-masked before it is stored."""
     if f.suffix == ".jsonl":
-        lines, stats = md.read_jsonl_transcript(f)
+        lines, stats = md.read_jsonl_transcript(f)  # one record per line: a key block is folded into its own line
     else:
-        lines, stats = f.read_text(encoding="utf-8", errors="replace").splitlines(), {}
+        # whole-text redaction BEFORE splitting: a key body between its markers is on lines with no marker of its own
+        lines = md.redact_secret_blocks(f.read_text(encoding="utf-8", errors="replace")).splitlines()
+        stats = {}
     return [md.mask_secrets(_SPLITLINES_CHARS_RE.sub(" ", ln)) for ln in lines], stats
 
 
@@ -339,45 +329,53 @@ def learn_from_transcript(repo_path=".", transcript_path=None, *, vendor="autono
     files, skipped = _transcript_files(src)
     if not files:
         return _fail("no .jsonl or .log transcript found (symlinked files are skipped)", 2, skipped=skipped)
+    q_path = root / QUEUE_REL
+    notices: List[str] = []
+    try:
+        with md.queue_lock(q_path):  # load -> merge -> commit -> promote is one critical section
+            res = _learn_locked(root, files, skipped, vendor, notices)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return _fail(f"learn failed: {exc}", 1)
+    return res
+
+
+def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor: str,
+                  notices: List[str]) -> Dict[str, Any]:
     snap_dir = root / SNAPSHOT_REL
     q_path = root / QUEUE_REL
     db_path = root / DB_REL
-    notices: List[str] = []
-    try:
-        old, _reason = _load_queue(root)
-        if old is not None:
-            meta = old.get("queueMeta") if isinstance(old.get("queueMeta"), dict) else {}
-            if meta.get("snapshotPath") != str(snap_dir):
-                return _fail("the existing .memlet/dream/APPROVAL-QUEUE.json was not built by `learn` (it cites "
-                             "another snapshot); move it aside before learning into this repository", 1)
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        stored, reader = [], {"messages": 0, "malformedLines": 0, "nonMessageLines": 0}
-        for f in files:
-            lines, st = _transcript_lines(f)
-            for k in reader:
-                reader[k] += int(st.get(k, 0))
-            fid, op = _store_snapshot(snap_dir, f, lines)
-            stored.append({"transcript": str(f), "snapshotFile": f"{SNAPSHOT_REL}/{fid}", "op": op})
-        snap = md.load_snapshot(snap_dir)
-        cands, cap = _stable_candidates(snap)
-        with tempfile.TemporaryDirectory(prefix="memlet-learn-") as tmp:
-            cpath = Path(tmp) / "candidates.json"
-            cpath.write_text(json.dumps(cands, ensure_ascii=False), encoding="utf-8")
-            receipt = md.run_dream_build(str(snap_dir), candidates_path=str(cpath),
-                                         out_json=str(Path(tmp) / "queue.json"), vendor=vendor)
-            built = json.loads((Path(tmp) / "queue.json").read_text(encoding="utf-8"))
-        merged, info = _merge(old, built, snap, snap_dir)
-        ver = md.verify_ontology_contract(merged, snap)
-        if not ver["ok"]:
-            return _fail("merged Dream queue failed the ontology contract; nothing was written",
-                         1, contractVerification=ver)
-        unchanged = old is not None and all(old.get(k) == merged[k] for k in ("nodes", "edges", "queueMeta"))
-        if not unchanged:
-            prior_sha = md.graph_sha256(old) if old is not None else None
-            md._commit_queue_and_db(q_path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n", db_path, merged,
-                                    replaces_sha=prior_sha)
-    except (OSError, ValueError, sqlite3.Error) as exc:
-        return _fail(f"learn failed: {exc}", 1)
+    old, _reason = _load_queue(root)
+    if old is not None:
+        meta = old.get("queueMeta") if isinstance(old.get("queueMeta"), dict) else {}
+        if meta.get("snapshotPath") != str(snap_dir):
+            return _fail("the existing .memlet/dream/APPROVAL-QUEUE.json was not built by `learn` (it cites "
+                         "another snapshot); move it aside before learning into this repository", 1)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    stored, reader = [], {"messages": 0, "malformedLines": 0, "nonMessageLines": 0}
+    for f in files:
+        lines, st = _transcript_lines(f)
+        for k in reader:
+            reader[k] += int(st.get(k, 0))
+        fid, op = _store_snapshot(snap_dir, f, lines)
+        stored.append({"transcript": str(f), "snapshotFile": f"{SNAPSHOT_REL}/{fid}", "op": op})
+    snap = md.load_snapshot(snap_dir)
+    cands, cap = _stable_candidates(snap)
+    with tempfile.TemporaryDirectory(prefix="memlet-learn-") as tmp:
+        cpath = Path(tmp) / "candidates.json"
+        cpath.write_text(json.dumps(cands, ensure_ascii=False), encoding="utf-8")
+        receipt = md.run_dream_build(str(snap_dir), candidates_path=str(cpath),
+                                     out_json=str(Path(tmp) / "queue.json"), vendor=vendor)
+        built = json.loads((Path(tmp) / "queue.json").read_text(encoding="utf-8"))
+    merged, info = _merge(old, built, snap, snap_dir)
+    ver = md.verify_ontology_contract(merged, snap)
+    if not ver["ok"]:
+        return _fail("merged Dream queue failed the ontology contract; nothing was written",
+                     1, contractVerification=ver)
+    unchanged = old is not None and all(old.get(k) == merged[k] for k in ("nodes", "edges", "queueMeta"))
+    if not unchanged:
+        prior_sha = md.graph_sha256(old) if old is not None else None
+        md._commit_queue_and_db(q_path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n", db_path, merged,
+                                replaces_sha=prior_sha)
     pending = md.list_pending(merged)
     note = _gitignore_notice(root)
     if note:
@@ -453,6 +451,9 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
         return _fail(str(exc), 2)
+    who = str(approver or "").strip()
+    if not who:  # an explicit human name is part of the review contract; nothing is ever filled in
+        return _fail("an approver name is required (the person who read the cited lines); nothing was changed", 2)
     wanted = _ids(ids)
     if not wanted:
         return _fail("at least one Dream item id is required", 2)
@@ -462,20 +463,22 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
     q = root / QUEUE_REL
     if not q.is_file():
         return _fail("no Dream queue (.memlet/dream/APPROVAL-QUEUE.json); run `learn` first", 1)
-    who, defaulted = _approver(approver)
     try:
-        if decision == md.APPROVED:
-            snap = root / SNAPSHOT_REL
-            if not snap.is_dir():
-                return _fail("no transcript snapshot (.memlet/dream/snapshot/) to verify pins against", 1)
-            res = md.approve_queue_items(q, wanted, who, snapshot_path=str(snap), db_path=str(root / DB_REL))
-        else:
-            res = md.reject_queue_items(q, wanted, who, reason=reason, db_path=str(root / DB_REL))
+        # the decision and the promotion that follows form one critical section: no committed decision is lost to a
+        # concurrent writer, and the promoted page never lags the queue it was rendered from
+        with md.queue_lock(q):
+            if decision == md.APPROVED:
+                snap = root / SNAPSHOT_REL
+                if not snap.is_dir():
+                    return _fail("no transcript snapshot (.memlet/dream/snapshot/) to verify pins against", 1)
+                res = md.approve_queue_items(q, wanted, who, snapshot_path=str(snap), db_path=str(root / DB_REL))
+            else:
+                res = md.reject_queue_items(q, wanted, who, reason=reason, db_path=str(root / DB_REL))
+            promotion = promote_approved(root)
     except (OSError, ValueError, sqlite3.Error) as exc:
         return _fail(f"{decision} failed: {exc}", 1)
-    promotion = promote_approved(root)
     out = {"ok": bool(res.get("ok")) and bool(promotion.get("ok")), "exitCode": 0, "command": f"learn-{decision}",
-           "decision": decision, "approver": who, "approverDefaulted": defaulted, "applied": res.get("applied", []),
+           "decision": decision, "approver": who, "applied": res.get("applied", []),
            "unchanged": res.get("unchanged", []), "refused": res.get("refused", []),
            "cascadedEdges": res.get("cascadedEdges", []), "approvalBoundary": res.get("approvalBoundary"),
            "promotion": {k: promotion.get(k) for k in ("ok", "page", "promoted", "removed", "op", "error")}}
@@ -486,7 +489,7 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
         errors.append(f"decision recorded, but promotion failed: {promotion.get('error')}")
     if errors:
         out.update(ok=False, exitCode=1, error="; ".join(errors))
-    lines = [f"## Memlet learn — {decision} by {who}" + (" (approver defaulted to the OS user)" if defaulted else ""), ""]
+    lines = [f"## Memlet learn — {decision} by {who}", ""]
     lines += [f"- {decision}: `{i}`" for i in out["applied"]]
     lines += [f"- unchanged: `{i}`" for i in out["unchanged"]]
     lines += [f"- REFUSED `{r['id']}`: {r['reason']}" for r in out["refused"]]
@@ -693,12 +696,23 @@ def _render_rule(node: Dict[str, Any], anchor: Optional[Tuple[str, Dict[str, Any
 
 def promote_approved(repo_path=".") -> Dict[str, Any]:
     """Write approved, pin-verified Dream lessons as rules into `.memlet/wiki/dream-approved.md`. Idempotent; removes
-    rules whose approval or citation no longer verifies. Anchors are sticky: once a rule is anchored, later promotions
+    rules whose approval or citation no longer verifies. Runs under
+    the queue lock (`memlet_dream.queue_lock`). Anchors are sticky: once a rule is anchored, later promotions
     keep that anchor and its recorded pin (so drift shows up as stale instead of the anchor silently disappearing)."""
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
         return _fail(str(exc), 2)
+    if _symlinked(root, (QUEUE_REL,)) or not (root / DREAM_DIR).is_dir():
+        return _promote_locked(root)  # no queue to serialise against (symlinks are refused inside)
+    try:
+        with md.queue_lock(root / QUEUE_REL):  # the page is rendered from the queue generation it reads
+            return _promote_locked(root)
+    except (OSError, ValueError) as exc:
+        return _fail(f"cannot promote: {exc}", 1, page=PROMOTED_PAGE, promoted=[], removed=[])
+
+
+def _promote_locked(root: Path) -> Dict[str, Any]:
     bad = _symlinked(root, (PROMOTED_PAGE, mw.LEDGER_PATH, QUEUE_REL, SNAPSHOT_REL))
     if bad:
         return _fail(f"refusing symlinked path {bad}", 2, page=PROMOTED_PAGE, promoted=[], removed=[])
@@ -812,27 +826,43 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
 # unified recall
 
 
-def _rules_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], List[str]]:
+    """({"rules": query matches, "safety": always-on importance-1 rules}, their sources, notices).
+    With a rule index: BM25 over its verified entries. Without one: the deterministic parsed fallback
+    (`memlet_recall.parsed_rule_entries`), labelled as such and never presented as reviewed; it has no safety list."""
     from prism_memory import memlet_recall as mr
     from prism_memory.memlet_index import INDEX_PAGE
-    if not (root / INDEX_PAGE).is_file():
-        return [], {"available": False, "reason": "no rule index (run `memlet index-build`)"}, []
+    mode = "index" if (root / INDEX_PAGE).is_file() else "parsed"
     # promoted Dream lessons are shown once, in the `dream` section, with their transcript citation
     promoted = [e["source"] for e in promoted_rule_entries(root)[0]]
-    res, picked = mr.recall_items(root, query, k=mr.MAX_K, safety=True, exclude=promoted)
+    res, picked = mr.recall_items(root, query, k=mr.MAX_K, safety=(mode == "index"), exclude=promoted,
+                                  fallback=True)
     notices = []
     if res.get("stale"):
         notices.append(f"{res['stale']} indexed rule(s) changed since the index was built and are not quoted")
     if (res.get("indexStale") or {}).get("stale"):
         notices.append("instruction files changed after the rule index was built; re-run `memlet index-build`")
-    items = []
+    out: Dict[str, List[Dict[str, Any]]] = {"rules": [], "safety": []}
     for it in picked:
-        text = "\n".join([f"- [{it['topic']}] `{it['source']}`:"] + [f"  > {q}" for q in it["quote"].splitlines()])
+        head = f"- [{it['topic']}] `{it['source']}`" + (f" (sha256 {it['sha256'][:12]})" if it.get("sha256") else "")
+        text = "\n".join([head + ":"] + [f"  > {q}" for q in it["quote"].splitlines()])
         item = {"key": it["key"], "source": it["source"], "topic": it["topic"], "quote": it["quote"], "text": text}
-        if it.get("dreamId"):
-            item["dreamId"] = it["dreamId"]
-        items.append(item)
-    return items, {"available": True, "reason": "", "staleEntries": res.get("stale", 0)}, notices
+        for extra in ("dreamId", "sha256"):
+            if it.get(extra):
+                item[extra] = it[extra]
+        out["rules" if it.get("match") else "safety"].append(item)
+    if mode == "parsed" and not res.get("spans") and not mr.parsed_rule_entries(root):
+        rules_src = {"available": False, "mode": mode, "reason": "no rule index and no instruction files with rules"}
+    else:
+        rules_src = {"available": True, "mode": mode, "staleEntries": res.get("stale", 0),
+                     "reason": "" if out["rules"] else "no rule matches the query"}
+    if mode == "index":
+        safety_src = {"available": True, "mode": mode, "reason": "importance-1 rules from the rule index, shown "
+                      "regardless of the query (not query matches)"}
+    else:
+        safety_src = {"available": False, "mode": mode, "reason": "parsed rules carry no reviewed importance; "
+                      "run `memlet index-build` for an always-on safety core"}
+    return out, {"rules": rules_src, "safety": safety_src}, notices
 
 
 def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
@@ -907,17 +937,24 @@ def _memory_items(store: Any, task: Any, query: str) -> Tuple[List[Dict[str, Any
 
 _HEAD = "## Memlet recall (deterministic; read the cited source before acting)"
 _SECTION_HEADS = {
-    "rules": "### Project rules (quoted verbatim from the instruction files; unchanged since indexed)",
+    "rules": "### Project rules matching the query (quoted verbatim from the instruction files; unchanged since indexed)",
+    "rules-parsed": ("### Project rules matching the query (parsed from instruction files; not an indexed/reviewed "
+                     "rule index — each cites file:lines and the SHA-256 of that text)"),
+    "safety": "### Always-on safety rules (importance 1 in the rule index; shown regardless of the query)",
     "dream": "### Approved lessons (human-approved Dream items; transcript citations re-verified)",
     "memory": "### Task memory (bi-temporal store)",
 }
 
 
-def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str]) -> str:
+def _head_for(section: str, rules_mode: str) -> str:
+    return _SECTION_HEADS["rules-parsed" if section == "rules" and rules_mode == "parsed" else section]
+
+
+def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str], rules_mode: str = "index") -> str:
     lines = [_HEAD]
     for s in _SECTIONS:
         if chosen.get(s):
-            lines += ["", _SECTION_HEADS[s]] + [it["text"] for it in chosen[s]]
+            lines += ["", _head_for(s, rules_mode)] + [it["text"] for it in chosen[s]]
     if footer:
         lines += ["", footer]
     return "\n".join(lines) + "\n"
@@ -937,17 +974,25 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         return _fail(f"budget must be an integer, got {budget!r}", 2)
     if isinstance(include, str):
         include = [s.strip() for s in include.split(",")]
-    wanted = [s for s in _SECTIONS if s in set(include or ())]
+    asked = set(include or ())
+    if "rules" in asked:
+        asked.add("safety")  # the always-on safety list belongs to the rules source
+    wanted = [s for s in _SECTIONS if s in asked]
     notices: List[str] = [f"unknown section ignored: {s}" for s in (include or ()) if s and s not in _SECTIONS]
     query = str(query or "")
     cands: Dict[str, List[Dict[str, Any]]] = {s: [] for s in _SECTIONS}
     sources: Dict[str, Dict[str, Any]] = {s: {"available": False, "reason": "not requested"} for s in _SECTIONS}
+    rules_mode = "index"
     if "rules" in wanted:
         try:
-            cands["rules"], sources["rules"], extra = _rules_items(root, query)
+            got, srcs, extra = _rules_items(root, query)
+            cands["rules"], cands["safety"] = got["rules"], got["safety"]
+            sources["rules"], sources["safety"] = srcs["rules"], srcs["safety"]
+            rules_mode = srcs["rules"]["mode"]
             notices += extra
         except (OSError, ValueError) as exc:
             sources["rules"] = {"available": False, "reason": f"rule recall failed: {exc}"}
+            sources["safety"] = {"available": False, "reason": f"rule recall failed: {exc}"}
     if "dream" in wanted:
         cands["dream"], sources["dream"], extra = _dream_items(root, query)
         notices += extra
@@ -969,7 +1014,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         nxt = {s: 0 for s in _SECTIONS}
 
         def _cost(s: str, item: Dict[str, Any]) -> int:
-            return est(item["text"] + "\n") + (est("\n" + _SECTION_HEADS[s] + "\n") if not chosen[s] else 0)
+            return est(item["text"] + "\n") + (est("\n" + _head_for(s, rules_mode) + "\n") if not chosen[s] else 0)
 
         for s in active:  # pass 1: each section fills its own share
             while nxt[s] < len(cands[s]):
@@ -993,13 +1038,13 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
                         spare -= c
                         nxt[s] += 1
                         progress = True
-    text = _render_recall(chosen, footer)
+    text = _render_recall(chosen, footer, rules_mode)
     if est(text) > budget:
-        text = _render_recall(chosen, None)
+        text = _render_recall(chosen, None, rules_mode)
         footer = None
     while est(text) > budget and order:  # the estimator is not additive across joins: trim until it truly fits
         chosen[order.pop()].pop()
-        text = _render_recall(chosen, None)
+        text = _render_recall(chosen, None, rules_mode)
     budget_too_small = est(text) > budget
     if budget_too_small:
         text = ""
@@ -1131,7 +1176,21 @@ def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]
     return res
 
 
+def _git_z(root: Path, args: List[str]) -> Tuple[Optional[List[str]], str]:
+    try:
+        r = subprocess.run(["git"] + args, cwd=str(root), capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git is unavailable ({exc}); pass the changed files explicitly"
+    if r.returncode != 0:
+        err = (r.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[0]
+        return None, ("not a git repository or unknown base ref; pass the changed files explicitly: " + err)[:300]
+    return [t for t in r.stdout.decode("utf-8", "surrogateescape").split("\0")], ""
+
+
 def _changed_files(root: Path, base: Optional[str], files: Optional[Iterable[str]]) -> Tuple[Optional[List[str]], Optional[str]]:
+    """`files` as given (absolute paths inside the repo made relative), else `git diff --name-status -z <base or HEAD>`
+    plus untracked files. NUL-delimited, so names are taken literally; both ends of a rename or copy and every deleted
+    path count as changed (a rule citing the old path must be re-checked)."""
     if files is not None:
         if isinstance(files, str):
             files = [files]
@@ -1153,62 +1212,89 @@ def _changed_files(root: Path, base: Optional[str], files: Optional[Iterable[str
     ref = base or "HEAD"
     if ref.startswith("-"):
         return None, f"invalid base ref: {ref}"
-    try:
-        diff = subprocess.run(["git", "diff", "--name-only", "--relative", ref, "--"], cwd=str(root),
-                              capture_output=True, text=True, timeout=30)
-        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=str(root),
-                                   capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, f"git is unavailable ({exc}); pass the changed files explicitly"
-    if diff.returncode != 0:
-        return None, ("not a git repository or unknown base ref; pass the changed files explicitly: "
-                      + (diff.stderr.strip().splitlines() or [""])[0])[:300]
+    toks, err = _git_z(root, ["diff", "--name-status", "-z", "--relative", ref, "--"])
+    if toks is None:
+        return None, err
     out = []
-    for line in diff.stdout.splitlines() + (untracked.stdout.splitlines() if untracked.returncode == 0 else []):
-        s = line.strip()
-        if s and s not in out:
-            out.append(s)
+    i = 0
+    while i < len(toks):
+        status = toks[i]
+        if not status:
+            i += 1
+            continue
+        n = 2 if status[:1] in ("R", "C") else 1
+        for path in toks[i + 1:i + 1 + n]:
+            if path and path not in out:
+                out.append(path)
+        i += 1 + n
+    untracked, _err = _git_z(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+    for path in untracked or []:
+        if path and path not in out:
+            out.append(path)
     return out, None
 
 
-def _cheap_rule_sources(root: Path, cfg: Optional[Dict[str, Any]]) -> List[str]:
-    """Instruction files without walking the repository: fixed names, the instruction globs, the files `init`
-    recorded in config.json, and the Memlet wiki pages (generated copies excluded)."""
-    found = set()
-
-    def _add(rel: str) -> None:
+def _memlet_state(root: Path, rel: str) -> bool:
+    """Memlet's own generated state under `.memlet/` (config, ledger, Dream queue/DB/snapshot, generated pages and
+    HTML, the promoted page). Hand-written `.memlet/wiki/**/*.md` pages are rule sources and are NOT ignored."""
+    if rel != mw.MEMLET_DIR and not rel.startswith(mw.MEMLET_DIR + "/"):
+        return False
+    if not (rel.startswith(mw.WIKI_DIR + "/") and rel.endswith(".md")):
+        return True
+    if rel in mw._GENERATED_PAGES or rel == PROMOTED_PAGE:
+        return True
+    marker = mw._MARKED_GENERATED_PAGES.get(rel)
+    if marker:
         p = root / rel
-        if not mw._unsafe_rel(rel) and p.is_file() and not p.is_symlink():
-            found.add(rel)
+        return not p.is_file() or marker in mw._read_text(p)  # a deleted BRIEF/INDEX-RULES page is generated state
+    return False
 
-    for rel in mw.TOP_INSTRUCTION_FILES:
-        _add(rel)
+
+def _cheap_rule_sources(root: Path, cfg: Optional[Dict[str, Any]], changed: Iterable[str] = ()) -> List[str]:
+    """Instruction files without walking the repository: fixed names, the instruction globs, slim outputs, the files
+    `init` recorded in config.json and every changed path that discovery would accept (a new nested AGENTS.md
+    included), each re-checked with `memlet_wiki.is_instruction_path`."""
+    found = set()
+    for rel in list(mw.TOP_INSTRUCTION_FILES) + mw.slim_output_files(root):
+        if mw.is_instruction_path(root, rel):
+            found.add(rel)
     for pat in mw.INSTRUCTION_GLOBS:
         for p in root.glob(pat):
-            _add(mw._rel(root, p))
-    for rel in (cfg or {}).get("instructionFiles") or []:
-        if isinstance(rel, str):
-            _add(rel)
+            rel = mw._rel(root, p)
+            if mw.is_instruction_path(root, rel):
+                found.add(rel)
+    for rel in list((cfg or {}).get("instructionFiles") or []) + list(changed):
+        if isinstance(rel, str) and mw.is_instruction_path(root, rel):
+            found.add(rel)
     return sorted(found)
 
 
 def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
     """Fast hook check: classify only the anchors / referenced paths of rules that touch the changed files (`files`,
-    else `git diff --name-only <base or HEAD>` plus untracked files). exitCode 0 = nothing stale, 1 = stale."""
+    else `git diff --name-status <base or HEAD>` with both rename ends, plus untracked files). Memlet's own generated
+    state is ignored (`ignoredFiles`); a deleted instruction file is listed in `removedInstructionFiles`.
+    exitCode 0 = nothing stale, 1 = stale."""
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
         return _fail(str(exc), 2, changedFiles=[], affected=[], staleCount=0)
-    changed, err = _changed_files(root, base, files)
+    listed, err = _changed_files(root, base, files)
     if err:
         return _fail(err, 2, changedFiles=[], affected=[], staleCount=0)
+    ignored = [f for f in listed if _memlet_state(root, f)]
+    changed = [f for f in listed if f not in ignored]
+    removed = [f for f in changed if not (root / f).exists() and not (root / f).is_symlink()
+               and (mw.instruction_path_shape(f) or (f.startswith(mw.WIKI_DIR + "/") and f.endswith(".md")))]
     res: Dict[str, Any] = {"ok": True, "exitCode": 0, "command": "check-changed", "repoPath": str(root),
-                           "changedFiles": changed, "affected": [], "staleCount": 0, "formatted": ""}
+                           "changedFiles": changed, "ignoredFiles": ignored, "removedInstructionFiles": removed,
+                           "affected": [], "staleCount": 0, "formatted": ""}
+    notes = [f"REMOVED instruction file `{f}`: its rules no longer apply; check nothing still relies on them\n"
+             for f in removed]
     if not changed:
         return res
     cfg, _err = _load_config(root)
     changed_set = set(changed)
-    rules = mw._rules_from_files(root, _cheap_rule_sources(root, cfg))
+    rules = mw._rules_from_files(root, _cheap_rule_sources(root, cfg, changed))
     page_pins: Dict[str, Dict[str, Any]] = {}
     for rel, text in _wiki_pages(root).items():
         for a in mw._extract_anchors(text, rel):
@@ -1216,35 +1302,38 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                 page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
         if not mw._is_generated_page(rel, text):
             body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
-            rules.extend(mw._extract_rules(body, rel))
+            page_rules = mw._extract_rules(body, rel)
+            if rel == PROMOTED_PAGE:  # same rule as handover: only lessons that still verify are rules
+                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
+                page_rules = [r for r in page_rules if r["line"] in live]
+            rules.extend(page_rules)
     touching = []
     for r in rules:
         paths = {mw._resolve_ref_path(root, r["source"], p) for p, _s in r["refs"]}
         if r["refs"] and (paths & changed_set or r["source"] in changed_set):
             touching.append(r)
-    if not touching:
-        return res
-    pins = mw._config_pins(root)
-    pins.update(page_pins)
-    anchors = mw._verify_rules(root, touching, pins, pin_source="pinned")
-    by_key = {a["anchor"]: a for a in anchors}
-    seen = set()
-    for r in touching:
-        keys = [k for k in r["anchors"] if by_key[k]["path"] in changed_set] or (
-            r["anchors"] if r["source"] in changed_set else [])
-        if not keys:
-            continue
-        worst = min(keys, key=lambda k: _STATUS_ORDER.index(by_key[k]["status"]))
-        dedupe = (r["source"], r["line"], worst)
-        if dedupe in seen:
-            continue
-        seen.add(dedupe)
-        a = by_key[worst]
-        res["affected"].append({"anchor": worst, "status": a["status"], "reason": a["reason"],
-                                "rule": mw._clip(r["text"], 160), "source": f"{r['source']}:{r['line']}"})
+    if touching:
+        pins = mw._config_pins(root)
+        pins.update(page_pins)
+        anchors = mw._verify_rules(root, touching, pins, pin_source="pinned")
+        by_key = {a["anchor"]: a for a in anchors}
+        seen = set()
+        for r in touching:
+            keys = [k for k in r["anchors"] if by_key[k]["path"] in changed_set] or (
+                r["anchors"] if r["source"] in changed_set else [])
+            if not keys:
+                continue
+            worst = min(keys, key=lambda k: _STATUS_ORDER.index(by_key[k]["status"]))
+            dedupe = (r["source"], r["line"], worst)
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            a = by_key[worst]
+            res["affected"].append({"anchor": worst, "status": a["status"], "reason": a["reason"],
+                                    "rule": mw._clip(r["text"], 160), "source": f"{r['source']}:{r['line']}"})
     res["staleCount"] = sum(1 for a in res["affected"] if a["status"] == "stale")
     if res["staleCount"]:
         res.update(ok=False, exitCode=1, error=f"{res['staleCount']} rule(s) touching the changed files have stale anchors")
     res["formatted"] = "".join(f"{a['status'].upper()} `{a['anchor']}` ({a['reason']}) — {a['source']}: "
-                               f"{mw._clip(a['rule'], 100)}\n" for a in res["affected"])
+                               f"{mw._clip(a['rule'], 100)}\n" for a in res["affected"]) + "".join(notes)
     return res

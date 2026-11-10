@@ -1014,5 +1014,61 @@ class F14SpanDigitsTests(unittest.TestCase):
         self.assertEqual(("valid.log", 123456789, 123456789), md.parse_span("valid.log:123456789"))
 
 
+class PrivateKeyBlockTests(unittest.TestCase):
+    """B2 fix round 1, finding 2: key blocks are redacted whole, line counts kept, in every snapshot form."""
+
+    B64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+
+    def test_unqualified_and_qualified_markers_are_masked(self):
+        for kind in ("PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY", "OPENSSH PRIVATE KEY",
+                     "ENCRYPTED PRIVATE KEY", "PGP PRIVATE KEY BLOCK"):
+            folded = f"Never expose -----BEGIN {kind}----- {self.B64} -----END {kind}----- ok"
+            out = md.mask_secrets(folded)
+            self.assertNotIn(self.B64, out, kind)
+            self.assertNotIn("PRIVATE KEY", out, kind)
+            self.assertFalse(md.has_unmasked_secret_or_canary(out))
+            block = f"a\n-----BEGIN {kind}-----\n{self.B64}\n{self.B64}\n-----END {kind}-----\nb"
+            red = md.redact_secret_blocks(block)
+            self.assertEqual(block.count("\n"), red.count("\n"), kind)
+            self.assertEqual(["a"] + [md.SECRET_BLOCK_MARK] * 4 + ["b"], red.split("\n"))
+        unterminated = md.redact_secret_blocks("-----BEGIN PRIVATE KEY-----\n" + self.B64 + "\n\nnext line")
+        self.assertEqual([md.SECRET_BLOCK_MARK, md.SECRET_BLOCK_MARK, "", "next line"], unterminated.split("\n"))
+        ppk = md.redact_secret_blocks("PuTTY-User-Key-File-2: ssh-rsa\nPrivate-Lines: 1\n" + self.B64
+                                      + "\nPrivate-MAC: abcdef\nafter")
+        self.assertEqual([md.SECRET_BLOCK_MARK] * 4 + ["after"], ppk.split("\n"))
+
+    def test_log_and_json_snapshots_never_pin_a_key_body(self):
+        tmp = Path(tempfile.mkdtemp(prefix="p0-pem-"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        text = ("2026-11-09T09:00:00Z [user] Never expose -----BEGIN RSA PRIVATE KEY-----\n" + self.B64
+                + "\n-----END RSA PRIVATE KEY-----\n2026-11-09T09:01:00Z [user] Do not commit keys\n")
+        (tmp / "logs").mkdir()
+        (tmp / "logs" / "s.log").write_text(text)
+        (tmp / "map.json").write_text(json.dumps({"m.log": text.splitlines(), "s.log": text}))
+        for snap in (md.load_snapshot(tmp / "logs"), md.load_snapshot(tmp / "map.json")):
+            for lines in snap.values():
+                self.assertEqual(4, len(lines))
+                self.assertNotIn(self.B64, "\n".join(lines))
+                self.assertEqual("2026-11-09T09:01:00Z [user] Do not commit keys", lines[3])
+            fid = sorted(snap)[0]
+            self.assertEqual(md.SECRET_BLOCK_MARK, md.resolve_pin(snap, f"{fid}:2")["quoteText"])
+            self.assertNotIn(self.B64, json.dumps(md.resolve_pin(snap, f"{fid}:1-3")))
+
+
+class QueueLockTests(unittest.TestCase):
+    """B2 fix round 1, finding 1: one re-entrant lock per queue, shared by every spelling of its path."""
+
+    def test_reentrant_and_path_spelling_independent(self):
+        tmp = Path(tempfile.mkdtemp(prefix="p0-lock-"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        q = tmp / "d" / "Q.json"
+        q.parent.mkdir()
+        self.assertEqual(md.queue_lock_path(q), md.queue_lock_path(tmp / "d" / ".." / "d" / "Q.json"))
+        with md.queue_lock(q):
+            with md.queue_lock(tmp / "d" / ".." / "d" / "Q.json", timeout=0.1):  # same thread: re-entrant
+                pass
+        self.assertEqual([], [p.name for p in q.parent.iterdir()])  # nothing is written next to the queue
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
