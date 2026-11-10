@@ -31,7 +31,7 @@ PATTERN_STRINGS = {
     'commands': ('rescue', 'viberescue', 'anti-slop', 'pack', 'opsec-check', 'opsec-fingerprint'),
     'environment': ('PRISM_MEMORY_HOME', 'PRISM_MEMORY_MODEL_DIR', 'DELTAHARNESS_TRANSCRIPT_DIRS', 'PRISM_TRANSCRIPT_DIRS', 'PRISM_PARENT_SESSION_ID', 'PRISM_PROTECTED_PATHS', 'DELTAHARNESS_PROTECTED_PATHS', 'DELTAHARNESS_NODE', 'DELTAHARNESS_TYPESCRIPT'),
     'old_tool': 'prism_memory_brief',
-    'repository': 'ian-nocturne/deltaharness',
+    'repository': 'ian-nocturne/memlet',
     'author': '{name = "Ian (Nocturne Lab)"}',
 }
 

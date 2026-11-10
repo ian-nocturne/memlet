@@ -134,7 +134,7 @@ Everything else lives under `memlet admin <command>`; run `memlet admin --help` 
 ### 1. Install & Initialize (Zero External Dependencies Required)
 
 ```bash
-pip install git+https://github.com/ian-nocturne/deltaharness.git@v9.0.0
+pip install git+https://github.com/ian-nocturne/memlet.git@v9.0.0
 
 # One-command, zero-daemon setup: .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 memlet init .
@@ -410,7 +410,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/deltaharness@v9.0.0
+      - uses: ian-nocturne/memlet@v9.0.0
         with:
           mode: "audit" # only supported mode
           repo-path: "."

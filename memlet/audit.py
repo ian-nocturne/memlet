@@ -1884,7 +1884,7 @@ def format_audit_sarif(report: Dict[str, Any]) -> Dict[str, Any]:
                 "tool": {
                     "driver": {
                         "name": "Memlet",
-                        "informationUri": "https://github.com/ian-nocturne/deltaharness",
+                        "informationUri": "https://github.com/ian-nocturne/memlet",
                         "version": "9.0.0",
                         "rules": rules,
                     }
