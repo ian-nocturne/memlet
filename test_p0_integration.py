@@ -36,6 +36,24 @@ class RescueEnvUnverifiedExitTests(unittest.TestCase):
         self.assertEqual("ENV_UNVERIFIED", doc["readiness"])
         self.assertFalse(doc["ok"])
 
+    def test_env_unverified_does_not_mask_another_warning(self):
+        # Reviewer counterexample: RLS enabled without a policy is a warning that exits 1 on its own.
+        repo = self._repo()
+        mig = repo / "supabase" / "migrations"
+        mig.mkdir(parents=True)
+        (mig / "0001_notes.sql").write_text(
+            "CREATE TABLE public.notes (id int);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\n", encoding="utf-8")
+        res = build_rescue_bundle(repo)
+        kinds = sorted(b.get("kind") for b in res["blockers"])
+        self.assertIn("unverified_env_key", kinds)
+        self.assertIn("supabase_rls_enabled_without_policy", kinds)
+        self.assertEqual(1, res["exitCode"])
+        self.assertFalse(res["ok"])
+        r = subprocess.run([sys.executable, "-B", str(CLI), "rescue", str(repo)], capture_output=True, text=True)
+        self.assertEqual(1, r.returncode, r.stderr)
+        from prism_memory import action_verdict
+        self.assertEqual(1, action_verdict.evaluate("rescue", rescue=res)["exit_code"])
+
 
 if __name__ == "__main__":
     unittest.main()
