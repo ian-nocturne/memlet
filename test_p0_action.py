@@ -23,31 +23,48 @@ ACTION_YML = ROOT / "action.yml"
 TESTS_YML = ROOT / ".github" / "workflows" / "tests.yml"
 
 
-def audit_result(**over):
-    base = {"ok": True, "errorCount": 0, "warningCount": 0, "scannedDocsCount": 2, "findings": [], "unverifiedDynamicCommandCount": 0}
+def afinding(severity="error", rule="missing_target"):
+    return {"ruleId": rule, "severity": severity, "message": "Target missing"}
+
+
+def audit_result(findings=(), **over):
+    """An audit result whose summary fields agree with `findings`; `over` then overrides single fields."""
+    findings = list(findings)
+    errors = sum(1 for f in findings if isinstance(f, dict) and f.get("severity") == "error")
+    base = {"ok": errors == 0, "errorCount": errors, "warningCount": len(findings) - errors, "scannedDocsCount": 2,
+            "findings": findings, "findingCount": len(findings), "unverifiedDynamicCommandCount": 0}
     base.update(over)
     return base
 
 
 def rescue_result(readiness, blockers=None, ok=None):
     blockers = list(blockers or [])
+    critical = sum(1 for b in blockers if isinstance(b, dict) and b.get("severity") == "critical")
     return {
         "ok": (readiness == "STATIC_CHECKS_PASSED") if ok is None else ok,
         "readiness": readiness,
-        "summary": {"readiness": readiness, "totalBlockers": len(blockers)},
+        "summary": {"readiness": readiness, "totalBlockers": len(blockers), "criticalCount": critical,
+                    "warningCount": len(blockers) - critical},
         "blockers": blockers,
         "rescueBriefMarkdown": "# Rescue brief (%s)" % readiness,
     }
 
 
-def slop_result(**over):
-    base = {"ok": True, "grade": "A+", "verdict": "STATIC_STYLE_RULES_PASSED", "slopScore": 0, "totalFindingCount": 0,
-            "findings": [], "markdownReport": "# Anti-slop receipt"}
+def sfinding(category="generic_gradient"):
+    return {"category": category, "severity": "warning", "weight": 5}
+
+
+def slop_result(n=0, **over):
+    """An anti-slop result with `n` findings; `over` then overrides single fields."""
+    findings = [sfinding() for _ in range(n)]
+    base = {"ok": n == 0, "grade": "A+", "verdict": "STATIC_STYLE_RULES_PASSED", "slopScore": 0, "totalFindingCount": n,
+            "findingCount": n, "returnedFindingCount": n, "truncated": False, "findings": findings,
+            "markdownReport": "# Anti-slop receipt"}
     base.update(over)
     return base
 
 
-NO_UI = dict(ok=False, grade="UNVERIFIED", verdict="NO_UI_OR_COPY_FILES_FOUND", slopScore=None)
+NO_UI = dict(ok=False, grade="UNVERIFIED", verdict="NO_UI_OR_COPY_FILES_FOUND", slopScore=None, scannedFiles=0)
 ENV_KEY = {"kind": "unverified_env_key", "severity": "warning", "file": "app.py", "line": 3, "key": "SERVICE_API_TOKEN"}
 CRITICAL = {"kind": "client_secret_exposure", "severity": "critical", "file": "web.tsx", "line": 1}
 LOCKFILES = {"kind": "competing_lockfiles", "severity": "warning", "file": "package-lock.json", "line": 1}
@@ -55,7 +72,7 @@ LOCKFILES = {"kind": "competing_lockfiles", "severity": "warning", "file": "pack
 
 class RescueVerdictTests(unittest.TestCase):
     def test_env_unverified_is_a_warning_and_exits_zero(self):
-        for blockers in ([], [ENV_KEY], [ENV_KEY, dict(ENV_KEY, key="OTHER_KEY")]):
+        for blockers in ([ENV_KEY], [ENV_KEY, dict(ENV_KEY, key="OTHER_KEY")]):
             v = av.evaluate("rescue", rescue=rescue_result("ENV_UNVERIFIED", blockers, ok=False))
             self.assertEqual(0, v["exit_code"], v)
             self.assertEqual([], v["blockers"])
@@ -87,7 +104,7 @@ class RescueVerdictTests(unittest.TestCase):
         self.assertEqual(1, v["finding_count"])
 
     def test_other_non_passing_readiness_still_blocks(self):
-        for readiness in ("UNVERIFIED", "NO_TARGETS_FOUND", "BLOCKED", "STATIC_CHECKS_WITH_WARNINGS"):
+        for readiness in ("UNVERIFIED", "NO_TARGETS_FOUND"):
             v = av.evaluate("rescue", rescue=rescue_result(readiness, [], ok=False))
             self.assertEqual(1, v["exit_code"], readiness)
             self.assertEqual("UNVERIFIED", v["status"], readiness)
@@ -117,12 +134,16 @@ class AntiSlopVerdictTests(unittest.TestCase):
         self.assertEqual(0, v["slop_score"])
 
     def test_findings_and_high_score_still_block(self):
-        v = av.evaluate("anti-slop", anti_slop=slop_result(ok=False, grade="D", verdict="HEAVY_AI_SLOP", slopScore=64, totalFindingCount=7))
+        v = av.evaluate("anti-slop", anti_slop=slop_result(7, grade="D", verdict="HEAVY_AI_SLOP", slopScore=64))
         self.assertEqual((1, "DRIFT_DETECTED", 7, 64), (v["exit_code"], v["status"], v["finding_count"], v["slop_score"]))
-        v = av.evaluate("anti-slop", anti_slop=slop_result(ok=False, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=3, totalFindingCount=1))
+        v = av.evaluate("anti-slop", anti_slop=slop_result(1, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=3))
         self.assertEqual(1, v["exit_code"])
-        v = av.evaluate("anti-slop", anti_slop=slop_result(ok=True, grade="C", slopScore=20, totalFindingCount=0))
-        self.assertEqual((1, 1), (v["exit_code"], v["finding_count"]))
+        v = av.evaluate("anti-slop", anti_slop=slop_result(4, grade="B", verdict="MODERATE_AI_TRACES", slopScore=20))
+        self.assertEqual((1, 4), (v["exit_code"], v["finding_count"]))
+        # a truncated detail list is legitimate: the total still counts
+        v = av.evaluate("anti-slop", anti_slop=slop_result(2, grade="F", verdict="UNMISTAKABLE_TEMPLATE_SLOP", slopScore=100,
+                                                           totalFindingCount=40, findingCount=40, truncated=True))
+        self.assertEqual((1, 40, 100), (v["exit_code"], v["finding_count"], v["slop_score"]))
 
     def test_clean_scan_passes(self):
         v = av.evaluate("anti-slop", anti_slop=slop_result())
@@ -133,12 +154,12 @@ class AuditVerdictTests(unittest.TestCase):
     """Audit keeps the blocking behaviour the inline Action code had."""
 
     def test_error_findings_block_as_drift(self):
-        v = av.evaluate("audit", audit=audit_result(ok=False, errorCount=2, findings=[{}, {}, {}]))
+        v = av.evaluate("audit", audit=audit_result([afinding(), afinding(), afinding("warning")]))
         self.assertEqual((1, "DRIFT_DETECTED", 2, 3), (v["exit_code"], v["status"], v["finding_count"], v["total_finding_count"]))
 
-    def test_ok_false_without_error_count_blocks(self):
-        v = av.evaluate("audit", audit=audit_result(ok=False))
-        self.assertEqual((1, "DRIFT_DETECTED"), (v["exit_code"], v["status"]))
+    def test_fail_on_drift_false_keeps_real_audit_drift_at_exit_zero(self):
+        v = av.evaluate("audit", audit=audit_result([afinding()]), fail_on_drift=False)
+        self.assertEqual((0, "DRIFT_DETECTED", 1), (v["exit_code"], v["status"], len(v["blockers"])))
 
     def test_no_instruction_docs_blocks_as_unverified(self):
         v = av.evaluate("audit", audit=audit_result(scannedDocsCount=0))
@@ -151,7 +172,7 @@ class AuditVerdictTests(unittest.TestCase):
         self.assertIn("3 dynamic command(s)", v["blockers"][0]["message"])
 
     def test_warning_only_findings_do_not_block(self):
-        v = av.evaluate("audit", audit=audit_result(warningCount=2, findings=[{"severity": "warning"}, {"severity": "warning"}]))
+        v = av.evaluate("audit", audit=audit_result([afinding("warning"), afinding("warning")]))
         self.assertEqual((0, "PASS", 0, 2), (v["exit_code"], v["status"], v["finding_count"], v["total_finding_count"]))
 
     def test_clean_audit_passes_and_missing_dynamic_count_reads_as_zero(self):
@@ -173,12 +194,12 @@ class FailClosedTests(unittest.TestCase):
     def test_rescue_missing_or_unknown_readiness(self):
         self._assert_closed(av.evaluate("rescue", rescue={"ok": True, "blockers": []}), "summary.readiness")
         self._assert_closed(av.evaluate("rescue", rescue=rescue_result("CLEAN_READY", ok=True)), "unknown readiness `CLEAN_READY`")
-        self._assert_closed(av.evaluate("rescue", rescue={"ok": True, "summary": {"readiness": "ENV_UNVERIFIED"}}), "`blockers` list")
-        self._assert_closed(av.evaluate("rescue", rescue=rescue_result("STATIC_CHECKS_PASSED", ok=False)), "`ok` is not true")
+        self._assert_closed(av.evaluate("rescue", rescue={"ok": False, "summary": {"readiness": "ENV_UNVERIFIED"}}), "`blockers` list")
+        self._assert_closed(av.evaluate("rescue", rescue=rescue_result("STATIC_CHECKS_PASSED", ok=False)), "`ok` is false but readiness")
 
     def test_anti_slop_missing_or_unknown_fields(self):
         self._assert_closed(av.evaluate("anti-slop", anti_slop={"ok": True, "slopScore": 0, "totalFindingCount": 0}), "`grade`")
-        self._assert_closed(av.evaluate("anti-slop", anti_slop=slop_result(ok=False, grade="UNVERIFIED", verdict="SOMETHING_ELSE", slopScore=None)), "unknown verdict `SOMETHING_ELSE`")
+        self._assert_closed(av.evaluate("anti-slop", anti_slop=slop_result(**dict(NO_UI, verdict="SOMETHING_ELSE"))), "unknown verdict `SOMETHING_ELSE`")
         self._assert_closed(av.evaluate("anti-slop", anti_slop=slop_result(slopScore=None)), "`slopScore`")
         res = slop_result()
         del res["ok"]
@@ -207,6 +228,214 @@ class FailClosedTests(unittest.TestCase):
             av.evaluate("everything")
 
 
+class ReviewRound1FailOpenTests(unittest.TestCase):
+    """Review finding F5: every malformed or self-contradictory result is MALFORMED_RESULT / exit 2, with or
+    without fail-on-drift. The first six inputs are the reviewer's, verbatim."""
+
+    def _closed(self, mode, result, needle):
+        for fail_on_drift in (True, False):
+            v = av.evaluate(mode, fail_on_drift=fail_on_drift, **{mode.replace("-", "_"): result})
+            self.assertEqual(2, v["exit_code"], v)
+            self.assertNotEqual("PASS", v["status"])
+            self.assertEqual(["MALFORMED_RESULT"], [b["code"] for b in v["blockers"]])
+            self.assertEqual([], v["warnings"], "an inconsistency must be reported before any warning shortcut")
+            self.assertIn(needle, v["blockers"][0]["message"])
+            self.assertIn("failing closed", v["blockers"][0]["message"])
+
+    # -- reviewer inputs
+    def test_reviewer_unknown_anti_slop_grade(self):
+        self._closed("anti-slop", {"ok": True, "grade": "TOTALLY_UNKNOWN", "slopScore": 0, "totalFindingCount": 0},
+                     "unknown grade `TOTALLY_UNKNOWN`")
+
+    def test_reviewer_negative_slop_score(self):
+        self._closed("anti-slop", {"ok": True, "grade": "A+", "slopScore": -500, "totalFindingCount": 0}, "anti-slop:")
+        # same input completed with every other field valid, so the score domain itself is what fails
+        self._closed("anti-slop", slop_result(slopScore=-500), "`slopScore` is -500, outside 0-100")
+        self._closed("anti-slop", slop_result(slopScore=101), "outside 0-100")
+
+    def test_reviewer_audit_error_finding_with_zero_error_count(self):
+        self._closed("audit", {"ok": True, "errorCount": 0, "scannedDocsCount": 1,
+                               "findings": [{"severity": "error", "ruleId": "missing_target", "message": "Target missing"}]},
+                     "`errorCount` is 0 but `findings` lists 1 error finding(s)")
+
+    def test_reviewer_no_ui_result_with_score_and_findings(self):
+        self._closed("anti-slop", {"ok": False, "grade": "UNVERIFIED", "verdict": "NO_UI_OR_COPY_FILES_FOUND", "slopScore": 100,
+                                   "totalFindingCount": 0, "findings": [{"severity": "error"}]}, "anti-slop:")
+        self._closed("anti-slop", slop_result(**dict(NO_UI, findings=[sfinding()])), "`totalFindingCount` is 0 but `findings` lists 1")
+        self._closed("anti-slop", slop_result(**dict(NO_UI, slopScore=100)), "grade is UNVERIFIED but `slopScore` is `100`")
+        self._closed("anti-slop", slop_result(**dict(NO_UI, ok=True)), "grade is UNVERIFIED but `ok` is true")
+        self._closed("anti-slop", slop_result(**dict(NO_UI, scannedFiles=3)), "grade is UNVERIFIED but `scannedFiles` is 3")
+        self._closed("anti-slop", slop_result(1, **dict(NO_UI)), "grade is UNVERIFIED but `totalFindingCount` is 1")
+
+    def test_reviewer_rescue_contradictory_readiness(self):
+        self._closed("rescue", {"ok": False, "readiness": "BLOCKED", "summary": {"readiness": "ENV_UNVERIFIED"},
+                                "blockers": [{"kind": "unverified_env_key", "severity": "critical"}]},
+                     "`readiness` is `BLOCKED` but `summary.readiness` is `ENV_UNVERIFIED`")
+        # each half of that input on its own
+        self._closed("rescue", rescue_result("ENV_UNVERIFIED", [dict(ENV_KEY, severity="critical")], ok=False),
+                     "`unverified_env_key` with severity `critical`")
+        self._closed("rescue", rescue_result("ENV_UNVERIFIED", [ENV_KEY, CRITICAL], ok=False),
+                     "readiness is `ENV_UNVERIFIED` but `blockers` lists 1 critical item(s)")
+
+    def test_reviewer_malformed_rescue_blocker_is_not_ordinary_drift(self):
+        self._closed("rescue", {"ok": True, "readiness": "STATIC_CHECKS_PASSED", "blockers": [{}]}, "`blockers[0]` has no `kind`")
+
+    # -- the same classes of hole, one field at a time
+    def test_anti_slop_allowlists_and_domains(self):
+        self._closed("anti-slop", slop_result(verdict="LOOKS_FINE"), "unknown verdict `LOOKS_FINE`")
+        self._closed("anti-slop", slop_result(verdict="HEAVY_AI_SLOP"), "unknown verdict `HEAVY_AI_SLOP`")
+        self._closed("anti-slop", slop_result(slopScore=64), "`slopScore` 64 is grade `D` but `grade` is `A+`")
+        self._closed("anti-slop", slop_result(slopScore=0.5), "`slopScore`")
+        self._closed("anti-slop", slop_result(slopScore=True), "`slopScore`")
+        self._closed("anti-slop", slop_result(totalFindingCount=-1), "`totalFindingCount` is not a non-negative integer")
+        self._closed("anti-slop", slop_result(totalFindingCount=1.5), "`totalFindingCount` is not a non-negative integer")
+        self._closed("anti-slop", slop_result(grade=7), "`grade`")
+
+    def test_anti_slop_counts_reconcile_with_findings(self):
+        self._closed("anti-slop", slop_result(findings=[sfinding()]), "`totalFindingCount` is 0 but `findings` lists 1")
+        self._closed("anti-slop", slop_result(2, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=10, totalFindingCount=5, findingCount=5),
+                     "`totalFindingCount` is 5 but `findings` lists 2")
+        self._closed("anti-slop", slop_result(2, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=10, ok=True), "`ok` is true but `totalFindingCount` is 2")
+        self._closed("anti-slop", slop_result(ok=False), "`ok` is false but `totalFindingCount` is 0")
+        self._closed("anti-slop", slop_result(findingCount=3), "`findingCount` is 3")
+        self._closed("anti-slop", slop_result(findings=None), "`findings` list of objects")
+        self._closed("anti-slop", slop_result(1, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=5, findings=["x"]), "`findings` list of objects")
+        self._closed("anti-slop", slop_result(1, grade="A", verdict="CLEAN_MINOR_POLISH", slopScore=5, findings=[{}]), "`findings[0]` has no `category`")
+
+    def test_audit_shapes_and_counts(self):
+        self._closed("audit", audit_result([afinding()], ok=True), "`ok` is true but `errorCount` is 1")
+        self._closed("audit", audit_result(ok=False), "`ok` is false but `errorCount` is 0")
+        self._closed("audit", audit_result([afinding("warning")], errorCount=1), "`errorCount` is 1 but `findings` lists 0 error")
+        self._closed("audit", audit_result([afinding("warning")], warningCount=0), "`warningCount` is 0 but `findings` lists 1 warning")
+        self._closed("audit", audit_result([afinding("warning")], findingCount=9), "`findingCount` is 9")
+        self._closed("audit", audit_result(findings=[{}]), "`findings[0].severity`")
+        self._closed("audit", audit_result([afinding("catastrophic")]), "`findings[0].severity` is `catastrophic`")
+        self._closed("audit", audit_result([{"severity": "warning"}]), "`findings[0]` has no `ruleId`")
+        self._closed("audit", audit_result(findings=["oops"]), "`findings` list of objects")
+        self._closed("audit", audit_result(errorCount=-1), "`errorCount` is not a non-negative integer")
+        self._closed("audit", audit_result(scannedDocsCount=1.5), "`scannedDocsCount` is not a non-negative integer")
+        self._closed("audit", audit_result(unverifiedDynamicCommandCount=-2), "`unverifiedDynamicCommandCount` is not a non-negative integer")
+
+    def test_rescue_shapes_counts_and_readiness(self):
+        self._closed("rescue", rescue_result("BLOCKED", [dict(CRITICAL, severity="apocalyptic")], ok=False), "`blockers[0].severity` is `apocalyptic`")
+        self._closed("rescue", rescue_result("BLOCKED", [{"severity": "critical"}], ok=False), "`blockers[0]` has no `kind`")
+        self._closed("rescue", rescue_result("BLOCKED", ["x"], ok=False), "`blockers` list of objects")
+        self._closed("rescue", rescue_result("STATIC_CHECKS_PASSED", [LOCKFILES]), "readiness is `STATIC_CHECKS_PASSED` but `blockers` lists 1")
+        self._closed("rescue", rescue_result("STATIC_CHECKS_WITH_WARNINGS", [CRITICAL], ok=False), "lists 1 critical item(s)")
+        self._closed("rescue", rescue_result("BLOCKED", [], ok=False), "readiness is `BLOCKED` but `blockers` lists 0 critical")
+        self._closed("rescue", rescue_result("BLOCKED", [LOCKFILES], ok=False), "readiness is `BLOCKED` but `blockers` lists 0 critical")
+        self._closed("rescue", rescue_result("ENV_UNVERIFIED", [], ok=False), "lists no `unverified_env_key` item")
+        self._closed("rescue", rescue_result("ENV_UNVERIFIED", [LOCKFILES], ok=False), "lists no `unverified_env_key` item")
+        self._closed("rescue", rescue_result("STATIC_CHECKS_WITH_WARNINGS", [], ok=False), "`blockers` is empty")
+        self._closed("rescue", rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=True), "`ok` is true but readiness is `ENV_UNVERIFIED`")
+        bad = rescue_result("BLOCKED", [CRITICAL], ok=False)
+        bad["summary"]["criticalCount"] = 0
+        self._closed("rescue", bad, "`summary.criticalCount` is 0 but `blockers` gives 1")
+        bad = rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=False)
+        bad["summary"]["totalBlockers"] = 0
+        self._closed("rescue", bad, "`summary.totalBlockers` is 0 but `blockers` gives 1")
+        bad = rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=False)
+        bad["summary"] = "ENV_UNVERIFIED"
+        self._closed("rescue", bad, "`summary` is not an object")
+        bad = rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=False)
+        del bad["ok"]
+        self._closed("rescue", bad, "boolean `ok`")
+
+    def test_real_engine_results_are_never_classified_as_malformed(self):
+        """The stricter checks must not reject what the bundled engines actually emit."""
+        from prism_memory.anti_slop import scan_anti_slop
+        from prism_memory.audit import audit_repository
+        from prism_memory.viberescue import build_rescue_bundle
+        targets = [ROOT] + [d for d in (ROOT / "dogfood-sandbox", ROOT / "dogfood-sandbox" / "before_rescue",
+                                         ROOT / "dogfood-sandbox" / "after_rescue") if d.is_dir()]
+        empty = Path(tempfile.mkdtemp(prefix="a4-empty-"))
+        self.addCleanup(lambda: shutil.rmtree(str(empty), ignore_errors=True))
+        targets.append(empty)
+        for target in targets:
+            for max_findings in (0, 1):
+                v = av.evaluate("all", audit=audit_repository(str(target), output_format="json"),
+                                rescue=build_rescue_bundle(str(target), write_files=False),
+                                anti_slop=scan_anti_slop(str(target), max_findings=max_findings))
+                self.assertNotIn("MALFORMED_RESULT", [b["code"] for b in v["blockers"]], (str(target), v["blockers"]))
+                self.assertIn(v["exit_code"], (0, 1), str(target))
+
+
+class FailOnDriftInputTests(unittest.TestCase):
+    """Review finding F11: only `true` / `false`; a typo must not switch failures off."""
+
+    def test_parse_accepts_only_true_false_and_empty(self):
+        for raw in ("true", "TRUE", " True ", "", "   ", None):
+            self.assertIs(True, av.parse_fail_on_drift(raw), repr(raw))
+        for raw in ("false", "FALSE", "  False\n"):
+            self.assertIs(False, av.parse_fail_on_drift(raw), repr(raw))
+        for raw in ("treu", "1", "0", "yes", "no", "off", "flase", "true false"):
+            with self.assertRaises(ValueError) as ctx:
+                av.parse_fail_on_drift(raw)
+            self.assertIn("Use 'true' or 'false'", str(ctx.exception))
+
+    def test_pure_api_rejects_a_non_bool_flag(self):
+        for bad in ("false", "treu", 0, None):
+            with self.assertRaises(ValueError):
+                av.evaluate("audit", audit=audit_result(), fail_on_drift=bad)
+
+
+class SarifWriteTests(unittest.TestCase):
+    """Review finding F12: the SARIF file is never written through a symlink."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="a4-sarif-"))
+        self.addCleanup(lambda: shutil.rmtree(str(self.tmp), ignore_errors=True))
+        self.victim = self.tmp / "outside-file.txt"
+        self.victim.write_text("KEEP THIS FILE\n", encoding="utf-8")
+
+    def test_symlink_destination_is_refused_and_target_untouched(self):
+        link = self.tmp / "out.sarif"
+        os.symlink(str(self.victim), str(link))
+        with self.assertRaises(av.OutputPathError) as ctx:
+            av.write_text_no_follow(str(link), "{}")
+        self.assertIn("symbolic link", str(ctx.exception))
+        self.assertEqual("KEEP THIS FILE\n", self.victim.read_text(encoding="utf-8"))
+        self.assertTrue(link.is_symlink())
+        dangling = self.tmp / "dangling.sarif"
+        os.symlink(str(self.tmp / "does-not-exist-yet.txt"), str(dangling))
+        with self.assertRaises(av.OutputPathError):
+            av.write_text_no_follow(str(dangling), "{}")
+        self.assertFalse((self.tmp / "does-not-exist-yet.txt").exists())
+
+    def test_directory_or_missing_parent_is_refused(self):
+        (self.tmp / "adir").mkdir()
+        with self.assertRaises(av.OutputPathError):
+            av.write_text_no_follow(str(self.tmp / "adir"), "{}")
+        with self.assertRaises(av.OutputPathError):
+            av.write_text_no_follow(str(self.tmp / "missing" / "out.sarif"), "{}")
+
+    def test_regular_write_is_atomic_replace_and_leaves_no_temp_file(self):
+        dest = self.tmp / "out.sarif"
+        av.write_text_no_follow(str(dest), "first")
+        av.write_text_no_follow(str(dest), "second \u2192")
+        self.assertEqual("second \u2192", dest.read_text(encoding="utf-8"))
+        self.assertEqual(["out.sarif", "outside-file.txt"], sorted(p.name for p in self.tmp.iterdir()))
+        self.assertTrue(os.stat(str(dest)).st_mode & 0o400)
+
+    def test_symlink_swapped_in_after_the_check_is_replaced_not_followed(self):
+        """The write itself (temp file + os.replace) never opens the destination, so a link that appears between
+        the check and the write is replaced as a directory entry."""
+        dest = self.tmp / "out.sarif"
+        real_check = av.check_output_path
+
+        def racing_check(path):
+            target = real_check(path)
+            os.symlink(str(self.victim), str(target))
+            return target
+
+        av.check_output_path = racing_check
+        self.addCleanup(lambda: setattr(av, "check_output_path", real_check))
+        av.write_text_no_follow(str(dest), "{\"sarif\": true}")
+        self.assertEqual("KEEP THIS FILE\n", self.victim.read_text(encoding="utf-8"))
+        self.assertFalse(dest.is_symlink())
+        self.assertEqual("{\"sarif\": true}", dest.read_text(encoding="utf-8"))
+
+
 class CombinedModeTests(unittest.TestCase):
     def test_backend_repo_in_mode_all_passes_with_warnings(self):
         v = av.evaluate("all", audit=audit_result(), rescue=rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=False), anti_slop=slop_result(**NO_UI))
@@ -216,7 +445,7 @@ class CombinedModeTests(unittest.TestCase):
         self.assertTrue({"blockers", "warnings", "exit_code"} <= set(v), sorted(v))
 
     def test_drift_in_one_gate_wins_over_warnings_in_others(self):
-        v = av.evaluate("all", audit=audit_result(ok=False, errorCount=1, findings=[{}]),
+        v = av.evaluate("all", audit=audit_result([afinding()]),
                         rescue=rescue_result("ENV_UNVERIFIED", [ENV_KEY], ok=False), anti_slop=slop_result(**NO_UI))
         self.assertEqual((1, "DRIFT_DETECTED", 1), (v["exit_code"], v["status"], v["finding_count"]))
         self.assertEqual(2, len(v["warnings"]))
@@ -349,6 +578,49 @@ class RunActionEndToEndTests(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("format 'sarif' needs mode 'audit' or 'all'", err)
 
+    def test_fail_on_drift_typo_is_a_configuration_error_not_a_silent_opt_out(self):
+        """F11 with the reviewer's values, on a repo with a real critical blocker."""
+        tmp, repo = self._repo(critical=True)
+        expected = {"true": 1, "false": 0, "": 1, "  FALSE ": 0, "treu": 2, "1": 2}
+        for flag, want in expected.items():
+            code, out, err = self._run(self._env(tmp, repo, "rescue", "json", INPUT_FAIL_ON_DRIFT=flag))
+            self.assertEqual(want, code, (flag, err))
+            if want == 2:
+                self.assertIn("invalid fail-on-drift value '%s'" % flag, err)
+                self.assertEqual("", out)
+            else:
+                self.assertEqual("DRIFT_DETECTED", json.loads(out)["verdict"]["status"])
+        env = self._env(tmp, repo, "rescue", "json")
+        env.pop("INPUT_FAIL_ON_DRIFT", None)
+        self.assertEqual(1, self._run(env)[0])
+
+    def test_sarif_symlink_is_refused_for_default_and_explicit_paths(self):
+        """F12 with the reviewer's setup: the default file name is a symlink in the working directory."""
+        tmp, repo = self._repo()
+        victim = tmp / "outside-file.txt"
+        victim.write_text("KEEP THIS FILE\n", encoding="utf-8")
+        workdir = tmp / "cwd"
+        workdir.mkdir()
+        os.symlink(str(victim), str(workdir / "deltaharness-audit.sarif"))
+        os.symlink(str(victim), str(tmp / "explicit.sarif"))
+        old_cwd = os.getcwd()
+        os.chdir(str(workdir))
+        self.addCleanup(lambda: os.chdir(old_cwd))
+        default_env = {"INPUT_MODE": "audit", "INPUT_REPO_PATH": str(repo), "INPUT_FORMAT": "json"}
+        for env in (default_env, dict(default_env, INPUT_SARIF_FILE=str(tmp / "explicit.sarif"))):
+            code, out, err = self._run(env)
+            self.assertEqual(2, code, err)
+            self.assertIn("refusing to write SARIF", err)
+            self.assertIn("symbolic link", err)
+            self.assertEqual("", out)
+            self.assertEqual("KEEP THIS FILE\n", victim.read_text(encoding="utf-8"))
+        # a mode that writes no SARIF is not affected by the link, and an explicit regular path still works
+        self.assertEqual(0, self._run(dict(default_env, INPUT_MODE="anti-slop"))[0])
+        code, _out, err = self._run(dict(default_env, INPUT_SARIF_FILE=str(tmp / "fine.sarif")))
+        self.assertEqual(0, code, err)
+        self.assertEqual("2.1.0", json.loads((tmp / "fine.sarif").read_text(encoding="utf-8"))["version"])
+        self.assertEqual("KEEP THIS FILE\n", victim.read_text(encoding="utf-8"))
+
     @unittest.skipUnless(shutil.which("bash"), "bash is required to execute the composite step script")
     def test_action_yml_run_script_executes_end_to_end(self):
         """Run the exact `run:` script from action.yml with the interpreter under test first on PATH."""
@@ -452,6 +724,8 @@ class TestsWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", self.text)
         uses = re.findall(r"uses:\s*(\S+)", self.text)
         self.assertEqual(["actions/checkout@v4", "actions/setup-python@v5"], uses)
+        # review answer 7: the checkout token is not left in the workspace git config
+        self.assertRegex(self.text, r"uses: actions/checkout@v4\n        with:\n          persist-credentials: false\n")
         for u in uses:
             self.assertRegex(u, r"^[\w.-]+/[\w.-]+@v\d+$")
 

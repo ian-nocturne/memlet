@@ -15,9 +15,15 @@ Rules
   blocks, whatever its severity (unchanged). With no such blocker, `STATIC_CHECKS_PASSED` passes and
   `ENV_UNVERIFIED` is a warning; `UNVERIFIED`, `NO_TARGETS_FOUND`, `BLOCKED` and `STATIC_CHECKS_WITH_WARNINGS` block.
 - anti-slop: findings or a slop score >= 20 block (unchanged). "No UI or copy files" is a warning.
-- Fail closed: a result that is missing, is not a dict, lacks a verdict field or carries an unknown verdict value is
-  a blocker with a message naming the field, and exits 2 even when `fail-on-drift` is false, because it means the
-  checker itself is broken rather than that the repository drifted.
+- Fail closed: a result is `MALFORMED_RESULT` (a blocker naming the field, exit 2 even when `fail-on-drift` is false,
+  because the checker itself is broken rather than the repository drifted) when it is missing or not a dict, lacks
+  a verdict field, carries a grade/verdict/readiness/severity outside the allowlists, has a score or count outside
+  its domain, lists a finding or blocker without its identifying fields, or contradicts itself (summary counts vs
+  the detail list, `ok` vs the counts, top-level vs `summary` readiness, readiness vs the blockers, grade vs score).
+  Every such check runs before any warning shortcut.
+- Inputs: `fail-on-drift` accepts only `true`/`false` (empty = `true`); anything else is a configuration error
+  (exit 2). The SARIF file is never written through a symlink: a symlink destination is refused (exit 2) and the
+  file is written to a temporary file in the same directory and moved into place atomically.
 
 A warning never produces status `PASS`: a run with warnings and no blockers exits 0 with status `UNVERIFIED`.
 """
@@ -25,6 +31,7 @@ A warning never produces status `PASS`: a run with warnings and no blockers exit
 import json
 import os
 import pathlib
+import tempfile
 import sys
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -46,6 +53,19 @@ RESCUE_KNOWN_READINESS = (
 SLOP_UNVERIFIED_GRADE = "UNVERIFIED"
 SLOP_NO_FILES_VERDICT = "NO_UI_OR_COPY_FILES_FOUND"
 SLOP_SCORE_LIMIT = 20
+# grade -> the only verdict the scanner pairs with it, and the score band each grade covers (upper bound inclusive)
+SLOP_GRADE_VERDICTS = {
+    "A+": "STATIC_STYLE_RULES_PASSED",
+    "A": "CLEAN_MINOR_POLISH",
+    "B": "MODERATE_AI_TRACES",
+    "C": "VISIBLE_AI_SLOP",
+    "D": "HEAVY_AI_SLOP",
+    "F": "UNMISTAKABLE_TEMPLATE_SLOP",
+    "UNVERIFIED": "NO_UI_OR_COPY_FILES_FOUND",
+}
+SLOP_GRADE_BANDS = ((0, "A+"), (12, "A"), (28, "B"), (50, "C"), (75, "D"))
+AUDIT_SEVERITIES = ("error", "warning")
+RESCUE_SEVERITIES = ("critical", "high", "warning")
 
 # Keys holding pre-rendered text; left out of the JSON report so it stays a data document.
 _RENDERED_KEYS = ("rescueBriefMarkdown", "onePromptRescueMarkdown", "markdownReport", "patchPromptMarkdown", "formatted", "sarif")
@@ -87,6 +107,27 @@ def _as_int(value: Any) -> Optional[int]:
     return None
 
 
+def _count_field(result: Mapping[str, Any], key: str, required: bool = True) -> Tuple[Optional[int], Optional[str]]:
+    """Read a non-negative integer count. Returns `(value, error)`; an absent optional field is `(None, None)`."""
+    if key not in result or result.get(key) is None:
+        return (None, f"result has no integer `{key}` field") if required else (None, None)
+    value = _as_int(result.get(key))
+    if value is None or value < 0:
+        return None, f"`{key}` is not a non-negative integer"
+    return value, None
+
+
+def _object_list(result: Mapping[str, Any], key: str) -> Optional[List[Mapping[str, Any]]]:
+    items = result.get(key)
+    if not isinstance(items, list) or any(not isinstance(i, Mapping) for i in items):
+        return None
+    return items
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def evaluate_audit(result: Any) -> Dict[str, Any]:
     gate = "audit"
     if not isinstance(result, Mapping):
@@ -94,24 +135,49 @@ def evaluate_audit(result: Any) -> Dict[str, Any]:
     ok = result.get("ok")
     if not isinstance(ok, bool):
         return _fail_closed(gate, "result has no boolean `ok` field")
-    err_cnt = _as_int(result.get("errorCount"))
-    if err_cnt is None or err_cnt < 0:
-        return _fail_closed(gate, "result has no integer `errorCount` field")
-    docs = _as_int(result.get("scannedDocsCount"))
-    if docs is None or docs < 0:
-        return _fail_closed(gate, "result has no integer `scannedDocsCount` field")
-    findings = result.get("findings")
-    if not isinstance(findings, list):
-        return _fail_closed(gate, "result has no `findings` list")
-    raw_dynamic = result.get("unverifiedDynamicCommandCount")
-    dynamic = 0 if raw_dynamic is None else _as_int(raw_dynamic)
-    if dynamic is None or dynamic < 0:
-        return _fail_closed(gate, "`unverifiedDynamicCommandCount` is not an integer")
+    err_cnt, err = _count_field(result, "errorCount")
+    if err:
+        return _fail_closed(gate, err)
+    docs, err = _count_field(result, "scannedDocsCount")
+    if err:
+        return _fail_closed(gate, err)
+    findings = _object_list(result, "findings")
+    if findings is None:
+        return _fail_closed(gate, "result has no `findings` list of objects")
+    dynamic, err = _count_field(result, "unverifiedDynamicCommandCount", required=False)
+    if err:
+        return _fail_closed(gate, err)
+    dynamic = dynamic or 0
+
+    # Shape of every finding, then summary counts against the detail list. A summary that says "0 errors" next
+    # to an error-severity finding is a contradiction, never a pass.
+    for idx, f in enumerate(findings):
+        if f.get("severity") not in AUDIT_SEVERITIES:
+            return _fail_closed(gate, f"`findings[{idx}].severity` is `{f.get('severity')}` (known: {', '.join(AUDIT_SEVERITIES)})")
+        if not _nonempty_str(f.get("ruleId")):
+            return _fail_closed(gate, f"`findings[{idx}]` has no `ruleId`")
+    listed_errors = sum(1 for f in findings if f.get("severity") == "error")
+    listed_warnings = len(findings) - listed_errors
+    if err_cnt != listed_errors:
+        return _fail_closed(gate, f"`errorCount` is {err_cnt} but `findings` lists {listed_errors} error finding(s)")
+    warn_cnt, err = _count_field(result, "warningCount", required=False)
+    if err:
+        return _fail_closed(gate, err)
+    if warn_cnt is not None and warn_cnt != listed_warnings:
+        return _fail_closed(gate, f"`warningCount` is {warn_cnt} but `findings` lists {listed_warnings} warning finding(s)")
+    for key in ("findingCount", "findingsCount"):
+        total, err = _count_field(result, key, required=False)
+        if err:
+            return _fail_closed(gate, err)
+        if total is not None and total != len(findings):
+            return _fail_closed(gate, f"`{key}` is {total} but `findings` lists {len(findings)} finding(s)")
+    if ok != (err_cnt == 0):
+        return _fail_closed(gate, f"`ok` is {str(ok).lower()} but `errorCount` is {err_cnt}")
 
     out = _gate(gate)
     out["blocking_count"] = err_cnt
     out["total_count"] = len(findings)
-    if not ok or err_cnt > 0:
+    if err_cnt > 0:
         out["drift"] = True
         out["blockers"].append(_item(gate, "DRIFT_DETECTED", f"audit: {err_cnt} error finding(s) in instruction documents"))
     elif docs == 0:
@@ -129,21 +195,64 @@ def evaluate_rescue(result: Any) -> Dict[str, Any]:
     if not isinstance(result, Mapping):
         return _fail_closed(gate, "result is missing or not an object")
     summary = result.get("summary")
-    readiness = summary.get("readiness") if isinstance(summary, Mapping) else None
-    if readiness is None:
-        readiness = result.get("readiness")
-    if not isinstance(readiness, str) or not readiness:
+    if summary is not None and not isinstance(summary, Mapping):
+        return _fail_closed(gate, "`summary` is not an object")
+    summary = summary or {}
+    top_readiness = result.get("readiness")
+    sum_readiness = summary.get("readiness")
+    if top_readiness is None and sum_readiness is None:
         return _fail_closed(gate, "result has no `summary.readiness` field")
-    if readiness not in RESCUE_KNOWN_READINESS:
-        return _fail_closed(gate, f"unknown readiness `{readiness}` (known: {', '.join(RESCUE_KNOWN_READINESS)})")
-    blockers = result.get("blockers")
-    if not isinstance(blockers, list) or any(not isinstance(b, Mapping) for b in blockers):
+    for label, value in (("readiness", top_readiness), ("summary.readiness", sum_readiness)):
+        if value is None:
+            continue
+        if not _nonempty_str(value):
+            return _fail_closed(gate, f"`{label}` is not a string")
+        if value not in RESCUE_KNOWN_READINESS:
+            return _fail_closed(gate, f"unknown readiness `{value}` (known: {', '.join(RESCUE_KNOWN_READINESS)})")
+    if top_readiness is not None and sum_readiness is not None and top_readiness != sum_readiness:
+        return _fail_closed(gate, f"`readiness` is `{top_readiness}` but `summary.readiness` is `{sum_readiness}`")
+    readiness = sum_readiness if sum_readiness is not None else top_readiness
+    ok = result.get("ok")
+    if not isinstance(ok, bool):
+        return _fail_closed(gate, "result has no boolean `ok` field")
+    blockers = _object_list(result, "blockers")
+    if blockers is None:
         return _fail_closed(gate, "result has no `blockers` list of objects")
+
+    for idx, b in enumerate(blockers):
+        if not _nonempty_str(b.get("kind")):
+            return _fail_closed(gate, f"`blockers[{idx}]` has no `kind`")
+        if b.get("severity") not in RESCUE_SEVERITIES:
+            return _fail_closed(gate, f"`blockers[{idx}].severity` is `{b.get('severity')}` (known: {', '.join(RESCUE_SEVERITIES)})")
+        if b.get("kind") == RESCUE_ENV_KEY_KIND and b.get("severity") != "warning":
+            return _fail_closed(gate, f"`blockers[{idx}]` is `{RESCUE_ENV_KEY_KIND}` with severity `{b.get('severity')}` (must be `warning`)")
 
     # `unverified_env_key` entries are how the bundle lists the ENV_UNVERIFIED condition itself (always severity
     # "warning"); they are reported as warnings. Every other entry is a real blocker and blocks as before.
     env_only = [b for b in blockers if b.get("kind") == RESCUE_ENV_KEY_KIND]
     real = [b for b in blockers if b.get("kind") != RESCUE_ENV_KEY_KIND]
+    critical = sum(1 for b in blockers if b.get("severity") == "critical")
+    crit_high = sum(1 for b in real if b.get("severity") in ("critical", "high"))
+
+    # Summary counts against the detail list, then readiness against the blockers it was derived from. All of
+    # this runs before the ENV_UNVERIFIED warning shortcut below.
+    for key, expected in (("totalBlockers", len(blockers)), ("criticalCount", critical), ("warningCount", len(blockers) - critical)):
+        value, err = _count_field(summary, key, required=False)
+        if err:
+            return _fail_closed(gate, "summary: " + err)
+        if value is not None and value != expected:
+            return _fail_closed(gate, f"`summary.{key}` is {value} but `blockers` gives {expected}")
+    if ok != (readiness == RESCUE_PASSED):
+        return _fail_closed(gate, f"`ok` is {str(ok).lower()} but readiness is `{readiness}`")
+    if readiness == RESCUE_PASSED and blockers:
+        return _fail_closed(gate, f"readiness is `{RESCUE_PASSED}` but `blockers` lists {len(blockers)} item(s)")
+    if (critical > 0) != (readiness == "BLOCKED"):
+        return _fail_closed(gate, f"readiness is `{readiness}` but `blockers` lists {critical} critical item(s)")
+    if readiness == RESCUE_ENV_UNVERIFIED and not env_only:
+        return _fail_closed(gate, f"readiness is `{RESCUE_ENV_UNVERIFIED}` but `blockers` lists no `{RESCUE_ENV_KEY_KIND}` item")
+    if readiness == "STATIC_CHECKS_WITH_WARNINGS" and not blockers:
+        return _fail_closed(gate, "readiness is `STATIC_CHECKS_WITH_WARNINGS` but `blockers` is empty")
+
     out = _gate(gate)
     out["total_count"] = len(blockers)
     env_warning = _item(
@@ -153,7 +262,6 @@ def evaluate_rescue(result: Any) -> Dict[str, Any]:
         "is present to verify them (expected in CI); not a failure",
     )
     if real:
-        crit_high = sum(1 for b in real if b.get("severity") in ("critical", "high"))
         out["blocking_count"] = crit_high or len(real)
         out["drift"] = True
         out["blockers"].append(
@@ -163,8 +271,6 @@ def evaluate_rescue(result: Any) -> Dict[str, Any]:
             out["warnings"].append(env_warning)
         return out
     if readiness == RESCUE_PASSED:
-        if result.get("ok") is not True:
-            return _fail_closed(gate, "readiness is STATIC_CHECKS_PASSED but `ok` is not true")
         return out
     if readiness == RESCUE_ENV_UNVERIFIED:
         out["warnings"].append(env_warning)
@@ -174,29 +280,61 @@ def evaluate_rescue(result: Any) -> Dict[str, Any]:
     return out
 
 
+def _slop_grade_for(score: int) -> str:
+    for limit, grade in SLOP_GRADE_BANDS:
+        if score <= limit:
+            return grade
+    return "F"
+
+
 def evaluate_anti_slop(result: Any) -> Dict[str, Any]:
     gate = "anti-slop"
     if not isinstance(result, Mapping):
         return _fail_closed(gate, "result is missing or not an object")
     grade = result.get("grade")
-    if not isinstance(grade, str) or not grade:
+    if not _nonempty_str(grade):
         return _fail_closed(gate, "result has no `grade` field")
+    if grade not in SLOP_GRADE_VERDICTS:
+        return _fail_closed(gate, f"unknown grade `{grade}` (known: {', '.join(SLOP_GRADE_VERDICTS)})")
+    verdict = result.get("verdict")
+    if verdict != SLOP_GRADE_VERDICTS[grade]:
+        return _fail_closed(gate, f"grade `{grade}` has unknown verdict `{verdict}` (expected `{SLOP_GRADE_VERDICTS[grade]}`)")
     ok = result.get("ok")
     if not isinstance(ok, bool):
         return _fail_closed(gate, "result has no boolean `ok` field")
-    raw_total = result.get("totalFindingCount")
-    if raw_total is None and isinstance(result.get("findings"), list):
-        raw_total = len(result["findings"])
-    total = _as_int(raw_total)
-    if total is None or total < 0:
-        return _fail_closed(gate, "result has no integer `totalFindingCount` field")
+    total, err = _count_field(result, "totalFindingCount")
+    if err:
+        return _fail_closed(gate, err)
+    findings = _object_list(result, "findings")
+    if findings is None:
+        return _fail_closed(gate, "result has no `findings` list of objects")
+    for idx, f in enumerate(findings):
+        if not _nonempty_str(f.get("category")):
+            return _fail_closed(gate, f"`findings[{idx}]` has no `category`")
+    if len(findings) > total or (result.get("truncated") is not True and len(findings) != total):
+        return _fail_closed(gate, f"`totalFindingCount` is {total} but `findings` lists {len(findings)} finding(s)")
+    for key, expected in (("findingCount", total), ("returnedFindingCount", len(findings))):
+        value, err = _count_field(result, key, required=False)
+        if err:
+            return _fail_closed(gate, err)
+        if value is not None and value != expected:
+            return _fail_closed(gate, f"`{key}` is {value} but {expected} was expected from the other fields")
 
     out = _gate(gate)
     out["total_count"] = total
-    if grade == SLOP_UNVERIFIED_GRADE and total == 0:
-        verdict = result.get("verdict")
-        if verdict != SLOP_NO_FILES_VERDICT:
-            return _fail_closed(gate, f"grade is UNVERIFIED with unknown verdict `{verdict}`")
+    if grade == SLOP_UNVERIFIED_GRADE:
+        # "Nothing to scan" is a warning only when every field agrees that nothing was scanned.
+        if result.get("slopScore") is not None:
+            return _fail_closed(gate, f"grade is UNVERIFIED but `slopScore` is `{result.get('slopScore')}`")
+        if total != 0:
+            return _fail_closed(gate, f"grade is UNVERIFIED but `totalFindingCount` is {total}")
+        if ok:
+            return _fail_closed(gate, "grade is UNVERIFIED but `ok` is true")
+        scanned, err = _count_field(result, "scannedFiles", required=False)
+        if err:
+            return _fail_closed(gate, err)
+        if scanned:
+            return _fail_closed(gate, f"grade is UNVERIFIED but `scannedFiles` is {scanned}")
         out["warnings"].append(
             _item(gate, SLOP_NO_FILES_VERDICT, "anti-slop: NO_UI_OR_COPY_FILES_FOUND - nothing to scan, gate skipped")
         )
@@ -204,15 +342,36 @@ def evaluate_anti_slop(result: Any) -> Dict[str, Any]:
     score = _as_int(result.get("slopScore"))
     if score is None:
         return _fail_closed(gate, "result has no integer `slopScore` field")
+    if score < 0 or score > 100:
+        return _fail_closed(gate, f"`slopScore` is {score}, outside 0-100")
+    if _slop_grade_for(score) != grade:
+        return _fail_closed(gate, f"`slopScore` {score} is grade `{_slop_grade_for(score)}` but `grade` is `{grade}`")
+    if ok != (total == 0):
+        return _fail_closed(gate, f"`ok` is {str(ok).lower()} but `totalFindingCount` is {total}")
     out["slop_score"] = score
-    if not ok or grade == SLOP_UNVERIFIED_GRADE or score >= SLOP_SCORE_LIMIT or total > 0:
+    if score >= SLOP_SCORE_LIMIT or total > 0:
         out["drift"] = True
         out["blocking_count"] = total or 1
         out["blockers"].append(_item(gate, "SLOP_DETECTED", f"anti-slop: {total} finding(s), slop score {score} (grade {grade})"))
     return out
 
 
+def parse_fail_on_drift(raw: Optional[str]) -> bool:
+    """`true` / `false` only (case-insensitive, surrounding space ignored); missing or empty means the default `true`.
+
+    Anything else raises ValueError: a typo such as `treu` must not silently turn failures off.
+    """
+    text = "" if raw is None else str(raw).strip().lower()
+    if text in ("", "true"):
+        return True
+    if text == "false":
+        return False
+    raise ValueError(f"invalid fail-on-drift value '{raw}'. Use 'true' or 'false'.")
+
+
 def combine(gates: List[Dict[str, Any]], fail_on_drift: bool = True) -> Dict[str, Any]:
+    if not isinstance(fail_on_drift, bool):
+        raise ValueError(f"fail_on_drift must be a bool, got {fail_on_drift!r}; parse inputs with parse_fail_on_drift().")
     blockers: List[Dict[str, str]] = []
     warnings: List[Dict[str, str]] = []
     for g in gates:
@@ -321,6 +480,47 @@ def render_report(
     return text, "\n\n---\n\n".join(p for p in summary_parts if p)
 
 
+class OutputPathError(Exception):
+    """The requested output path cannot be written safely."""
+
+
+def check_output_path(path: str) -> pathlib.Path:
+    """Refuse to write through a symlink or onto a non-file. Returns the path to write."""
+    target = pathlib.Path(path)
+    if target.is_symlink():
+        raise OutputPathError(f"refusing to write SARIF to '{path}': it is a symbolic link. Remove the link or choose another sarif-file.")
+    if target.exists() and not target.is_file():
+        raise OutputPathError(f"refusing to write SARIF to '{path}': it exists and is not a regular file.")
+    parent = target.parent
+    if not parent.is_dir():
+        raise OutputPathError(f"cannot write SARIF to '{path}': directory '{parent}' does not exist.")
+    return target
+
+
+def write_text_no_follow(path: str, text: str) -> None:
+    """Write `text` to `path` without ever following a symlink at `path`.
+
+    The content goes to a new temporary file (O_EXCL) in the same directory and is moved over the destination
+    with `os.replace`, which replaces the directory entry itself: if a symlink appears there after the check,
+    the link is replaced and its target is left untouched.
+    """
+    target = check_output_path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix="." + target.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(text)
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp_name, 0o666 & ~umask)  # mkstemp creates 0600; match what a plain open() would have given
+        os.replace(tmp_name, str(target))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _append(path: Optional[str], text: str) -> None:
     if path:
         with open(path, "a", encoding="utf-8") as fp:
@@ -355,8 +555,18 @@ def run_action(env: Optional[Mapping[str, str]] = None, stdout: Any = None, stde
     repo_path = env.get("INPUT_REPO_PATH", ".").strip() or "."
     base_ref = env.get("INPUT_BASE_REF", "").strip() or None
     head_ref = env.get("INPUT_HEAD_REF", "HEAD").strip() or "HEAD"
-    fail_on_drift = env.get("INPUT_FAIL_ON_DRIFT", "true").strip().lower() == "true"
+    try:
+        fail_on_drift = parse_fail_on_drift(env.get("INPUT_FAIL_ON_DRIFT"))
+    except ValueError as exc:
+        stderr.write(f"::error title=Memlet Check::{exc}\n")
+        return 2
     sarif_file = env.get("INPUT_SARIF_FILE", "deltaharness-audit.sarif").strip()
+    if sarif_file and mode in ("audit", "all"):
+        try:
+            check_output_path(sarif_file)  # fail before running the gates; the write below checks again
+        except OutputPathError as exc:
+            stderr.write(f"::error title=Memlet Check::{exc}\n")
+            return 2
 
     audit_res: Any = None
     rescue_res: Any = None
@@ -372,7 +582,11 @@ def run_action(env: Optional[Mapping[str, str]] = None, stdout: Any = None, stde
         if sarif_file or fmt == "sarif":
             audit_sarif = format_audit_sarif(audit_res)
         if sarif_file:
-            pathlib.Path(sarif_file).write_text(json.dumps(audit_sarif, indent=2, ensure_ascii=False), encoding="utf-8")
+            try:
+                write_text_no_follow(sarif_file, json.dumps(audit_sarif, indent=2, ensure_ascii=False))
+            except OutputPathError as exc:
+                stderr.write(f"::error title=Memlet Check::{exc}\n")
+                return 2
     if mode in ("rescue", "all"):
         from prism_memory.viberescue import build_rescue_bundle
 
