@@ -499,8 +499,14 @@ def _top_command(argv, parser):
     return None
 
 
+def _deprecation_enabled():
+    # Keep redirected stderr machine-readable unless the caller opts in.
+    return (os.environ.get('MEMLET_NO_DEPRECATION') != '1' and
+            (os.environ.get('MEMLET_DEPRECATION') == '1' or sys.stderr.isatty()))
+
+
 def _deprecated(name, replacement):
-    if os.environ.get('MEMLET_NO_DEPRECATION') != '1':
+    if _deprecation_enabled():
         print("memlet: '{}' is now '{}'; the short form will be removed in a future release."
               .format(name, replacement), file=sys.stderr)
 
@@ -1016,7 +1022,7 @@ def cli():
     legacy_script = legacy_name in PROGRAM_NAMES[1:]
     previous_notice = os.environ.get('MEMLET_NO_DEPRECATION')
     if legacy_script:
-        if previous_notice != '1':
+        if _deprecation_enabled():
             print("{} is now 'memlet'; this command name will be removed in a future release."
                   .format(legacy_name), file=sys.stderr)
         # A legacy executable and legacy subcommand still emit exactly one notice.

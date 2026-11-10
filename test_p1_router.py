@@ -2,6 +2,7 @@
 import argparse
 import builtins
 import contextlib
+import gc
 import io
 import json
 import os
@@ -26,14 +27,20 @@ class Output(io.StringIO):
         return self.tty
 
 
-def invoke(argv, *, tty=False, program='memlet', suppress=True):
-    out, err = Output(tty), io.StringIO()
+def invoke(argv, *, tty=False, stderr_tty=False, program='memlet', suppress=False, force_notice=False):
+    out, err = Output(tty), Output(stderr_tty)
     env = {key: value for key, value in os.environ.items()
            if key not in ('CODEX_THREAD_ID', 'PRISM_PARENT_SESSION_ID', 'ANTIGRAVITY_AGENT',
-                          'MEMLET_NO_DEPRECATION')}
+                          'MEMLET_NO_DEPRECATION', 'MEMLET_DEPRECATION')}
     if suppress:
         env['MEMLET_NO_DEPRECATION'] = '1'
+    if force_notice:
+        env['MEMLET_DEPRECATION'] = '1'
     with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, 'argv', [program] + argv):
+        # Python 3.13 warns when earlier tests' unclosed sqlite connections are
+        # collected. Drain that unrelated garbage before capturing CLI stderr;
+        # do not suppress ResourceWarnings raised by the invocation itself.
+        gc.collect()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = memory_cli.cli()
@@ -43,13 +50,25 @@ def invoke(argv, *, tty=False, program='memlet', suppress=True):
 
 
 @contextlib.contextmanager
-def cwd(path):
-    previous = Path.cwd()
-    os.chdir(str(path))
+def installed_bridge(bridge):
+    """Patch only the stub's cache entries, preserving unrelated lazy imports."""
+    missing = object()
+    name = 'prism_memory.memlet_bridge'
+    previous_module = sys.modules.get(name, missing)
+    previous_attribute = vars(prism_memory).get('memlet_bridge', missing)
+    sys.modules[name] = bridge
+    prism_memory.memlet_bridge = bridge
     try:
         yield
     finally:
-        os.chdir(str(previous))
+        if previous_attribute is missing:
+            delattr(prism_memory, 'memlet_bridge')
+        else:
+            prism_memory.memlet_bridge = previous_attribute
+        if previous_module is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous_module
 
 
 class RouterHelpTests(unittest.TestCase):
@@ -101,38 +120,48 @@ class RouterHelpTests(unittest.TestCase):
 class DeprecationTests(unittest.TestCase):
     def test_notice_exactly_once_on_stderr_and_suppressible(self):
         want = "memlet: 'schema' is now 'memlet admin schema'; the short form will be removed in a future release.\n"
-        normal = invoke(['schema'], suppress=False)
+        normal = invoke(['schema'], force_notice=True)
         quiet = invoke(['schema'], suppress=True)
-        admin = invoke(['admin', 'schema'], suppress=False)
+        admin = invoke(['admin', 'schema'], force_notice=True)
         self.assertEqual(want, normal[2])
         self.assertEqual('', quiet[2])
         self.assertEqual('', admin[2])
         self.assertEqual(normal[:2], quiet[:2])
         self.assertEqual(quiet, admin)
+        self.assertEqual(quiet, invoke(['schema']))
+        self.assertEqual(quiet, invoke(['schema'], tty=True))  # stdout TTY is irrelevant
+        self.assertEqual(want, invoke(['schema'], stderr_tty=True)[2])
+        self.assertEqual(quiet, invoke(['schema'], stderr_tty=True, suppress=True, force_notice=True))
         json.loads(normal[1])
 
     def test_legacy_help_warns_and_option_values_do_not_trigger_warnings(self):
-        code, _, err = invoke(['--task', 'wiki', 'schema', '--help'], suppress=False)
+        code, _, err = invoke(['--task', 'wiki', 'schema', '--help'], force_notice=True)
         self.assertEqual(0, code)
         self.assertIn("'schema' is now", err)
         self.assertNotIn("'wiki' is now", err)
-        self.assertEqual('', invoke(['--task', 'schema', 'recall', '--help'], suppress=False)[2])
-        self.assertEqual('', invoke(['--help', 'schema'], suppress=False)[2])
-        self.assertIn("'schema' is now", invoke(['--tas=foo', 'schema', '--help'], suppress=False)[2])
+        self.assertEqual('', invoke(['--task', 'schema', 'recall', '--help'], force_notice=True)[2])
+        self.assertEqual('', invoke(['--help', 'schema'], force_notice=True)[2])
+        self.assertIn("'schema' is now", invoke(['--tas=foo', 'schema', '--help'], force_notice=True)[2])
 
     def test_product_commands_and_admin_do_not_warn(self):
         for name in list(memory_cli.PRODUCT_COMMANDS) + ['admin']:
-            self.assertEqual('', invoke([name, '--help'], suppress=False)[2])
+            self.assertEqual('', invoke([name, '--help'], force_notice=True)[2])
 
     def test_legacy_executable_names_delegate_and_warn_once(self):
         expected = invoke(['schema'])
         for name in ('ieum-memory', 'prism-memory', 'deltaharness'):
             with self.subTest(program=name):
-                code, out, err = invoke(['schema'], program='/bin/' + name, suppress=False)
+                code, out, err = invoke(['schema'], program='/bin/' + name, force_notice=True)
                 self.assertEqual(expected[:2], (code, out))
                 self.assertEqual(name + " is now 'memlet'; this command name will be removed in a future release.\n", err)
                 self.assertEqual(expected, invoke(['schema'], program=name))
-        self.assertEqual('', invoke(['--version'], suppress=False)[2])
+                self.assertEqual(err, invoke(['schema'], program=name, stderr_tty=True)[2])
+                self.assertEqual(expected, invoke(['schema'], program=name, suppress=True, force_notice=True, stderr_tty=True))
+                with mock.patch.object(memory_cli, 'main', side_effect=ValueError('broken')):
+                    code, out, error = invoke(['capture'], program=name)
+                self.assertEqual((1, ''), (code, out))
+                self.assertEqual({'ok': False, 'error': 'broken', 'type': 'ValueError'}, json.loads(error))
+        self.assertEqual('', invoke(['--version'], force_notice=True)[2])
 
     def test_legacy_executable_restores_notice_environment_on_exit(self):
         for preset in (None, '0', '1'):
@@ -238,12 +267,9 @@ class BridgeWiringTests(unittest.TestCase):
         for name in ('unified_recall', 'changed_check', 'accept_anchor', 'learn_from_transcript',
                      'learn_pending', 'learn_approve', 'learn_reject'):
             setattr(self.bridge, name, mock.Mock(side_effect=lambda *a, **k: {'ok': True, 'formatted': 'bridge text\n'}))
-        self.modules = mock.patch.dict(sys.modules, {'prism_memory.memlet_bridge': self.bridge})
-        self.modules.start()
-        self.addCleanup(self.modules.stop)
-        parent = mock.patch.object(prism_memory, 'memlet_bridge', self.bridge, create=True)
-        parent.start()
-        self.addCleanup(parent.stop)
+        installed = installed_bridge(self.bridge)
+        installed.__enter__()
+        self.addCleanup(installed.__exit__, None, None, None)
 
     def test_positional_and_unified_recall_call_bridge_without_store_by_default(self):
         self.assertEqual(0, invoke(['recall', 'fix auth', '--repo', '/repo', '--budget', '99'])[0])
@@ -329,6 +355,15 @@ class BridgeWiringTests(unittest.TestCase):
         self.assertEqual(1, invoke(['learn', '--pending'])[0])
 
     def test_missing_bridge_is_clear_json_error_without_traceback(self):
+        # Nested injection must restore both import locations even on failure.
+        alternate = types.ModuleType('prism_memory.memlet_bridge')
+        with self.assertRaisesRegex(RuntimeError, 'cleanup'):
+            with installed_bridge(alternate):
+                self.assertIs(alternate, sys.modules['prism_memory.memlet_bridge'])
+                self.assertIs(alternate, prism_memory.memlet_bridge)
+                raise RuntimeError('cleanup')
+        self.assertIs(self.bridge, sys.modules['prism_memory.memlet_bridge'])
+        self.assertIs(self.bridge, prism_memory.memlet_bridge)
         original_import = builtins.__import__
 
         def without_bridge(name, globals=None, locals=None, fromlist=(), level=0):
