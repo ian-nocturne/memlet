@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -16,6 +17,31 @@ import uuid
 import work_memory as ledger
 import memory_skills as skills_ledger
 import memory_intelligence as memory
+
+
+def default_standalone_task_id():
+    """Use one canonical repository identity for CLI and MCP standalone defaults."""
+    cwd = Path.cwd().resolve()
+    try:
+        proc = subprocess.run(['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
+                              capture_output=True, text=True, check=True)
+        root = Path(proc.stdout.strip()).resolve()
+    except (OSError, subprocess.CalledProcessError):
+        root = cwd
+    digest = hashlib.sha1(os.fsencode(str(root))).hexdigest()[:8]
+    return 'standalone/' + root.name + '-' + digest
+
+
+def legacy_standalone_notice(store, task_id):
+    """Point to older memories without copying them or changing task selection."""
+    if task_id == 'standalone/main':
+        return None
+    with store.db() as db:
+        has_current = db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', (task_id,)).fetchone()
+        has_legacy = db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', ('standalone/main',)).fetchone()
+    if not has_current and has_legacy:
+        return 'Older memories live under standalone/main; read them with --task standalone/main (MCP: task="standalone/main").'
+    return None
 
 
 def _encoded(value):

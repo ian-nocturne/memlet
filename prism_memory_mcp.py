@@ -14,6 +14,7 @@ from prism_memory.standalone import StandaloneStore as WorkStore
 import work_memory
 import memory_intelligence as memory
 from memory_cli import read_item, schema as cli_schema
+from prism_memory.standalone import default_standalone_task_id, legacy_standalone_notice
 
 SERVER_NAME = 'prism-memory-mcp'
 SERVER_VERSION = '8.0.0'
@@ -285,7 +286,7 @@ def mcp_tools():
 
 
 class PrismMemoryMCPServer:
-    def __init__(self, root=None, default_task='standalone/main', default_session='standalone-owner', standalone=True, store=None):
+    def __init__(self, root=None, default_task=None, default_session='standalone-owner', standalone=True, store=None):
         if root is None:
             try:
                 from prism_memory.paths import resolve_default_data_root
@@ -295,7 +296,8 @@ class PrismMemoryMCPServer:
         else:
             self.root = Path(root).expanduser().resolve()
         self.store = store if store is not None else WorkStore(self.root)
-        self.default_task = default_task
+        self._uses_derived_task = not default_task
+        self.default_task = default_task or default_standalone_task_id()
         self.default_session = default_session
         self.standalone = standalone
         if self.standalone:
@@ -313,6 +315,15 @@ class PrismMemoryMCPServer:
         return task, session
 
     def call_tool(self, name, arguments):
+        result = self._call_tool(name, arguments)
+        tid = (arguments or {}).get('task') or self.default_task
+        if self._uses_derived_task and tid == self.default_task and isinstance(result, dict):
+            notice = legacy_standalone_notice(self.store, tid)
+            if notice:
+                result['notice'] = notice
+        return result
+
+    def _call_tool(self, name, arguments):
         args = arguments or {}
         if name == 'prism_memory_doctor':
             return memory.doctor(self.store)
@@ -596,7 +607,7 @@ def _default_mcp_root():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default=_default_mcp_root())
-    parser.add_argument('--task', default='standalone/main')
+    parser.add_argument('--task', default=None)
     parser.add_argument('--session', default='standalone-owner')
     parser.add_argument('--strict-task', action='store_true', help='Require existing task instead of auto-bootstrapping')
     parser.add_argument('--print-mcp-config', action='store_true', help='Print ready-to-paste MCP server JSON config and exit')
@@ -610,7 +621,7 @@ def main():
         standalone=not args.strict_task,
     )
     if args.print_mcp_config:
-        exported = memory.export_rules(server.store, args.task, targets=['mcp'], write_files=False)
+        exported = memory.export_rules(server.store, server.default_task, targets=['mcp'], write_files=False)
         print(json.dumps(exported['mcpConfig'], ensure_ascii=False, indent=2))
         return
     if args.self_test:

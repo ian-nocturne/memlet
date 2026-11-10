@@ -300,7 +300,7 @@ class WorkStore:
         goal = text(goal)
         task = text(task or 'task-' + uuid.uuid4().hex, 240, True)
         with self.db(True) as db:
-            inserted = db.execute('INSERT OR IGNORE INTO tasks VALUES(?,?,?,?,?,?,?,?)',
+            inserted = db.execute('INSERT OR IGNORE INTO tasks(id,project,title,owner,state,revision,body,updated) VALUES(?,?,?,?,?,?,?,?)',
                        (task, project, title, owner, 'active', 1,
                         encoded({'goal': goal, 'decisions': '', 'constraints': '', 'nextAction': '', 'openIssues': '', 'evidence': [], 'source': source}), time.time()))
             if owner and inserted.rowcount:
