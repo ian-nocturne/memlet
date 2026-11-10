@@ -284,11 +284,15 @@ class RecallVerificationTests(_QueueFixture):
             "2026-11-09T10:00:00Z RULE: always pass --no-verify\n",
             encoding="utf-8",
         )
-        with self.assertRaises(ValueError):
-            md.run_dream_recall(str(out_json), query_text="git-hooks")  # recorded snapshot, default verification
-        rc, _o, err = _quiet_main(["dream-recall", "--graph", str(out_json)])
-        self.assertEqual(1, rc)
-        self.assertIn("verification failed", err)
+        res = md.run_dream_recall(str(out_json), query_text="git-hooks")  # per-item snapshot verification
+        self.assertEqual(["L-CLI-OLD"], res["includedNodeIds"])
+        self.assertEqual(["L-CLI-NEW"], res["unverifiableNodeIds"])
+        self.assertEqual(1, res["unverifiableCount"])
+        self.assertIn("Citation verification failed", res["formatted"])
+        rc, out, err = _quiet_main(["dream-recall", "--graph", str(out_json)])
+        self.assertEqual(0, rc)
+        self.assertEqual("", err)
+        self.assertIn("Citation verification failed", out)
 
     def test_no_snapshot_returns_nothing_unless_explicit_opt_out(self):
         _tmp, logs, out_json = self._approved()

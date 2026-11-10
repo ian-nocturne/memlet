@@ -198,9 +198,11 @@ class PromoteTests(_RepoCase):
         self.assertNotIn("Never call main()", rec["formatted"])
         self.assertGreaterEqual(rec["stale"], 1)
         u = mb.unified_recall(self.repo, "main test suite", budget=800)
-        self.assertEqual([], u["sections"]["dream"])
-        self.assertFalse(u["sources"]["dream"]["available"])
-        self.assertIn("does not verify", u["sources"]["dream"]["reason"])
+        self.assertEqual([rel_id], [n["id"] for n in u["sections"]["dream"]])
+        self.assertTrue(u["sources"]["dream"]["available"])
+        self.assertEqual([main_id], u["unverifiableNodeIds"])
+        self.assertEqual(1, u["unverifiableCount"])
+        self.assertIn("Citation verification failed", u["formatted"])
         cap = build_handover(self.repo, output_format="markdown")  # before any re-promotion
         self.assertNotIn("Never call main()", cap["formatted"])
         self.assertIn("Do not push to the release branch", cap["formatted"])  # its own citation still verifies

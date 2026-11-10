@@ -240,10 +240,10 @@ class StandaloneStore:
         with self.db(True) as db:
             row = db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone()
             if not row or row["owner"] != owner:
-                raise ValueError("담당자가 바뀌어 입력을 보내지 않았어요. 현재 담당을 다시 확인해 주세요.")
+                raise ValueError("Owner changed; input was not sent. Check the current owner.")
             lease = db.execute("SELECT * FROM input_leases WHERE task=?", (task,)).fetchone()
             if lease and float(lease["expires"] or 0.0) > time.time() and lease["token"] != token:
-                raise ValueError("이 업무의 다른 입력을 처리 중이에요. 잠시 뒤 보내 주세요.")
+                raise ValueError("Another input for this task is being processed. Try again later.")
             if lease and float(lease["expires"] or 0.0) > time.time() and lease["token"] == token:
                 return False
             db.execute(
@@ -263,7 +263,7 @@ class StandaloneStore:
                 core = ledger.current(conn, task_id, list(ledger.FIELDS.values()))
                 row["body"] = {**row["body"], **memory.effective_fields({"current": core})}
         if row is None:
-            raise ValueError("업무를 찾지 못했어요.")
+            raise ValueError("Task not found.")
         return row
 
     def _seed_memory(self, db, item):
@@ -324,7 +324,7 @@ class StandaloneStore:
     def _link(self, db, task: str, session: str, role: str, evidence: str):
         _text(session, 240, True)
         if role not in ("responsible", "previous", "worker", "reviewer", "reference"):
-            raise ValueError("세션 역할을 확인해 주세요.")
+            raise ValueError("Invalid session role.")
         cols = {r[1] for r in db.execute("PRAGMA table_info(sessions)").fetchall()}
         ev_col = "evidence" if "evidence" in cols else "reason"
         db.execute(
@@ -336,10 +336,10 @@ class StandaloneStore:
     def link(self, task: str, session: str, role: str = "reference", evidence: str = "user-link"):
         self.get(task)
         if role == "responsible":
-            raise ValueError("책임자 변경은 담당 교대에서 진행해 주세요.")
+            raise ValueError("Change the owner through the handoff command.")
         with self.db(True) as db:
             if db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone()[0] == session:
-                raise ValueError("현재 책임자의 역할은 담당 교대에서 변경해 주세요.")
+                raise ValueError("Change the current owner role through the handoff command.")
             self._link(db, task, session, role, evidence)
         return self.get(task)
 
@@ -393,10 +393,10 @@ class StandaloneStore:
             self._check_input_lease(db, task, input_token)
             row = db.execute("SELECT owner, revision FROM tasks WHERE id=?", (task,)).fetchone()
             if not row or row["owner"] != previous:
-                raise ValueError("책임자가 바뀌었어요. 새 세션은 생성됐지만 책임 변경은 보류했어요.")
+                raise ValueError("Owner changed. The new session was created, but ownership transfer was deferred.")
             ctx = db.execute("SELECT revision FROM contexts WHERE id=? AND task=?", (context_id, task)).fetchone()
             if ctx and ctx["revision"] != row["revision"]:
-                raise ValueError("교대 중 업무 맥락이 바뀌었어요. 생성된 대화를 확인하고 담당 변경을 재검토해 주세요.")
+                raise ValueError("Task context changed during handoff. Review the created conversation before transferring ownership.")
             if previous:
                 self._link(db, task, previous, "previous", "explicit-handoff:" + context_id)
             self._link(db, task, successor, "responsible", "accepted-handoff:" + context_id)
@@ -461,7 +461,7 @@ class StandaloneStore:
         with self.db() as db:
             row = db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone()
             if not row:
-                raise ValueError("업무를 찾지 못했어요.")
+                raise ValueError("Task not found.")
             view = self._memory_view(db, task, query, budget, include_retrieval, **options)
             rev = row["revision"]
         ret = view.get("retrieval") or {}
@@ -488,7 +488,7 @@ class StandaloneStore:
         with self.db() as db:
             row = db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone()
             if not row:
-                raise ValueError("업무를 찾지 못했어요.")
+                raise ValueError("Task not found.")
             items = skills_ledger.snapshot_skills(
                 db, task, at=at, known_at=known, before=before, after=after,
                 shared=bool(options.get("shared", False)),
@@ -513,7 +513,7 @@ class StandaloneStore:
     def patch_memory(self, task: str, revision: int, operation: str, patches: list):
         _text(operation, 128, True)
         if not isinstance(patches, list) or not 1 <= len(patches) <= 30:
-            raise ValueError("기억 변경 항목은 1~30개로 지정해 주세요.")
+            raise ValueError("Provide between 1 and 30 memory changes.")
         payload = _fingerprint({"revision": revision, "patches": patches})
         with self.db(True) as db:
             prior = db.execute(
@@ -522,11 +522,11 @@ class StandaloneStore:
             ).fetchone()
             if prior:
                 if prior["digest"] != payload:
-                    raise ValueError("같은 기억 요청의 내용이 바뀌었어요.")
+                    raise ValueError("The content of this memory request changed.")
                 return json.loads(prior["result"])
             current = self.row(db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone())
             if not current or current["revision"] != revision:
-                raise ValueError("업무가 갱신됐어요. 최신 내용을 확인해 주세요.")
+                raise ValueError("Task was updated. Review its current state.")
             self._check_input_lease(db, task)
             touched = set()
             now = time.time()
@@ -534,11 +534,11 @@ class StandaloneStore:
             source = {"kind": "explicit-memory-edit", "session": current["owner"], "operation": operation}
             for i, patch in enumerate(patches):
                 if not isinstance(patch, dict) or set(patch) - {"id", "kind", "op", "content", "evidence", "validFrom", "validUntil"}:
-                    raise ValueError("기억 변경 형식을 확인해 주세요.")
+                    raise ValueError("Invalid memory change format.")
                 kind = patch.get("kind")
                 op = patch.get("op")
                 if kind not in ledger.FIELDS.values():
-                    raise ValueError("목표·결정·제약·다음 행동·확인 항목만 수정할 수 있어요.")
+                    raise ValueError("Only goals, decisions, constraints, next actions and open issues can be changed.")
                 value = _text(patch.get("content", ""), 8000, op in ("assert", "replace"))
                 evidence = _text(patch.get("evidence", ""), 2000)
                 ledger.record(
@@ -569,9 +569,9 @@ class StandaloneStore:
         with self.db(True) as db:
             item = self.row(db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone())
             if not item:
-                raise ValueError("업무를 찾지 못했어요.")
+                raise ValueError("Task not found.")
             if expected_revision is not None and item["revision"] != expected_revision:
-                raise ValueError("인계 준비 중 기억이 갱신됐어요. 최신 내용으로 다시 준비해 주세요.")
+                raise ValueError("Memory changed while preparing the handoff. Prepare it again with the current state.")
             links = [dict(r) for r in db.execute("SELECT * FROM sessions WHERE task=? ORDER BY created, session", (task,))]
             body = {
                 "taskId": task,
@@ -1006,7 +1006,7 @@ class StandaloneService:
             )
         if action == "context":
             return {"ok": True, "context": self.checkpoint_packet(tid, body.get("query", ""))}
-        raise ValueError("업무 행동을 확인해 주세요.")
+        raise ValueError("Invalid task action.")
 
 
 class MemoryEngine:

@@ -355,7 +355,7 @@ def _validate_memlet_arguments(name, args):
     if not isinstance(args, dict):
         raise ValueError('arguments must be an object')
     unknown = set(args) - set(schema['properties'])
-    if name == 'memlet_learn' and (unknown or args.get('action') not in ('transcript', 'pending')):
+    if name == 'memlet_learn' and (str(args.get('action', '')).lower() in ('approve', 'reject') or unknown & {'approve', 'reject', 'by', 'approver', 'ids', 'reason'}):
         raise ValueError('Approval is CLI-only (memlet learn --approve ID --by NAME); MCP allows only transcript and pending, with no extra approval/rejection arguments')
     if unknown:
         raise ValueError('Unknown arguments: ' + ', '.join(sorted(unknown)))

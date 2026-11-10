@@ -104,13 +104,20 @@ _PIN_RE = line_lazy_marker("<!-- memlet:brief ", "", " -->")
 _BRIEF_META_RE = line_lazy_marker("<!-- memlet:brief-meta ", r"\{", "} -->")
 _PIN_BODY_RE = re.compile(r"rank=\d+ pins=(?P<pins>\S+:\d+-\d+=[0-9a-f]{64}(?: \S+:\d+-\d+=[0-9a-f]{64})*)")
 # Secret masking: one linear-time implementation (`_mask`) used by every brief / index / recall / handover display.
-# The patterns are unchanged; they are evaluated by `audit.LazyBlockPattern` / `audit.LinearAlternation`, which give
+# Patterns are evaluated by `audit.LazyBlockPattern` / `audit.LinearAlternation`, which give
 # the same matches as the plain regexes without retrying long runs from every start (`'z' * 100000` took seconds).
 _PEM_PATTERN = r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----"
 _PEM_RE = LazyBlockPattern(_PEM_PATTERN, re.compile(r"-----BEGIN [A-Z0-9 ]+-----"),
                            re.compile(r"-----END [A-Z0-9 ]+-----"), "-----END ")
+SECRET_MASK_FAMILIES = (
+    "OpenAI/Anthropic sk-", "Stripe sk_live_/sk_test_/rk_live_/rk_test_/whsec_", "GitHub ghp_/gho_/ghu_/ghs_/ghr_/github_pat_",
+    "Slack xoxa-/xoxb-/xoxp-/xoxr-/xoxs-/xoxe-/xapp-", "AWS AKIA/ASIA access key IDs", "Google AIza",
+    "GitLab glpat-", "npm npm_", "PyPI pypi-", "Polar polar_oat_/polar_pat_/polar_sk_",
+    "PostgreSQL/MySQL/MongoDB connection URLs", "JWT", "URL credentials", "PEM blocks",
+    "assignments whose name contains KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/AUTH (8+ non-space value characters)",
+)
 _EXTRA_SECRET_PATTERN = (
-    r"(?:sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}"
+    r"(?:sk-[A-Za-z0-9_\-]{16,}|(?:sk_live_|sk_test_|rk_live_|whsec_)[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abprs]-[A-Za-z0-9\-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{8,}"
     r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@"
     r"|\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)[A-Z0-9_]*\s*[:=]\s*['\"]?[^\s'\"]{8,}"
     r"|(?:api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+]{12,})")
@@ -158,19 +165,24 @@ def _url_credentials_finder(text: str):
 def _keyword_word_finder(text: str):
     """`\\b[A-Z0-9_]*(?:KEY|TOKEN|...|AUTH)[A-Z0-9_]*\\s*[:=]\\s*['\\"]?[^\\s'\\"]{8,}` (re.I). Both runs are one word
     of class characters: a start is only possible at a word boundary, i.e. at the start of a word run, and the match
-    exists iff that word contains a keyword and the separator/value follow the word. One test per word."""
+    exists iff that word contains a keyword and the separator/value follow the word. Search for a keyword
+    first, then inspect its whole word once; ordinary prose words need no Python-level scan."""
     word = re.compile(r"[A-Z0-9_]+", re.I)
+    word_char = re.compile(r"[A-Z0-9_]", re.I)
     keyword = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH", re.I)
     rest = re.compile(r"\s*[:=]\s*['\"]?[^\s'\"]{8,}")
     wordch = re.compile(r"\w")
 
     def find(pos: int):
         while True:
-            m = word.search(text, pos)
+            m = keyword.search(text, pos)
             if m is None:
                 return None
-            p, e = m.span()
-            if not (p > 0 and wordch.match(text, p - 1)) and keyword.search(text, p, e):
+            p = m.start()
+            while p > pos and word_char.match(text, p - 1):
+                p -= 1
+            e = word.match(text, m.start()).end()
+            if not (p > 0 and wordch.match(text, p - 1)):
                 t = rest.match(text, e)
                 if t:
                     return p, t.end()
@@ -180,7 +192,7 @@ def _keyword_word_finder(text: str):
 
 def _extra_secret_alternation():
     cls = r"[A-Za-z0-9_\-]"
-    head = re.compile(r"sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}",
+    head = re.compile(r"sk-[A-Za-z0-9_\-]{16,}|(?:sk_live_|sk_test_|rk_live_|whsec_)[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abprs]-[A-Za-z0-9\-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{8,}",
                       re.I)
     jwt = run_tail_finder(re.compile(r"eyJ", re.I), re.compile(cls + "*", re.I), 10,
                           re.compile(r"\." + cls + r"{10,}\." + cls + r"{10,}", re.I))

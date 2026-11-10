@@ -693,7 +693,8 @@ class MemletMCPTests(unittest.TestCase):
             with self.subTest(args=args):
                 response = self.rpc('memlet_learn', **args)
                 self.assertTrue(response['isError'])
-                self.assertIn('CLI-only', response['structuredContent']['error'])
+                expected = 'action must be one of' if args.get('action') in ('unknown', '') else 'CLI-only'
+                self.assertIn(expected, response['structuredContent']['error'])
                 self.assertEqual(before, self.snapshot())
 
     def test_budget_and_required_fields(self):

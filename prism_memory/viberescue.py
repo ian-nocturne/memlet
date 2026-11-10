@@ -856,7 +856,7 @@ def build_rescue_bundle(
 
     js_rel_files: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS and not d.startswith(".git"))
+        dirnames[:] = sorted(d for d in dirnames if d != ".memlet" and d not in EXCLUDED_DIRS and not d.startswith(".git"))
         for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
             if not fpath.is_symlink() and fpath.suffix.lower() in JS_AST_EXTENSIONS:
@@ -864,7 +864,7 @@ def build_rescue_bundle(
     js_analysis, js_ast = _typescript_env_scan(root, js_rel_files)
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS and not d.startswith(".git"))
+        dirnames[:] = sorted(d for d in dirnames if d != ".memlet" and d not in EXCLUDED_DIRS and not d.startswith(".git"))
         for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
             if fpath.is_symlink():
@@ -1069,7 +1069,9 @@ def build_rescue_bundle(
     # 6. Include instruction/script drift from `audit_repository`
     audit_res = audit_repository(root, output_format="json")
     audit_findings = audit_res.get("findings", [])
-    for af in audit_findings[:25]:
+    anchor_observations = [af for af in audit_findings if str(af.get("ruleId", "")).startswith("pinned_anchor_")
+                           and af.get("severity") == "warning"]
+    for af in [af for af in audit_findings if af not in anchor_observations][:25]:
         rule_id = af.get("ruleId") or af.get("kind") or "drift"
         blockers.append({
             "kind": f"instruction_drift:{rule_id}",
@@ -1169,6 +1171,7 @@ def build_rescue_bundle(
             "totalBlockers": len(blockers),
             "criticalCount": critical_count,
             "warningCount": warning_count,
+            "anchorObservations": anchor_observations,
         },
         "blockers": blockers,
     }

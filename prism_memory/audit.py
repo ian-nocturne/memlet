@@ -1727,6 +1727,22 @@ def audit_repository(
                 except (OSError, json.JSONDecodeError):
                     pass
 
+    pinned = None
+    from prism_memory import memlet_wiki as mw
+    if (root / mw.CONFIG_PATH).is_file():
+        pinned = mw.pinned_anchor_report(root)
+        for a in pinned["anchors"]:
+            if a["status"] == "active":
+                continue
+            source = (a["sources"] or [mw.CONFIG_PATH + ":1"])[0]
+            doc, _, line = source.rpartition(":")
+            _add_finding(rule_id="pinned_anchor_" + a["status"].replace("-", "_"),
+                         severity="error" if a["status"] == "stale" else "warning",
+                         doc_rel=doc, line_no=int(line) if line.isdigit() else 1,
+                         target_path=a["path"], symbol=a["symbol"],
+                         message=f"{a['status'].upper()} `{a['anchor']}` ({a['reason']})",
+                         remediation="Re-read the rule and code; explicitly accept the anchor after review.")
+
     error_count = sum(1 for f in findings if f["severity"] == "error")
     warning_count = sum(1 for f in findings if f["severity"] == "warning")
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -1758,6 +1774,8 @@ def audit_repository(
         "elapsedMs": elapsed_ms,
     }
 
+    if pinned is not None:
+        report["pinnedAnchors"] = pinned
     fmt = (output_format or "json").strip().lower()
     if fmt == "markdown":
         report["formatted"] = format_audit_markdown(report)
@@ -1778,6 +1796,9 @@ def format_audit_markdown(report: Dict[str, Any]) -> str:
         f"- **Findings**: {report.get('errorCount', 0)} errors, {report.get('warningCount', 0)} warnings",
         "",
     ]
+    if "pinnedAnchors" in report:
+        lines.append("- Pinned anchors: " + json.dumps(report["pinnedAnchors"]["summary"], sort_keys=True))
+        lines.extend(f"- {a['status'].upper()} `{a['anchor']}` ({a['reason']})" for a in report["pinnedAnchors"]["anchors"])
     findings = report.get("findings") or []
     if not findings:
         lines.append("All instruction documents (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, etc.) match the current code and script signatures.")

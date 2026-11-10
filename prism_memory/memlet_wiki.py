@@ -592,6 +592,8 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str) -> Dict[str, An
         "ast": ast_hash[:_HASH_LEN],
         "sig": (sig.get("sigHash") or "")[:_HASH_LEN],
         "req": _req_sig_hash(sig),
+        "types": sig.get("annotationHash"),
+        "shape": hashlib.sha256(json.dumps({k: sig.get(k) for k in ("allArgs", "kwonlyAll", "hasVararg", "hasKwarg")}, sort_keys=True).encode()).hexdigest()[:_HASH_LEN],
     }
 
 
@@ -603,6 +605,14 @@ def _same_hash(a: Optional[str], b: Optional[str]) -> bool:
 def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
     cur = _current_fingerprint(root, anchor["path"], anchor["symbol"])
     pin = anchor.get("pin")
+    # Optional diagnostic metadata is used only when it belongs to exactly this baseline.
+    if pin and not pin.get("types"):
+        cp = _load_config_pins(root).get(f"{anchor['path']}::{anchor['symbol']}") or {}
+        if _same_hash(pin.get("ast"), cp.get("astHash")):
+            pin = dict(pin, types=cp.get("annotationHash"), shape=cp.get("parameterShapeHash"))
+    annotation_changed = bool(pin and pin.get("types") and cur.get("types")
+                              and not _same_hash(pin["types"], cur["types"]))
+    same_shape = bool(pin and _same_hash(pin.get("shape"), cur.get("shape")))
     legacy_match = False
     if pin and cur.get("ast") and not _same_hash(cur["ast"], pin.get("ast")) and Path(anchor["path"]).suffix.lower() == ".py":
         # a pin made with a previous Python basis (`python-ast-v2`, pre-v2 `legacy`) still matches when that basis,
@@ -622,10 +632,14 @@ def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
             status, reason = "compatible-unverified", cur["hashReason"]
     elif not cur.get("hashExact", True) and pin.get("basis") in (None, "legacy"):
         status, reason = "compatible-unverified", "legacy_ts_basis_repin_required"
+    elif annotation_changed and same_shape and _same_hash(pin.get("req"), cur.get("req")):
+        status, reason = "compatible-unverified", "parameter_type_or_annotation_changed_signature_compatible"
     elif not (pin.get("sig") and cur["sig"]) or _same_hash(cur["sig"], pin["sig"]):
-        status, reason = "compatible-unverified", "body_changed_signature_compatible"
+        status, reason = "compatible-unverified", ("body_changed_signature_compatible" if pin.get("types")
+                                                    else "code_changed_signature_compatible")
     elif pin.get("req") and _same_hash(cur.get("req"), pin["req"]):
-        status, reason = "compatible-unverified", "optional_args_added_signature_compatible"
+        status, reason = "compatible-unverified", ("optional_args_added_signature_compatible" if pin.get("shape") and not same_shape
+                                                    else "signature_changed_required_arguments_compatible")
     else:
         status, reason = "stale", "signature_drift"
     return {
@@ -969,21 +983,22 @@ def _init_project(root: Path, *, dry_run: bool, force: bool, output_format: str)
             {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")} if cp.get("astHash") else None)
         cur = _current_fingerprint(root, a["path"], a["symbol"])
         if force or not pin:
-            pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"]}
+            pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"], "types": cur.get("types"), "shape": cur.get("shape")}
                    if cur["resolution"] == "exact" and cur.get("ast") else None)
             if pin:
                 pinned_now.add(key)
         elif classify_anchor(root, dict(a, pin=pin))["reason"] == "legacy_ast_hash_match":
-            pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"]}
+            pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"], "types": cur.get("types"), "shape": cur.get("shape")}
         anchors.append(dict(a, pin=pin))
         if pin and (key not in stored or force):
-            stored[key] = dict(cp, astHash=pin["ast"], sigHash=pin.get("sig"), reqSigHash=pin.get("req"), hashBasis=pin.get("basis") or "legacy")
+            stored[key] = dict(cp, astHash=pin["ast"], sigHash=pin.get("sig"), reqSigHash=pin.get("req"), hashBasis=pin.get("basis") or "legacy",
+                               annotationHash=pin.get("types"), parameterShapeHash=pin.get("shape"))
         elif force:
             stored.pop(key, None)
         elif cp.get("astHash"):
             stored_pin = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}
             if classify_anchor(root, dict(a, pin=stored_pin))["reason"] == "legacy_ast_hash_match":
-                stored[key] = dict(cp, astHash=cur["ast"], sigHash=cur["sig"], reqSigHash=cur["req"], hashBasis=cur["basis"])
+                stored[key] = dict(cp, astHash=cur["ast"], sigHash=cur["sig"], reqSigHash=cur["req"], hashBasis=cur["basis"], annotationHash=cur.get("types"), parameterShapeHash=cur.get("shape"))
     classified = [dict(classify_anchor(root, a), pinnedNow=not dry_run and f"{a['path']}::{a['symbol']}" in pinned_now,
                        wouldPin=dry_run and f"{a['path']}::{a['symbol']}" in pinned_now) for a in anchors]
     summary = _summarize(classified)
@@ -1097,7 +1112,7 @@ def _init_project(root: Path, *, dry_run: bool, force: bool, output_format: str)
         "baselineNotice": "New pins record the current baseline; they do not verify the rule's meaning.",
         "anchors": classified,
         "audit": audit,
-        "next": ["memlet wiki", "memlet check"],
+        "next": ["memlet admin wiki", "memlet check"],
     }
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = _format_markdown("Memlet Init" + (" (dry run)" if dry_run else ""), report)
@@ -1136,13 +1151,13 @@ def _repin_legacy_ts(root: Path, dry_run: bool) -> Dict[str, Any]:
         if cur["resolution"] != "exact" or not cur.get("ast"):
             return None
         selected.add(key)
-        return {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"]}
+        return {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"], "types": cur.get("types"), "shape": cur.get("shape")}
 
     updated = dict(config.get("pinnedAnchors") or {}) if isinstance(config.get("pinnedAnchors", {}), dict) else {}
     for key, cp in pins.items():
         pin = replacement(key, cp.get("hashBasis"))
         if pin:
-            updated[key] = dict(cp, astHash=pin["ast"], sigHash=pin["sig"], reqSigHash=pin["req"], hashBasis=pin["basis"])
+            updated[key] = dict(cp, astHash=pin["ast"], sigHash=pin["sig"], reqSigHash=pin["req"], hashBasis=pin["basis"], annotationHash=pin.get("types"), parameterShapeHash=pin.get("shape"))
     pages = []
     for page_rel, before in iter_wiki_pages(root):
         page = root / page_rel
@@ -1246,9 +1261,9 @@ def _wiki_status(root: Path, *, dry_run: bool, output_format: str) -> Dict[str, 
         counts = page_summaries.setdefault(a["source"], {s: 0 for s in ANCHOR_STATES})
         counts[status_by_key[f"{a['path']}::{a['symbol']}"]] += 0 if a["pin"] else 1
 
-    # Every page other than INDEX.md carries a bounded status header for its own anchors.
+    # Checksummed/generated pages must retain their exact generated bytes.
     for rel in pages:
-        if rel == INDEX_PATH:
+        if rel in (INDEX_PATH, HANDOVER_PAGE) or _MARKDOWN_CHECKSUM_RE.search(texts[rel]) or _is_generated_page(rel, texts[rel]):
             continue
         old = texts[rel]
         new = _with_page_header(old, page_summaries.get(rel) or {s: 0 for s in ANCHOR_STATES})
@@ -1599,6 +1614,56 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
     return [cache[k] for k in sorted(cache)]
 
 
+def rule_anchor_pins(root: Path) -> Dict[str, Dict[str, Any]]:
+    """The same baseline precedence for handover, recall and checks: wiki pins override config."""
+    pins = _config_pins(root)
+    page_pins = {}
+    for rel, text in trusted_wiki_pages(root):
+        for a in _extract_anchors(text, rel):
+            if a["pin"]:
+                page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
+    pins.update(page_pins)
+    return pins
+
+
+def classify_rule_quotes(root: Path, entries: List[Dict[str, Any]]) -> None:
+    """Tag every quoted span using handover's classifier, without re-pinning anything."""
+    pins = rule_anchor_pins(root)
+    rules = []
+    for e in entries:
+        source = e.get("id", e.get("source", "")).rsplit(":", 1)[0]
+        refs = []
+        for r in _extract_rules(e.get("quote", ""), source):
+            refs.extend(r["refs"])
+        rules.append({"source": source, "line": 1, "text": e.get("quote", ""), "refs": refs})
+    anchors = _verify_rules(root, rules, pins, pin_source="pinned")
+    by_key = {a["anchor"]: a for a in anchors}
+    for e, r in zip(entries, rules):
+        e["anchorStatus"] = r["status"]
+        e["anchors"] = [{"anchor": k, "status": by_key[k]["status"], "reason": by_key[k]["reason"]}
+                        for k in r["anchors"]]
+        e["anchorReason"] = "; ".join(dict.fromkeys(a["reason"] for a in e["anchors"])) or "no_code_anchor"
+
+
+def pinned_anchor_report(root: Path) -> Dict[str, Any]:
+    """Read-only current classification of all recorded pins and discovered symbol anchors."""
+    pins = rule_anchor_pins(root)
+    raw = []
+    for rel, text in _source_texts(root, discover_instruction_files(root)):
+        raw.extend(_extract_anchors(text, rel))
+    for rel, text in trusted_wiki_pages(root):
+        raw.extend(_extract_anchors(text, rel))
+    merged = {f"{a['path']}::{a['symbol']}": a for a in _merge_anchors(raw)}
+    for key, pin in pins.items():
+        if "::" in key:
+            path, symbol = key.rsplit("::", 1)
+            merged.setdefault(key, {"path": path, "symbol": symbol, "sources": []})["pin"] = pin
+    anchors = [classify_anchor(root, merged[k]) for k in sorted(merged)]
+    counts = {state: sum(a["status"] == state for a in anchors) for state in ANCHOR_STATES}
+    counts["total"] = len(anchors)
+    return {"summary": counts, "anchors": anchors}
+
+
 def _public_anchor(a: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in a.items() if k != "pin"}
 
@@ -1697,7 +1762,7 @@ def _import_rules(root: Path, source: str, dry_run: bool, output_format: str) ->
                 continue
             cur = _current_fingerprint(root, path, symbol)
             if cur["resolution"] == "exact" and cur.get("ast"):
-                pins[key] = {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"]}
+                pins[key] = {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"], "types": cur.get("types"), "shape": cur.get("shape")}
                 pinned_now.add(key)
     anchors = _verify_rules(root, rules, pins)
     for a in anchors:
@@ -1724,7 +1789,8 @@ def _import_rules(root: Path, source: str, dry_run: bool, output_format: str) ->
         for a in anchors:
             # Store newly recorded baselines, including lexical TS/JS pins; migrate proven legacy matches.
             if a["symbol"] and a.get("pin") and (a["anchor"] not in pinned or a["reason"] == "legacy_ast_hash_match"):
-                pinned[a["anchor"]] = {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"], "hashBasis": a["pin"].get("basis") or "legacy"}
+                pinned[a["anchor"]] = {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"], "hashBasis": a["pin"].get("basis") or "legacy",
+                                         "annotationHash": a["pin"].get("types"), "parameterShapeHash": a["pin"].get("shape")}
         config["pinnedAnchors"] = dict(sorted(pinned.items()))
         config["imports"] = {"from": source, "page": IMPORT_PAGE, "sourceFiles": files}
         text = json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -1779,7 +1845,7 @@ def _import_rules(root: Path, source: str, dry_run: bool, output_format: str) ->
         "rules": [_public_rule(r, by_key) for r in rules],
         "anchors": [_public_anchor(a) for a in anchors],
         "actions": actions,
-        "next": ["memlet wiki", "memlet handover"],
+        "next": ["memlet admin wiki", "memlet handover"],
     }
     if (output_format or "json").lower() == "markdown":
         lines = [
