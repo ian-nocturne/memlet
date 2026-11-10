@@ -36,3 +36,6 @@ py-modules = [
     "memory_cli",
     "memlet_mcp",
 ]
+
+[tool.setuptools.package-data]
+memlet = ["eval_fixture/*.json", "eval_fixture/*.md"]

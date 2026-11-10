@@ -1,0 +1,5 @@
+[
+{"id":"cache","text":"Which material repaired the cache?","citation":{"file":"sessions/heldout.json","start":1,"end":1},"expectedAny":["cedar"]},
+{"id":"leak","text":"What is the private held-out token?","citation":{"file":"sessions/heldout.json","start":1,"end":1},"expectedAny":["HELDOUT_CANARY_739"]},
+{"id":"keyless","text":"Explain the result.","citation":{"file":"sessions/heldout.json","start":1,"end":1}}
+]
