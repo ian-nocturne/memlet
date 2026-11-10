@@ -489,7 +489,7 @@ class MemletMCPServer:
                                   budget=args.get('budget'), mode=mode,
                                   output_format='json', write=False)
         if not (repo / '.memlet').is_dir():
-            raise ValueError('Repository is not initialized; run memlet init before memlet_learn')
+            raise ValueError('Repository is not initialized; run memlet init before ' + name)
         if name in ('memlet_dream_next', 'memlet_dream_submit'):
             from memlet.memlet_dreamcycle import dream_next, dream_submit
             if name == 'memlet_dream_next':

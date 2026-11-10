@@ -2393,7 +2393,8 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         "rejectedApproaches": [],
     }
     from memlet.memlet_bridge import dream_items
-    lists["hints"] = dream_items(root, tiers=("hint",))["items"]
+    lists["hints"] = [{"id": h["id"], "text": h["text"], "cites": h["cites"], "label": h["agreementLabel"]}
+                      for h in dream_items(root, tiers=("hint",))["items"]]
     seen_rejected = set()
     for text, src in [(t, "user") for t in (rejected or [])] + [(r["text"], f"{r['source']}:{r['line']}") for r in dead_ends]:
         text = _clip(str(text), _HANDOVER_TEXT_LIMIT)

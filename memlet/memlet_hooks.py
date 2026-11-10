@@ -1117,7 +1117,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
         git_changes = gplan is not None and any(it["op"] in ("create", "update", "delete", "chmod")
                                                 for it in gplan["items"])
         problems = _preflight(root, cplan, gplan, init_runs=run_init is not None,
-                              record_changes=(cplan["op"] != "unchanged" or git_changes or dream)
+                              record_changes=(cplan["op"] != "unchanged" or git_changes or dream or bool((cfg or {}).get("hooks", {}).get("dream")))
                               and (cfg is not None or run_init is not None))
         if problems:
             raise Refused("cannot install safely, nothing was changed: " + "; ".join(problems))
@@ -1161,7 +1161,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             rep["actions"] += [{"op": "would-" + it["op"] if it["op"] in ("create", "update", "delete", "chmod")
                                 else it["op"], "path": it["path"]} for it in gplan["items"]]
             changes = changes or git_changes
-        if (changes or dream) and cfg is not None and not cfg_problem:
+        if (changes or dream or bool((cfg or {}).get("hooks", {}).get("dream"))) and cfg is not None and not cfg_problem:
             rep["actions"].append({"op": "would-update", "path": ".memlet/config.json"})
         rep["formatted"] = _render(rep)
         return rep
@@ -1206,6 +1206,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             new_cfg = copy.deepcopy(cfg)
             if dream and not remove:
                 new_cfg.setdefault("hooks", {})["dream"] = True
+            else:
+                new_cfg.setdefault("hooks", {}).pop("dream", None)
             if remove:
                 _set_record(new_cfg, "claude", scope, None)
                 if gplan is not None:
@@ -1471,7 +1473,7 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     else:  # unknown is not zero: the count is left out, never printed as 0
         _log(root, "session-start", "pending lessons unavailable: queue not readable")
     from memlet.memlet_dreamcycle import dream_status
-    status_result = dream_status(root)
+    status_result = dream_status(root) if st.get("dream") else {}
     waiting = status_result.get("waiting", 0)
     hints = status_result.get("counts", {}).get("hint", 0)
     if not active and not stale and not reverify and not pending and not waiting and not hints:
@@ -1481,8 +1483,9 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
                     f", {pending} lesson(s) pending human approval (`memlet learn --pending`)")
     status = (f"Not verified, do not rely on: {stale} stale anchor(s), {reverify} to re-verify{pending_part}; "
               "see `memlet check .`.")
-    if hints:
-        status += f" {hints} unreviewed hint(s); verify in code before use."
+    if st.get("dream") and pending is not None:
+        status = status.replace(f"{pending} lesson(s) pending human approval (`memlet learn --pending`)",
+                                f"{pending} unapproved lesson(s), of which {hints} shown as unreviewed hint(s) (`memlet learn --pending`)")
     if waiting:
         status += f" {waiting} session(s) waiting to dream; run `memlet dream --via …`."
     items = [f"- {_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]

@@ -16,17 +16,48 @@ import time
 from pathlib import Path
 
 VENDORS = ("claude", "codex", "gemini")
+MODEL_FAMILIES = {"claude": ("haiku", "sonnet", "opus", "fable")}
 DEFAULT_MODELS = {"claude": "haiku", "codex": "gpt-5-mini", "gemini": "gemini-2.5-flash"}
 _PAID_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
              "ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
              "AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 _SETTINGS_RISK_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper")
-_SETTINGS_RISK_ENV = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_", "OPENAI_", "GOOGLE_", "GEMINI_", "AZURE_")
+# Settings routing checks retain the brief runner's scope; unrelated AWS_REGION
+# or another provider's config is not evidence that Claude will use paid auth.
+_SETTINGS_RISK_ENV = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_BEARER_TOKEN")
+_STRIPPED_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_", "OPENAI_", "GOOGLE_", "GEMINI_", "AZURE_")
+
+
+def valid_model(model):
+    return isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}", model) is not None
+
+
+def same_model(vendor_a, model_a, vendor_b, model_b):
+    """Conservative identity, shared by launch and read-time agreement checks."""
+    a, b = str(model_a).casefold(), str(model_b).casefold()
+    if a == b:
+        return True
+    if vendor_a == vendor_b:
+        tokens_a, tokens_b = set(re.split(r"[^a-z0-9]+", a)), set(re.split(r"[^a-z0-9]+", b))
+        return bool(tokens_a & tokens_b & set(MODEL_FAMILIES.get(vendor_a, ())))
+    return False
+
+
+def static_vendor_refusal(vendor):
+    if vendor == "claude":
+        return None
+    reasons = {
+        "codex": "Codex read-only sandbox restricts shell commands, but not all apps/browser/computer-use tools; no documented disable-all mode",
+        "gemini": "agy --sandbox documents terminal restrictions, not a tool-free mode",
+        "agy": "agy is not a supported vendor spelling; use gemini (which has no verified tool-free mode)",
+    }
+    reason = reasons.get(vendor, "unknown vendor spelling; expected claude, codex or gemini")
+    return str(vendor) + ": no verified tool-free, subscription-only mode; refusing: " + reason
 
 
 def _runner_env():
     env = {k: v for k, v in os.environ.items() if k not in _PAID_ENV
-           and not k.startswith(_SETTINGS_RISK_ENV)
+           and not k.startswith(_STRIPPED_ENV_PREFIXES)
            and k not in ("NODE_OPTIONS", "BASH_ENV", "ENV", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES")}
     env["MEMLET_DREAMING"] = "1"
     return env
@@ -61,10 +92,9 @@ def _settings_risks(config_dir):
 def check_vendor(vendor, *, config=None, timeout=60):
     def result(ok, reason):
         return {"ok": ok, "vendor": vendor, "reason": reason, "isolation": "tool-free"}
-    if vendor != "claude":
-        reason = ("Codex read-only sandbox restricts shell commands, but not all apps/browser/computer-use tools; no documented disable-all mode"
-                  if vendor == "codex" else "agy --sandbox documents terminal restrictions, not a tool-free mode")
-        return result(False, vendor + ": no verified tool-free, subscription-only mode; refusing: " + reason)
+    refusal = static_vendor_refusal(vendor)
+    if refusal:
+        return result(False, refusal)
     try:
         with tempfile.TemporaryDirectory(prefix="memlet-auth-") as empty:
             r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
@@ -75,14 +105,14 @@ def check_vendor(vendor, *, config=None, timeout=60):
     except (OSError, subprocess.SubprocessError, ValueError):
         return result(False, "could not confirm subscription authentication")
     if r.returncode != 0 or not isinstance(st, dict):
-        return result(False, "refusing: claude auth status failed")
+        return result(False, "refusing: `claude auth status` exited %s or returned an invalid object" % r.returncode)
     if not (st.get("loggedIn") and st.get("authMethod") == "claude.ai" and st.get("apiProvider") == "firstParty"
             and st.get("subscriptionType")):
         return result(False, "refusing: Claude is not authenticated by a claude.ai subscription")
     risks = _settings_risks(st.get("configDirectory"))
     if risks:
         return result(False, "refusing: settings could select API-key or third-party auth: " + ", ".join(risks))
-    return result(True, "claude.ai subscription")
+    return result(True, "claude.ai subscription (%s)" % st.get("subscriptionType"))
 
 
 def _capture(argv, data, timeout, limit, cwd):
@@ -92,7 +122,6 @@ def _capture(argv, data, timeout, limit, cwd):
                           cwd=cwd, env=_runner_env(), start_new_session=True) as p:
         selector = selectors.DefaultSelector()
         output, errors, sent = bytearray(), bytearray(), 0
-        complete = False
         try:
             for pipe in (p.stdin, p.stdout, p.stderr):
                 os.set_blocking(pipe.fileno(), False)
@@ -124,23 +153,23 @@ def _capture(argv, data, timeout, limit, cwd):
                                 raise ValueError("vendor output exceeds byte limit")
             rc = p.wait(timeout=max(0.01, deadline - time.monotonic()))
             text = output.decode("utf-8", "strict")
-            complete = True
             return rc, text
         finally:
             selector.close()
-            if not complete or p.poll() is None:
-                # A launcher can exit before its child. Kill its whole private group even then.
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
+            # Normal exit can leave descendants with closed pipes in this private group.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
 
 
 def run_vendor(vendor, prompt, *, stdin_text="", timeout=120, max_output_bytes=262144, runner=None, model=None, config=None):
-    model = model or DEFAULT_MODELS.get(vendor, "")
+    model = DEFAULT_MODELS.get(vendor, "") if model is None else model
     result = {"ok": False, "vendor": vendor, "model": model, "text": "", "error": "", "isolation": "tool-free"}
-    if vendor not in VENDORS or not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,100}", model):
-        return dict(result, error="unknown vendor or invalid model")
-    if not isinstance(prompt, str) or not isinstance(stdin_text, str) or len(prompt.encode()) > 65536 or len(stdin_text.encode()) > 1048576:
+    if vendor not in VENDORS:
+        return dict(result, error=static_vendor_refusal(vendor))
+    if not valid_model(model):
+        return dict(result, error="invalid model id")
+    if not isinstance(prompt, str) or prompt.startswith("-") or not isinstance(stdin_text, str) or len(prompt.encode()) > 65536 or len(stdin_text.encode()) > 1048576:
         return dict(result, error="vendor input exceeds bound")
     timeout, limit = max(0.01, min(float(timeout), 1800)), max(1, min(int(max_output_bytes), 1048576))
     started = time.monotonic()
