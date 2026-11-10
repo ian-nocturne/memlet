@@ -1070,9 +1070,11 @@ def build_rescue_bundle(
         complexity = "NEEDS_VERIFICATION"
         exit_code = 1
     elif critical_count == 0 and unverified_env_keys:
+        # Not a pass (`ok` stays False below), but not a failure either: there is no local .env to check
+        # against, which is the normal state of a CI runner. Exit 0 so `memlet rescue` and the Action agree.
         readiness = "ENV_UNVERIFIED"
         complexity = "NEEDS_ENV_VERIFICATION"
-        exit_code = 1
+        exit_code = 0
     elif critical_count == 0 and warning_count == 0:
         readiness = "STATIC_CHECKS_PASSED"
         complexity = "NONE"
@@ -1099,7 +1101,7 @@ def build_rescue_bundle(
     json_path = out_root / "rescue-bundle.json"
 
     raw_bundle: Dict[str, Any] = {
-        "ok": exit_code == 0,
+        "ok": exit_code == 0 and readiness != "ENV_UNVERIFIED",
         "exitCode": exit_code,
         "readiness": readiness,
         "bundleId": f"rescue-{bundle_id}",
