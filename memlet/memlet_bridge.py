@@ -24,6 +24,10 @@ and `formatted` holds a Markdown rendering.
 
 from __future__ import annotations
 
+from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
+from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT, VENDOR_AGREEMENT,
+                         VETO_PREFIX, VETO_TEMPLATE, TIERS)
+
 import contextlib
 import copy
 import hashlib
@@ -560,15 +564,25 @@ def learn_pending(repo_path=".") -> Dict[str, Any]:
         item.update(trust[str(item["id"])])
         item.update(proposers=_display_records((node or {}).get("proposers", [])),
                     verification=_display_records((node or {}).get("verification", [])))
+        item.update(_lesson_fields(node))
+        if item.get("quoteLines"):
+            item["quote"] = lesson_text(node)
         item["pinsVerify"] = bool(snap is not None and node is not None and _node_edges_verify(node, snap) is None)
     for item in res["pendingNodes"] + res["pendingEdges"]:
         for key in ("quote", "currentQuote", "title", "scopeTag", "targetLabel"):
             if isinstance(item.get(key), str):
                 item[key] = safe_lesson_display(item[key])
+    from .vocabulary import LESSON_SEPARATOR
+    for item in res["pendingNodes"]:
+        if item.get("quoteLines"):
+            item["quote"] = LESSON_SEPARATOR.join(item["quoteLines"])
     lines = [f"## Pending Dream items ({res['counts']['pendingNodes']} node(s), {res['counts']['pendingEdges']} edge(s))", ""]
     for item in res["pendingNodes"]:
         flag = "" if item["pinsVerify"] else " — citation does NOT verify: " + str(item.get("citationReason") or "snapshot unavailable")
-        lines.append(f"- `{item['id']}` [{item['categoryLabel']}] {item['quote']} (cites `{SNAPSHOT_REL}/{item['span']}`){flag}")
+        if item.get("quoteLines"):
+            lines.append(f"- `{item['id']}` [{item['categoryLabel']}]{flag}\n" + _lesson_quote_block(item))
+        else:
+            lines.append(f"- `{item['id']}` [{item['categoryLabel']}] {item['quote']} (cites `{SNAPSHOT_REL}/{item['span']}`){flag}")
         lines.append("  tier=" + item["tier"] + "; " + item["agreementLabel"] + "; proposers=" + ", ".join(str(r.get("vendor")) + "/" + str(r.get("isolation", "none")) for r in item["proposers"] if isinstance(r, dict))
                      + "; verification=" + ", ".join(str(r.get("vendor")) + ":" + str(r.get("verdict")) for r in item["verification"] if isinstance(r, dict)))
         if item.get("citationReason") and item.get("currentQuote"):
@@ -690,7 +704,7 @@ def _find_by_basename(root: Path, name: str) -> List[str]:
 def _resolve_lesson_anchor(root: Path, node: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     """A real `path::symbol` for a lesson whose scope names code, only when that symbol exists right now."""
     pp = node.get("primaryPin") if isinstance(node.get("primaryPin"), dict) else {}
-    text = f"{node.get('title') or ''}\n{pp.get('quoteText') or ''}"
+    text = f"{node.get('title') or ''}\n{node.get('scopeTag') or ''}\n{lesson_text(node)}"
     for m in mw.iter_explicit_anchors(text):
         if "::" in m.group(0):
             path, sym = mw._clean_ref_path(m.group("path")), m.group("symbol").rstrip(".-")
@@ -805,13 +819,40 @@ def _approved_lessons(root: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
 
 
 def lesson_text(node: Dict[str, Any]) -> str:
-    """The reviewed pinned quote, capped at 8192 characters with an explicit ellipsis.
+    return md.lesson_text(node)
 
-    Preserve code anchors/backticks. Escape HTML comment delimiters so transcript text cannot inject pin metadata.
-    """
-    text = (node.get("primaryPin") or {}).get("quoteText") or node.get("title") or ""
-    text = md._LINE_PREFIX_RE.sub("", str(text), count=1).strip()
-    return safe_lesson_display(text, limit=md.LESSON_TEXT_MAX_CHARS)
+
+def _lesson_fields(node):
+    fields = md.lesson_display_fields(node)
+    if fields:
+        fields["cites"] = [dict(c, file=SNAPSHOT_REL + "/" + c["file"]) for c in fields["cites"]]
+    return fields
+
+
+def _lesson_quote_block(item):
+    """Multi-line readers: one quoted line per citation, with relation source labels."""
+    lines = []
+    for quote, cite in zip(item.get("quoteLines", []), item.get("cites", [])):
+        tags = []
+        for edge in item.get("edgeSources", []):
+            parsed = md.parse_span(edge["span"])
+            if parsed and cite["file"].endswith(parsed[0]) and parsed[1] <= cite["start"] <= parsed[2]:
+                tags.append(edge["edgeType"] + " source")
+        lines.append("  > " + quote + " (`{file}:{start}-{end}`".format(**cite) + ("; " + ", ".join(tags) if tags else "") + ")")
+    return "\n".join(lines)
+
+
+def enrich_promoted_rules(root, rules):
+    if not any(r["source"] == PROMOTED_PAGE for r in rules):
+        return
+    entries = {e["source"]: e for e in promoted_rule_entries(root)[0]}
+    for r in rules:
+        e = entries.get("%s:%s" % (r["source"], r["line"]))
+        if e and e.get("quoteLines"):
+            r.update({k: e[k] for k in ("quoteLines", "cites", "edgeSources")})
+            r["text"] = e["quote"]
+
+
 
 
 def _render_rule(node: Dict[str, Any], anchor: Optional[Tuple[str, Dict[str, Any]]]) -> Tuple[str, List[str]]:
@@ -953,12 +994,12 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
                  "dreamId": r["id"]}
         anchor = (r["pins"][0]["key"], r["pins"][0]["pin"]) if r["pins"] else None
         ok = (node is not None and snap is not None and _sha(r["body"])[:16] == r["textSha"]
-              and md.approval_state(node, "node") == "approved" and md.node_approval_digest(node) == r["digest"]
+              and md.approval_state(node, "node") == TIER_APPROVED and md.node_approval_digest(node) == r["digest"]
               and _render_rule(node, anchor)[0] == r["body"]  # the quoted text is exactly what was approved
               and (view_by_id.get(r["id"]) or {}).get("verdict") == "SUPPORTED"
               and _node_edges_verify(node, snap) is None)
         if ok:
-            entry.update(quote=r["body"], lines=1)
+            entry.update(quote=r["body"], lines=1, **_lesson_fields(node))
             fresh.append(entry)
         else:
             stale.append(entry)
@@ -988,7 +1029,7 @@ def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]
     out: Dict[str, List[Dict[str, Any]]] = {"rules": [], "safety": [], "staleRules": []}
     for it in picked:
         head = f"- [{it['topic']}] `{it['source']}`" + (f" (sha256 {it['sha256'][:12]})" if it.get("sha256") else "")
-        head += f" [{it['anchorStatus']}: {it['anchorReason']}]"
+        head += " " + suggested_label(it) + f"[{it['anchorStatus']}: {it['anchorReason']}]"
         text = "\n".join([head + ":"] + [f"  > {q}" for q in it["quote"].splitlines()])
         item = {"key": it["key"], "source": it["source"], "topic": it["topic"], "quote": it["quote"], "text": text,
                 "anchorStatus": it["anchorStatus"], "anchorReason": it["anchorReason"], "anchors": it["anchors"]}
@@ -1041,7 +1082,9 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         text = (f"- [{nid}] ({md.category_label(n.get('category'))}; {_defuse(n.get('scopeTag'), 48)}) {label}"
                 f"{lesson_text(n)} — cites `{source}`")
         items.append({"id": nid, "category": n.get("category"), "statusKind": n.get("statusKind"),
-                      "title": n.get("title"), "quote": lesson_text(n), "source": source, "text": text})
+                      "title": n.get("title"), "quote": lesson_text(n), "source": source, "text": text, **_lesson_fields(n)})
+        if items[-1].get("quoteLines"):
+            items[-1]["text"] = f"- [{nid}] ({md.category_label(n.get('category'))}) {label}\n" + _lesson_quote_block(items[-1])
     states = {it["id"]: it for it in dream_items(root)["items"]}
     permitted = set(states)
     items = [it for it in items if it["id"] in permitted]
@@ -1115,7 +1158,7 @@ _SECTION_HEADS = {
     "safety": "### Always-on safety rules (importance 1 in the rule index; shown regardless of the query)",
     "dream": "### Approved lessons (human-approved Dream items; transcript citations re-verified)",
     "memory": "### Task memory (bi-temporal store)",
-    "hints": "### Unreviewed hints — two vendors agreed and the citations check out, but nobody approved these; verify in the code before relying on them",
+    "hints": "### " + HINT_LABEL,
 }
 
 
@@ -1129,7 +1172,7 @@ def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str
         lines.append("- WARNING: " + verification_notice)
     for s in _SECTIONS:
         if chosen.get(s):
-            lines += ["", ("### " + hint_label(chosen[s]) if s == "hints" else _head_for(s, rules_mode))] + [it["text"] for it in chosen[s]]
+            lines += ["", ("### " + hint_label(chosen[s]) + "\n" + HINT_HELP if s == "hints" else _head_for(s, rules_mode))] + [it["text"] for it in chosen[s]]
     if footer:
         lines += ["", footer]
     return "\n".join(lines) + "\n"
@@ -1180,12 +1223,15 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         if stale_dream:
             sources["staleRules"] = {"available": True, "reason": "anchored code changed"}
     if "hints" in wanted:
-        hints = dream_items(root, tiers=("hint",), query=query)
+        hints = dream_items(root, tiers=(TIER_HINT,), query=query)
         sources["hints"] = {"available": hints["ok"], "reason": "", "label": hint_label(hints["items"])}
         for hint in hints["items"]:
             citation = hint["cites"][0]
             src = "{file}:{start}-{end}".format(**citation)
-            cands["hints"].append(dict(hint, quote=hint["text"], text="- [hint; " + hint_item_label(hint) + "] " + hint["text"] + " — cites `" + src + "`"))
+            text = "- [hint; " + hint_item_label(hint) + "] " + hint["text"] + " — cites `" + src + "`"
+            if hint.get("quoteLines"):
+                text = "- [hint; " + hint_item_label(hint) + "]\n" + _lesson_quote_block(hint)
+            cands["hints"].append(dict(hint, quote=hint["text"], text=text))
     if "memory" in wanted:
         cands["memory"], sources["memory"] = _memory_items(store, task, query)
     for s in _SECTIONS:
@@ -1511,6 +1557,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                 live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
                 page_rules = [r for r in page_rules if r["line"] in live]
             rules.extend(page_rules)
+    mw._attach_sidecar(root, rules)  # wiki rules must acquire accepted anchors BEFORE path filtering
     touching = []
     for r in rules:
         paths = {mw._resolve_ref_path(root, r["source"], p) for p, _s in r["refs"]}
@@ -1533,33 +1580,32 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                 continue
             seen.add(dedupe)
             a = by_key[worst]
+            lesson_fields = {k: r[k] for k in ("quoteLines", "cites", "edgeSources") if k in r}
+            from .vocabulary import LESSON_SEPARATOR
+            rule_text = LESSON_SEPARATOR.join(mw._clip(q, 160) for q in r["quoteLines"]) if r.get("quoteLines") else mw._clip(r["text"], 160)
             res["affected"].append({"anchor": worst, "status": a["status"], "reason": a["reason"],
-                                    "rule": mw._clip(r["text"], 160), "source": f"{r['source']}:{r['line']}"})
+                                    "rule": rule_text, **lesson_fields, "source": f"{r['source']}:{r['line']}",
+                                    **mw._suggested_fields(r, worst)})
     if not changed and (root / mw.CONFIG_PATH).is_file():
         res["pinnedAnchors"] = mw.pinned_anchor_report(root)
         shown = {a["anchor"] for a in res["affected"]}
         for a in res["pinnedAnchors"]["anchors"]:
             if not changed and a["pinned"] and a["status"] == "stale" and a["anchor"] not in shown:
-                res["affected"].append({"anchor": a["anchor"], "status": a["status"], "reason": a["reason"],
-                                        "rule": "pinned anchor (including committed changes)",
-                                        "source": ", ".join(a["sources"]) or mw.CONFIG_PATH})
-    res["hints"] = dream_items(root, tiers=("hint",), files=changed)["items"]
+                rows = a.get("rules") or [{"rule": "pinned anchor (including committed changes)",
+                                           "source": ", ".join(a["sources"]) or mw.CONFIG_PATH}]
+                res["affected"].extend(dict(row, anchor=a["anchor"], status=a["status"], reason=a["reason"]) for row in rows)
+    res["hints"] = dream_items(root, tiers=(TIER_HINT,), files=changed)["items"]
     res["hintsLabel"] = hint_label(res["hints"])
     res["staleCount"] = sum(1 for a in res["affected"] if a["status"] == "stale")
     if res["staleCount"]:
         res.update(ok=False, exitCode=1, error=f"{res['staleCount']} rule(s) or recorded pins have stale anchors")
-    res["formatted"] = "".join(f"{a['status'].upper()} `{a['anchor']}` ({a['reason']}) — {a['source']}: "
-                               f"{mw._clip(a['rule'], 100)}\n" for a in res["affected"]) + "".join(notes)
+    res["formatted"] = "".join(f"{a['status'].upper()} `{a['anchor']}` ({a['reason']}) — {a['source']}: " +
+                               (f"{suggested_label(a)}" + ("\n" + _lesson_quote_block(a) if a.get("quoteLines") else mw._clip(a['rule'], 100)) + "\n") for a in res["affected"]) + "".join(notes)
     if res["hints"]:
-        res["formatted"] += "\n" + res["hintsLabel"] + "\n" + "\n".join("- [" + hint_item_label(h) + "] " + h["text"] for h in res["hints"]) + "\n"
+        res["formatted"] += "\n### " + res["hintsLabel"] + "\n" + HINT_HELP + "\n" + "\n".join("- [" + hint_item_label(h) + "]" + ("\n" + _lesson_quote_block(h) if h.get("quoteLines") else " " + h["text"]) for h in res["hints"]) + "\n"
     return res
 
 
-HINT_HELP = ("Screened against a list of permission phrases, labelled unreviewed, never shown among verified items; "
-             "the phrase list is not a proof that a hint cannot loosen a rule. "
-             "A trusted non-SUPPORTED verdict permanently vetoes the hint tier for that content; human approval still wins")
-HINT_LABEL = ("Unreviewed hints — two vendors agreed and the citations check out, but nobody approved these; "
-              "verify in the code before relying on them. " + HINT_HELP)
 # A phrase list, not a proof about semantics. Normalization closes spelling bypasses;
 # unreviewed hints can still contain permission language not represented in this list.
 _PERMISSION_RE = re.compile(
@@ -1605,7 +1651,7 @@ def hidden_hint_blocked(text):
 
 def safe_lesson_display(text, limit=None):
     # Render only: never rewrite the stored quote or its hash.
-    text = str(text)
+    text = str(text).replace("⟶", "→")
     hidden = any(_hidden_character(c) for c in text)
     text = "".join(c for c in text if not _hidden_character(c))
     text = _ANSI.sub(" ", text)
@@ -1669,48 +1715,48 @@ def _compute_tier(node, *, snapshot, config):
     """Computed on read. Receipts are integrity checks, never signatures or approvals."""
     from memlet.memlet_dreamcycle import evidence_pins
     if not isinstance(node, dict):
-        return "pending"
+        return TIER_PENDING
     decision = md.approval_state(node, "node")
-    if decision == "rejected" or node.get("verdict") == md.REJECTED:
-        return "rejected"
+    if decision == TIER_REJECTED or node.get("verdict") == md.REJECTED:
+        return TIER_REJECTED
     try:
         if not isinstance(snapshot, dict) or _node_edges_verify(node, snapshot):
-            return "pending"
+            return TIER_PENDING
         edges = node.get("edges", [])
-        if any(md.approval_state(e, "edge") == "rejected" or e.get("edgeVerdict") == md.REJECTED for e in edges):
-            return "pending"
-        if decision == "approved":
-            return "approved" if _approved_node(node, snapshot) else "pending"
+        if any(md.approval_state(e, "edge") == TIER_REJECTED or e.get("edgeVerdict") == md.REJECTED for e in edges):
+            return TIER_PENDING
+        if decision == TIER_APPROVED:
+            return TIER_APPROVED if _approved_node(node, snapshot) else TIER_PENDING
         if not dream_settings(config)[0]:
-            return "pending"
-        if (node.get("primaryPin") or {}).get("sha256") in config.get("_dreamRejectedQuoteHashes", ()):
-            return "pending"
+            return TIER_PENDING
+        if md.lesson_quote_digest(node) in config.get("_dreamRejectedQuoteHashes", ()):
+            return TIER_PENDING
         if not edges or not {e.get("edgeType") for e in edges} <= {"BLOCKS", "RESOLVES"}:
-            return "pending"
+            return TIER_PENDING
         pins = evidence_pins(node)
         if any(md._verify_pin_dict(pin, snapshot, "evidence") for pin in pins):
-            return "pending"
+            return TIER_PENDING
         texts = [p["quoteText"] for p in pins]
         quote_lines = {(p["fileId"], p["startLine"] + i): line for p in pins
                        for i, line in enumerate(p["quoteLines"])}
         if hidden_hint_blocked("\n".join(quote_lines.values())):
-            return "pending"
+            return TIER_PENDING
         texts += [node.get("title", ""), node.get("scopeTag", "")] + [e.get("targetLabel", "") for e in edges]
         if any(permission_phrase(t) for t in texts):
-            return "pending"
+            return TIER_PENDING
         if _agreement_basis(node, config):
-            return "hint"
+            return TIER_HINT
     except (TypeError, ValueError, KeyError, AttributeError):
         pass
-    return "pending"
+    return TIER_PENDING
 
 
 def tier_config(graph, config):
     config = copy.deepcopy(config or {})
-    config["_dreamRejectedQuoteHashes"] = {(n.get("primaryPin") or {}).get("sha256")
+    config["_dreamRejectedQuoteHashes"] = {md.lesson_quote_digest(n)
         for n in (graph or {}).get("nodes", []) if isinstance(n, dict)
-        and (md.approval_state(n, "node") == "rejected" or n.get("verdict") == md.REJECTED
-             or any(md.approval_state(e, "edge") == "rejected" or e.get("edgeVerdict") == md.REJECTED
+        and (md.approval_state(n, "node") == TIER_REJECTED or n.get("verdict") == md.REJECTED
+             or any(md.approval_state(e, "edge") == TIER_REJECTED or e.get("edgeVerdict") == md.REJECTED
                     for e in n.get("edges", [])))}
     return config
 
@@ -1720,7 +1766,7 @@ def item_trust(node, *, snapshot, config):
     from memlet.memlet_dreamcycle import trusted_record
     tier = _compute_tier(node, snapshot=snapshot, config=config)
     basis = _agreement_basis(node or {}, config)
-    vetoes = ["vetoed by %s/%s: %s" % (r["vendor"], r["model"], r.get("verdict"))
+    vetoes = [VETO_TEMPLATE % (r["vendor"], r["model"], r.get("verdict"))
               for r in (node or {}).get("verification", [])
               if trusted_record(r, node) and r.get("verdict") != "SUPPORTED"]
     label = "; ".join(vetoes) if vetoes else (hint_item_label({"agreementBasis": basis}) if basis else "no trusted agreement")
@@ -1754,20 +1800,17 @@ def _agreement_basis(node, config):
 
 
 def hint_label(items):
-    if any(it.get("agreementBasis") == "model" or it.get("label") == "two models of the same vendor agreed" for it in items):
-        return ("Unreviewed hints — two models agreed (agreement basis labelled per item); nobody approved these; "
-                "verify in the code before relying on them. " + HINT_HELP)
     return HINT_LABEL
 
 
 def hint_item_label(item):
-    return item.get("label") or item.get("agreementLabel") or ("two models of the same vendor agreed" if item.get("agreementBasis") == "model" else "two vendors agreed")
+    return item.get("label") or item.get("agreementLabel") or (MODEL_AGREEMENT if item.get("agreementBasis") == "model" else VENDOR_AGREEMENT)
 
 
-def dream_items(repo_path=".", *, tiers=("approved",), query="", files=None):
+def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None):
     """Fixed in-repo snapshot, per-item rehash, disjoint tiers. Rejected items never leave this reader."""
     from memlet.memlet_dreamcycle import evidence_pins, _canonical_path
-    counts = {"approved": 0, "hint": 0, "pending": 0}
+    counts = {TIER_APPROVED: 0, TIER_HINT: 0, TIER_PENDING: 0}
     try:
         root = mw._resolve_root(repo_path)
         bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL, mw.CONFIG_PATH))
@@ -1788,13 +1831,13 @@ def dream_items(repo_path=".", *, tiers=("approved",), query="", files=None):
                 continue
             item_state = trust[str(node["id"])]
             tier = item_state["tier"]
-            if tier == "rejected":
+            if tier == TIER_REJECTED:
                 continue
-            if tier == "pending" and md.approval_state(node, "node") == "approved":
+            if tier == TIER_PENDING and md.approval_state(node, "node") == TIER_APPROVED:
                 notices.append(node["id"] + ": pending; approval has no live approved-valid edge, a rejected edge, or stale citations")
-            if tier == "pending" and (node.get("primaryPin") or {}).get("sha256") in config["_dreamRejectedQuoteHashes"]:
-                notices.append(node["id"] + ": pending; primary quote matches a rejected item; explicit human approval is required")
-            if item_state["agreementLabel"].startswith("vetoed by "):
+            if tier == TIER_PENDING and md.lesson_quote_digest(node) in config["_dreamRejectedQuoteHashes"]:
+                notices.append(node["id"] + ": pending; " + ("primary quote matches" if len(md.lesson_lines(node)) == 1 else "full cited quote set matches") + " a rejected item; explicit human approval is required")
+            if item_state["agreementLabel"].startswith(VETO_PREFIX):
                 notices.append(node["id"] + ": " + item_state["agreementLabel"])
             counts[tier] += 1
             if tier not in tiers:
@@ -1824,6 +1867,13 @@ def dream_items(repo_path=".", *, tiers=("approved",), query="", files=None):
                   "edgeTypes": sorted({e["edgeType"] for e in node.get("edges", [])}), "text": text,
                   "cites": cites, "scope": scope, "proposers": _display_records(node.get("proposers", [])),
                   "verification": _display_records(node.get("verification", []))}
+            fields = _lesson_fields(node)
+            if fields:
+                # Display hashes are per-line projections of stored pins, never fresh trust baselines.
+                pins_verify = snapshot is not None and _node_edges_verify(node, snapshot) is None
+                fields["cites"] = [dict(c, verified=bool(pins_verify and
+                    (md.resolve_pin(snapshot, c["span"]) or {}).get("sha256") == c["sha256"])) for c in fields["cites"]]
+                it.update(fields)
             it.update(item_state)
             items.append(it)
         if snap_why:

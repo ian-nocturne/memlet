@@ -18,6 +18,8 @@ structured JSON, human-readable Markdown, or GitHub Code Scanning SARIF v2.1.0.
 from __future__ import annotations
 
 from pathlib import Path
+from .vocabulary import suggested_label
+
 import json
 import os
 import re
@@ -1732,13 +1734,15 @@ def audit_repository(
             if a["status"] == "active":
                 continue
             source = (a["sources"] or [mw.CONFIG_PATH + ":1"])[0]
+            rule = next((r for r in a.get("rules", []) if r["source"] == source), {})
+            label = suggested_label(rule).rstrip()
             doc, _, line = source.rpartition(":")
             _add_finding(rule_id="pinned_anchor_" + a["status"].replace("-", "_"),
                          severity="error" if a["status"] == "stale" else "warning",
                          doc_rel=doc, line_no=int(line) if line.isdigit() else 1,
                          target_path=a["path"], symbol=a["symbol"],
                          message=f"{a['status'].upper()} `{a['anchor']}` ({a['reason']})"
-                                 + (" [suggested anchor]" if a.get("suggested") else ""),
+                                 + (" " + label if label else ""),
                          remediation="Re-read the rule and code; explicitly accept the anchor after review.")
         for d in (pinned.get("sidecar") or {}).get("detached") or []:  # accepted sidecar anchors that no longer attach
             anchor = str(d.get("anchor") or "")
@@ -1803,7 +1807,12 @@ def format_audit_markdown(report: Dict[str, Any]) -> str:
     ]
     if "pinnedAnchors" in report:
         lines.append("- Pinned anchors: " + json.dumps(report["pinnedAnchors"]["summary"], sort_keys=True))
-        lines.extend(f"- {a['status'].upper()} `{a['anchor']}` ({a['reason']})" for a in report["pinnedAnchors"]["anchors"])
+        for a in report["pinnedAnchors"]["anchors"]:
+            head = f"- {a['status'].upper()} `{a['anchor']}` ({a['reason']})"
+            if a.get("rules"):
+                lines.extend(head + f" — {suggested_label(r)}{r['rule']} (`{r['source']}`)" for r in a["rules"])
+            else:
+                lines.append(head)
     findings = report.get("findings") or []
     if not findings:
         lines.append("All instruction documents (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, etc.) match the current code and script signatures.")

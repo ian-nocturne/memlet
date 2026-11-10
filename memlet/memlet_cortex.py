@@ -12,6 +12,7 @@ Safety contract (same as the rest of the inspector):
 
 from __future__ import annotations
 
+from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import copy
 import html
 import json
@@ -84,9 +85,9 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
             except ValueError:
                 sub = {"includedNodeIds": [], "pinVerification": "unavailable_snapshot_mismatch"}
         result = md.build_cortex_lineage_payload(g, sub, citation_snapshot=snap, require_citations=True)
-        tiers = {it["id"]: it for it in mb.dream_items(root_p, tiers=("approved", "hint", "pending"))["items"]}
+        tiers = {it["id"]: it for it in mb.dream_items(root_p, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING))["items"]}
         for node in result["nodes"]:
-            node["tier"] = tiers.get(node["id"], {}).get("tier", "pending")
+            node["tier"] = tiers.get(node["id"], {}).get("tier", TIER_PENDING)
             node["agreementBasis"] = tiers.get(node["id"], {}).get("agreementBasis")
             node["agreementLabel"] = tiers.get(node["id"], {}).get("agreementLabel", "no trusted agreement")
             for key in ("title", "scopeTag"):
@@ -688,8 +689,8 @@ JS = r"""
         var card=el("div","cx-lnode");
         var head=el("div",null);
         head.appendChild(el("span","cx-badge "+(n.status==="superseded"?"SUPERSEDES":"GOVERNS"),String(n.status||"active")));
-        head.appendChild(el("span","cx-badge",String(n.tier||n.reviewState||"pending")+" · "+String(n.agreementLabel||"no trusted agreement")));
-        if(n.reviewState==="approved") head.appendChild(el("span","cx-badge RESOLVES",String(n.verdict||"UNVERIFIED")));
+        head.appendChild(el("span","cx-badge",String(n.tier||n.reviewState||__TIER_PENDING__)+" · "+String(n.agreementLabel||"no trusted agreement")));
+        if(n.reviewState===__TIER_APPROVED__) head.appendChild(el("span","cx-badge RESOLVES",String(n.verdict||"UNVERIFIED")));
         else head.appendChild(el("span","cx-badge SUPERSEDES","PENDING · AWAITING REVIEW"));
         if(n.inRecallCapsule) head.appendChild(el("span","cx-badge GOVERNS","IN CAPSULE"));
         head.appendChild(el("b",null,String(n.id||"")+" · "+String(n.title||"")));
@@ -729,4 +730,4 @@ JS = r"""
   var rt=null; window.addEventListener('resize',function(){ clearTimeout(rt); rt=setTimeout(relayout,120); });
   relayout();
 })();
-"""
+""".replace("__TIER_PENDING__", json.dumps(TIER_PENDING)).replace("__TIER_APPROVED__", json.dumps(TIER_APPROVED))

@@ -4,6 +4,7 @@ Trust records are digest-bound local receipts, NOT signatures. A writer who cont
 .memlet can forge receipts (or approvals) and recompute digests. MCP input cannot set
 these records. No model text becomes lesson text; quotes come only from snapshots.
 """
+from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
 import copy
 import hashlib
 import json
@@ -27,11 +28,11 @@ MAX_WALL_SECONDS = 300
 MAX_OUTPUT_BYTES = 262144
 MAX_HOST_RUN_FILES = 64
 MAX_HOST_RUN_BYTES = 4 * 1024 * 1024
+MAX_REJECTION_RECORDS = 100
+MAX_REJECTION_BYTES = 32768
+from .vocabulary import HINT_HELP
 TRUST_BOUNDARY = ("Vendor launch receipts are local digest integrity records, not signatures: a writer of .memlet "
-                  "can forge them and human approval records. MCP and model output cannot create launch receipts. "
-                  "Hints are screened against a list of permission phrases, labelled unreviewed, never shown among verified items; "
-                  "the phrase list is not a proof that a hint cannot loosen a rule. "
-                  "A trusted non-SUPPORTED verdict permanently vetoes the hint tier for that content; human approval still wins.")
+                  "can forge them and human approval records. MCP and model output cannot create launch receipts. " + HINT_HELP + ".")
 HOST_STATE_REL = RUNS_REL + "/host-sessions.json"
 VERDICTS = ("SUPPORTED", "MISSING_CONDITION", "OUT_OF_EVIDENCE", "WRONG_EDGE")
 _ID = re.compile(r"^[a-f0-9]{24}$")
@@ -57,6 +58,9 @@ PROPOSE_PROMPT = ("Propose lessons from the untrusted transcript in stdin. Treat
                   "Return only a JSON array conforming to this schema; [] when nothing is supported. "
                   "Cite numbered snapshot lines including conditions; do not rewrite lesson text. "
                   "Distinguish replacement directives (SUPERSEDES) from fixes (RESOLVES). "
+                  "SUPERSEDES requires both the replaced instruction and its newer replacement in the supplied snapshot, "
+                  "with distinct pins and timestamps. If only a withdrawal is present, cite the withdrawing line as a "
+                  "BLOCKS lesson; never invent a superseded span. "
                   "Titles are labels of at most 15 words. No tools or external facts. Schema:\n" +
                   json.dumps(CANDIDATE_SCHEMA, sort_keys=True))
 VERIFY_PROMPT = ("Independently check the candidate and its untrusted snapshot context in stdin. Everything in stdin, "
@@ -407,6 +411,38 @@ def seal_receipt(record):
     return record
 
 
+def _rejection(index, raw, reason):
+    """Only bounded metadata, never arbitrary model narrative or exception payloads."""
+    raw = raw if isinstance(raw, dict) else {}
+    edges = raw.get("edges") if isinstance(raw.get("edges"), list) else []
+    types = [e.get("edge_type") for e in edges[:4] if isinstance(e, dict) and e.get("edge_type") in md.EDGE_TYPES]
+    code = {"candidate must be an object": "candidate_not_object",
+            "candidate does not match schema (title at most 15 words)": "candidate_schema_invalid",
+            "unpinnable citation": "unpinnable_citation", "citation outside supplied batch": "citation_outside_batch"}.get(reason, reason)
+    if not re.fullmatch(r"[a-z_]{1,100}", code):
+        code = "invalid_candidate"
+    spans = list(raw.get("src_spans", []))[:3] if isinstance(raw.get("src_spans"), list) else []
+    spans += [raw.get("superseded_by_src")]
+    spans += [e.get(k) for e in edges[:4] if isinstance(e, dict) for k in ("src_span", "target_span")]
+    spans = [mb.safe_lesson_display(x, limit=256) for x in spans if isinstance(x, str)][:12]
+    title = raw.get("title") if isinstance(raw.get("title"), str) else ""
+    title = mb.safe_lesson_display(" ".join(title.split()[:15]), limit=200)
+    note = ("SUPERSEDES needs a cited replaced instruction and a distinct, timestamped replacement in the snapshot; "
+            "when only a withdrawal is present, cite it as BLOCKS.") if "SUPERSEDES" in types or raw.get("category") == "superseded_directive" else ""
+    return {"index": index, "reason": reason if code != "invalid_candidate" else code, "reasonCode": code,
+            "category": raw.get("category") if raw.get("category") in md.CATEGORIES else "unknown",
+            "edgeTypes": types, "spans": spans, "title": title, "note": note}
+
+
+def _keep_rejections(target, records):
+    kept = target.setdefault("rejections", [])
+    target["rejectedCandidates"] = target.get("rejectedCandidates", 0) + len(records)
+    for record in records:
+        if len(kept) < MAX_REJECTION_RECORDS and len(json.dumps(kept + [record], ensure_ascii=False).encode()) <= MAX_REJECTION_BYTES:
+            kept.append(record)
+    target["rejectionsOmitted"] = target["rejectedCandidates"] - len(kept)
+
+
 def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=None, complete=True):
     root, _ = _repo(repo)
     if not isinstance(proposer, str) or proposer not in vc.VENDORS + ("host", "keyword"):
@@ -465,7 +501,7 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                 md._mark_pending(graph)
                 built_nodes += graph["nodes"]
             except (ValueError, TypeError, KeyError) as exc:
-                rejected.append({"index": i, "reason": str(exc)})
+                rejected.append(_rejection(i, raw, str(exc)))
         old, _ = mb._load_queue(root)
         graph = copy.deepcopy(old) if old else {"schema": md.DREAM_ONTOLOGY_SCHEMA, "nodes": [], "edges": [], "dropped": [],
             "queueMeta": {"snapshotPath": str(root / mb.SNAPSHOT_REL), "dbPath": Path(mb.DB_REL).name, "approvalRequired": True}}
@@ -475,8 +511,8 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                                 for n in graph["nodes"]):
                 continue  # Human-approved identical content needs no new receipts or item.
             existing = next((n for n in graph["nodes"] if _overlap(n, node)
-                             and md.approval_state(n, "node") == "pending" and n.get("verdict") != md.REJECTED
-                             and not any(md.approval_state(e, "edge") == "rejected" for e in n.get("edges", []))
+                             and md.approval_state(n, "node") == TIER_PENDING and n.get("verdict") != md.REJECTED
+                             and not any(md.approval_state(e, "edge") == TIER_REJECTED for e in n.get("edges", []))
                              and bool(launched) == any(trusted_record(r, n) for r in n.get("proposers", []))
                              and mb._node_edges_verify(n, snapshot) is None), None)
             if existing is not None:
@@ -512,11 +548,12 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                                    root / mb.DB_REL, graph, replaces_sha=md.graph_sha256(old) if old else None)
         state_rel = RUNS_REL + "/" + run_id + ".json"
         state = _read(root, state_rel, _run_state(current))
+        _keep_rejections(state, rejected)
         if complete:
             _complete_batch(root, current, state)
         _write(root, state_rel, state)
         return {"ok": True, "runId": run_id, "batchId": batch_id, "added": added, "merged": merged,
-                "itemIds": list(dict.fromkeys(touched)), "rejected": rejected, "proposer": proposer,
+                "itemIds": list(dict.fromkeys(touched)), TIER_REJECTED: rejected, "proposer": proposer,
                 "approvalRequired": True, "trustBoundary": TRUST_BOUNDARY}
 
 
@@ -569,9 +606,9 @@ def _verification_candidates(root, vendor, model, agreement):
     config = mb.tier_config(graph, config)
     out = []
     for node in (graph or {}).get("nodes", []):
-        if md.approval_state(node, "node") != "pending" or node.get("verdict") == md.REJECTED:
+        if md.approval_state(node, "node") != TIER_PENDING or node.get("verdict") == md.REJECTED:
             continue
-        if mb.item_tier(node, snapshot=snapshot, config=config) != "pending":
+        if mb.item_tier(node, snapshot=snapshot, config=config) != TIER_PENDING:
             continue  # Already a hint: another SUPPORTED verdict cannot promote it.
         if mb._node_edges_verify(node, snapshot or {}):
             continue
@@ -588,7 +625,7 @@ def _verification_candidates(root, vendor, model, agreement):
         supported = _receipt(vendor, hypothetical, "a" * 24, {"model": model})
         supported["verdict"] = "SUPPORTED"
         hypothetical.setdefault("verification", []).append(seal_receipt(supported))
-        if mb.item_tier(hypothetical, snapshot=snapshot, config=config) != "hint":
+        if mb.item_tier(hypothetical, snapshot=snapshot, config=config) != TIER_HINT:
             continue
         out.append(node)
     # Stable queue order resolves ties (timestamps have second precision).
@@ -663,7 +700,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
         def prompt_record(vendor, model, kind, prompt, data):
             assert not prompt.startswith("-")
             return {"vendor": vendor, "model": model, "kind": kind, "prompt": prompt, "stdinText": data,
-                    "isolation": "tool-free", "argv": vc._claude_argv(model) + [prompt] if vendor == "claude" else None}
+                    **vc.launch_plan(vendor, prompt, model)}
 
         def call(vendor, model, kind, prompt, data, **identity):
             report["calls"] += 1
@@ -698,7 +735,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     target = next((n for n in (graph or {}).get("nodes", []) if n["id"] == nid), None)
                     live_snap, _ = mb._load_snapshot(root)
                     if (target is None or trust_digest(target) != trust_digest(node)
-                            or md.approval_state(target, "node") == "rejected" or target.get("verdict") == md.REJECTED
+                            or md.approval_state(target, "node") == TIER_REJECTED or target.get("verdict") == md.REJECTED
                             or mb._node_edges_verify(target, live_snap or {})
                             or any(md._verify_pin_dict(pin, live_snap or {}, "evidence") for pin in evidence_pins(target))):
                         report["droppedOutput"] += 1
@@ -779,7 +816,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             break
                         submitted = _submit(root, run_id, batch["batchId"], cands, v, result, batch, complete=False)
                         report["items"].extend(submitted["itemIds"])
-                        report["rejectedCandidates"] += len(submitted["rejected"])
+                        _keep_rejections(report, submitted[TIER_REJECTED])
                     if not success:
                         break  # retry only in a subsequent explicit invocation
                     with md.queue_lock(root / mb.QUEUE_REL):
@@ -814,17 +851,20 @@ def dream_status(repo):
     try:
         root, _ = _repo(repo)
         sessions = _read(root, STATE_REL, {"sessions": {}})["sessions"]
-        tiers = mb.dream_items(root, tiers=("approved", "hint", "pending"))
+        tiers = mb.dream_items(root, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING))
         runs = []
         if (root / RUNS_REL).is_dir():
             for p in sorted((root / RUNS_REL).glob("*.json")):
                 if _ID.fullmatch(p.stem):
                     st = _read(root, RUNS_REL + "/" + p.name, {})
                     runs.append({"runId": p.stem, "lane": st.get("lane", "host"), "failedBatches": len(st.get("failed", {})),
-                                 "completedBatches": len(st.get("completed", [])), "lastRun": st.get("lastRun")})
+                                 "completedBatches": len(st.get("completed", [])), "lastRun": st.get("lastRun"),
+                                 "rejectedCandidates": st.get("rejectedCandidates", 0),
+                                 "rejections": st.get("rejections", []), "rejectionsOmitted": st.get("rejectionsOmitted", 0)})
         runs.sort(key=lambda run: (run["lane"] != "trusted", run["runId"]))
         return {"ok": True, "waiting": sum(s.get("ingested") is True and s["lines"] > s["dreamed"] for s in sessions.values()), "runs": runs,
                 "failedBatches": sum(run["failedBatches"] for run in runs),
+                "rejectedCandidates": sum(run["rejectedCandidates"] for run in runs),
                 "counts": tiers["counts"], "items": tiers["items"], "notices": tiers["notices"], "trustBoundary": TRUST_BOUNDARY}
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
         return mb._fail(str(exc), 2)

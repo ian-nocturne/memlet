@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from memlet.memlet_wiki import estimate_tokens
+from .vocabulary import APPROVED, PENDING as REVIEW_PENDING, REJECTED as REJECTED_DECISION
 
 DREAM_ONTOLOGY_SCHEMA = "memlet.dream_ontology.v1"
 CORTEX_LINEAGE_SCHEMA = "memlet.cortex_lineage.v1"
@@ -1335,6 +1336,11 @@ def format_flat_memory(
                 f"- [{lid}] ({category_label(cat)} | {scope_lbl}) {title_lbl}\n"
                 f"  quote [{safe_sp} {safe_sha}]: {clean_q}"
             )
+        if len(lesson_lines(n)) > 1 and not sp:
+            from .memlet_bridge import safe_lesson_display
+            entry = entry.split("\n", 1)[0] + "\n" + "\n".join(
+                "  > " + safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(), limit=_FLAT_QUOTE_CHARS)
+                + " [" + p["span"] + "]" for p in lesson_lines(n))
         candidate = "\n".join(lines + [entry])
         if estimate_tokens(candidate) > budget:
             break
@@ -1860,6 +1866,14 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             )
             bucket = sec_governs
 
+        parts = lesson_lines(n)
+        if len(parts) > 1 and b_kind != "supersedes":
+            item = item.split("\n", 1)[0]
+            for part in parts:
+                types = [e["edgeType"] for e in lesson_edge_sources(n)
+                         if (lambda span: span and span[0] == part["file"] and span[1] <= part["start"] <= span[2])(parse_span(e["span"]))]
+                source_mark = ("; " + ", ".join(sorted(set(types))) + " source") if types else ""
+                item += "\n  > " + _window_quote(part["quote"], is_replacement=False) + " [" + part["span"] + source_mark + "]"
         bucket_idx = len(bucket)
         bucket.append(item)
         cand_formatted = _assemble_sections(header, sec_blocks, sec_resolves, sec_governs, sec_supersedes)
@@ -1968,12 +1982,12 @@ def build_cortex_lineage_payload(
         cited = _citation_ok(n, "node") and all(_citation_ok(e, "edge") for e in (n.get("edges") or [])
                                                 if isinstance(e, dict))
         node_cited.append(cited)
-        if st == "approved" and not cited:
+        if st == APPROVED and not cited:
             st = "unverified"  # approved by a human, but its cited text cannot be verified now
-        if st == "approved":
+        if st == APPROVED:
             n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
             n["edgeVerdict"] = "VALID"
-        elif st == "rejected":
+        elif st == REJECTED_DECISION:
             n["verdict"] = REJECTED
         else:
             # Pending items stay visible for review; structure only, relabelled below.
@@ -1985,13 +1999,13 @@ def build_cortex_lineage_payload(
     edge_review: Dict[str, str] = {}
     for eid, refs in _edge_refs(display).items():
         st = _edge_state(refs)
-        if st == "approved" and not all(_citation_ok(r, "edge") for r in refs):
+        if st == APPROVED and not all(_citation_ok(r, "edge") for r in refs):
             st = "unverified"
         edge_review[eid] = st
         for ref in refs:
-            if st == "approved":
+            if st == APPROVED:
                 ref["edgeVerdict"] = "VALID"
-            elif st == "rejected":
+            elif st == REJECTED_DECISION:
                 ref["edgeVerdict"] = REJECTED
             elif str(ref.get("edgeVerdict") or "").upper() == PENDING:
                 ref["edgeVerdict"] = "UNVERIFIED"
@@ -2068,9 +2082,9 @@ def build_cortex_lineage_payload(
         st = "superseded" if (is_declared_sup or lid in superseded_target_ids) else (
             "dead_end" if cat == "repeated_pitfall" else "active"
         )
-        raw_q_lines = pp.get("quoteLines") if isinstance(pp.get("quoteLines"), list) else []
+        raw_q_lines = [p["quote"] for p in lesson_lines(n)]
         raw_vendors = n.get("vendorOrigins") if isinstance(n.get("vendorOrigins"), list) else []
-        is_approved = node_review[idx] == "approved"
+        is_approved = node_review[idx] == APPROVED
         approver = str((n.get("approval") or {}).get("by") or "") if is_approved else ""
         unverified = node_review[idx] == "unverified"
         nodes_out.append({
@@ -2081,10 +2095,11 @@ def build_cortex_lineage_payload(
             "status": st,
             "isSuperseded": st == "superseded",
             "inRecallCapsule": bool(is_approved and ((not has_recall_info) or (lid in included_set))),
-            "reviewState": "approved" if is_approved else "pending",
+            "reviewState": APPROVED if is_approved else REVIEW_PENDING,
             "vendorOrigins": [safe_truncate_masked(str(v), 48) for v in raw_vendors],
             "srcSpan": safe_truncate_masked(str(pp.get("span") or ""), 64),
             "quoteLines": [_display_snapshot_line(ln) for ln in raw_q_lines],
+            **({"cites": lesson_display_fields(n)["cites"], "edgeSources": lesson_edge_sources(n)} if len(raw_q_lines) > 1 else {}),
             "sha256Pin": str(pp.get("sha256") or ""),
             "supersededBySpan": safe_truncate_masked(str(sp.get("span") or ""), 64) if sp else None,
             "supersededBySha256": str(sp.get("sha256") or "") if sp else None,
@@ -2129,7 +2144,7 @@ def build_cortex_lineage_payload(
             "targetSpan": safe_truncate_masked(str(tp.get("span") or ""), 64) if tp else None,
             "targetSha256": str(tp.get("sha256") or "") if tp else None,
             "vendorOrigin": safe_truncate_masked(str(e.get("vendorOrigin") or ""), 64),
-            "reviewState": "approved" if edge_review.get(str(e.get("edgeId") or "")) == "approved" else "pending",
+            "reviewState": APPROVED if edge_review.get(str(e.get("edgeId") or "")) == APPROVED else REVIEW_PENDING,
         })
     sub_d = subgraph_info if isinstance(subgraph_info, dict) else {}
     return {
@@ -2142,7 +2157,7 @@ def build_cortex_lineage_payload(
             "counts": dict(sub_d.get("counts") or {}) if isinstance(sub_d.get("counts"), dict) else {},
             "pinVerification": str(sub_d.get("pinVerification") or "not_reported"),
         },
-        "pendingReviewCount": sum(1 for n in nodes_out if n.get("reviewState") == "pending"),
+        "pendingReviewCount": sum(1 for n in nodes_out if n.get("reviewState") == REVIEW_PENDING),
         "unverifiedCitationCount": sum(1 for n in nodes_out if not n.get("citationVerified")),
     }
 
@@ -2810,8 +2825,6 @@ def run_dream_build(
 # Approval API (library only). Approval is the only way an item leaves PENDING.
 # ---------------------------------------------------------------------------------------------
 
-APPROVED = "approved"
-REJECTED_DECISION = "rejected"
 APPROVAL_RECORD_SCHEMA = "memlet.dream_approval.v1"
 APPROVAL_BOUNDARY = (
     "Approval records are integrity checks, not signatures: each one binds the approver name, a UTC time and a "
@@ -2892,22 +2905,22 @@ def approval_state(item: Any, kind: str) -> str:
     (it can only hide an item). See `APPROVAL_BOUNDARY` for what this does and does not protect against.
     """
     if not isinstance(item, dict):
-        return "pending"
+        return REVIEW_PENDING
     rec = item.get("approval")
     if not isinstance(rec, dict):
-        return "pending"
+        return REVIEW_PENDING
     decision = rec.get("decision")
     if decision == REJECTED_DECISION:
-        return "rejected"
+        return REJECTED_DECISION
     if decision != APPROVED:
-        return "pending"
+        return REVIEW_PENDING
     by = rec.get("by")
     if not isinstance(by, str) or not by.strip() or not _valid_utc_stamp(rec.get("at")):
-        return "pending"
+        return REVIEW_PENDING
     expected = node_approval_digest(item) if kind == "node" else edge_approval_digest(item)
     if rec.get("digest") != expected:
-        return "pending"
-    return "approved"
+        return REVIEW_PENDING
+    return APPROVED
 
 
 def _load_queue(queue_path: Any) -> Tuple[Path, Dict[str, Any]]:
@@ -3063,11 +3076,11 @@ def _edge_refs(graph: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
 def _edge_state(refs: List[Dict[str, Any]]) -> str:
     """An edge is approved only if every stored copy carries a valid approval for identical content."""
     states = {approval_state(r, "edge") for r in refs}
-    if "rejected" in states:
-        return "rejected"
-    if states == {"approved"} and len({edge_approval_digest(r) for r in refs}) == 1:
-        return "approved"
-    return "pending"
+    if REJECTED_DECISION in states:
+        return REJECTED_DECISION
+    if states == {APPROVED} and len({edge_approval_digest(r) for r in refs}) == 1:
+        return APPROVED
+    return REVIEW_PENDING
 
 
 def _locate_snapshot(
@@ -3150,13 +3163,13 @@ def citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) 
         reason = _verify_item_pins(n, "node", snapshot)
         for e in n.get("edges") or []:
             reason = reason or _verify_item_pins(e, "edge", snapshot)
-        if reason and approval_state(n, "node") != "rejected":
+        if reason and approval_state(n, "node") != REJECTED_DECISION:
             n["citationReason"] = reason
             n.pop("approval", None)
             n["verdict"] = PENDING
     for refs in _edge_refs(view).values():
         for e in refs:
-            if _verify_item_pins(e, "edge", snapshot) and approval_state(e, "edge") != "rejected":
+            if _verify_item_pins(e, "edge", snapshot) and approval_state(e, "edge") != REJECTED_DECISION:
                 e.pop("approval", None)
                 e["edgeVerdict"] = PENDING
     return view
@@ -3198,6 +3211,61 @@ def citation_verified_graph(graph: Dict[str, Any], snapshot: Dict[str, List[str]
     return view
 
 
+def lesson_lines(node):
+    """Distinct own cited lines in file/line order; display never changes pins or digests."""
+    from .vocabulary import MAX_LESSON_LINES
+    pins = node.get("allPins") or [node.get("primaryPin")]
+    lines = {}
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        parsed = parse_span(str(pin.get("span", "")))
+        if not parsed:
+            continue
+        f, start, end = parsed
+        quotes = pin.get("quoteLines") or str(pin.get("quoteText", "")).split("\n")
+        for number, quote in zip(range(start, end + 1), quotes):
+            if not isinstance(quote, str):
+                continue
+            lines[(f, number)] = {"file": f, "start": number, "end": number,
+                                  "span": "%s:%d" % (f, number), "quote": quote,
+                                  "sha256": sha256_hex(quote)}
+    return [lines[k] for k in sorted(lines)[:MAX_LESSON_LINES]]
+
+
+def lesson_quote_digest(node):
+    # A full set of quote hashes, independent of location, closes re-proposal
+    # bypasses while allowing two different fixes for the same symptom.
+    return _canonical_digest({"quotes": sorted({p["sha256"] for p in lesson_lines(node)})})
+
+
+def lesson_edge_sources(node):
+    return [{"edgeType": e.get("edgeType"), "span": e["srcPin"]["span"]}
+            for e in node.get("edges", []) if isinstance(e.get("srcPin"), dict) and parse_span(e["srcPin"].get("span", ""))]
+
+
+def lesson_text(node):
+    from .memlet_bridge import safe_lesson_display
+    from .vocabulary import LESSON_SEPARATOR
+    parts = lesson_lines(node)
+    if len(parts) <= 1:  # Preserve legacy single-citation display exactly.
+        text = (node.get("primaryPin") or {}).get("quoteText") or node.get("title") or ""
+        return safe_lesson_display(_LINE_PREFIX_RE.sub("", str(text), count=1).strip(), limit=LESSON_TEXT_MAX_CHARS)
+    return LESSON_SEPARATOR.join(safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(),
+                                                    limit=LESSON_TEXT_MAX_CHARS) for p in parts)
+
+
+def lesson_display_fields(node):
+    from .memlet_bridge import safe_lesson_display
+    parts = lesson_lines(node)
+    if len(parts) <= 1:
+        return {}
+    return {"quoteLines": [safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(),
+                                              limit=LESSON_TEXT_MAX_CHARS) for p in parts],
+            "cites": [{k: v for k, v in p.items() if k != "quote"} for p in parts],
+            "edgeSources": lesson_edge_sources(node)}
+
+
 def category_label(category: Any) -> str:
     """Draft category names describe keyword extraction, never independent verification."""
     return {"verified_workaround": "workaround draft", "verified_procedure": "procedure draft"}.get(
@@ -3219,9 +3287,9 @@ def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
         if not isinstance(n, dict):
             continue
         st = approval_state(n, "node")
-        if st == "approved":
+        if st == APPROVED:
             counts["approvedNodes"] += 1
-        elif st == "rejected":
+        elif st == REJECTED_DECISION:
             counts["rejectedNodes"] += 1
         else:
             pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
@@ -3235,7 +3303,8 @@ def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
                 "claimedVerdict": n.get("claimedVerdict"),
                 "staleApproval": isinstance(n.get("approval"), dict) or bool(n.get("citationReason")),
                 "citationReason": n.get("citationReason"),
-                "quote": pp.get("quoteText", ""),
+                "quote": lesson_text(n) if len(lesson_lines(n)) > 1 else pp.get("quoteText", ""),
+                **lesson_display_fields(n),
                 "currentQuote": ((resolve_pin(snapshot_files or {}, pp.get("span", "")) or {}).get("quoteText")
                                  if snapshot_files is not None else None),
                 "categoryLabel": category_label(n.get("category")),
@@ -3243,9 +3312,9 @@ def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
     p_edges: List[Dict[str, Any]] = []
     for eid, refs in _edge_refs(graph).items():
         st = _edge_state(refs)
-        if st == "approved":
+        if st == APPROVED:
             counts["approvedEdges"] += 1
-        elif st == "rejected":
+        elif st == REJECTED_DECISION:
             counts["rejectedEdges"] += 1
         else:
             e = refs[0]
@@ -3518,12 +3587,12 @@ def _decide_locked(
                 continue
             n = nodes_by_id[item_id][0]
             cur = approval_state(n, "node")
-            if cur == "rejected" and decision == APPROVED and not reconsider:
+            if cur == REJECTED_DECISION and decision == APPROVED and not reconsider:
                 refused.append({"id": item_id, "reason": "already_rejected"})
                 continue
-            if decision == APPROVED and (refresh_citations or (reconsider and cur == "rejected")):
+            if decision == APPROVED and (refresh_citations or (reconsider and cur == REJECTED_DECISION)):
                 refresh(n, "node")
-                cur = "pending"
+                cur = REVIEW_PENDING
                 for e in n.get("edges", []):
                     for ref in edge_refs.get(str(e.get("edgeId")), [e]):
                         refresh(ref, "edge")
@@ -3537,12 +3606,12 @@ def _decide_locked(
                 else:
                     unchanged.append(item_id)
                 continue
-            if cur != "pending" and decision != REJECTED_DECISION and not reconsider:
+            if cur != REVIEW_PENDING and decision != REJECTED_DECISION and not reconsider:
                 refused.append({"id": item_id, "reason": f"already_{cur}"})
                 continue
             owned = [
                 str(e.get("edgeId")) for e in (n.get("edges") or [])
-                if isinstance(e, dict) and e.get("edgeId") and (decision == REJECTED_DECISION or reconsider or _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == "pending")
+                if isinstance(e, dict) and e.get("edgeId") and (decision == REJECTED_DECISION or reconsider or _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == REVIEW_PENDING)
             ] if cascade_edges else []
             err = _verify_item_pins(n, "node", snap or {}) if decision == APPROVED else None
             if not err:
@@ -3567,14 +3636,14 @@ def _decide_locked(
             done.append(item_id)
         elif item_id in edge_refs:
             cur = _edge_state(edge_refs[item_id])
-            if decision == APPROVED and refresh_citations and (cur != "rejected" or reconsider):
+            if decision == APPROVED and refresh_citations and (cur != REJECTED_DECISION or reconsider):
                 for ref in edge_refs[item_id]:
                     refresh(ref, "edge")
-                cur = "pending"
+                cur = REVIEW_PENDING
             if cur == decision:
                 unchanged.append(item_id)
                 continue
-            if cur != "pending" and decision != REJECTED_DECISION and not reconsider:
+            if cur != REVIEW_PENDING and decision != REJECTED_DECISION and not reconsider:
                 refused.append({"id": item_id, "reason": f"already_{cur}"})
                 continue
             err = _edge_problem(item_id)
@@ -3681,13 +3750,13 @@ def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
         if not isinstance(n, dict):
             continue
         st = approval_state(n, "node")
-        if st == "approved" and not item_quotes_consistent(n, "node"):
-            st = "pending"  # a stored quote no longer matches its pinned hash: never shown as approved
-        if st == "approved":
+        if st == APPROVED and not item_quotes_consistent(n, "node"):
+            st = REVIEW_PENDING  # a stored quote no longer matches its pinned hash: never shown as approved
+        if st == APPROVED:
             n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
             n["edgeVerdict"] = "VALID"
             n["verifiedBy"] = str(n["approval"].get("by"))
-        elif st == "rejected" or str(n.get("verdict") or "").upper() == REJECTED:
+        elif st == REJECTED_DECISION or str(n.get("verdict") or "").upper() == REJECTED:
             stats["rejectedNodes"] += 1
             n["verdict"] = REJECTED
             n["edgeVerdict"] = REJECTED
@@ -3697,11 +3766,11 @@ def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
             n["edgeVerdict"] = PENDING
     for _eid, refs in _edge_refs(g).items():
         st = _edge_state(refs)
-        if st == "approved" and not all(item_quotes_consistent(r, "edge") for r in refs):
-            st = "pending"
-        if st == "approved":
+        if st == APPROVED and not all(item_quotes_consistent(r, "edge") for r in refs):
+            st = REVIEW_PENDING
+        if st == APPROVED:
             mark = "VALID"
-        elif st == "rejected" or str(refs[0].get("edgeVerdict") or "").upper() == REJECTED:
+        elif st == REJECTED_DECISION or str(refs[0].get("edgeVerdict") or "").upper() == REJECTED:
             stats["rejectedEdges"] += 1
             mark = REJECTED
         else:

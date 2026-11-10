@@ -283,14 +283,17 @@ def _admin_groups():
 
 def _configure_help(parser, sub):
     """Keep the legacy parser map intact; limit only argparse's display entries."""
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
     commands = dict(sub.choices)
+    plugin_help = '\n'.join(('memlet ' + name if meta.get('product') else 'memlet admin ' + name) + ': ' + meta['help']
+                            for name, meta in _PLUGIN_COMMANDS.items() if name in ('dream', 'anchors', 'eval'))
     for child in set(commands.values()):
         _add_global_options(child)
     admin = sub.add_parser('admin', help='Advanced and legacy commands.',
                            allow_abbrev=False,
                            formatter_class=argparse.RawDescriptionHelpFormatter,
                            description='Advanced and legacy Memlet commands.',
-                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in _admin_groups()))
+                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in _admin_groups()) + '\n\n' + plugin_help)
     _add_global_options(admin)
     _reserve_legacy_prefixes(admin)
     admin.set_defaults(_admin=True)
@@ -301,7 +304,7 @@ def _configure_help(parser, sub):
     sub._choices_actions = [sub._ChoicesPseudoAction(name, (), description)
                            for name, description in list(_product_commands().items()) +
                            [('admin', 'Advanced and legacy commands.')]]
-    parser.epilog = 'For advanced and legacy commands, run: memlet admin --help'
+    parser.epilog = 'For advanced and legacy commands, run: memlet admin --help\n' + plugin_help
 
 
 def _top_command(argv, parser):

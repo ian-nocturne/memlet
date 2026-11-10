@@ -31,6 +31,10 @@ class EvalTests(unittest.TestCase):
         self.patch = patch.object(vendor_cli, 'run_vendor', vendor)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        # This fixture simulates TWO launchable vendors; production availability is tested in integration.
+        available = patch.object(vendor_cli, 'static_vendor_refusal', return_value=None)
+        available.start()
+        self.addCleanup(available.stop)
         self.output = 'cedar'
 
     def put(self, path, obj):
