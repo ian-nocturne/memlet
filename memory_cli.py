@@ -415,43 +415,251 @@ def _program_name():
     return name if name in PROGRAM_NAMES else 'memlet'
 
 
+PRODUCT_COMMANDS = {
+    'init': 'Set up repository memory and code anchors.',
+    'check': 'Check repository rules and changed code anchors.',
+    'recall': 'Recall relevant rules, lessons, and memory.',
+    'handover': 'Build or verify a handover capsule checksum.',
+    'learn': 'Learn from memory or review transcript lessons.',
+    'ui': 'Export the local memory inspector.',
+}
+ADMIN_GROUPS = (
+    ('Memory store', 'schema brief stats scenes capture recall read skills skill cases links learn feedback '
+     'skill-manage skill-sync index backfill preflight capsule consolidate sync-md export'),
+    ('Rules/wiki', 'init check audit wiki import slim-plan rule-context rule-recall index-build handover'),
+    ('Dream', 'dream-build dream dream-recall dream-pending dream-approve dream-reject'),
+    ('Rescue/anti-slop/pack', 'rescue viberescue anti-slop pack'),
+    ('Benchmarks', 'repo-benchmark compare-bench benchmark-compare benchmark'),
+    ('Maintenance', 'doctor backup restore heal-skills verify-skill inspector ui opsec-check opsec-fingerprint'),
+)
+
+
+class _OutputFormat(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace._format_explicit = True
+
+
+def _add_global_options(parser, *, defaults=False):
+    """Use a separate namespace so a command's own option always wins.
+
+    SUPPRESS on child parsers preserves values parsed before the command.
+    Existing local options are never replaced with a global option.
+    """
+    for name, default in (('root', _default_cli_root()), ('task', ''), ('session', ''), ('standalone', False)):
+        flag = '--' + name
+        if flag in parser._option_string_actions:
+            continue
+        kwargs = {'dest': '_global_' + name, 'default': default if defaults else argparse.SUPPRESS}
+        if name == 'standalone':
+            kwargs.update(action='store_true', help='Bootstrap task automatically if it does not exist')
+        else:
+            kwargs['metavar'] = name.upper()
+        parser.add_argument(flag, **kwargs)
+
+
+def _configure_help(parser, sub):
+    """Keep the legacy parser map intact; limit only argparse's display entries."""
+    commands = dict(sub.choices)
+    for child in set(commands.values()):
+        _add_global_options(child)
+    admin = sub.add_parser('admin', help='Advanced and legacy commands.',
+                           formatter_class=argparse.RawDescriptionHelpFormatter,
+                           description='Advanced and legacy Memlet commands.',
+                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in ADMIN_GROUPS))
+    _add_global_options(admin)
+    admin.set_defaults(_admin=True)
+    nested = admin.add_subparsers(dest='action', required=True, metavar='COMMAND')
+    # These are the very same parsers and handlers, including hidden experiments.
+    nested.choices.update(commands)
+    sub.metavar = '{' + ','.join(list(PRODUCT_COMMANDS) + ['admin']) + '}'
+    sub._choices_actions = [sub._ChoicesPseudoAction(name, (), description)
+                           for name, description in list(PRODUCT_COMMANDS.items()) +
+                           [('admin', 'Advanced and legacy commands.')]]
+    parser.epilog = 'For advanced and legacy commands, run: memlet admin --help'
+
+
+def _top_command(argv, parser):
+    """Read only the root prefix; option values that look like commands are values."""
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in ('--help', '-h', '--version'):
+            return None
+        if not token.startswith('-'):
+            return token
+        flag, equals, _ = token.partition('=')
+        option = parser._option_string_actions.get(flag)
+        if option is None and flag.startswith('--'):
+            matches = [action for key, action in parser._option_string_actions.items() if key.startswith(flag)]
+            option = matches[0] if len(matches) == 1 else None
+        if option is None:
+            return None
+        i += 1 if equals or option.nargs == 0 else 2
+    return None
+
+
+def _deprecated(name, replacement):
+    if os.environ.get('MEMLET_NO_DEPRECATION') != '1':
+        print("memlet: '{}' is now '{}'; the short form will be removed in a future release."
+              .format(name, replacement), file=sys.stderr)
+
+
+def _bridge_call(name, *args, **kwargs):
+    try:
+        from prism_memory import memlet_bridge
+    except ImportError:
+        return {'ok': False, 'error': 'Repository memory bridge is unavailable; install a Memlet build '
+                'containing prism_memory.memlet_bridge.', 'exitCode': 1}
+    return getattr(memlet_bridge, name)(*args, **kwargs)
+
+
+def _route_new(args):
+    """New flags take explicit routes; flag-less legacy handlers below stay intact."""
+    if args.action in ('check', 'audit'):
+        repo = args.repo_path or args.repo_positional or '.'
+        if args.changed:
+            return _bridge_call('changed_check', repo, base=args.base)
+        if args.accept:
+            return _bridge_call('accept_anchor', repo, anchors=args.accept, dry_run=args.dry_run)
+        if args.repin_legacy_ts:
+            from prism_memory.memlet_wiki import repin_legacy_ts_anchors
+            return repin_legacy_ts_anchors(repo, dry_run=args.dry_run)
+    if args.action == 'recall' and (args.unified or args.positional_query is not None):
+        kwargs = {'budget': args.budget}
+        if args.standalone or args.task:
+            store = WorkStore(args.root)
+            task = args.task or _standalone_task_id()
+            if args.standalone:
+                store.ensure_standalone_task(task, session=args.session or 'standalone-owner')
+            kwargs.update(store=store, task=task)
+        return _bridge_call('unified_recall', args.repo,
+                            args.positional_query if args.positional_query is not None else args.query, **kwargs)
+    if args.action == 'learn' and not args.file:
+        if args.transcript:
+            return _bridge_call('learn_from_transcript', args.repo, args.transcript, vendor=args.vendor)
+        if args.pending:
+            return _bridge_call('learn_pending', args.repo)
+        if args.approve:
+            return _bridge_call('learn_approve', args.repo, ids=args.approve, approver=args.by)
+        if args.reject:
+            return _bridge_call('learn_reject', args.repo, ids=args.reject, approver=args.by, reason=args.reason)
+    if args.action == 'handover' and args.verify:
+        from prism_memory.memlet_wiki import verify_handover_checksum, verify_handover_markdown
+        try:
+            path = Path(args.verify)
+            content = path.read_text(encoding='utf-8')
+            ok = (verify_handover_checksum(json.loads(content)) if path.suffix.lower() == '.json'
+                  else verify_handover_markdown(content))
+            reason = 'checksum verified' if ok else 'checksum mismatch or missing checksum'
+        except (OSError, ValueError) as exc:
+            ok, reason = False, 'cannot verify capsule: ' + ' '.join(str(exc).splitlines())
+        result = {'ok': ok, 'exitCode': 0 if ok else 1, 'reason': reason}
+        if not (getattr(args, '_format_explicit', False) and args.format == 'json'):
+            result['_cli_text'] = 'memlet: ' + reason + '\n'
+        return result
+    if args.action == 'dream-pending':
+        from prism_memory.memlet_dream import list_pending
+        return list_pending(args.graph)
+    if args.action == 'dream-approve':
+        from prism_memory.memlet_dream import approve_queue_items
+        return approve_queue_items(args.graph, args.ids, approver=args.by,
+                                   snapshot_path=args.snapshot, db_path=args.db)
+    if args.action == 'dream-reject':
+        from prism_memory.memlet_dream import reject_queue_items
+        return reject_queue_items(args.graph, args.ids, approver=args.by, reason=args.reason, db_path=args.db)
+    return None
+
+
+def _text_result(result):
+    """Prefer the handler's rendering, with a text fallback for store/UI responses."""
+    if isinstance(result.get('formatted'), str):
+        return result['formatted']
+
+    def lines(value, depth=0):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.startswith('_cli_'):
+                    continue
+                if isinstance(child, (dict, list)):
+                    yield '  ' * depth + '- ' + str(key) + ':'
+                    yield from lines(child, depth + 1)
+                else:
+                    yield '  ' * depth + '- ' + str(key) + ': ' + str(child)
+        elif isinstance(value, list):
+            for child in value:
+                if isinstance(child, (dict, list)):
+                    yield from lines(child, depth)
+                else:
+                    yield '  ' * depth + '- ' + str(child)
+    return '\n'.join(lines(result))
+
+
 def main():
-    parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet (formerly Ieum Memory / DeltaHarness / PRISM Memory): '+__doc__)
+    parser = _build_parser()
+    argv = sys.argv[1:]
+    command = _top_command(argv, parser)
+    if command and command not in PRODUCT_COMMANDS and command != 'admin':
+        sub = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+        if command in sub.choices:
+            _deprecated(command, 'memlet admin ' + command)
+    args = parser.parse_args(argv)
+    for name in ('root', 'task', 'session', 'standalone'):
+        if not hasattr(args, name):
+            setattr(args, name, getattr(args, '_global_' + name))
+    if args.action == 'learn' and (args.approve or args.reject) and not args.by.strip():
+        parser.error('learn --approve/--reject requires --by NAME')
+    if args.action == 'recall' and args.budget is None:
+        args.budget = 1200 if args.unified or args.positional_query is not None else 6000
+    human = args.action in PRODUCT_COMMANDS
+    if human and not getattr(args, '_format_explicit', False) and sys.stdout.isatty():
+        args.format = 'markdown'
+    result = _main(args, parser)
+    if human and args.format == 'markdown' and isinstance(result, dict) and '_cli_text' not in result:
+        rendered = _text_result(result)
+        result['_cli_text'] = rendered + ('\n' if rendered and not rendered.endswith('\n') else '')
+    return result
+
+
+def _build_parser():
+    parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet: local repository memory.')
     from prism_memory import VERSION
     parser.add_argument('--version',action='version',version=VERSION)
-    parser.add_argument('--root',default=_default_cli_root())
-    parser.add_argument('--task',default='')
-    parser.add_argument('--session',default='')
-    parser.add_argument('--standalone',action='store_true',help='Bootstrap task automatically if it does not exist')
+    _add_global_options(parser, defaults=True)
     sub=parser.add_subparsers(dest='action',required=True)
     sub.add_parser('schema'); sub.add_parser('brief'); sub.add_parser('stats'); sub.add_parser('scenes'); sub.add_parser('doctor')
     bak_p=sub.add_parser('backup');bak_p.add_argument('--dest-dir',default=None);bak_p.add_argument('--include-models',action='store_true')
     res_p=sub.add_parser('restore');res_p.add_argument('--backup-dir',required=True)
     rb_p=sub.add_parser('repo-benchmark');rb_p.add_argument('--work-dir',default=None)
     aud_p=sub.add_parser('audit',aliases=['check']);aud_p.add_argument('repo_positional',nargs='?',default=None);aud_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    aud_p.add_argument('--base',default=None);aud_p.add_argument('--head',default='HEAD');aud_p.add_argument('--format',default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
+    aud_p.add_argument('--base',default=None);aud_p.add_argument('--head',default='HEAD');aud_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
+    check_mode=aud_p.add_mutually_exclusive_group()
+    check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
+    check_mode.add_argument('--accept',action='append',default=[],metavar='ANCHOR',help='Re-pin a named path::symbol anchor (repeatable)')
+    check_mode.add_argument('--repin-legacy-ts',action='store_true',help='Re-pin legacy TypeScript anchors')
+    aud_p.add_argument('--dry-run',action='store_true',help='Preview supported anchor updates')
     resc_p=sub.add_parser('rescue',aliases=['viberescue']);resc_p.add_argument('repo_positional',nargs='?',default=None);resc_p.add_argument('extra_positional',nargs='?',default=None);resc_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    resc_p.add_argument('--write',action='store_true');resc_p.add_argument('--output-dir',default=None);resc_p.add_argument('--format',default='json',choices=['json','markdown','prompt']);resc_p.add_argument('--exit-zero',action='store_true')
+    resc_p.add_argument('--write',action='store_true');resc_p.add_argument('--output-dir',default=None);resc_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','prompt']);resc_p.add_argument('--exit-zero',action='store_true')
     slop_p=sub.add_parser('anti-slop');slop_p.add_argument('repo_positional',nargs='?',default=None);slop_p.add_argument('extra_positional',nargs='?',default=None);slop_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    slop_p.add_argument('--lock',action='store_true');slop_p.add_argument('--force',action='store_true');slop_p.add_argument('--archetype',default='linear-precision');slop_p.add_argument('--format',default='json',choices=['json','markdown','prompt']);slop_p.add_argument('--exit-zero',action='store_true')
+    slop_p.add_argument('--lock',action='store_true');slop_p.add_argument('--force',action='store_true');slop_p.add_argument('--archetype',default='linear-precision');slop_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','prompt']);slop_p.add_argument('--exit-zero',action='store_true')
     init_p=sub.add_parser('init',help='Zero-daemon onboarding: create .memlet/config.json and .memlet/wiki/INDEX.md (never reads .env)')
     init_p.add_argument('repo_positional',nargs='?',default=None);init_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     init_p.add_argument('--dry-run',action='store_true');init_p.add_argument('--force',action='store_true',help='Regenerate INDEX.md and re-pin anchors')
-    init_p.add_argument('--format',default='json',choices=['json','markdown'])
+    init_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     wiki_p=sub.add_parser('wiki',help='Check AST anchors in .memlet/wiki/*.md (active / compatible-unverified / stale)')
     wiki_p.add_argument('repo_positional',nargs='?',default=None);wiki_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    wiki_p.add_argument('--dry-run',action='store_true');wiki_p.add_argument('--format',default='json',choices=['json','markdown'])
+    wiki_p.add_argument('--dry-run',action='store_true');wiki_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     imp_rules_p=sub.add_parser('import',help='Import rules from CLAUDE.md / AGENTS.md / .cursorrules / .ai-memory / .claude-mem and tag each with its live AST status')
     imp_rules_p.add_argument('repo_positional',nargs='?',default=None);imp_rules_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     imp_rules_p.add_argument('--from',dest='source',default='auto',choices=['auto','claude-md','cursorrules','ai-memory','claude-mem'])
-    imp_rules_p.add_argument('--dry-run',action='store_true');imp_rules_p.add_argument('--format',default='json',choices=['json','markdown'])
+    imp_rules_p.add_argument('--dry-run',action='store_true');imp_rules_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     slim_p=sub.add_parser('slim-plan',help='Propose a slimmer AGENTS.md by moving (never rewriting) older directives into an indexed log; writes only to --out, with a preservation proof')
     slim_p.add_argument('repo_positional',nargs='?',default=None);slim_p.add_argument('--out',required=True)
     slim_p.add_argument('--keep-recent',type=int,default=2);slim_p.add_argument('--split-rules',action='store_true')
-    dream_b=sub.add_parser('dream-build',aliases=['dream'],help='Build verified Dream ontology graph + SQLite tables from session logs and optional candidates (no model call)')
+    dream_b=sub.add_parser('dream-build',aliases=['dream'],help='Build a PENDING approval queue from session logs and optional candidates (no model call)')
     dream_b.add_argument('--candidates',default=None,help='Optional path to raw candidate JSON; if omitted, deterministically extracts candidates from --snapshot')
-    dream_b.add_argument('--snapshot',required=True,help='Path to session log directory (*.log) or JSON snapshot map')
-    dream_b.add_argument('--out-json',required=True,help='Output path for verified ontology JSON')
+    dream_b.add_argument('--snapshot',required=True,help='Path to a .log/.jsonl transcript, log directory, or JSON snapshot map')
+    dream_b.add_argument('--out-json',required=True,help='Output path for the PENDING approval queue JSON')
     dream_b.add_argument('--out-db',default=None,help='Optional SQLite DB path to write ontology_nodes, ontology_edges, and dream_runs')
     dream_b.add_argument('--vendor',default='autonomous-deterministic',help='Extractor vendor tag')
     dream_p=sub.add_parser('dream-recall',help='1-hop ontology subgraph recall (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS) from a verified Dream queue JSON (no model call)')
@@ -460,7 +668,19 @@ def main():
     dream_p.add_argument('--budget','--max-tokens',dest='budget',type=int,default=1500,help='Maximum token budget (default 1500)')
     dream_p.add_argument('--snapshot',default=None,help='Optional log directory or JSON snapshot map to verify pins before recall')
     dream_p.add_argument('--out-md',default=None,help='Optional path to write the Markdown approval queue capsule')
-    dream_p.add_argument('--format',default='json',choices=['json','markdown'],help='Stdout format (json or markdown)')
+    dream_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'],help='Stdout format (json or markdown)')
+    dream_p.add_argument('--allow-unverified',action='store_true',help='Allow recall without a snapshot, labelled UNVERIFIED')
+    for name in ('dream-pending','dream-approve','dream-reject'):
+        p=sub.add_parser(name)
+        p.add_argument('--graph',required=True,help='Path to the Dream approval queue JSON')
+        if name!='dream-pending':
+            p.add_argument('ids',nargs='+',metavar='ID')
+            p.add_argument('--by',required=True,help='Name of the human reviewer')
+            p.add_argument('--db',default=None,help='Optional SQLite ontology database')
+            if name=='dream-approve':
+                p.add_argument('--snapshot',default=None,help='Snapshot used to verify citation pins')
+            else:
+                p.add_argument('--reason',default='')
     rctx_p=sub.add_parser('rule-context',help='T0 safety core (verbatim quotes) + T1 rule index from the verified INDEX-RULES.md (no model call)')
     rctx_p.add_argument('repo_positional',nargs='?',default=None)
     rctx_p.add_argument('--core-budget',type=int,default=600);rctx_p.add_argument('--index-budget',type=int,default=600)
@@ -474,16 +694,18 @@ def main():
     index_p.add_argument('repo_positional',nargs='?',default=None)
     index_p.add_argument('--via',default='claude',choices=['claude'])
     brief_p=sub.add_parser('brief-build',help='EXPERIMENTAL (failed its faithfulness evaluation): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified')
+    brief_p.description='EXPERIMENTAL: failed its faithfulness evaluation; meaning is NOT verified.'
     brief_p.add_argument('repo_positional',nargs='?',default=None)
     brief_p.add_argument('--via',default='claude',choices=['claude'],help='Runner: claude only (tool-free, claude.ai subscription verified before the call; refuses API-key auth)')
-    hand_p=sub.add_parser('handover',help='Signed, budgeted handover capsule (default <500 tokens): verified constraints only, stale anchors quarantined')
+    hand_p=sub.add_parser('handover',help='Checksummed, budgeted handover capsule: constraints with matching pins; stale anchors quarantined')
     hand_p.add_argument('repo_positional',nargs='?',default=None);hand_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     hand_p.add_argument('--next-step',default=None);hand_p.add_argument('--rejected',action='append',default=[],help='Rejected approach / dead-end (repeatable)')
-    hand_p.add_argument('--format',default='json',choices=['json','markdown']);hand_p.add_argument('--write',action='store_true',help='Write .memlet/wiki/HANDOVER.md and record a handover ledger event')
-    hand_p.add_argument('--mode',default=None,choices=['verified','digest','brief','index'],help='verified (default): code-anchored rules only; index: verbatim key rules + topic index (.memlet/wiki/INDEX-RULES.md); digest and brief are EXPERIMENTAL (failed their evaluations; not a replacement for the instructions)')
+    hand_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown']);hand_p.add_argument('--write',action='store_true',help='Write .memlet/wiki/HANDOVER.md and record a handover ledger event')
+    hand_p.add_argument('--mode',default=None,choices=['verified','digest','brief','index'],metavar='{verified,index}',help='verified (default): code-anchored rules; index: verbatim key rules and topic index')
     hand_p.add_argument('--budget',default=None,help='Token budget: a number (clamped to 500-2000) or auto (~12%% of the instruction text); default from .memlet/config.json handover.tokenBudget, else 500')
+    hand_p.add_argument('--verify',metavar='FILE',help='Verify a JSON or Markdown capsule checksum')
     cmp_p=sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet')
-    cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',default='json',choices=['json','markdown'])
+    cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     opsec_p=sub.add_parser('opsec-check');opsec_p.add_argument('repo_positional',nargs='?',default=None);opsec_p.add_argument('--file','--repo-path','--repo',dest='target_file',default=None);opsec_p.add_argument('--canon',default=None);opsec_p.add_argument('--history',action='store_true',help='Also scan added lines in the full git history (git log -p --all); exit 2 if history cannot be scanned');opsec_p.add_argument('--require-canon',action='store_true',help='Exit 2 when no persona canon (fingerprint file) is found')
     sub.add_parser('opsec-fingerprint',help='Read one identifier per stdin line and print its sha256 fingerprint (plaintext is not stored)')
     heal_p=sub.add_parser('heal-skills');heal_p.add_argument('--dry-run',action='store_true')
@@ -495,7 +717,7 @@ def main():
     sync_md_p=sub.add_parser('sync-md');sync_md_p.add_argument('--note-path',default=None);sync_md_p.add_argument('--explicit-user',action='store_true')
     bench_p=sub.add_parser('benchmark',help='Without --task: refactoring & handover comparison benchmark; with --task: memory store benchmark')
     bench_p.add_argument('repo_positional',nargs='?',default=None);bench_p.add_argument('--budget',type=int,default=6000)
-    bench_p.add_argument('--format',default=None,choices=['json','markdown'])
+    bench_p.add_argument('--format',action=_OutputFormat,default=None,choices=['json','markdown'])
     insp_p=sub.add_parser('inspector',help='Without --task: same HTML report as `ui`; with --task: task-memory inspector');insp_p.add_argument('--budget',type=int,default=6000)
     ui_p=sub.add_parser('ui',help='Nocturne Memory & Routing Inspector: self-contained HTML report (AST health, benchmark, handover, Routlet matrix)')
     for p in (insp_p,ui_p):
@@ -505,14 +727,19 @@ def main():
     pack_p.add_argument('repo_positional',nargs='?',default=None,help='Output directory (same as --output)')
     pack_p.add_argument('--stack',default='all',choices=PACK_STACK_CHOICES);pack_p.add_argument('--output',default=None,help='Output directory; omit to compute in memory only')
     pack_p.add_argument('--output-dir',default=None);pack_p.add_argument('--dry-run',action='store_true');pack_p.add_argument('--list',action='store_true',help='List available stack packs')
-    pack_p.add_argument('--format',default='json',choices=['json','markdown'])
+    pack_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     exp_p=sub.add_parser('export');exp_p.add_argument('--targets',default='claude,agents,cursor,windsurf,mcp')
     exp_p.add_argument('--target-dir',default=None);exp_p.add_argument('--write',action='store_true');exp_p.add_argument('--lang',default='ko')
     cap_p=sub.add_parser('capture');cap_p.add_argument('--file',default=None);cap_p.add_argument('--text',default=None)
     cap_p.add_argument('--kind',default='auto');cap_p.add_argument('--command',default='');cap_p.add_argument('--operation-id',default='')
     recall=sub.add_parser('recall');recall.add_argument('--query',default='');recall.add_argument('--at');recall.add_argument('--known-at')
     recall.add_argument('--before');recall.add_argument('--after');recall.add_argument('--shared',action='store_true');recall.add_argument('--federated',action='store_true')
-    recall.add_argument('--budget',type=int,default=6000)
+    recall.add_argument('--budget',type=int,default=None)
+    recall.add_argument('positional_query',nargs='?',help='Recall across repository rules and approved lessons')
+    recall.add_argument('--unified',action='store_true',help='Recall across repository sources')
+    recall.add_argument('--repo',default='.',help='Repository for unified recall')
+    recall.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
+    ui_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     read=sub.add_parser('read');read.add_argument('--id',required=True);read.add_argument('--offset',type=int,default=0);read.add_argument('--size',type=int,default=6000)
     skills_p=sub.add_parser('skills');skills_p.add_argument('--query',default='');skills_p.add_argument('--include-inactive',action='store_true')
     skills_p.add_argument('--at');skills_p.add_argument('--known-at');skills_p.add_argument('--before');skills_p.add_argument('--after')
@@ -520,12 +747,31 @@ def main():
     skill_p=sub.add_parser('skill');skill_p.add_argument('--id',required=True)
     cases_p=sub.add_parser('cases');cases_p.add_argument('--limit',type=int,default=25)
     links_p=sub.add_parser('links');links_p.add_argument('--id',default=None);links_p.add_argument('--limit',type=int,default=100)
-    for name in ('learn','feedback','skill-manage'):
+    for name in ('feedback','skill-manage'):
         sub.add_parser(name).add_argument('--file',required=True)
+    learn=sub.add_parser('learn')
+    learn_mode=learn.add_mutually_exclusive_group(required=True)
+    learn_mode.add_argument('--file',help='Existing memory-store learning request JSON')
+    learn_mode.add_argument('--transcript',metavar='PATH',help='Add transcript lessons to the PENDING queue')
+    learn_mode.add_argument('--pending',action='store_true',help='List lessons awaiting review')
+    learn_mode.add_argument('--approve',nargs='+',metavar='ID',help='Approve lessons as a human reviewer')
+    learn_mode.add_argument('--reject',nargs='+',metavar='ID',help='Reject lessons as a human reviewer')
+    learn.add_argument('--by',default='',help='Name of the human reviewer (required for decisions)')
+    learn.add_argument('--reason',default='')
+    learn.add_argument('--repo',default='.')
+    learn.add_argument('--vendor',default='autonomous-deterministic')
+    learn.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     sub.add_parser('skill-sync')
     idx=sub.add_parser('index');idx.add_argument('--limit',type=int,default=200)
     imp=sub.add_parser('backfill');imp.add_argument('--source-session',required=True);imp.add_argument('--end-byte',type=int)
-    args=parser.parse_args()
+    _configure_help(parser, sub)
+    return parser
+
+
+def _main(args, parser):
+    routed = _route_new(args)
+    if routed is not None:
+        return routed
     if args.action=='schema':return schema()
     if args.action=='repo-benchmark':return memory.repo_benchmark(work_dir=args.work_dir)
     if args.action=='opsec-check':
@@ -578,6 +824,7 @@ def main():
             budget_tokens=args.budget,
             snapshot_path=args.snapshot,
             out_md=args.out_md,
+            **({'allow_unverified': True} if args.allow_unverified else {})
         )
         if args.format=='markdown' and isinstance(res.get('formatted'),str):
             res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
@@ -765,6 +1012,15 @@ def main():
 
 
 def cli():
+    legacy_name = Path(sys.argv[0]).name
+    legacy_script = legacy_name in PROGRAM_NAMES[1:]
+    previous_notice = os.environ.get('MEMLET_NO_DEPRECATION')
+    if legacy_script:
+        if previous_notice != '1':
+            print("{} is now 'memlet'; this command name will be removed in a future release."
+                  .format(legacy_name), file=sys.stderr)
+        # A legacy executable and legacy subcommand still emit exactly one notice.
+        os.environ['MEMLET_NO_DEPRECATION'] = '1'
     try:
         result = main()
         exit_zero = result.pop('_cli_exit_zero', False) if isinstance(result, dict) else False
@@ -781,6 +1037,12 @@ def cli():
     except Exception as exc:
         print(json.dumps({'ok': False, 'error': str(exc), 'type': type(exc).__name__}, ensure_ascii=False), file=sys.stderr)
         return 1
+    finally:
+        if legacy_script:
+            if previous_notice is None:
+                os.environ.pop('MEMLET_NO_DEPRECATION', None)
+            else:
+                os.environ['MEMLET_NO_DEPRECATION'] = previous_notice
 
 
 if __name__=='__main__':

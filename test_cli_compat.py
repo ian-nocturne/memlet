@@ -87,6 +87,7 @@ class Sandbox:
     def run(self, argv, stdin=""):
         env = {k: v for k, v in os.environ.items() if k not in ("CODEX_THREAD_ID", "PRISM_PARENT_SESSION_ID", "ANTIGRAVITY_AGENT")}
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["MEMLET_NO_DEPRECATION"] = "1"
         return subprocess.run([sys.executable, "-B", str(CLI)] + argv, cwd=str(self.repo), input=stdin,
                               capture_output=True, text=True, env=env, timeout=120)
 
