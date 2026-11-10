@@ -273,10 +273,10 @@ class CliContractTests(unittest.TestCase):
     def test_version(self):
         proc = subprocess.run([sys.executable,str(REPO/'memory_cli.py'),'--version'], capture_output=True,text=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual('8.4.0', proc.stdout.strip())
-        self.assertEqual('8.4.0', VERSION)
+        self.assertEqual('8.5.0', proc.stdout.strip())
+        self.assertEqual('8.5.0', VERSION)
         from prism_memory.contracts import VERSION as contract_version
-        self.assertEqual('8.4.0', contract_version)
+        self.assertEqual('8.5.0', contract_version)
         # Existing SDK/protocol tests pin SERVER_VERSION to 8.0.0; preserve it.
         self.assertEqual('8.0.0', prism_memory_mcp.SERVER_VERSION)
 

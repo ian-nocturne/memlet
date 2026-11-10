@@ -64,7 +64,7 @@ There are good agent memory tools already. Memlet is not trying to be a general 
 ### 1. Install & Initialize (Zero External Dependencies Required)
 
 ```bash
-pip install git+https://github.com/ian-nocturne/deltaharness.git@v8.4.0
+pip install git+https://github.com/ian-nocturne/deltaharness.git@v8.5.0
 
 # One-command, zero-daemon setup: .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 memlet init .
@@ -275,9 +275,9 @@ memlet admin pack --stack nextjs-supabase --output ./harness-packs
 | `memlet learn --transcript PATH` / `--pending` / `--approve ID... --by NAME [--reconsider\|--refresh-citations]` / `--reject ID... --by NAME` | Pending lesson queue with a human approval gate; approvals can be revoked. |
 | `memlet ui [.] [--out\|--output FILE]` | Self-contained, escaped HTML inspector. |
 | `memlet admin --help` | Every other command, grouped: memory store, rules/wiki, Dream, rescue / anti-slop / pack, benchmarks, maintenance. |
-| `memlet --version` | Prints `8.4.0`. |
+| `memlet --version` | Prints `8.5.0`. |
 
-**Upgrading from an earlier release**
+**Upgrading from 8.4.x to 8.5.0**
 
 - Old top-level names such as `memlet wiki`, `memlet import`, `memlet rescue` still work unchanged. In a terminal they print one line pointing to `memlet admin <name>`; in pipes and CI nothing extra is printed. Set `MEMLET_NO_DEPRECATION=1` to silence it.
 - A command that returns `ok: false` now exits `1` (it used to exit `0` in some cases), and an unexpected error prints its JSON on stderr instead of stdout.
@@ -356,7 +356,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/deltaharness@v8.4.0
+      - uses: ian-nocturne/deltaharness@v8.5.0
         with:
           mode: "audit" # 'audit', 'rescue', 'anti-slop', or 'all'
           repo-path: "."

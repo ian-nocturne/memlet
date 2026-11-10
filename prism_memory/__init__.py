@@ -1,5 +1,5 @@
-"""PRISM Memory v8.4.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
-VERSION = "8.4.0"
+"""PRISM Memory v8.5.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
+VERSION = "8.5.0"
 
 from .contracts import (
     EVIDENCE_STATES,

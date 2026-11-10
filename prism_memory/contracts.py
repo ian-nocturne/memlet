@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-VERSION = "8.4.0"
+VERSION = "8.5.0"
 
 EVIDENCE_STATES = (
     "reported",

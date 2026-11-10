@@ -1888,7 +1888,7 @@ def format_audit_sarif(report: Dict[str, Any]) -> Dict[str, Any]:
                     "driver": {
                         "name": "Ieum Memory",
                         "informationUri": "https://github.com/ian-nocturne/deltaharness",
-                        "version": "8.4.0",
+                        "version": "8.5.0",
                         "rules": rules,
                     }
                 },

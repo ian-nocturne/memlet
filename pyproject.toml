@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memlet"
-version = "8.4.0"
+version = "8.5.0"
 description = "Memlet (formerly Ieum Memory / DeltaHarness / PRISM Memory) — code-anchored agent memory: zero-daemon init, AST-anchored Markdown wiki, instruction drift checker, bitemporal skill engine & VibeRescue kit"
 readme = "README.md"
 requires-python = ">=3.9"

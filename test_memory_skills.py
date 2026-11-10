@@ -3774,7 +3774,7 @@ class MemletInitWikiTests(unittest.TestCase):
                 pack_dir = out_dir / stack
                 self.assertEqual(expected, {p.name for p in pack_dir.iterdir()})
                 manifest = json.loads((pack_dir / 'MANIFEST.json').read_text(encoding='utf-8'))
-                self.assertEqual('8.4.0', manifest['version'])
+                self.assertEqual('8.5.0', manifest['version'])
                 self.assertEqual(stack, manifest['stack'])
                 self.assertEqual(list(PACK_FILES), [f['path'] for f in manifest['files']])
                 for entry in manifest['files']:
