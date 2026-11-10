@@ -394,10 +394,30 @@ def _check_inline_call_vs_signature(
     return None
 
 
+def _resolve_git_commit(repo_root: Path, ref: str) -> str:
+    """Resolve non-option commit refs; diff/show never receive caller refs.
+
+    Old Git without rev-parse --end-of-options uses --verify alone, safely:
+    the nonempty ref has already been checked for a leading dash and separators.
+    """
+    if (not isinstance(ref, str) or not ref or ref.startswith("-") or
+            any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in ref)):
+        raise ValueError("invalid Git ref: option-like, empty, or contains whitespace/control characters")
+    for separator in (["--end-of-options"], []):
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify"] + separator + [ref + "^{commit}"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=3.0,
+        )
+        oid = proc.stdout.strip()
+        if proc.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid):
+            return oid.lower()
+    raise ValueError("cannot resolve Git commit ref: " + ref)
+
+
 def _git_show_text(repo_root: Path, ref: str, rel_path: str) -> Optional[str]:
     try:
         p_show = subprocess.run(
-            ["git", "show", f"{ref}:{rel_path}"],
+            ["git", "show", "--no-ext-diff", "--no-textconv", f"{ref}:{rel_path}", "--"],
             cwd=str(repo_root),
             capture_output=True,
             text=True,
@@ -430,7 +450,7 @@ def _compute_git_diff_changes(
     requested commits even when the working tree differs. Pass `head_ref="WORKTREE"` to compare the
     base commit against the current working tree on disk instead.
     """
-    use_worktree = str(head_ref or "").strip().upper() == "WORKTREE"
+    use_worktree = isinstance(head_ref, str) and head_ref.upper() == "WORKTREE"
     diff_info: Dict[str, Any] = {
         "baseRef": base_ref,
         "headRef": head_ref,
@@ -438,8 +458,13 @@ def _compute_git_diff_changes(
         "changedFiles": {},
         "worktreeDiffersFromHead": [],
     }
-    diff_cmd = ["git", "diff", "--name-status", base_ref] if use_worktree else ["git", "diff", "--name-status", base_ref, head_ref]
     try:
+        base_oid = _resolve_git_commit(repo_root, base_ref)
+        head_oid = None if use_worktree else _resolve_git_commit(repo_root, head_ref)
+        diff_cmd = ["git", "diff", "--no-ext-diff", "--no-textconv", "--name-status", base_oid]
+        if head_oid is not None:
+            diff_cmd.append(head_oid)
+        diff_cmd.append("--")
         proc = subprocess.run(
             diff_cmd,
             cwd=str(repo_root),
@@ -450,7 +475,7 @@ def _compute_git_diff_changes(
         if proc.returncode != 0:
             diff_info["error"] = (proc.stderr or proc.stdout or "").strip()
             return diff_info
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         diff_info["error"] = str(exc)
         return diff_info
 
@@ -474,7 +499,7 @@ def _compute_git_diff_changes(
         # Load base file content via `git show <base_ref>:<old_rel_path>`
         base_content: Optional[str] = None
         if not status.startswith("A"):
-            base_content = _git_show_text(repo_root, base_ref, old_rel_path)
+            base_content = _git_show_text(repo_root, base_oid, old_rel_path)
 
         head_path = repo_root / rel_path
         if status.startswith("D"):
@@ -489,7 +514,7 @@ def _compute_git_diff_changes(
             except OSError:
                 head_content = None
         else:
-            head_content = _git_show_text(repo_root, head_ref, rel_path)
+            head_content = _git_show_text(repo_root, head_oid, rel_path)
             try:
                 disk_text = head_path.read_text(encoding="utf-8", errors="ignore") if head_path.is_file() else None
             except OSError:
@@ -670,8 +695,15 @@ def audit_repository(
             all_rel_paths.append((rel_s, p_full))
 
     git_diff_data: Optional[Dict[str, Any]] = None
-    if base_ref:
+    if base_ref is not None:
         git_diff_data = _compute_git_diff_changes(root, base_ref=base_ref, head_ref=head_ref)
+    elif head_ref != "HEAD" and head_ref != "WORKTREE":
+        # No-Git zero-setup auditing remains available when refs are omitted.
+        try:
+            _resolve_git_commit(root, head_ref)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            git_diff_data = {"baseRef": base_ref, "headRef": head_ref,
+                             "changedFiles": {}, "error": str(exc)}
 
     findings: List[Dict[str, Any]] = []
     seen_finding_keys: Set[Tuple[Any, ...]] = set()

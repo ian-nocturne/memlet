@@ -564,7 +564,7 @@ class MemletMCPTests(unittest.TestCase):
         self.git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')
         self.assertTrue(init_project(self.repo)['ok'])
         self.server = PrismMemoryMCPServer(self.root / 'store', default_task='mcp/test')
-        self.transcript = self.root / 'session.jsonl'
+        self.transcript = self.repo / 'session.jsonl'
         records = [
             {'type': 'user', 'timestamp': '2026-11-09T09:00:00Z',
              'message': {'role': 'user', 'content': 'Never call main() in app.py from the test suite'}},
@@ -790,6 +790,105 @@ class MemletMCPTests(unittest.TestCase):
         self.learn()
         pending = self.payload('memlet_learn', action='pending')
         self.assertEqual(self.cli('learn', '--pending', '--repo', str(self.repo), '--format', 'json'), pending)
+
+    def test_learn_requires_initialized_repository_without_creating_state(self):
+        uninitialized = self.root / 'uninitialized'
+        uninitialized.mkdir()
+        for action in ('transcript', 'pending'):
+            args = {'action': action}
+            if action == 'transcript':
+                args['transcript_path'] = str(self.transcript)
+            result = self.rpc('memlet_learn', repo_path=str(uninitialized), **args)
+            self.assertTrue(result['isError'])
+            self.assertIn('memlet init', result['structuredContent']['error'])
+            self.assertEqual([], list(uninitialized.iterdir()))
+
+    def test_external_transcript_is_refused_before_library_read_or_write(self):
+        external = self.root / 'external.log'
+        external.write_text('2026-11-09T10:00:00Z RULE: never call main() in app.py; PRIVATE_CANARY\n')
+        before = self.snapshot()
+        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': ''}), \
+                patch.object(bridge, 'learn_from_transcript') as learn:
+            result = self.rpc('memlet_learn', action='transcript', transcript_path=str(external))
+            learn.assert_not_called()
+        self.assertTrue(result['isError'])
+        self.assertIn('known agent transcript root', result['structuredContent']['error'])
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(result))
+        self.assertEqual(before, self.snapshot())
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(self.payload('memlet_learn', action='pending')))
+
+    def test_known_agent_roots_and_trusted_environment_override(self):
+        home = self.root / 'home'
+        with patch('prism_memory_mcp.Path.home', return_value=home), \
+                patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': ''}):
+            for relative in ('.prism-memory/sessions', '.codex/sessions', '.claude/projects', '.muse/sessions'):
+                directory = home / relative
+                directory.mkdir(parents=True)
+                transcript = directory / 'session.jsonl'
+                transcript.write_bytes(self.transcript.read_bytes())
+                self.payload('memlet_learn', action='transcript', transcript_path=str(transcript))
+        custom = self.root / 'trusted'
+        custom.mkdir()
+        transcript = custom / 'session.jsonl'
+        transcript.write_bytes(self.transcript.read_bytes())
+        for variable in ('DELTAHARNESS_TRANSCRIPT_DIRS', 'PRISM_TRANSCRIPT_DIRS'):
+            env = {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': '', variable: str(custom)}
+            with patch.dict(os.environ, env):
+                self.payload('memlet_learn', action='transcript', transcript_path=str(transcript))
+                # The repository remains allowed alongside a host-configured root.
+                self.learn()
+                rejected = self.rpc('memlet_learn', action='transcript', transcript_path=str(home / '.codex/sessions/session.jsonl'))
+                self.assertTrue(rejected['isError'])
+
+    def test_oversized_review_transcript_refused_before_library_without_writes(self):
+        large = self.repo / 'review-21mib.log'
+        with large.open('w') as output:
+            output.write('2026-11-09T10:00:00Z RULE: never call main() in app.py\n')
+            for _ in range(21):
+                output.write('z' * 1048576 + '\n')
+        before = self.snapshot()
+        with patch.object(bridge, 'learn_from_transcript') as learn:
+            result = self.rpc('memlet_learn', action='transcript', transcript_path=str(large))
+            learn.assert_not_called()
+        self.assertTrue(result['isError'])
+        self.assertIn('8 MiB', result['structuredContent']['error'])
+        self.assertEqual(before, self.snapshot())
+
+    def test_transcript_fifo_and_symlinked_ancestor_are_refused_without_reading(self):
+        fifo = self.repo / 'named-pipe.log'
+        os.mkfifo(str(fifo))
+        directory = self.repo / 'linked-dir'
+        directory.symlink_to(self.repo, target_is_directory=True)
+        # snapshot() reads regular files only; do not read the FIFO itself.
+        with patch.object(bridge, 'learn_from_transcript') as learn:
+            for path in (fifo, directory / self.transcript.name, self.repo):
+                result = self.rpc('memlet_learn', action='transcript', transcript_path=str(path))
+                self.assertTrue(result['isError'])
+            learn.assert_not_called()
+
+    def test_handover_configured_index_matches_cli_when_mode_is_omitted(self):
+        config = self.repo / '.memlet/config.json'
+        data = json.loads(config.read_text())
+        data['handover'] = {'mode': 'index'}
+        config.write_text(json.dumps(data))
+        result = self.payload('memlet_handover')
+        expected = self.cli('handover', str(self.repo), '--format', 'json')
+        self.assertEqual('index', result['mode'])
+        self.assertEqual(expected, result)
+
+    def test_experimental_configured_mode_is_explicitly_refused(self):
+        config = self.repo / '.memlet/config.json'
+        for mode in ('digest', 'brief'):
+            data = json.loads(config.read_text())
+            data['handover'] = {'mode': mode}
+            config.write_text(json.dumps(data))
+            before = self.snapshot()
+            result = self.rpc('memlet_handover')
+            self.assertTrue(result['isError'])
+            self.assertIn('experimental', result['structuredContent']['error'])
+            self.assertIn(mode, result['structuredContent']['error'])
+            self.assertEqual(before, self.snapshot())
+            self.assertEqual('index', self.payload('memlet_handover', mode='index')['mode'])
 
 
 if __name__ == '__main__':
