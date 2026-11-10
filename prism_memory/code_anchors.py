@@ -61,14 +61,58 @@ def _strip_docstring_from_body(body_nodes):
     return body_nodes
 
 
+# Python hash bases. `python-ast-v3` (current) hashes a canonical AST rendering that is identical on Python 3.9-3.13:
+# every field in `_fields` order, `type_params` (added in 3.12) omitted while empty, strings rendered as ASCII JSON
+# (repr() escapes characters newer than the interpreter's Unicode database, e.g. U+1F6DF on 3.9). `python-ast-v2`
+# hashed `ast.dump`, whose output differs between interpreter versions (3.13 omits empty fields, 3.12 adds
+# `type_params`), and the pre-v2 `legacy` basis hashed `ast.dump` without stripping docstrings. Pins made with an
+# older basis are still matched by recomputing that basis on the running interpreter (same-runtime legacy match).
+PYTHON_HASH_BASIS = "python-ast-v3"
+PYTHON_PREVIOUS_BASES = ("python-ast-v2", "legacy")
+_OMIT_WHEN_EMPTY = frozenset({"type_params"})
+
+
+def canonical_ast_dump(node) -> str:
+    """Version-stable rendering of an AST (see PYTHON_HASH_BASIS). Attributes (line numbers) are never included."""
+    if isinstance(node, ast.AST):
+        parts = []
+        for name in node._fields:
+            value = getattr(node, name, None)
+            if name in _OMIT_WHEN_EMPTY and (value is None or value == []):
+                continue
+            parts.append(name + "=" + canonical_ast_dump(value))
+        return type(node).__name__ + "(" + ", ".join(parts) + ")"
+    if isinstance(node, list):
+        return "[" + ", ".join(canonical_ast_dump(item) for item in node) + "]"
+    if isinstance(node, str):
+        return "s" + json.dumps(node, ensure_ascii=True)
+    if isinstance(node, bytes):
+        return "b" + node.hex()
+    return repr(node)  # int, float, complex, bool, None, Ellipsis: stable across versions
+
+
+def _docstring_stripped(node):
+    cloned = copy.deepcopy(node)
+    for child in ast.walk(cloned):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            child.body = _strip_docstring_from_body(child.body)
+    return cloned
+
+
 def normalized_symbol_ast_hash(node) -> str:
-    """Compute a docstring/comment/lineno-invariant AST hash for a function or class."""
+    """Compute a docstring/comment/lineno-invariant AST hash for a function or class (basis `python-ast-v3`:
+    identical on every supported Python version)."""
     try:
-        cloned = copy.deepcopy(node)
-        for child in ast.walk(cloned):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                child.body = _strip_docstring_from_body(child.body)
-        return _sha256_text(ast.dump(cloned, annotate_fields=True, include_attributes=False))
+        return _sha256_text(canonical_ast_dump(_docstring_stripped(node)))
+    except Exception:
+        return _sha256_text(canonical_ast_dump(node))
+
+
+def normalized_symbol_ast_hash_v2(node) -> str:
+    """The previous basis (`python-ast-v2`): `ast.dump` of the docstring-stripped node. Interpreter-specific; only
+    used to recognise pins made with it on the running interpreter."""
+    try:
+        return _sha256_text(ast.dump(_docstring_stripped(node), annotate_fields=True, include_attributes=False))
     except Exception:
         return _sha256_text(ast.dump(node, annotate_fields=True, include_attributes=False))
 
@@ -1043,8 +1087,21 @@ def extract_file_symbol_signatures(file_path):
     return res
 
 
-def extract_file_symbol_hashes(file_path, *, legacy: bool = False):
-    """Extract per-symbol SHA256 hashes from a source file via AST (Python) or polyglot contract extractor."""
+def previous_python_symbol_hashes(file_path) -> List[Dict[str, str]]:
+    """Per-symbol hashes of a Python file under every previous basis (`PYTHON_PREVIOUS_BASES` order), computed on
+    the running interpreter, to recognise a pin or tracked hash made with an older basis."""
+    return [extract_file_symbol_hashes(file_path, basis=b) for b in PYTHON_PREVIOUS_BASES]
+
+
+def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Optional[str] = None):
+    """Extract per-symbol SHA256 hashes from a source file via AST (Python) or polyglot contract extractor.
+    Python symbols use the current basis (`PYTHON_HASH_BASIS`) unless `basis` names a previous one
+    (`python-ast-v2`, or `legacy`, same as `legacy=True`)."""
+    if legacy:
+        basis = "legacy"
+    if basis == PYTHON_HASH_BASIS:
+        basis = None
+    legacy = basis is not None  # any previous basis: computed fresh, never cached
     p = Path(file_path)
     try:
         if p.is_symlink() or not p.is_file():
@@ -1072,8 +1129,12 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False):
             by_short = {}
             for qname, name, is_nested, node in scoped_nodes:
                 try:
-                    norm_dump = ast.dump(node, annotate_fields=True, include_attributes=False)
-                    hval = _sha256_text(norm_dump) if legacy else normalized_symbol_ast_hash(node)
+                    if basis == "legacy":
+                        hval = _sha256_text(ast.dump(node, annotate_fields=True, include_attributes=False))
+                    elif basis == "python-ast-v2":
+                        hval = normalized_symbol_ast_hash_v2(node)
+                    else:
+                        hval = normalized_symbol_ast_hash(node)
                 except Exception:
                     start_ln = max(0, getattr(node, "lineno", 1) - 1)
                     end_ln = getattr(node, "end_lineno", start_ln + 1)

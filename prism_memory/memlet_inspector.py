@@ -76,11 +76,11 @@ def _e(value: Any) -> str:
 def _read_ledger(root: Path) -> Dict[str, Any]:
     ledger = root / memlet_wiki.LEDGER_PATH
     out: Dict[str, Any] = {"present": False, "anchorSnapshots": [], "wikiEvents": [], "eventCounts": {}}
-    if ledger.is_symlink() or not ledger.is_file():
+    if memlet_wiki.first_managed_problem(root, memlet_wiki._LEDGER_FILES) or not ledger.is_file():
         return out
     out["present"] = True
     try:
-        with contextlib.closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        with contextlib.closing(memlet_wiki.connect_managed_sqlite(root, memlet_wiki.LEDGER_PATH, readonly=True)) as conn:
             with contextlib.suppress(sqlite3.Error):
                 out["anchorSnapshots"] = [
                     {"anchor": r[0], "path": r[1], "symbol": r[2], "status": r[3], "astHash": r[4],
@@ -98,7 +98,7 @@ def _read_ledger(root: Path) -> Dict[str, Any]:
                 ]
                 out["eventCounts"] = {t: n for t, n in conn.execute(
                     "SELECT event_type, COUNT(*) FROM wiki_events GROUP BY event_type ORDER BY event_type")}
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         out["error"] = type(exc).__name__
     return out
 
@@ -916,11 +916,20 @@ def export_inspector_html(repo_path: str = ".", output_path: Optional[str] = Non
         target = root / INSPECTOR_FILE
     else:
         target = None
-    bytes_written = _atomic_write(target, doc) if target else 0
+    refused = None
+    if target is not None and not output_path:
+        # the default output is a Memlet-managed file: the shared checked writer refuses a symlinked or non-regular
+        # `.memlet/inspector.html` (or `.memlet`) instead of replacing or following it; nothing is written then
+        try:
+            bytes_written = memlet_wiki.write_managed_text(root, INSPECTOR_FILE, doc)
+        except memlet_wiki.UnsafePathError as exc:
+            refused, bytes_written, target = str(exc), 0, None
+    else:
+        bytes_written = _atomic_write(target, doc) if target else 0
     live = payload["workspaces"]["live"]
     result: Dict[str, Any] = {
-        "ok": True,
-        "exitCode": 0,
+        "ok": refused is None,
+        "exitCode": 0 if refused is None else 2,
         "command": "ui",
         "outputPath": str(target) if target else None,
         "written": target is not None,
@@ -933,7 +942,9 @@ def export_inspector_html(repo_path: str = ".", output_path: Optional[str] = Non
         "externalNetworkCalls": 0,
         "errors": payload.get("errors") or [],
     }
-    if target is None:
+    if refused is not None:
+        result["error"] = f"{refused}; the inspector file was not written"
+    elif target is None:
         result["html"] = doc
         result["hint"] = "No .memlet/ directory: pass --output PATH (or run `memlet init`) to write the inspector file."
     return result

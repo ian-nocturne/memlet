@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from prism_memory.memlet_brief import (_PIN_BODY_RE, _PIN_RE, _cited_text, _claude_argv, _mask, _resolve_cited_file,
-                                       _runner_env, _sha, _source_lines, check_runner, prompt_names)
+                                       _runner_env, _sha, _source_lines, check_runner, line_lazy_marker, prompt_names)
 
 INDEX_PAGE = ".memlet/wiki/INDEX-RULES.md"
 INDEX_SCHEMA = "memlet-index/v1"
@@ -27,7 +27,8 @@ MAX_SPAN = 12          # lines one entry may cite
 QUOTE_MAX_LINES = 4    # longer spans are indexed, never quoted
 _ENTRY_RE = re.compile(r"^\s*[-*]\s+(?P<topic>[^|\[\]]{2,80}?)\s*\|\s*(?P<imp>[123])\s*\[src:\s*(?P<src>[^\]]+)\]\s*$")
 _CITE_RE = re.compile(r"^\s*(?P<file>[^:\s][^:]*?):(?P<a>\d+)(?:\s*-\s*(?P<b>\d+))?\s*$")
-_IDX_PIN_RE = re.compile(r"<!-- memlet:index (?P<body>.*?) -->")
+_IDX_PIN_RE = line_lazy_marker("<!-- memlet:index ", "", " -->")  # linear on a line full of unclosed openers
+_IDX_META_RE = line_lazy_marker("<!-- memlet:index-meta ", r"\{", "} -->")
 _IDX_BODY_RE = re.compile(r"rank=\d+ imp=(?P<imp>[123]) pins=(?P<pins>\S+:\d+-\d+=[0-9a-f]{64})")
 
 
@@ -149,13 +150,13 @@ def _locate(lines: List[str], width: int, sha: str, hint: int) -> Optional[int]:
 def load_verified_index(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """(fresh entries with their current verbatim text, stale entries, meta). No model call. `meta["staleness"]`
     (see `index_staleness`) says whether instruction files changed after the index was built."""
-    page = root / INDEX_PAGE
-    if not page.is_file() or page.is_symlink():
+    from prism_memory.memlet_wiki import MAX_WIKI_PAGE_BYTES, read_managed_text
+    text = read_managed_text(root, INDEX_PAGE, MAX_WIKI_PAGE_BYTES)  # contained, regular, size-capped
+    if text is None:
         return [], [], None
-    text = page.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r"<!-- memlet:index-meta (\{.*?\}) -->", text)
+    m = _IDX_META_RE.search(text)
     try:
-        meta = json.loads(m.group(1)) if m else None
+        meta = json.loads(m.group("body") + "}") if m else None
     except ValueError:
         meta = None
     files = _source_lines(root)
@@ -166,6 +167,8 @@ def load_verified_index(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str
     for line in text.splitlines():
         if not line.startswith("- "):
             continue
+        if len(fresh) + len(stale) >= MAX_ENTRIES:  # bounded work: index-build never writes more entries than this
+            break
         marks = list(_IDX_PIN_RE.finditer(line))
         body = _IDX_BODY_RE.fullmatch(marks[-1].group("body").strip()) if len(marks) == 1 else None
         head = line[2:marks[-1].start()].rstrip() if marks else line[2:]
@@ -175,7 +178,7 @@ def load_verified_index(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str
         f, a, b, sha = re.fullmatch(r"(\S+?):(\d+)-(\d+)=([0-9a-f]{64})", body.group("pins")).groups()
         a, b = int(a), int(b)
         lines = files.get(f)
-        start = _locate(lines, b - a + 1, sha, a) if lines is not None else None
+        start = _locate(lines, b - a + 1, sha, a) if lines is not None and 1 <= b - a + 1 <= MAX_SPAN else None
         entry = {"topic": topic, "importance": int(body.group("imp")), "source": f"{f}:{a}-{b}"}
         if start is None:
             stale.append(entry)

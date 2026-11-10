@@ -147,7 +147,7 @@ PERMISSIVE_POLICY_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-SECRET_VALUE_REDACT_RE = re.compile(
+_SECRET_VALUE_PATTERN = (
     r"(?<![A-Za-z0-9])(sk_(?:live|test)_[A-Za-z0-9_-]{8,}|rk_(?:live|test)_[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_-]{8,}|"
     r"sk-[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{5,})?|"
     r"postgres(?:ql)?://[^\s'\"`\[\]\\]{3,}|mysql://[^\s'\"`\[\]\\]{3,}|mongodb(?:\+srv)?://[^\s'\"`\[\]\\]{3,}|"
@@ -156,6 +156,32 @@ SECRET_VALUE_REDACT_RE = re.compile(
     r"npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|polar_(?:oat|pat|sk)_[A-Za-z0-9_-]{16,}|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
+_SECRET_VALUE_RX = re.compile(_SECRET_VALUE_PATTERN)  # reference semantics; never run on untrusted long text
+
+
+def _secret_value_alternation():
+    """`_SECRET_VALUE_PATTERN` in linear time (see `audit.LinearAlternation`). Every alternative except the JWT one
+    is a literal prefix followed by one character run with nothing after it, so one regex covers them; the JWT
+    alternative (`eyJ` + run + `.` + ...) retried each `eyJ` of a `-eyJ-eyJ...` run against the rest of the run, so
+    it gets a run-memoised finder. Same matches as the single regex (differentially tested)."""
+    from .audit import LinearAlternation, regex_finder, run_tail_finder
+    cls = r"[A-Za-z0-9_-]"
+    before_jwt = re.compile(
+        r"(?<![A-Za-z0-9])(?:sk_(?:live|test)_[A-Za-z0-9_-]{8,}|rk_(?:live|test)_[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_-]{8,}|"
+        r"sk-[A-Za-z0-9_-]{12,})")
+    after_jwt = re.compile(
+        r"(?<![A-Za-z0-9])(?:postgres(?:ql)?://[^\s'\"`\[\]\\]{3,}|mysql://[^\s'\"`\[\]\\]{3,}|"
+        r"mongodb(?:\+srv)?://[^\s'\"`\[\]\\]{3,}|"
+        r"github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{16,}|glpat-[A-Za-z0-9_-]{16,}|"
+        r"(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox[baprse]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|"
+        r"npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}|polar_(?:oat|pat|sk)_[A-Za-z0-9_-]{16,}|"
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+    jwt = run_tail_finder(re.compile(r"(?<![A-Za-z0-9])eyJ"), re.compile(cls + "*"), 10,
+                          re.compile(r"\." + cls + r"{10,}(?:\." + cls + r"{5,})?"))
+    return LinearAlternation(_SECRET_VALUE_PATTERN, [regex_finder(before_jwt), jwt, regex_finder(after_jwt)])
+
+
+SECRET_VALUE_REDACT_RE = _secret_value_alternation()
 
 
 def mask_sensitive_text(text: str) -> str:
@@ -315,7 +341,7 @@ def _strip_code_comments_preserve_lines(content: str, ext: str) -> str:
             if ln.lstrip().startswith("#"):
                 lines.append("")
             else:
-                lines.append(re.sub(r"\s+#.*$", "", ln))
+                lines.append(re.sub(r"(?<!\s)\s+#.*$", "", ln))  # one start per whitespace run: linear, same result
         return "\n".join(lines)
     if ext == ".sql":
         return blank_sql_non_executable(content)
@@ -1102,6 +1128,9 @@ def build_rescue_bundle(
     brief_path = out_root / "RESCUE_BRIEF.md"
     prompt_path = out_root / "ONE_PROMPT_RESCUE.md"
     json_path = out_root / "rescue-bundle.json"
+    write_refused = _rescue_output_problem((brief_path, prompt_path, json_path)) if write_files else None
+    if write_refused:
+        write_files = False  # nothing is written; the bundle reports the refusal
 
     raw_bundle: Dict[str, Any] = {
         "ok": exit_code == 0 and readiness != "ENV_UNVERIFIED",
@@ -1166,12 +1195,14 @@ def build_rescue_bundle(
         or SECRET_VALUE_REDACT_RE.search(bundle["onePromptRescueMarkdown"])
     )
 
+    if write_refused:
+        bundle.update(ok=False, exitCode=2, error=write_refused, written=False)
     if write_files:
         out_root.mkdir(parents=True, exist_ok=True)
-        brief_path.write_text(bundle["rescueBriefMarkdown"], encoding="utf-8")
-        prompt_path.write_text(bundle["onePromptRescueMarkdown"], encoding="utf-8")
         serializable = {k: v for k, v in bundle.items() if k not in ("rescueBriefMarkdown", "onePromptRescueMarkdown")}
-        json_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
+        for target, text in ((brief_path, bundle["rescueBriefMarkdown"]), (prompt_path, bundle["onePromptRescueMarkdown"]),
+                             (json_path, json.dumps(serializable, indent=2, ensure_ascii=False))):
+            _replace_output_file(target, text)
 
     if output_format == "markdown":
         bundle["formatted"] = bundle["rescueBriefMarkdown"]
@@ -1179,6 +1210,48 @@ def build_rescue_bundle(
         bundle["formatted"] = bundle["onePromptRescueMarkdown"]
 
     return bundle
+
+
+def _rescue_output_problem(paths) -> Optional[str]:
+    """Why the rescue outputs must not be written (a leaf that is a symlink or not a regular file), else None.
+    Checked for all three files before any is written, so a refusal writes nothing."""
+    for p in paths:
+        try:
+            st = os.lstat(str(p))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"cannot inspect {p.name}: {exc}"
+        import stat as _stat
+        if _stat.S_ISLNK(st.st_mode):
+            return f"refusing to write {p.name}: it is a symlink (rescue outputs are never written through a link)"
+        if not _stat.S_ISREG(st.st_mode):
+            return f"refusing to write {p.name}: it is not a regular file"
+    return None
+
+
+def _replace_output_file(target: Path, text: str) -> None:
+    """Atomic replace through a temp file in the same directory: a leaf symlink is replaced, never followed."""
+    import tempfile
+    data = text.encode("utf-8")
+    try:
+        mode = os.lstat(str(target)).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o644
+    fd, tmp = tempfile.mkstemp(prefix="." + target.name + ".rescue-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, str(target))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def format_rescue_markdown(bundle: Dict[str, Any]) -> str:

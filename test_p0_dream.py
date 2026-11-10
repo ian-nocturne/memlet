@@ -754,8 +754,10 @@ class F2NoUnapprovedUnderVerifiedLabelTests(unittest.TestCase):
         md.approve_queue_items(q, ["L-OLD", "L-NEW"], "human")
         lineage = mc._load_dream_lineage({"path": str(w / "ws")})
         states = {n["id"]: (n["verdict"], n["reviewState"], n["inRecallCapsule"], n["verifiedBy"]) for n in lineage["nodes"]}
-        self.assertEqual(("SUPPORTED", "approved", True, "human"), states["L-OLD"])
-        self.assertEqual("UNVERIFIED_OPT_OUT", lineage["subgraphCapsule"]["pinVerification"])  # UI never follows queue paths
+        # final round A5: the UI verifies citations against the fixed in-repo snapshot (.memlet/dream/snapshot); this
+        # fixture keeps its transcripts elsewhere, so the approval is shown but its citation is not verified
+        self.assertEqual(("PENDING", "pending", False, "citation not verified"), states["L-OLD"])
+        self.assertEqual("unavailable_no_snapshot", lineage["subgraphCapsule"]["pinVerification"])  # UI never follows queue paths
 
 
 @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "chmod does not restrict root")

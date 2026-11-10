@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -45,8 +46,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .audit import BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, audit_repository, iter_explicit_anchors
-from .code_anchors import extract_file_symbol_hashes, extract_file_symbol_signatures
+from .audit import (BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, LazyBlockPattern, SpanMatch,
+                    audit_repository, iter_explicit_anchors)
+from .code_anchors import (PYTHON_HASH_BASIS, extract_file_symbol_hashes, extract_file_symbol_signatures,
+                           previous_python_symbol_hashes)
 
 MEMLET_VERSION = "8.4.0"
 CONFIG_SCHEMA_VERSION = 1
@@ -65,8 +68,14 @@ PIN_RE = re.compile(
     r"<!--\s*memlet:anchor\s+(?P<path>[^\s:]+)::(?P<symbol>[A-Za-z_$][\w.$-]*)"
     r"\s+ast=(?P<ast>[0-9a-f]{6,64})(?:\s+sig=(?P<sig>[0-9a-f]{6,64}))?(?:\s+req=(?P<req>[0-9a-f]{6,64}))?(?:\s+basis=(?P<basis>[A-Za-z0-9_.-]+))?\s*-->"
 )
-_STATUS_BLOCK_RE = re.compile(r"<!-- memlet:status:(?:begin|start) -->.*?" + re.escape(STATUS_END), re.S)
-_PAGE_STATUS_RE = re.compile(re.escape(PAGE_STATUS_BEGIN) + r".*?" + re.escape(PAGE_STATUS_END) + r"\n?", re.S)
+# Generated status blocks (lazy BEGIN...END), matched in linear time: an unclosed opener is never retried against the
+# rest of the page (20,000 unclosed markers took seconds with the plain lazy regex).
+_STATUS_BLOCK_RE = LazyBlockPattern(r"<!-- memlet:status:(?:begin|start) -->.*?" + re.escape(STATUS_END),
+                                    re.compile(r"<!-- memlet:status:(?:begin|start) -->"), re.compile(re.escape(STATUS_END)),
+                                    STATUS_END)
+_PAGE_STATUS_RE = LazyBlockPattern(re.escape(PAGE_STATUS_BEGIN) + r".*?" + re.escape(PAGE_STATUS_END) + r"\n?",
+                                   re.compile(re.escape(PAGE_STATUS_BEGIN)), re.compile(re.escape(PAGE_STATUS_END)),
+                                   PAGE_STATUS_END, suffix="\n")
 _LEDGER_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS anchor_snapshots (anchor TEXT PRIMARY KEY, path TEXT, symbol TEXT, status TEXT,"
     " ast_hash TEXT, sig_hash TEXT, req_sig_hash TEXT, updated_at TEXT)",
@@ -98,13 +107,12 @@ def slim_output_files(root: Path) -> List[str]:
     out = []
     for rel, header in sorted(SLIM_OUTPUTS.items()):
         p = root / rel
-        if p.is_symlink() or not p.is_file() or any(q.is_symlink() for q in p.parents if root in q.parents):
+        if contained_path_problem(root, rel) or not p.is_file():
             continue
-        try:
-            with p.open("r", encoding="utf-8", errors="ignore") as fh:
-                first = fh.readline().rstrip("\r\n")
-        except OSError:
+        text = read_regular_text(p, _MAX_SOURCE_BYTES)
+        if text is None:
             continue
+        first = text.split("\n", 1)[0].rstrip("\r")
         if first == header:
             out.append(rel)
     return out
@@ -143,10 +151,11 @@ def is_instruction_path(root: Path, rel: str) -> bool:
         return False
     p = root / rel
     try:
-        if p.is_symlink() or not p.is_file():
+        # one containment rule for fixed names, globs and nested files alike: no symlink in any component (an
+        # instruction directory linked to text outside the repository is never read), a regular file inside root
+        if contained_path_problem(root, rel) or not p.is_file():
             return False
-        p.resolve().relative_to(root)
-    except (OSError, ValueError):
+    except OSError:
         return False
     from .memlet_slim import SLIM_OUTPUTS
     if rel in SLIM_OUTPUTS:
@@ -195,9 +204,10 @@ def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> L
 
     def _add(p: Path) -> None:
         try:
-            if p.is_symlink() or not p.is_file():
-                return
             rel = _rel(root, p)
+            # the same containment rule as `is_instruction_path`: no symlinked component anywhere on the path
+            if contained_path_problem(root, rel) or not p.is_file():
+                return
         except (OSError, ValueError):
             return
         if not _is_secret_path(rel):
@@ -229,11 +239,289 @@ def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> L
     return sorted(found)
 
 
-def _read_text(p: Path) -> str:
+# ---------------------------------------------------------------------------
+# One rule for every repository path Memlet reads or writes.
+#
+# * Containment (`contained_path_problem`): every component from the repository root down to the leaf is checked
+#   with lstat. No component may be a symbolic link, every ancestor must be a real directory, an existing leaf must
+#   be a regular file (or a real directory when one is asked for) and the location must resolve inside the root.
+#   Instruction discovery, wiki pages, audit discovery and every Memlet-managed write use this one check.
+# * Reads (`read_regular_text`): open without following a leaf symlink and without blocking (a FIFO is refused, not
+#   waited on), verify a regular file with fstat and read at most a size cap.
+# * Managed writes (`write_managed_text` / `write_managed_bytes` / `connect_managed_sqlite`): only below `.memlet/`,
+#   refused (nothing written) when the containment check fails; text goes to a temp file in the same directory and
+#   replaces the target atomically, so a leaf that turns into a symlink is replaced, never followed.
+
+MAX_TEXT_READ_BYTES = 8 * 1024 * 1024
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_WIKI_PAGES = 500
+MAX_WIKI_PAGE_BYTES = 1_000_000
+MAX_WIKI_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 16 * 1024 * 1024
+
+
+class UnsafePathError(ValueError):
+    """A Memlet-managed location is a symlink, not a regular file / real directory, or outside the repository."""
+
+
+def _rel_parts(rel: Any) -> Optional[Tuple[str, ...]]:
+    rel = str(rel).replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    parts = tuple(rel.split("/"))
+    if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in parts):
+        return None
+    return parts
+
+
+def contained_path_problem(root: Path, rel: Any, *, leaf: str = "file") -> Optional[str]:
+    """None when `root/rel` is a safe in-repository location, else why not (see the block comment above).
+    A location that does not exist yet is fine as long as its existing ancestors are."""
+    parts = _rel_parts(rel)
+    if parts is None:
+        return f"unsafe repository path: {str(rel)[:200]!r}"
+    cur, exists = Path(root), True
+    for i, part in enumerate(parts):
+        cur = cur / part
+        shown = "/".join(parts[:i + 1])
+        try:
+            st = os.lstat(str(cur))
+        except FileNotFoundError:
+            exists = False
+            break
+        except OSError as exc:
+            return f"cannot inspect {shown}: {exc.strerror or exc}"
+        if stat.S_ISLNK(st.st_mode):
+            return f"refusing symlinked path {shown}"
+        if i < len(parts) - 1 or leaf == "dir":
+            if not stat.S_ISDIR(st.st_mode):
+                return f"{shown} is not a directory"
+        elif not stat.S_ISREG(st.st_mode):
+            return f"{shown} is not a regular file"
     try:
-        return p.read_text(encoding="utf-8", errors="ignore")
+        (cur if exists else cur.parent).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return f"{'/'.join(parts)} resolves outside the repository"
+    return None
+
+
+def managed_path_problem(root: Path, rel: Any, *, leaf: str = "file") -> Optional[str]:
+    """`contained_path_problem` for a location Memlet owns: it must be `.memlet` or below it."""
+    parts = _rel_parts(rel)
+    if parts is None or parts[0] != MEMLET_DIR:
+        return f"not a Memlet-managed path: {str(rel)[:200]!r}"
+    return contained_path_problem(root, rel, leaf=leaf)
+
+
+def first_managed_problem(root: Path, rels: Iterable[str]) -> Optional[str]:
+    for rel in rels:
+        problem = managed_path_problem(root, rel, leaf="dir" if rel in (MEMLET_DIR, WIKI_DIR) else "file")
+        if problem:
+            return problem
+    return None
+
+
+def read_regular_text(p: Path, limit: int = MAX_TEXT_READ_BYTES, *, errors: str = "ignore") -> Optional[str]:
+    """Text of a regular file of at most `limit` bytes, else None. A symlinked leaf is not followed and a FIFO or
+    device is refused without blocking (O_NONBLOCK, then fstat)."""
+    data = read_regular_bytes(p, limit)
+    return None if data is None else data.decode("utf-8", errors=errors)
+
+
+def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> Optional[bytes]:
+    """Bytes of a regular file of at most `limit` bytes, else None (see `read_regular_text`)."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(p), flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, min(1 << 20, limit + 1 - total))
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+            if total > limit:
+                return None
     except OSError:
-        return ""
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def read_managed_text(root: Path, rel: str, limit: int = MAX_TEXT_READ_BYTES) -> Optional[str]:
+    """`read_regular_text` of a Memlet-managed file, None when it is missing, unsafe, unreadable or over `limit`."""
+    if managed_path_problem(root, rel):
+        return None
+    return read_regular_text(root / rel, limit)
+
+
+def read_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """(`.memlet/config.json` as an object, error). (None, None) when it does not exist. Never follows a symlink,
+    never blocks on a FIFO, never reads more than MAX_CONFIG_BYTES."""
+    problem = managed_path_problem(root, CONFIG_PATH)
+    if problem:
+        return None, ("refusing a symlinked .memlet/config.json" if "symlink" in problem and "config.json" in problem
+                      else problem)
+    p = root / CONFIG_PATH
+    if not os.path.lexists(str(p)):
+        return None, None
+    text = read_regular_text(p, MAX_CONFIG_BYTES)
+    if text is None:
+        return None, f".memlet/config.json is unreadable or larger than {MAX_CONFIG_BYTES} bytes"
+    try:
+        cfg = json.loads(text)
+    except ValueError as exc:
+        return None, f".memlet/config.json is unreadable: {exc}"
+    return (cfg, None) if isinstance(cfg, dict) else (None, ".memlet/config.json is not an object")
+
+
+def _ensure_managed_dir(root: Path, parts: Tuple[str, ...]) -> Path:
+    cur = Path(root)
+    for i, part in enumerate(parts):
+        cur = cur / part
+        try:
+            os.mkdir(str(cur))
+        except FileExistsError:
+            pass
+        st = os.lstat(str(cur))
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise UnsafePathError(f"refusing {'/'.join(parts[:i + 1])}: not a real directory")
+    return cur
+
+
+def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool = False,
+                        new_mode: int = 0o644) -> int:
+    """Write `data` to `root/rel` (below `.memlet/`), refusing (UnsafePathError, nothing written) when the location
+    fails `managed_path_problem`. Replaces atomically through a temp file in the same directory and keeps an existing
+    file's mode; `create_only` creates a new file exclusively (O_EXCL | O_NOFOLLOW) instead."""
+    problem = managed_path_problem(root, rel)
+    if problem:
+        raise UnsafePathError(problem)
+    parts = _rel_parts(rel)
+    parent = _ensure_managed_dir(root, parts[:-1])
+    target = parent / parts[-1]
+    if create_only:
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), new_mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return len(data)
+    try:
+        mode = stat.S_IMODE(os.lstat(str(target)).st_mode)
+    except FileNotFoundError:
+        mode = new_mode
+    fd, tmp = tempfile.mkstemp(prefix="." + parts[-1][:40] + ".memlet-", dir=str(parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        problem = managed_path_problem(root, rel)  # re-checked just before the replace
+        if problem:
+            raise UnsafePathError(problem)
+        os.replace(tmp, str(target))  # renames over the leaf: a symlink there would be replaced, never followed
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return len(data)
+
+
+def write_managed_text(root: Path, rel: str, text: str, **kw: Any) -> int:
+    return write_managed_bytes(root, rel, text.encode("utf-8"), **kw)
+
+
+def managed_target(target: Path) -> Tuple[Path, str]:
+    """(repository root, `.memlet/...` relative path) of an absolute path below a `.memlet` directory."""
+    parts = Path(target).parts
+    idx = [i for i, p in enumerate(parts) if p == MEMLET_DIR]
+    if not idx:
+        raise UnsafePathError(f"not a Memlet-managed path: {target}")
+    return Path(*parts[:idx[-1]]), "/".join(parts[idx[-1]:])
+
+
+def write_managed_path(target: Path, text: str, **kw: Any) -> int:
+    root, rel = managed_target(target)
+    return write_managed_text(root, rel, text, **kw)
+
+
+def connect_managed_sqlite(root: Path, rel: str, *, readonly: bool = False, **kw: Any) -> sqlite3.Connection:
+    """sqlite3 connection to a Memlet-managed database, after checking the database and its journal/WAL/SHM side files
+    (none may be a symlink or a non-regular file). `readonly` never creates anything."""
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        problem = managed_path_problem(root, rel + suffix)
+        if problem:
+            raise UnsafePathError(problem)
+    path = root / rel
+    if readonly:
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, **kw)
+    _ensure_managed_dir(root, _rel_parts(rel)[:-1])
+    return sqlite3.connect(str(path), **kw)
+
+
+def iter_wiki_pages(root: Path) -> List[Tuple[str, str]]:
+    """(repo-relative path, text) of the Markdown pages under `.memlet/wiki/`, in path order, each passing the
+    containment rule. Bounded: at most MAX_WIKI_PAGES pages, MAX_WIKI_PAGE_BYTES per page (a larger page is skipped)
+    and MAX_WIKI_TOTAL_BYTES in total (later pages are skipped)."""
+    if managed_path_problem(root, WIKI_DIR, leaf="dir") or not (root / WIKI_DIR).is_dir():
+        return []
+    out: List[Tuple[str, str]] = []
+    total = 0
+    for p in sorted((root / WIKI_DIR).rglob("*.md")):
+        if len(out) >= MAX_WIKI_PAGES:
+            break
+        try:
+            rel = _rel(root, p)
+        except ValueError:
+            continue
+        if contained_path_problem(root, rel):
+            continue
+        text = read_regular_text(p, MAX_WIKI_PAGE_BYTES)
+        if text is None:
+            continue
+        total += len(text)
+        if total > MAX_WIKI_TOTAL_BYTES:
+            break
+        out.append((rel, text))
+    return out
+
+
+def trusted_wiki_pages(root: Path) -> List[Tuple[str, str]]:
+    """`iter_wiki_pages` for readers that present rules or pins as verified (handover, changed-file check): the
+    Memlet-owned promoted Dream page is left out entirely (rules and pins) unless it is exactly what Memlet last
+    wrote there (ledger hash), the same ownership rule promotion applies before overwriting it. A hand edit of that
+    page, e.g. a re-written anchor comment, is not trusted until an explicit `accept` / promotion records it."""
+    out = []
+    for rel, text in iter_wiki_pages(root):
+        if rel == DREAM_PROMOTED_PAGE:
+            from prism_memory.memlet_bridge import _page_edit_problem
+            if _page_edit_problem(root, text, for_reader=True):
+                continue
+        out.append((rel, text))
+    return out
+
+
+def memlet_write_lock(root: Path):
+    """The one lock every writer of Memlet's wiki state takes (config pins, wiki pages, the promoted Dream page and
+    the ledger): the Dream queue lock, so anchor accept, init / wiki / import / handover --write and Dream
+    promotion are serialised against each other. Re-entrant within a thread."""
+    from prism_memory import memlet_dream as md
+    return md.queue_lock(root / MEMLET_DIR / "dream" / "APPROVAL-QUEUE.json")
+
+
+def _read_text(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> str:
+    """Text of a regular file (never a FIFO, never through a symlinked leaf), "" when unreadable or over `limit`."""
+    text = read_regular_text(p, limit)
+    return "" if text is None else text
 
 
 def _extract_anchors(text: str, source: str) -> List[Dict[str, Any]]:
@@ -298,7 +586,7 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str) -> Dict[str, An
     return {
         "resolution": "exact",
         "basis": ("ts-js-lexical-v3" if sig_info.get("__language__") in ("typescript", "javascript")
-                  else "python-ast-v2" if sig_info.get("__language__") == "python" else "contract-v1"),
+                  else PYTHON_HASH_BASIS if sig_info.get("__language__") == "python" else "contract-v1"),
         "hashExact": sig_info.get("__language__") not in ("typescript", "javascript"),
         "hashReason": "ts_js_lexical_scan_unverified",
         "ast": ast_hash[:_HASH_LEN],
@@ -317,8 +605,10 @@ def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
     pin = anchor.get("pin")
     legacy_match = False
     if pin and cur.get("ast") and not _same_hash(cur["ast"], pin.get("ast")) and Path(anchor["path"]).suffix.lower() == ".py":
-        legacy_hash = extract_file_symbol_hashes(root / anchor["path"], legacy=True).get(anchor["symbol"])
-        legacy_match = _same_hash(legacy_hash, pin.get("ast"))
+        # a pin made with a previous Python basis (`python-ast-v2`, pre-v2 `legacy`) still matches when that basis,
+        # recomputed on this interpreter, gives the pinned hash: unchanged code never turns stale by a basis bump
+        legacy_match = any(_same_hash(h.get(anchor["symbol"]), pin.get("ast"))
+                           for h in previous_python_symbol_hashes(root / anchor["path"]))
     if cur["resolution"] in ("missing", "parse_error", "rejected"):
         status, reason = "stale", cur["reason"]
     elif cur["resolution"] != "exact":
@@ -508,12 +798,11 @@ def _sync_snapshots(conn: sqlite3.Connection, classified: List[Dict[str, Any]], 
 
 def _read_ledger_hashes(ledger: Path) -> Dict[str, str]:
     """Read-only view of the last recorded page hashes (used by `--dry-run`)."""
-    if ledger.is_symlink() or not ledger.is_file():
-        return {}
     try:
-        with contextlib.closing(sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True)) as conn:
+        root, rel = managed_target(ledger)
+        with contextlib.closing(connect_managed_sqlite(root, rel, readonly=True)) as conn:
             return _last_page_hashes(conn)
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, ValueError):
         return {}
 
 
@@ -539,10 +828,7 @@ def _validated_config_pins(config):
 
 
 def _load_config_pins(root: Path) -> Dict[str, Any]:
-    try:
-        config = json.loads((root / CONFIG_PATH).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    config, _err = read_config(root)
     return _validated_config_pins(config)[0] if isinstance(config, dict) else {}
 
 
@@ -595,20 +881,60 @@ def _resolve_root(repo_path) -> Path:
     return root
 
 
+_LEDGER_FILES = (LEDGER_PATH, LEDGER_PATH + "-journal", LEDGER_PATH + "-wal", LEDGER_PATH + "-shm")
+_WIKI_STATE_PATHS = (MEMLET_DIR, CONFIG_PATH, WIKI_DIR, INDEX_PATH) + _LEDGER_FILES
+
+
+def _refused(command: str, root: Path, problem: str, dry_run: bool = False, output_format: str = "json",
+             **extra: Any) -> Dict[str, Any]:
+    """The clean refusal of a wiki mutation whose Memlet-managed location is unsafe: nothing was written."""
+    error = f"{problem}; nothing was written (Memlet never writes through a symlink or outside the repository)"
+    report = {"ok": False, "exitCode": 2, "command": command, "dryRun": bool(dry_run), "repoPath": str(root),
+              "error": error, "actions": []}
+    report.update(extra)
+    if (output_format or "json").lower() == "markdown":
+        report["formatted"] = f"## Memlet {command.capitalize()}\n\n- ERROR: {error}\n"
+    return report
+
+
+def _guarded(command: str, root: Path, dry_run: bool, output_format: str, paths: Iterable[str], fn):
+    """Run a wiki mutation: refuse up front when any fixed managed path is unsafe, then hold the Memlet write lock
+    (shared with Dream promotion and anchor accept) for the whole read-modify-write, unless it is a dry run."""
+    problem = first_managed_problem(root, paths)
+    if problem:
+        return _refused(command, root, problem, dry_run, output_format)
+    try:
+        if dry_run:
+            return fn()
+        with memlet_write_lock(root):
+            return fn()
+    except UnsafePathError as exc:
+        return _refused(command, root, str(exc), dry_run, output_format)
+
+
 def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, output_format: str = "json") -> Dict[str, Any]:
-    """`memlet init`: onboard a repo into `.memlet/` (read-only when `dry_run`)."""
+    """`memlet init`: onboard a repo into `.memlet/` (read-only when `dry_run`). Refused (ok false, nothing written)
+    when `.memlet`, its config, wiki, index or ledger is a symlink or not a regular file / real directory."""
     root = _resolve_root(repo_path)
+    return _guarded("init", root, dry_run, output_format, _WIKI_STATE_PATHS,
+                    lambda: _init_project(root, dry_run=dry_run, force=force, output_format=output_format))
+
+
+def _init_project(root: Path, *, dry_run: bool, force: bool, output_format: str) -> Dict[str, Any]:
     head = _git_head(root)
     instruction_files = discover_instruction_files(root)
     raw: List[Dict[str, Any]] = []
-    for rel in instruction_files:
-        raw.extend(_extract_anchors(_read_text(root / rel), rel))
+    for rel, src_text in _source_texts(root, instruction_files):
+        raw.extend(_extract_anchors(src_text, rel))
     config_path = root / CONFIG_PATH
     config = _base_config(head, instruction_files)
     backup = None
     if config_path.is_file():
         try:
-            existing = json.loads(_read_text(config_path))
+            existing_text = read_regular_text(config_path, MAX_CONFIG_BYTES)
+            if existing_text is None:
+                raise ValueError(f"not a regular file of at most {MAX_CONFIG_BYTES} bytes")
+            existing = json.loads(existing_text)
             if not isinstance(existing, dict):
                 raise ValueError("config must be a JSON object")
         except (ValueError, OSError) as exc:
@@ -625,15 +951,11 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
     config.update(repoHead=head, instructionFiles=instruction_files, anchorStates=list(ANCHOR_STATES))
     stored, skipped_pins = _validated_config_pins(config)
     page_pins = {}
-    wiki_dir = root / WIKI_DIR
-    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
-        for page in sorted(wiki_dir.rglob("*.md")):
-            if page.is_symlink() or not page.is_file():
-                continue
-            for a in _extract_anchors(_read_text(page), _rel(root, page)):
-                if a["pin"]:
-                    page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
-                    raw.append(a)
+    for page_rel, page_text in iter_wiki_pages(root):
+        for a in _extract_anchors(page_text, page_rel):
+            if a["pin"]:
+                page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
+                raw.append(a)
     for key in stored:
         if "::" in key:
             path, symbol = key.rsplit("::", 1)
@@ -690,58 +1012,53 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
     actions: List[Dict[str, str]] = []
     if backup is not None:
         if not dry_run:
-            with backup.open("xb") as out:
-                out.write(config_path.read_bytes())
+            data = read_regular_bytes(config_path, MAX_CONFIG_BYTES * 4)
+            if data is None:
+                raise UnsafePathError(".memlet/config.json is not a regular file of a size Memlet backs up")
+            write_managed_bytes(root, _rel(root, backup), data, create_only=True)
         actions.append({"op": "would-backup" if dry_run else "backup", "path": _rel(root, backup)})
 
     plan = [(CONFIG_PATH, config_text, True), (INDEX_PATH, index_text, force or index_additions)]
     for rel, text, overwrite in plan:
         target = root / rel
         exists = target.is_file()
-        if exists and target.read_text(encoding="utf-8", errors="ignore") == text:
+        if exists and _read_text(target) == text:
             op = "unchanged"
         elif exists and not overwrite:
             op = "kept"
         else:
             op = "update" if exists else "create"
             if not dry_run:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
+                write_managed_text(root, rel, text)
         if dry_run and op in ("create", "update"):
             op = "would-" + op
         actions.append({"op": op, "path": rel})
 
     pin_migrations = {}
-    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
-        for page in sorted(wiki_dir.rglob("*.md")):
-            if page.is_symlink() or not page.is_file():
-                continue
-            old = _read_text(page)
-            def migrate(m):
-                key = f"{m.group('path')}::{m.group('symbol')}"
-                cp = stored.get(key)
-                if not cp:
-                    return m.group(0)
-                sig = f" sig={cp['sigHash']}" if cp.get("sigHash") else ""
-                req = f" req={cp['reqSigHash']}" if cp.get("reqSigHash") else ""
-                return f"<!-- memlet:anchor {key} ast={cp['astHash']}{sig}{req} basis={cp.get('hashBasis') or 'legacy'} -->"
-            new = PIN_RE.sub(migrate, old) if force else _migrate_legacy_comments(root, old)
-            if new != old:
-                if not dry_run:
-                    page.write_text(new, encoding="utf-8")
-                    pin_migrations[_rel(root, page)] = (_page_body_sha256(old), _page_body_sha256(new))
-                actions.append({"op": "would-update" if dry_run else "update", "path": _rel(root, page)})
+    for page_rel, old in iter_wiki_pages(root):  # read after the writes above: INDEX.md may just have been written
+        def migrate(m):
+            key = f"{m.group('path')}::{m.group('symbol')}"
+            cp = stored.get(key)
+            if not cp:
+                return m.group(0)
+            sig = f" sig={cp['sigHash']}" if cp.get("sigHash") else ""
+            req = f" req={cp['reqSigHash']}" if cp.get("reqSigHash") else ""
+            return f"<!-- memlet:anchor {key} ast={cp['astHash']}{sig}{req} basis={cp.get('hashBasis') or 'legacy'} -->"
+        new = PIN_RE.sub(migrate, old) if force else _migrate_legacy_comments(root, old)
+        if new != old:
+            if not dry_run:
+                write_managed_text(root, page_rel, new)
+                pin_migrations[page_rel] = (_page_body_sha256(old), _page_body_sha256(new))
+            actions.append({"op": "would-update" if dry_run else "update", "path": page_rel})
 
     ledger = root / LEDGER_PATH
     index_written = any(a["path"] == INDEX_PATH and a["op"] in ("create", "update") for a in actions)
-    if ledger.is_symlink():
-        op = "kept"
-    elif dry_run:
+    if dry_run:
         op = "would-update" if ledger.is_file() else "would-create"
     else:
         existed = ledger.is_file()
         now = _utc_now()
-        with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+        with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
             with conn:
                 _ledger_ready(conn)
                 changed = _sync_snapshots(conn, classified, now)
@@ -794,10 +1111,16 @@ def repin_legacy_ts_anchors(repo_path=".", *, dry_run: bool = False) -> Dict[str
     of its behavior. The dry run previews identical selections without writes.
     """
     root = _resolve_root(repo_path)
+    return _guarded("repin", root, dry_run, "json", _WIKI_STATE_PATHS, lambda: _repin_legacy_ts(root, dry_run))
+
+
+def _repin_legacy_ts(root: Path, dry_run: bool) -> Dict[str, Any]:
     config_path = root / CONFIG_PATH
-    config = json.loads(_read_text(config_path)) if config_path.is_file() else _base_config(_git_head(root), [])
-    if not isinstance(config, dict):
-        raise ValueError("memlet config must be a JSON object")
+    config, err = read_config(root)
+    if err:
+        raise ValueError(f"memlet config must be a JSON object ({err})")
+    if config is None:
+        config = _base_config(_git_head(root), [])
     pins, skipped = _validated_config_pins(config)
     selected, cache = set(), {}
 
@@ -821,37 +1144,32 @@ def repin_legacy_ts_anchors(repo_path=".", *, dry_run: bool = False) -> Dict[str
         if pin:
             updated[key] = dict(cp, astHash=pin["ast"], sigHash=pin["sig"], reqSigHash=pin["req"], hashBasis=pin["basis"])
     pages = []
-    wiki_dir = root / WIKI_DIR
-    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
-        for page in sorted(wiki_dir.rglob("*.md")):
-            if page.is_symlink() or not page.is_file():
-                continue
-            before = _read_text(page)
-            def replace(m):
-                key = f"{m.group('path')}::{m.group('symbol')}"
-                pin = replacement(key, m.group("basis"))
-                if not pin:
-                    return m.group(0)
-                sig = f" sig={pin['sig']}" if pin.get("sig") else ""
-                req = f" req={pin['req']}" if pin.get("req") else ""
-                return f"<!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} basis={pin['basis']} -->"
-            after = PIN_RE.sub(replace, before)
-            if before != after:
-                pages.append((page, before, after))
+    for page_rel, before in iter_wiki_pages(root):
+        page = root / page_rel
+
+        def replace(m):
+            key = f"{m.group('path')}::{m.group('symbol')}"
+            pin = replacement(key, m.group("basis"))
+            if not pin:
+                return m.group(0)
+            sig = f" sig={pin['sig']}" if pin.get("sig") else ""
+            req = f" req={pin['req']}" if pin.get("req") else ""
+            return f"<!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} basis={pin['basis']} -->"
+        after = PIN_RE.sub(replace, before)
+        if before != after:
+            pages.append((page, before, after))
     actions = []
     if updated != config.get("pinnedAnchors", {}):
         config["pinnedAnchors"] = updated
         if not dry_run:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            write_managed_text(root, CONFIG_PATH, json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         actions.append({"op": "would-update" if dry_run else "update", "path": CONFIG_PATH})
     for page, before, after in pages:
         if not dry_run:
-            page.write_text(after, encoding="utf-8")
+            write_managed_text(root, _rel(root, page), after)
         actions.append({"op": "would-update" if dry_run else "update", "path": _rel(root, page)})
-    ledger = root / LEDGER_PATH
-    if pages and not dry_run and not ledger.is_symlink():
-        with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+    if pages and not dry_run:
+        with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
             with conn:
                 _ledger_ready(conn)
                 last, now = _last_page_hashes(conn), _utc_now()
@@ -871,22 +1189,27 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
     per-page status headers, and sync human page edits into `.memlet/ledger.sqlite3`."""
     root = _resolve_root(repo_path)
     wiki_dir = root / WIKI_DIR
-    initialized = wiki_dir.is_dir() and not wiki_dir.is_symlink()
+    if not (wiki_dir.is_dir() or os.path.lexists(str(wiki_dir))) or dry_run:
+        return _wiki_status(root, dry_run=dry_run, output_format=output_format)
+    return _guarded("wiki", root, dry_run, output_format, _WIKI_STATE_PATHS,
+                    lambda: _wiki_status(root, dry_run=dry_run, output_format=output_format))
+
+
+def _wiki_status(root: Path, *, dry_run: bool, output_format: str) -> Dict[str, Any]:
+    wiki_dir = root / WIKI_DIR
+    initialized = wiki_dir.is_dir() and not managed_path_problem(root, WIKI_DIR, leaf="dir")
     raw: List[Dict[str, Any]] = []
     pages: List[str] = []
     texts: Dict[str, str] = {}
     if initialized:
-        for p in sorted(wiki_dir.rglob("*.md")):
-            if p.is_symlink() or not p.is_file():
-                continue
-            rel = _rel(root, p)
+        for rel, text in iter_wiki_pages(root):
             pages.append(rel)
-            texts[rel] = _read_text(p)
+            texts[rel] = text
             raw.extend(_extract_anchors(_STATUS_BLOCK_RE.sub("", _PAGE_STATUS_RE.sub("", texts[rel])), rel))
     else:
         # Not initialized: read-only preview over instruction files, nothing is written.
-        for rel in discover_instruction_files(root):
-            raw.extend(_extract_anchors(_read_text(root / rel), rel))
+        for rel, src_text in _source_texts(root, discover_instruction_files(root)):
+            raw.extend(_extract_anchors(src_text, rel))
     original_hashes = {rel: _page_body_sha256(text) for rel, text in texts.items()}
     merged = _merge_anchors(raw)
     if initialized:
@@ -903,8 +1226,8 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
 
     actions: List[Dict[str, str]] = []
     index = root / INDEX_PATH
-    if initialized and index.is_file() and not index.is_symlink():
-        old = _read_text(index)
+    if initialized and INDEX_PATH in texts:
+        old = texts[INDEX_PATH]
         block = _status_block(classified, summary)
         new = _STATUS_BLOCK_RE.sub(lambda _m: block, old) if _STATUS_BLOCK_RE.search(old) else old.rstrip("\n") + "\n\n" + block + "\n"
         new = _migrate_legacy_comments(root, new)
@@ -913,7 +1236,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         elif dry_run:
             actions.append({"op": "would-update", "path": INDEX_PATH})
         else:
-            index.write_text(new, encoding="utf-8")
+            write_managed_text(root, INDEX_PATH, new)
             texts[INDEX_PATH] = new
             actions.append({"op": "update", "path": INDEX_PATH})
 
@@ -935,16 +1258,13 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         elif dry_run:
             actions.append({"op": "would-update", "path": rel})
         else:
-            (root / rel).write_text(new, encoding="utf-8")
+            write_managed_text(root, rel, new)
             texts[rel] = new
             actions.append({"op": "update", "path": rel})
 
     config_path = root / CONFIG_PATH
-    if initialized and config_path.is_file() and not config_path.is_symlink():
-        try:
-            config = json.loads(_read_text(config_path))
-        except (ValueError, OSError):
-            config = None
+    if initialized and config_path.is_file() and not managed_path_problem(root, CONFIG_PATH):
+        config, _cfg_err = read_config(root)
         pins = config.get("pinnedAnchors") if isinstance(config, dict) else None
         migrated = False
         for key, cp in list(pins.items()) if isinstance(pins, dict) else []:
@@ -959,14 +1279,14 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
                 migrated = True
         if migrated:
             if not dry_run:
-                config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                write_managed_text(root, CONFIG_PATH, json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             actions.append({"op": "would-update" if dry_run else "update", "path": CONFIG_PATH})
 
     # Bi-directional sync: a page body that differs from its last recorded hash is a human edit.
     ledger = root / LEDGER_PATH
     ledger_synced = False
     user_edited: List[str] = []
-    if initialized and not ledger.is_symlink():
+    if initialized and not first_managed_problem(root, _LEDGER_FILES):
         page_hashes = {rel: _page_body_sha256(texts[rel]) for rel in pages}
         if dry_run:
             last = _read_ledger_hashes(ledger)
@@ -974,7 +1294,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         else:
             existed = ledger.is_file()
             now = _utc_now()
-            with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+            with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
                 with conn:
                     _ledger_ready(conn)
                     last = _last_page_hashes(conn)
@@ -1042,7 +1362,48 @@ _MAX_SOURCE_BYTES = 1_000_000
 _MAX_RULES_PER_FILE = 200
 _RULE_TEXT_LIMIT = 300
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(?P<text>\S.*)$")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
+class _HeadingMatch:
+    __slots__ = ("_title",)
+
+    def __init__(self, title: str) -> None:
+        self._title = title
+
+    def group(self, name: Any = 0) -> str:
+        return self._title
+
+
+class _HeadingPattern:
+    """`^\\s{0,3}#{1,6}\\s+(?P<title>.*?)\\s*#*\\s*$` as a direct scan (the regex backtracked quadratically over a
+    long run of spaces before a non-space, non-`#` character: 5 KB took seconds). Same matches and same `title`:
+    up to 3 leading whitespace characters, 1-6 `#`, at least one whitespace character, then the rest with trailing
+    whitespace, a trailing `#` run and whitespace before it removed. Only `match` / `search` with `group("title")`."""
+
+    pattern = r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*#*\s*$"
+
+    def match(self, line: str, pos: int = 0) -> Optional[_HeadingMatch]:
+        if pos:
+            return None
+        n = len(line)
+        i = 0
+        while i < n and i < 4 and line[i].isspace():
+            i += 1
+        if i > 3:
+            return None
+        j = i
+        while j < n and line[j] == "#":
+            j += 1
+        if not 1 <= j - i <= 6 or j >= n or not line[j].isspace():
+            return None
+        # `\\s+` is greedy and the title lazy: the title is what remains once trailing whitespace, one trailing `#`
+        # run and the whitespace before it are removed; `.` cannot cross a newline, `\\s` can (so a trailing newline
+        # is absorbed, a newline inside the title is no match)
+        title = line[j:].strip().rstrip("#").rstrip()
+        return None if "\n" in title else _HeadingMatch(title)
+
+    search = match
+
+
+_HEADING_RE = _HeadingPattern()
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 _DEAD_END_HEADING_RE = re.compile(r"\b(?:rejected|dead[\s-]?ends?)\b", re.I)
 
@@ -1050,7 +1411,7 @@ _DEAD_END_HEADING_RE = re.compile(r"\b(?:rejected|dead[\s-]?ends?)\b", re.I)
 def _memory_dir_files(root: Path, dirname: str) -> List[str]:
     """Markdown files under a memory-tool directory (`.ai-memory/`, `.claude-mem/`), bounded and secret-free."""
     base = root / dirname
-    if base.is_symlink() or not base.is_dir():
+    if contained_path_problem(root, dirname, leaf="dir") or not base.is_dir():
         return []
     out: List[str] = []
     for p in sorted(base.rglob("*.md")):
@@ -1062,7 +1423,7 @@ def _memory_dir_files(root: Path, dirname: str) -> List[str]:
         except (OSError, ValueError):
             continue
         parts = Path(rel).parts
-        if p.is_symlink() or not p.is_file() or len(parts) > 8 or _is_secret_path(rel):
+        if contained_path_problem(root, rel) or not p.is_file() or len(parts) > 8 or _is_secret_path(rel):
             continue
         if any(part in EXCLUDED_DIRS for part in parts):
             continue
@@ -1141,16 +1502,28 @@ def _extract_rules(text: str, source: str) -> List[Dict[str, Any]]:
     return rules
 
 
+def _source_texts(root: Path, files: Iterable[str]) -> List[Tuple[str, str]]:
+    """(rel, text) of instruction / memory source files that pass the containment rule, each at most
+    _MAX_SOURCE_BYTES (a larger file is skipped) and MAX_SOURCE_TOTAL_BYTES together (later files are skipped)."""
+    out: List[Tuple[str, str]] = []
+    total = 0
+    for rel in files:
+        if contained_path_problem(root, rel):
+            continue
+        text = read_regular_text(root / rel, _MAX_SOURCE_BYTES)
+        if text is None:
+            continue
+        total += len(text)
+        if total > MAX_SOURCE_TOTAL_BYTES:
+            break
+        out.append((rel, text))
+    return out
+
+
 def _rules_from_files(root: Path, files: Iterable[str]) -> List[Dict[str, Any]]:
     rules: List[Dict[str, Any]] = []
-    for rel in files:
-        p = root / rel
-        try:
-            if p.stat().st_size > _MAX_SOURCE_BYTES:
-                continue
-        except OSError:
-            continue
-        rules.extend(_extract_rules(_read_text(p), rel))
+    for rel, text in _source_texts(root, files):
+        rules.extend(_extract_rules(text, rel))
     return rules
 
 
@@ -1280,15 +1653,14 @@ def _render_import_page(files: List[str], rules: List[Dict[str, Any]], by_key: D
 
 def _write_generated_page(root: Path, rel: str, text: str, dry_run: bool) -> str:
     target = root / rel
-    if any(p.is_symlink() for p in (root / MEMLET_DIR, root / WIKI_DIR, target)):
-        return "kept"
+    if managed_path_problem(root, rel):
+        return "kept"  # a symlinked / non-regular component: never written through
     exists = target.is_file()
     if exists and _PAGE_STATUS_RE.sub("", _read_text(target)) == text:
         return "unchanged"
     if dry_run:
         return "would-update" if exists else "would-create"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text, encoding="utf-8")
+    write_managed_text(root, rel, text)
     return "update" if exists else "create"
 
 
@@ -1302,6 +1674,13 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
     `.ai-memory/**/*.md` / `.claude-mem/**/*.md` and audit every code anchor they mention right away."""
     root = _resolve_root(repo_path)
     source = (source or "auto").lower()
+    if source not in IMPORT_SOURCES:
+        import_source_files(root, source)  # raises the usual ValueError for an unknown source
+    return _guarded("import", root, dry_run, output_format, _WIKI_STATE_PATHS + (IMPORT_PAGE,),
+                    lambda: _import_rules(root, source, dry_run, output_format))
+
+
+def _import_rules(root: Path, source: str, dry_run: bool, output_format: str) -> Dict[str, Any]:
     head = _git_head(root)
     files = import_source_files(root, source)
     rules = _rules_from_files(root, files)
@@ -1332,12 +1711,11 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
     actions = [{"op": _write_generated_page(root, IMPORT_PAGE, page_text, dry_run), "path": IMPORT_PAGE}]
     cfg_path = root / CONFIG_PATH
     config: Any = None
-    if cfg_path.is_file() and not cfg_path.is_symlink():
-        try:
-            config = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    if cfg_path.is_file():
+        config, cfg_err = read_config(root)
+        if cfg_err:
             config = False  # unreadable config is left alone
-    if config is False or cfg_path.is_symlink():
+    if config is False:
         actions.append({"op": "kept", "path": CONFIG_PATH})
     else:
         existed = isinstance(config, dict)
@@ -1355,20 +1733,17 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
         elif dry_run:
             op = "would-update" if existed else "would-create"
         else:
-            cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            cfg_path.write_text(text, encoding="utf-8")
+            write_managed_text(root, CONFIG_PATH, text)
             op = "update" if existed else "create"
         actions.append({"op": op, "path": CONFIG_PATH})
 
     ledger = root / LEDGER_PATH
-    if ledger.is_symlink():
-        op = "kept"
-    elif dry_run:
+    if dry_run:
         op = "would-update" if ledger.is_file() else "would-create"
     else:
         existed = ledger.is_file()
         now = _utc_now()
-        with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+        with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
             with conn:
                 _ledger_ready(conn)
                 changed = _sync_snapshots(conn, [a for a in anchors if a["symbol"]], now)
@@ -1471,7 +1846,37 @@ _DIGEST_RISK_RE = re.compile(
     r"approv\w*|budget|quota|production|real\s+money|trading|publish|upload)\b|비밀|키|결제|유료|과금|실거래|배포|푸시|커밋|삭제|승인|게시|업로드|한도",
     re.I)
 _DIGEST_SECTION_RE = re.compile(r"rule|constraint|safety|guard|policy|principle|must|never|don't|do not|forbid|금지|원칙|규칙|주의|필수|안전", re.I)
-_DIGEST_SOURCE_TAIL_RE = re.compile(r"\s+—\s+source\s+`[^`]*`.*$")
+_DIGEST_SOURCE_TAIL_AFTER_DASH_RE = re.compile(r"\s+source\s+`[^`]*`.*$")
+
+
+class _DigestSourceTailPattern:
+    """`\\s+—\\s+source\\s+`[^`]*`.*$` without retrying every whitespace start: a match must start at the first
+    whitespace character of the run that ends at an em dash, so each em dash is tried once (100 KB of spaces took
+    seconds with the regex). `search` / `sub` with the same spans as the regex."""
+
+    pattern = r"\s+—\s+source\s+`[^`]*`.*$"
+
+    def search(self, text: str, pos: int = 0) -> Optional[SpanMatch]:
+        d = text.find("—", pos)
+        while d >= 0:
+            s = d
+            while s > pos and text[s - 1].isspace():
+                s -= 1
+            if s < d:
+                m = _DIGEST_SOURCE_TAIL_AFTER_DASH_RE.match(text, d + 1)
+                if m:
+                    return SpanMatch(text, s, m.end())
+            d = text.find("—", d + 1)
+        return None
+
+    def sub(self, repl: Any, text: str, count: int = 0) -> str:
+        m = self.search(text)  # the match runs to the end of the text, so there is at most one
+        if m is None:
+            return text
+        return text[:m.start()] + (repl(m) if callable(repl) else repl) + text[m.end():]
+
+
+_DIGEST_SOURCE_TAIL_RE = _DigestSourceTailPattern()
 _HANDOVER_TEXT_LIMIT = 160
 _NEXT_ACTION_LIMIT = 300
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
@@ -1703,18 +2108,14 @@ def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
     A number is clamped to [HANDOVER_BUDGET_MIN, HANDOVER_BUDGET_MAX]; `auto` scales with the instruction text."""
     source = "argument"
     if budget is None:
-        cfg_path = root / CONFIG_PATH
-        try:
-            cfg = None if cfg_path.is_symlink() else json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            cfg = None
+        cfg, _err = read_config(root)  # regular file, size-capped, never a FIFO or a symlink
         hand = cfg.get("handover") if isinstance(cfg, dict) else None
         budget = hand.get("tokenBudget") if isinstance(hand, dict) else None
         source = "config"
     if budget is None:
         return HANDOVER_TOKEN_BUDGET, "default"
     if str(budget).strip().lower() == "auto":
-        text = "".join(_read_text(root / f) for f in discover_instruction_files(root))
+        text = "".join(t for _rel_path, t in _source_texts(root, discover_instruction_files(root)))
         want = int(round(estimate_tokens(text) * HANDOVER_AUTO_RATIO))
         return max(HANDOVER_BUDGET_MIN, min(HANDOVER_BUDGET_MAX, want)), f"{source}:auto"
     try:
@@ -1729,11 +2130,7 @@ def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
 def resolve_handover_mode(root: Path, mode=None) -> str:
     """Explicit argument > config.json `handover.mode` > `verified`. Unknown values fall back to `verified`."""
     if mode is None:
-        try:
-            cfg_path = root / CONFIG_PATH
-            cfg = None if cfg_path.is_symlink() else json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            cfg = None
+        cfg, _err = read_config(root)
         hand = cfg.get("handover") if isinstance(cfg, dict) else None
         mode = hand.get("mode") if isinstance(hand, dict) else None
     mode = str(mode or "verified").strip().lower()
@@ -1778,8 +2175,8 @@ def _digest_prose(root: Path, files: Iterable[str], known: set) -> List[Dict[str
     """Prose lines that state a rule (strong wording) in files whose rules are otherwise bullets — `_extract_rules`
     skips such lines, yet instruction files often put their most important rule in a paragraph."""
     out: List[Dict[str, Any]] = []
-    for rel in files:
-        lines = _read_text(root / rel).splitlines()
+    for rel, src_text in _source_texts(root, files):
+        lines = src_text.splitlines()
         if not any(_BULLET_RE.match(l) for l in lines):
             continue  # plain-line files are already fully extracted
         section, in_fence, front = "", False, bool(lines and lines[0].strip() == "---")
@@ -1868,24 +2265,18 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     skip_sources = {s for s in sources if any(_DIGEST_SKIP_SEGMENT_RE.search(seg) for seg in s.split("/")[:-1])} if digest else set()
     rules = _rules_from_files(root, [s for s in sources if s not in skip_sources])
     page_pins: Dict[str, Dict[str, Any]] = {}
-    wiki_dir = root / WIKI_DIR
-    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
-        for p in sorted(wiki_dir.rglob("*.md")):
-            if p.is_symlink() or not p.is_file():
-                continue
-            rel = _rel(root, p)
-            text = _read_text(p)
-            for a in _extract_anchors(text, rel):
-                if a["pin"]:
-                    page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
-            if not _is_generated_page(rel, text) and not (digest or brief or index):  # alt modes: wiki gives pins only
-                body = _STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text))
-                page_rules = _extract_rules(body, rel)
-                if rel == DREAM_PROMOTED_PAGE:  # promoted Dream lessons travel only while approval and citation verify
-                    from prism_memory.memlet_bridge import promoted_rule_entries
-                    live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
-                    page_rules = [r for r in page_rules if r["line"] in live]
-                rules.extend(page_rules)
+    for rel, text in trusted_wiki_pages(root):
+        for a in _extract_anchors(text, rel):
+            if a["pin"]:
+                page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
+        if not _is_generated_page(rel, text) and not (digest or brief or index):  # alt modes: wiki gives pins only
+            body = _STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text))
+            page_rules = _extract_rules(body, rel)
+            if rel == DREAM_PROMOTED_PAGE:  # promoted Dream lessons travel only while approval and citation verify
+                from prism_memory.memlet_bridge import promoted_rule_entries
+                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
+                page_rules = [r for r in page_rules if r["line"] in live]
+            rules.extend(page_rules)
     dead_ends = [r for r in rules if _DEAD_END_HEADING_RE.search(r["section"])]
     dead_ids = {id(r) for r in dead_ends}
     constraints, seen = [], set()
@@ -2055,27 +2446,36 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         omitted[victim] += 1
 
     actions: List[Dict[str, str]] = []
+    write_refused: Optional[str] = None
     if write:
         page = "# Memlet Handover\n\n" + markdown
-        op = _write_generated_page(root, HANDOVER_PAGE, page, dry_run=False)
-        actions.append({"op": op, "path": HANDOVER_PAGE})
-        ledger = root / LEDGER_PATH
-        if ledger.is_symlink():
-            actions.append({"op": "kept", "path": LEDGER_PATH})
+        problem = first_managed_problem(root, (MEMLET_DIR, WIKI_DIR, HANDOVER_PAGE) + _LEDGER_FILES)
+        if problem:  # nothing is written through a symlinked / non-regular component; the capsule is still returned
+            actions += [{"op": "kept", "path": HANDOVER_PAGE}, {"op": "kept", "path": LEDGER_PATH}]
+            write_refused = problem
         else:
-            existed = ledger.is_file()
-            now = _utc_now()
-            with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
-                with conn:
-                    _ledger_ready(conn)
-                    _sync_snapshots(conn, [a for a in anchors if a["symbol"]], now)
-                    _record_page(conn, HANDOVER_PAGE, _page_body_sha256(page), "handover", now)
-            actions.append({"op": "update" if existed else "create", "path": LEDGER_PATH})
+            write_refused = None
+            ledger = root / LEDGER_PATH
+            try:
+                with memlet_write_lock(root):
+                    op = _write_generated_page(root, HANDOVER_PAGE, page, dry_run=False)
+                    actions.append({"op": op, "path": HANDOVER_PAGE})
+                    existed = ledger.is_file()
+                    now = _utc_now()
+                    with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
+                        with conn:
+                            _ledger_ready(conn)
+                            _sync_snapshots(conn, [a for a in anchors if a["symbol"]], now)
+                            _record_page(conn, HANDOVER_PAGE, _page_body_sha256(page), "handover", now)
+                    actions.append({"op": "update" if existed else "create", "path": LEDGER_PATH})
+            except UnsafePathError as exc:
+                write_refused = str(exc)
 
     over = tokens >= token_budget
+    refused_write = write and write_refused is not None
     report: Dict[str, Any] = {
-        "ok": not over,
-        "exitCode": 2 if over else 0,
+        "ok": not over and not refused_write,
+        "exitCode": 2 if (over or refused_write) else 0,
         "command": "handover",
         "repoPath": str(root),
         **capsule,
@@ -2091,6 +2491,9 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     }
     if budget_source != "default":  # additive only when a budget was chosen: the default report stays byte-identical
         report["tokenBudgetSource"] = budget_source
+    if refused_write:  # additive, only when `--write` was refused: nothing was written
+        report["written"] = False
+        report["error"] = f"{write_refused}; HANDOVER.md and the ledger were not written"
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = markdown
     return report

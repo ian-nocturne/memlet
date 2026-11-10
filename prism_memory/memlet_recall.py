@@ -95,18 +95,12 @@ def parsed_rule_entries(root: Path) -> List[Dict[str, Any]]:
     current text, quoted from the secret-masked file. Not reviewed or ranked by importance: `importance` is 2 for all."""
     from prism_memory.memlet_brief import _mask, _sha, _source_lines
     from prism_memory import memlet_wiki as mw
-    files = dict(_source_lines(root))
-    wiki = root / mw.WIKI_DIR
-    if wiki.is_dir() and not wiki.is_symlink() and not (root / mw.MEMLET_DIR).is_symlink():
-        for p in sorted(wiki.rglob("*.md")):
-            if p.is_symlink() or not p.is_file():
-                continue
-            rel = mw._rel(root, p)
-            text = mw._read_text(p)
-            if mw._is_generated_page(rel, text) or rel == mw.DREAM_PROMOTED_PAGE or rel in mw._MARKED_GENERATED_PAGES:
-                continue
-            body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
-            files[rel] = body.splitlines()
+    files = dict(_source_lines(root))  # discovered instruction files: one containment rule, bounded reads
+    for rel, text in mw.iter_wiki_pages(root):  # contained, size-capped, at most MAX_WIKI_PAGES pages
+        if mw._is_generated_page(rel, text) or rel == mw.DREAM_PROMOTED_PAGE or rel in mw._MARKED_GENERATED_PAGES:
+            continue
+        body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
+        files[rel] = body.splitlines()
     out: List[Dict[str, Any]] = []
     for rel in sorted(files):
         lines = files[rel]
