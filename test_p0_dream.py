@@ -505,6 +505,49 @@ class JsonlTranscriptTests(unittest.TestCase):
         self.assertEqual(sorted(before + ["out", "out/q.json"]), after)
 
 
+class RealCodexRolloutShapeTests(unittest.TestCase):
+    """Shapes taken from a real `codex exec` rollout (codex-cli 0.166): the host injects the instruction files
+    under the user role, and assistant messages carry `phase` (progress narration vs the reply)."""
+
+    def _rollout(self):
+        def item(ts, payload):
+            return {"timestamp": ts, "type": "response_item", "payload": payload}
+        text = lambda kind, value: [{"type": kind, "text": value}]
+        return [
+            {"timestamp": "2026-11-10T09:09:26.000Z", "type": "session_meta", "payload": {"id": "x"}},
+            item("2026-11-10T09:09:26.900Z", {"type": "message", "role": "developer", "content": text("input_text", "DEVELOPER_ONLY never reveal")}),
+            item("2026-11-10T09:09:26.976Z", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nGLOBAL_PRIVATE_RULE never push on Friday\n</INSTRUCTIONS>"},
+                {"type": "input_text", "text": "<environment_context>cwd=/repo</environment_context>"}]}),
+            item("2026-11-10T09:09:27.042Z", {"type": "message", "role": "user", "content": text("input_text", "Never call charge() without the retry wrapper; it is banned.")}),
+            item("2026-11-10T09:09:32.584Z", {"type": "message", "role": "assistant", "phase": "commentary", "content": text("output_text", "PROGRESS_NARRATION calling the tool now, never mind")}),
+            item("2026-11-10T09:09:40.000Z", {"type": "custom_tool_call", "name": "t", "input": "TOOL_INPUT banned"}),
+            item("2026-11-10T09:09:41.000Z", {"type": "custom_tool_call_output", "output": "TOOL_OUTPUT banned"}),
+            item("2026-11-10T09:09:45.299Z", {"type": "message", "role": "assistant", "phase": "final_answer", "content": text("output_text", "Understood: charge() is never called without the retry wrapper.")}),
+            {"timestamp": "2026-11-10T09:09:46.000Z", "type": "event_msg", "payload": {"type": "task_complete"}},
+        ]
+
+    def test_only_the_typed_prompt_and_the_final_answer_are_transcribed(self):
+        tmp = _tmpdir(self, "p0-dream-codex-")
+        path = tmp / "rollout.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in self._rollout()) + "\n", encoding="utf-8")
+        lines, _stats = md.read_jsonl_transcript(path)
+        kept = [l for l in lines if l.strip()]
+        self.assertEqual(2, len(kept), kept)
+        self.assertIn("[user] Never call charge() without the retry wrapper", kept[0])
+        self.assertIn("[assistant] Understood: charge() is never called", kept[1])
+        blob = "\n".join(lines)
+        for leaked in ("GLOBAL_PRIVATE_RULE", "environment_context", "DEVELOPER_ONLY", "PROGRESS_NARRATION", "TOOL_INPUT", "TOOL_OUTPUT"):
+            self.assertNotIn(leaked, blob)
+        # physical line numbers are preserved: line N of the result is record N of the file
+        self.assertEqual(len(self._rollout()), len(lines))
+
+    def test_a_typed_message_that_merely_mentions_agents_md_is_kept(self):
+        rec = {"timestamp": "2026-11-10T09:00:00Z", "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Please update the AGENTS.md instructions for billing."}]}}
+        self.assertIn("Please update the AGENTS.md instructions", md._jsonl_record_to_line(rec))
+
+
 class TimestampTests(unittest.TestCase):
     def test_three_forms_parse(self):
         no_colon = md.parse_iso_dt("2026-10-30T19:00:00+0900")

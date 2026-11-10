@@ -2141,6 +2141,21 @@ _JSONL_TEXT_ITEM_TYPES = ("text", "input_text", "output_text")
 # records, and any non-final channel (analysis / reasoning / commentary), are never transcribed.
 _TRANSCRIPT_ROLES = ("user", "assistant")
 _VISIBLE_CHANNELS = (None, "", "final")
+# Codex rollouts label assistant messages with a `phase`: progress narration is "commentary", the reply is
+# "final_answer". Only the reply is transcribed.
+_VISIBLE_PHASES = (None, "", "final", "final_answer")
+# Text a host injects under the `user` role before the human's own message (seen in real Codex rollouts: the
+# repository's and the user's global instruction files, the environment description). It was not typed in the
+# session, it repeats rules that already live in instruction files, and it can hold personal global settings,
+# so it is never transcribed.
+_HOST_INJECTED_USER_PREFIXES = (
+    "# AGENTS.md instructions for ",
+    "<INSTRUCTIONS>",
+    "<user_instructions>",
+    "<environment_context>",
+    "<system-reminder>",
+    "<turn_aborted>",
+)
 
 
 def _jsonl_text(content: Any) -> str:
@@ -2170,6 +2185,8 @@ def _visible_message(container: Any) -> bool:
         return False
     channel = container.get("channel")
     if channel not in _VISIBLE_CHANNELS:
+        return False
+    if container.get("phase") not in _VISIBLE_PHASES:
         return False
     recipient = container.get("recipient")
     if recipient not in (None, "", "all", "user"):
@@ -2246,6 +2263,8 @@ def _jsonl_record_to_line(obj: Any, prefer_response_items: bool = False) -> Opti
     if not found:
         return None
     role, text, ts = found
+    if role == "user" and str(text or "").lstrip().startswith(_HOST_INJECTED_USER_PREFIXES):
+        return None
     body = " ".join(str(text or "").split())
     if not body:
         return None
