@@ -103,7 +103,8 @@ def build_index(repo_path=".", *, via: str = "claude", runner=None, write: bool 
         text, rc = runner(prompt), 0
     entries, dropped = parse_index(text, files)
     meta = {"schema": INDEX_SCHEMA, "via": via, "builtAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "inputSha256": _sha(prompt), "files": sorted(files)}
+            "inputSha256": _sha(prompt), "files": sorted(files),
+            "fileSha256": {rel: _file_sha(lines) for rel, lines in sorted(files.items())}}
     report = {"ok": bool(entries) and rc == 0, "command": "index-build", "repoPath": str(root), "via": via,
               "returncode": rc, "entries": len(entries), "dropped": dropped, "meta": meta}
     if write and entries:
@@ -115,6 +116,30 @@ def build_index(repo_path=".", *, via: str = "claude", runner=None, write: bool 
     return report
 
 
+def _file_sha(lines: List[str]) -> str:
+    return _sha("\n".join(lines))
+
+
+def index_staleness(meta: Optional[Dict[str, Any]], files: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Did the instruction files change after the index was built? New files (e.g. `management/agent-*.md` written by
+    `memlet slim-plan`), removed files and files whose text differs are listed; an index built before per-file hashes
+    were recorded falls back to comparing the whole input digest. Advisory only: entries are still verified one by
+    one against their pins."""
+    out = {"stale": False, "newFiles": [], "removedFiles": [], "changedFiles": [], "inputChanged": False}
+    if not isinstance(meta, dict):
+        return out
+    built = [f for f in meta.get("files") or [] if isinstance(f, str)] if isinstance(meta.get("files"), list) else []
+    out["newFiles"] = [f for f in sorted(files) if f not in built]
+    out["removedFiles"] = [f for f in built if f not in files]
+    shas = meta.get("fileSha256") if isinstance(meta.get("fileSha256"), dict) else None
+    if shas is not None:
+        out["changedFiles"] = [f for f in sorted(files) if f in shas and shas[f] != _file_sha(files[f])]
+    else:
+        out["inputChanged"] = _sha(build_prompt(files)) != meta.get("inputSha256")
+    out["stale"] = bool(out["newFiles"] or out["removedFiles"] or out["changedFiles"] or out["inputChanged"])
+    return out
+
+
 def _locate(lines: List[str], width: int, sha: str, hint: int) -> Optional[int]:
     """1-based start line of the pinned text (it may have moved), nearest to the hint; None if it is gone."""
     starts = [i + 1 for i in range(0, max(0, len(lines) - width + 1)) if _sha("\n".join(lines[i:i + width])) == sha]
@@ -122,7 +147,8 @@ def _locate(lines: List[str], width: int, sha: str, hint: int) -> Optional[int]:
 
 
 def load_verified_index(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """(fresh entries with their current verbatim text, stale entries, meta). No model call."""
+    """(fresh entries with their current verbatim text, stale entries, meta). No model call. `meta["staleness"]`
+    (see `index_staleness`) says whether instruction files changed after the index was built."""
     page = root / INDEX_PAGE
     if not page.is_file() or page.is_symlink():
         return [], [], None
@@ -133,6 +159,8 @@ def load_verified_index(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str
     except ValueError:
         meta = None
     files = _source_lines(root)
+    if meta is not None:
+        meta["staleness"] = index_staleness(meta, files)
     masked_files: Dict[str, List[str]] = {}
     fresh, stale = [], []
     for line in text.splitlines():

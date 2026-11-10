@@ -106,9 +106,18 @@ def _read_ledger(root: Path) -> Dict[str, Any]:
 def _audit_block(root: Path) -> Dict[str, Any]:
     rep = audit_repository(root)
     findings = []
+    # `audit_repository` emits ruleId / docPath / targetPath; the older rule / file / reference names stay accepted.
+    aliases = (("rule", ("ruleId", "rule")), ("severity", ("severity",)), ("file", ("docPath", "file")),
+               ("line", ("line",)), ("message", ("message",)), ("reference", ("targetPath", "reference")),
+               ("symbol", ("symbol",)))
     for f in (rep.get("findings") or [])[:_MAX_AUDIT_FINDINGS]:
         if isinstance(f, dict):
-            findings.append({k: f.get(k) for k in ("rule", "severity", "file", "line", "message", "reference") if k in f})
+            row = {}
+            for out_key, keys in aliases:
+                src = next((k for k in keys if f.get(k) is not None), None)
+                if src is not None:
+                    row[out_key] = f[src]
+            findings.append(row)
     return {
         "scannedDocsCount": rep.get("scannedDocsCount", 0),
         "referencesChecked": rep.get("referencesChecked", 0),
@@ -589,6 +598,12 @@ def _audit_card(ws: Dict[str, Any]) -> str:
     cells = "".join(f'<div><div class="lbl">{_e(k)}</div><div class="kpi">{_e(v if v is not None else 0)}</div></div>' for k, v in kpis)
     rules = a.get("countsByRule") or {}
     chips = " ".join(f'<span class="pill">{_e(k)} · {_e(v)}</span>' for k, v in rules.items()) or '<span class="pill">no findings</span>'
+    rows = "".join(
+        f'<li><code>{_e(f.get("rule") or "?")}</code> {_e(f.get("file") or "?")}:{_e(f.get("line") or "?")}'
+        + (f' → <code>{_e(f.get("reference"))}</code>' if f.get("reference") else "") + "</li>"
+        for f in (a.get("findings") or [])[:10] if isinstance(f, dict))
+    if rows:
+        chips += f'<ul class="sub" style="margin:10px 0 0 0;padding-left:18px">{rows}</ul>'
     led = ws.get("ledger") or {}
     led_line = (f'SQLite ledger: {len(led.get("anchorSnapshots") or [])} anchor snapshots · '
                 f'{sum((led.get("eventCounts") or {}).values())} wiki events') if led.get("present") else \

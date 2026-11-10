@@ -39,22 +39,54 @@ def _tokens(text: str) -> List[str]:
     return out
 
 
-def _entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+MAX_PROMOTED = 100  # approved Dream lessons promoted to `.memlet/wiki/dream-approved.md` (memlet_bridge)
+
+
+def _entries_meta(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Verified index entries plus promoted Dream lessons (each re-verified on every call by `memlet_bridge`:
+    unedited line, still approved for the same content, transcript citation unchanged), and the index meta."""
     from prism_memory.memlet_brief import _mask
     from prism_memory.memlet_index import load_verified_index
-    fresh, stale, _ = load_verified_index(root)
+    fresh, stale, meta = load_verified_index(root)
+    fresh, stale = fresh[:MAX_ENTRIES], stale[:MAX_ENTRIES]
+    from prism_memory.memlet_bridge import promoted_rule_entries
+    p_fresh, p_stale = promoted_rule_entries(root)
+    fresh, stale = fresh + p_fresh[:MAX_PROMOTED], stale + p_stale[:MAX_PROMOTED]
     import hashlib
     for e in fresh + stale:  # topics and paths come from the index page / file names: mask what is displayed
         e["id"] = e["source"]  # verified citation: private identity for membership, exclusion and de-duplication
         e["key"] = hashlib.sha256(e["id"].encode("utf-8")).hexdigest()[:16]  # opaque, collision-safe public handle
         e["topic"] = _mask(e["topic"])
         e["source"] = _mask(e["source"])  # display only
-    return fresh[:MAX_ENTRIES], stale[:MAX_ENTRIES]
+        if "quote" in e and e.get("dreamId"):
+            e["quote"] = _mask(e["quote"])
+    return fresh, stale, meta
+
+
+def _entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    fresh, stale, _ = _entries_meta(root)
+    return fresh, stale
 
 
 def _stale_line(stale: List[Dict[str, Any]]) -> str:
     return (f"- WARNING: {len(stale)} indexed rule(s) changed since the index was built; they are not quoted — re-read: "
             + "; ".join(f"`{e['source']}`" for e in stale[:3]))
+
+
+def _index_stale_line(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Warning when instruction files changed after the index was built (new rules there are not indexed yet)."""
+    st = (meta or {}).get("staleness") or {}
+    if not st.get("stale"):
+        return None
+    from prism_memory.memlet_brief import _mask
+    parts = []
+    for key, label in (("newFiles", "new"), ("changedFiles", "changed"), ("removedFiles", "removed")):
+        if st.get(key):
+            parts.append(f"{label}: " + ", ".join(f"`{_mask(f)}`" for f in st[key][:3])
+                         + (f" (+{len(st[key]) - 3})" if len(st[key]) > 3 else ""))
+    detail = "; ".join(parts) or "instruction text differs from what was indexed"
+    return (f"- WARNING: instruction files changed after the rule index was built ({detail}); rules added since are "
+            "not indexed — re-run `memlet index-build`")
 
 
 def _quote_block(e: Dict[str, Any]) -> str:
@@ -94,12 +126,13 @@ def build_context(repo_path=".", *, core_budget: int = 600, index_budget: int = 
     core_budget + index_budget tokens; if even the fixed text does not fit, the call fails instead of overrunning."""
     from prism_memory.memlet_wiki import _resolve_root, estimate_tokens
     root = _resolve_root(repo_path)
-    fresh, stale = _entries(root)
+    fresh, stale, meta = _entries_meta(root)
+    index_warning = _index_stale_line(meta)
     core_head = "## Project rules — safety core (quoted verbatim; source unchanged since the index was built)"
     index_head = ("## Rule index — BEFORE acting on any of these topics, read the cited lines "
                   "(not listing a rule here does not mean it does not exist)")
     total = max(0, int(core_budget)) + max(0, int(index_budget))
-    fixed = [core_head, index_head] + ([_stale_line(stale)] if stale else [])
+    fixed = [core_head, index_head] + ([_stale_line(stale)] if stale else []) + ([index_warning] if index_warning else [])
     omit_reserve = "- 999 more indexed rule(s) not listed for the token budget; read the instructions if unsure"
     reserve = estimate_tokens("\n".join(fixed + [omit_reserve, "- (none)", "- (none)", ""]))
     if reserve > total:
@@ -134,6 +167,8 @@ def build_context(repo_path=".", *, core_budget: int = 600, index_budget: int = 
             lines.append(f"- {omitted} more indexed rule(s) not listed for the token budget; read the instructions if unsure")
         if stale:
             lines.append(_stale_line(stale))
+        if index_warning:
+            lines.append(index_warning)
         return "\n".join(lines) + "\n"
     text = render()
     while estimate_tokens(text) > total and index:  # estimator is not additive across joins: trim until it truly fits
@@ -152,9 +187,21 @@ def build_context(repo_path=".", *, core_budget: int = 600, index_budget: int = 
 
 def recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str] = (), safety: bool = False) -> Dict[str, Any]:
     """T2: BM25 over (topic + cited source text) of fresh entries; top-k spans quoted verbatim. Deterministic."""
+    return _recall(repo_path, query, k=k, exclude=exclude, safety=safety)
+
+
+def recall_items(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str] = (),
+                 safety: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """`recall` plus the picked entries as items (key, source, topic, quote, importance[, dreamId]) for callers that
+    lay out their own budget (`memlet_bridge.unified_recall`). The `recall` result itself is unchanged."""
+    return _recall(repo_path, query, k=k, exclude=exclude, safety=safety, with_items=True)
+
+
+def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str] = (), safety: bool = False,
+            with_items: bool = False):
     from prism_memory.memlet_wiki import _resolve_root, estimate_tokens
     root = _resolve_root(repo_path)
-    fresh, stale = _entries(root)
+    fresh, stale, meta = _entries_meta(root)
     k = max(0, min(int(k), MAX_K))
     skip = set(exclude)  # verified citations or opaque keys (never masked display strings, which can collide)
     out_of = lambda e: e["id"] in skip or e["key"] in skip
@@ -185,8 +232,23 @@ def recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str]
     lines += [_quote_block(e) for e in picked] or ["- (no indexed rule matched; consult the rule index)"]
     if stale:
         lines.append(_stale_line(stale))
+    index_warning = _index_stale_line(meta)
+    if index_warning:
+        lines.append(index_warning)
     text = "\n".join(lines) + "\n"
-    return {"ok": True, "command": "recall", "repoPath": str(root), "k": k, "stale": len(stale),
-            "spans": [e["source"] for e in picked], "spanKeys": [e["key"] for e in picked],
-            "scores": [round(-s, 4) for s, _, _ in scored[:k]], "tokenEstimate": estimate_tokens(text),
-            "formatted": text}
+    res = {"ok": True, "command": "recall", "repoPath": str(root), "k": k, "stale": len(stale),
+           "spans": [e["source"] for e in picked], "spanKeys": [e["key"] for e in picked],
+           "scores": [round(-s, 4) for s, _, _ in scored[:k]], "tokenEstimate": estimate_tokens(text),
+           "formatted": text}
+    if index_warning:  # additive, only when the index is outdated: the CLI's golden key set stays unchanged otherwise
+        res["indexStale"] = (meta or {}).get("staleness")
+    if with_items:
+        items = []
+        for e in picked:
+            item = {"key": e["key"], "source": e["source"], "topic": e["topic"], "quote": e["quote"],
+                    "importance": e["importance"]}
+            if e.get("dreamId"):
+                item["dreamId"] = e["dreamId"]
+            items.append(item)
+        return res, items
+    return res

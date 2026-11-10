@@ -84,7 +84,9 @@ TOP_INSTRUCTION_FILES = (
     ".clinerules",
     ".github/copilot-instructions.md",
 )
-INSTRUCTION_GLOBS = (".cursor/rules/*.md", ".cursor/rules/*.mdc", ".github/instructions/*.md")
+# `management/agent-*.md`: where `memlet slim-plan` moves directives and standing rules out of AGENTS.md
+# (memlet_slim.LOG_REL / RULES_REL); following them keeps moved rules indexed, recalled and handed over.
+INSTRUCTION_GLOBS = (".cursor/rules/*.md", ".cursor/rules/*.mdc", ".github/instructions/*.md", "management/agent-*.md")
 NESTED_INSTRUCTION_NAMES = ("CLAUDE.md", "AGENTS.md", "SKILL.md")
 _SCRATCH_DIRS = {"_workspace", "worktrees", ".worktrees"}
 
@@ -951,6 +953,7 @@ IMPORT_SOURCES = ("auto", "claude-md", "cursorrules", "ai-memory", "claude-mem")
 _MEMORY_DIRS = {"ai-memory": ".ai-memory", "claude-mem": ".claude-mem"}
 BRIEF_PAGE = ".memlet/wiki/BRIEF.md"  # written by `memlet brief-build`; never read back as wiki rule text
 RULE_INDEX_PAGE = ".memlet/wiki/INDEX-RULES.md"  # written by `memlet index-build`; never read back as wiki rule text
+DREAM_PROMOTED_PAGE = ".memlet/wiki/dream-approved.md"  # memlet_bridge.PROMOTED_PAGE: read as rules only while verified
 _GENERATED_PAGES = (INDEX_PATH, IMPORT_PAGE, HANDOVER_PAGE)
 # BRIEF.md / INDEX-RULES.md count as generated only when they carry their generator's marker: a page a person wrote
 # under the same name keeps being read as ordinary wiki rules.
@@ -1560,6 +1563,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         if held:
             lines.append(f"- WARNING: {held} indexed rule(s) changed since the index was built (re-read before relying on "
                          "them): " + "; ".join(f"{a['topic']} `{a['source']}`" for a in (c.get("staleIndex") or [])))
+        if c.get("indexOutdated"):
+            lines.append("- WARNING: instructions changed after indexing; re-run `memlet index-build`")
     if c.get("mode") == "brief":
         src = c.get("briefSource") or {}
         lines += ["", f"### Project brief (LLM-written by {src.get('via') or 'n/a'} at {src.get('builtAt') or 'n/a'}; cited "
@@ -1801,7 +1806,12 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
                     page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
             if not _is_generated_page(rel, text) and not (digest or brief or index):  # alt modes: wiki gives pins only
                 body = _STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text))
-                rules.extend(_extract_rules(body, rel))
+                page_rules = _extract_rules(body, rel)
+                if rel == DREAM_PROMOTED_PAGE:  # promoted Dream lessons travel only while approval and citation verify
+                    from prism_memory.memlet_bridge import promoted_rule_entries
+                    live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
+                    page_rules = [r for r in page_rules if r["line"] in live]
+                rules.extend(page_rules)
     dead_ends = [r for r in rules if _DEAD_END_HEADING_RE.search(r["section"])]
     dead_ids = {id(r) for r in dead_ends}
     constraints, seen = [], set()
@@ -1943,6 +1953,8 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
             capsule["mode"] = "index"
             capsule["indexSource"] = ({k: index_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if index_meta
                                       else None)
+            if index_meta and (index_meta.get("staleness") or {}).get("stale"):
+                capsule["indexOutdated"] = True  # additive, only when stale: unchanged capsules stay byte-identical
         if brief:
             capsule["mode"] = "brief"
             capsule["briefSource"] = ({k: brief_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if brief_meta
