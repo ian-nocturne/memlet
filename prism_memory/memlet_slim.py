@@ -26,6 +26,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 LOG_REL = "management/agent-directives-log.md"
 RULES_REL = "management/agent-rules.md"
+# First line of each moved-content file. It is the ownership proof Memlet's instruction discovery requires before it
+# treats `management/agent-*.md` as agent instructions (memlet_wiki.slim_output_files); a foreign file is never followed.
+LOG_HEADER = "# Agent directives log (moved verbatim from AGENTS.md by memlet slim-plan)"
+RULES_HEADER = "# Standing rules (moved verbatim from AGENTS.md by memlet slim-plan)"
+SLIM_OUTPUTS = {LOG_REL: LOG_HEADER, RULES_REL: RULES_HEADER}
 _HEADING_RE = re.compile(r"^#{1,6}\s")
 _TITLE_RE = re.compile(r"^\s*>?\s*\*\*(?P<t>.+?)\*\*")
 TITLE_MAX = 120
@@ -91,7 +96,7 @@ def plan(lines: List[str], keep_recent: int = 2, split_rules: bool = False) -> D
     if len(segs) <= keep_recent and not split_rules:
         return {"ok": False, "why": "nothing to move (no dated directive blocks beyond the kept ones)"}
     keep, move = segs[:keep_recent], segs[keep_recent:]
-    log: List[Slot] = [("gen", "# Agent directives log (moved verbatim from AGENTS.md by memlet slim-plan)"), ("gen", "")]
+    log: List[Slot] = [("gen", LOG_HEADER), ("gen", "")]
     index: List[Slot] = []
     for s, e in move:
         a = len(log) + 1
@@ -106,7 +111,7 @@ def plan(lines: List[str], keep_recent: int = 2, split_rules: bool = False) -> D
     agents += [("gen", "## Directive index (older directives, verbatim in the log)")] + index + [("gen", "")]
     files: Dict[str, List[Slot]] = {"AGENTS.md": agents, LOG_REL: log}
     if split_rules and first_heading < len(lines):
-        rules: List[Slot] = [("gen", "# Standing rules (moved verbatim from AGENTS.md by memlet slim-plan)"), ("gen", "")]
+        rules: List[Slot] = [("gen", RULES_HEADER), ("gen", "")]
         rindex: List[Slot] = []
         for s, e in _sections(lines, first_heading):
             a = len(rules) + 1

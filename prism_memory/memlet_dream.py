@@ -21,6 +21,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -65,11 +66,18 @@ CANARY_SECRETS: Tuple[str, ...] = (
 )
 
 # Expanded secret patterns covering PEM private keys, OpenAI/Anthropic/GitHub/Slack/AWS/Google keys, JWTs, and key=value secrets
-_PEM_BLOCK_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 _-]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]+PRIVATE KEY-----"
-)
+# Private-key armour, qualified or not: `PRIVATE KEY` (PKCS#8), `RSA/EC/DSA/OPENSSH/ENCRYPTED PRIVATE KEY`,
+# `PGP PRIVATE KEY BLOCK`; also a PuTTY `.ppk` key (header line through its `Private-MAC:` line).
+_KEY_BEGIN = r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----"
+_KEY_END = r"-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----"
+_PEM_BLOCK_RE = re.compile(_KEY_BEGIN + r"[\s\S]*?" + _KEY_END)
+_PPK_BLOCK_RE = re.compile(r"PuTTY-User-Key-File-\d+:[\s\S]*?Private-MAC:[^\n]*")
+# A begin marker whose end marker is missing: everything up to the next blank line (text) is the key body.
+_PEM_OPEN_RE = re.compile(_KEY_BEGIN + r"[\s\S]*?(?=\n[ \t]*\n|\Z)")
 _SECRET_PATTERNS: Tuple[re.Pattern[str], ...] = (
-    re.compile(r"-----BEGIN [A-Z0-9 _-]+PRIVATE KEY-----"),
+    re.compile(_KEY_BEGIN + r"[^\n]*"),  # per line: a begin marker and anything after it on that line
+    re.compile(r"[^\n]*" + _KEY_END),     # per line: a key body ending in an end marker
+    re.compile(r"PuTTY-User-Key-File-\d+:[^\n]*"),
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -128,11 +136,31 @@ def sanitize_node_id(raw_id: Any, fallback: str = "L-000") -> str:
     return s or fallback[:48]
 
 
+SECRET_BLOCK_MARK = "[REDACTED_SECRET_BLOCK]"
+
+
+def redact_secret_blocks(text: str) -> str:
+    """Replace every multi-line private-key block (PEM/PKCS#8/OpenSSH/PGP armour, PuTTY .ppk) with one
+    `[REDACTED_SECRET_BLOCK]` per line it spanned, so the line count, and every pin that addresses a later line, is
+    unchanged. A begin marker without an end marker is redacted up to the next blank line (or the end of the text).
+    Run on the whole text BEFORE splitting into lines: line-by-line masking cannot see a key body between markers."""
+    if not text:
+        return text or ""
+
+    def _block(m: "re.Match[str]") -> str:
+        return "\n".join([SECRET_BLOCK_MARK] * (m.group(0).count("\n") + 1))
+
+    for rx in (_PEM_BLOCK_RE, _PPK_BLOCK_RE, _PEM_OPEN_RE):
+        text = rx.sub(_block, text)
+    return text
+
+
 def mask_secrets(text: str) -> str:
-    """Mask synthetic canary strings, PEM private keys, and secret patterns BEFORE any truncation or storage."""
+    """Mask synthetic canary strings, PEM private keys, and secret patterns BEFORE any truncation or storage.
+    Multi-line key blocks keep their line count (see `redact_secret_blocks`)."""
     if not text:
         return ""
-    out = _PEM_BLOCK_RE.sub("[REDACTED_SECRET]", text)
+    out = redact_secret_blocks(text)
     for c in CANARY_SECRETS:
         if c in out:
             out = out.replace(c, "[REDACTED_CANARY]")
@@ -2243,7 +2271,7 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
             if f.suffix == ".jsonl":
                 _add_jsonl(out, rel, f)
             else:
-                out[rel] = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                out[rel] = redact_secret_blocks(f.read_text(encoding="utf-8", errors="replace")).splitlines()
                 report["logFiles"] += 1
         if not out:
             raise ValueError(
@@ -2261,9 +2289,11 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
             res: Dict[str, List[str]] = {}
             for k, v in raw.items():
                 if isinstance(v, list):
-                    res[str(k)] = [str(line) for line in v]
+                    lines = [str(line) for line in v]
+                    red = redact_secret_blocks("\n".join(lines)).split("\n")
+                    res[str(k)] = red if len(red) == len(lines) else [mask_secrets(x) for x in lines]
                 elif isinstance(v, str):
-                    res[str(k)] = v.splitlines()
+                    res[str(k)] = redact_secret_blocks(v).splitlines()
             if res:
                 return res, report
         raise ValueError(f"Invalid JSON snapshot structure in: {p}")
@@ -2561,16 +2591,17 @@ def run_dream_build(
     if not ver["ok"]:
         raise ValueError(f"Ontology contract verification failed during dream-build: {ver}")
 
-    prior_sha: Optional[str] = None
-    if out_json_p.is_file():
-        try:
-            prior = json.loads(out_json_p.read_text(encoding="utf-8"))
-            if isinstance(prior, dict):
-                prior_sha = graph_sha256(prior)
-        except (ValueError, OSError):
-            prior_sha = None
     json_str = json.dumps(graph, ensure_ascii=False, indent=2) + "\n"
-    _commit_queue_and_db(out_json_p, json_str, out_db_p, graph, replaces_sha=prior_sha)
+    with queue_lock(out_json_p):  # the prior generation is read and replaced under the queue lock
+        prior_sha: Optional[str] = None
+        if out_json_p.is_file():
+            try:
+                prior = json.loads(out_json_p.read_text(encoding="utf-8"))
+                if isinstance(prior, dict):
+                    prior_sha = graph_sha256(prior)
+            except (ValueError, OSError):
+                prior_sha = None
+        _commit_queue_and_db(out_json_p, json_str, out_db_p, graph, replaces_sha=prior_sha)
 
     edge_counts: Dict[str, int] = {et: 0 for et in EDGE_TYPES}
     for e in graph.get("edges", []):
@@ -2716,6 +2747,121 @@ def _load_queue(queue_path: Any) -> Tuple[Path, Dict[str, Any]]:
     if not isinstance(graph, dict) or graph.get("schema") != DREAM_ONTOLOGY_SCHEMA:
         raise ValueError(f"Not a {DREAM_ONTOLOGY_SCHEMA} queue: {q}")
     return q, graph
+
+
+QUEUE_LOCK_TIMEOUT = 30.0
+_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: Dict[str, "threading.RLock"] = {}
+_LOCK_DEPTH = threading.local()
+
+
+def queue_lock_path(queue_path: Any) -> Path:
+    """Lock file for a queue: in a private per-user directory under the system temp dir, named by the SHA-256 of the
+    queue's resolved path, so locking never writes next to the user's outputs and every caller of the same queue
+    (any spelling of its path) meets on the same file."""
+    import os
+    import tempfile
+
+    q = Path(str(queue_path)).expanduser()
+    real = q.parent.resolve() / q.name
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    base = Path(tempfile.gettempdir()) / f"memlet-locks-{uid}"
+    if base.is_symlink():
+        raise ValueError(f"Refusing a symlinked lock directory: {base}")
+    base.mkdir(mode=0o700, exist_ok=True)
+    if hasattr(os, "getuid") and base.stat().st_uid != os.getuid():
+        raise ValueError(f"Lock directory {base} is owned by another user")
+    return base / (hashlib.sha256(str(real).encode("utf-8")).hexdigest()[:32] + ".lock")
+
+
+@contextlib.contextmanager
+def queue_lock(queue_path: Any, timeout: Optional[float] = None) -> Iterator[Path]:
+    """Exclusive lock for one queue, held across load -> decide/merge -> generation check -> JSON replace -> DB commit
+    (and, in `memlet_bridge`, the promotion that follows), so two writers can never both start from the same old graph.
+
+    Re-entrant within a thread. Threads of one process serialise on a per-queue `threading.RLock`; processes on an
+    advisory `fcntl.flock` of the lock file named by `queue_lock_path` (macOS, Linux; every process of one user meets
+    there, different OS users updating one queue are not serialised). Without `fcntl` (Windows) `msvcrt.locking` is used; if
+    neither exists, an exclusively created `<lock>.excl` file is the lock, and a crashed holder leaves it behind
+    (the timeout error names the file to delete). Waiting longer than `timeout` seconds raises `TimeoutError`."""
+    import os
+    import time
+
+    timeout = QUEUE_LOCK_TIMEOUT if timeout is None else timeout  # read at call time (tunable per process)
+    lock_path = queue_lock_path(queue_path)
+    key = str(lock_path)
+    depth = getattr(_LOCK_DEPTH, "held", None)
+    if depth is None:
+        depth = _LOCK_DEPTH.held = {}
+    if depth.get(key):
+        depth[key] += 1
+        try:
+            yield lock_path
+        finally:
+            depth[key] -= 1
+        return
+    with _LOCKS_GUARD:
+        rlock = _THREAD_LOCKS.setdefault(key, threading.RLock())
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    busy = (f"timed out after {timeout:g}s waiting for the Dream queue lock {lock_path}: another Memlet process is "
+            "updating this queue; retry")
+    if not rlock.acquire(timeout=max(0.0, float(timeout))):
+        raise TimeoutError(busy)
+    fd: Optional[int] = None
+    excl: Optional[Path] = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.is_symlink():
+            raise ValueError(f"Refusing a symlinked queue lock: {lock_path}")
+        try:
+            import fcntl  # type: ignore
+        except ImportError:  # pragma: no cover - not reached on macOS/Linux
+            fcntl = None  # type: ignore
+        try:
+            import msvcrt  # type: ignore
+        except ImportError:
+            msvcrt = None  # type: ignore
+        if fcntl is not None or msvcrt is not None:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:  # pragma: no cover - Windows
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(busy)
+                    time.sleep(0.02)
+        else:  # pragma: no cover - platforms with neither fcntl nor msvcrt
+            excl = lock_path.with_name(lock_path.name + ".excl")
+            while True:
+                try:
+                    os.close(os.open(str(excl), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                    break
+                except FileExistsError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(busy + f" (if no Memlet process is running, delete {excl})")
+                    time.sleep(0.02)
+        depth[key] = 1
+        try:
+            yield lock_path
+        finally:
+            depth[key] = 0
+    finally:
+        if fd is not None:
+            try:
+                if fcntl is not None:  # bound whenever fd is
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        if excl is not None:
+            try:
+                excl.unlink()
+            except OSError:
+                pass
+        rlock.release()
 
 
 def _edge_refs(graph: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -2978,6 +3124,23 @@ def _decide_queue_items(
         raise ValueError("An approver name is required to record a decision.")
     if isinstance(ids, str):
         ids = [ids]
+    if Path(str(queue_path)).expanduser().is_symlink():
+        raise ValueError(f"Refusing symlinked Dream queue: {queue_path}")
+    # one lock from load to commit: a concurrent writer can never start from the graph this call is replacing
+    with queue_lock(queue_path):
+        return _decide_locked(queue_path, ids, decision, who, snapshot_path, db_path, cascade_edges, reason)
+
+
+def _decide_locked(
+    queue_path: Any,
+    ids: Sequence[str],
+    decision: str,
+    who: str,
+    snapshot_path: Optional[Any],
+    db_path: Optional[Any],
+    cascade_edges: bool,
+    reason: str,
+) -> Dict[str, Any]:
     q_path, graph = _load_queue(queue_path)
     prior_sha = graph_sha256(graph)
     db_target = _resolve_approval_db(q_path, graph, db_path)
