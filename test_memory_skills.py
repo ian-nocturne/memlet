@@ -3398,7 +3398,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual(['AGENTS.md', 'CLAUDE.md'], data['instructionFiles'])
             self.assertRegex(data['repoHead'], r'^[0-9a-f]{40}$')
             self.assertEqual({'would-create'}, {a['op'] for a in data['actions']})
-            self.assertEqual({'active': 0, 'compatible-unverified': 0, 'stale': 1, 'path-exists': 0, 'unpinned': 3, 'total': 4}, data['anchorSummary'])
+            self.assertEqual({'active': 3, 'compatible-unverified': 0, 'stale': 1, 'path-exists': 0, 'unpinned': 0, 'total': 4}, data['anchorSummary'])
             self.assertNotIn('memlet-canary-do-not-read', out)
             code2, out2 = self._cli('init', str(repo), '--dry-run')
             self.assertEqual(out, out2)  # deterministic
@@ -3589,8 +3589,8 @@ class MemletInitWikiTests(unittest.TestCase):
             data = json.loads(out)
             self.assertFalse((repo / '.memlet').exists())
             self.assertEqual(['.ai-memory/notes/auth.md', '.cursor/rules/api.mdc', '.cursorrules', 'CLAUDE.md'], data['sourcesScanned'])
-            self.assertEqual((7, 0, 0, 2, 1, 4), (data['importedCount'], data['activeCount'], data['compatibleUnverifiedCount'],
-                                               data['staleCount'], data['unanchoredCount'], data['unpinnedCount']))
+            self.assertEqual((7, 4, 0, 2, 1), (data['importedCount'], data['activeCount'], data['compatibleUnverifiedCount'],
+                                               data['staleCount'], data['unanchoredCount']))
             self.assertEqual(1, data['brokenPathsCount'])  # `mod.py::mint_token` is a missing symbol, not a broken path
             self.assertEqual(['legacy_auth.py'], data['brokenPaths'])
             by_text = {r['text']: r for r in data['rules']}
@@ -3598,7 +3598,7 @@ class MemletInitWikiTests(unittest.TestCase):
             self.assertEqual([{'anchor': 'legacy_auth.py', 'status': 'stale', 'reason': 'missing_path'}],
                              by_text['Sessions live in `legacy_auth.py`.']['anchors'])
             self.assertEqual('stale', by_text['Tokens are minted in `mod.py::mint_token`.']['status'])
-            self.assertEqual('unpinned', by_text['Handlers call `mod.py::real`.']['status'])  # .mdc front matter skipped
+            self.assertEqual('active', by_text['Handlers call `mod.py::real`.']['status'])  # .mdc front matter skipped
             self.assertEqual(5, by_text['Handlers call `mod.py::real`.']['line'])
             self.assertEqual('unanchored', by_text['Keep commits small.']['status'])
             self.assertNotIn('memlet-canary-do-not-read', out)
@@ -4728,7 +4728,8 @@ class ConsolidatedReviewTests(unittest.TestCase):
         for page in (BRIEF_PAGE, INDEX_PAGE):
             (d / page).write_text('# Notes\n- Never deploy before reading `release-gate.md`.\n')
             cap = build_handover(d)
-            self.assertEqual([{'anchor': 'release-gate.md', 'reason': 'path_exists'}], cap['pathExistsAnchors'], page)
+            self.assertTrue(any('Never deploy before reading `release-gate.md`.' == r['rule'] for r in cap['pathExistsAnchors']), page)
+            self.assertTrue(all(r['source'].startswith(page + ':') for r in cap['pathExistsAnchors']))
             self.assertEqual([], cap['activeConstraints'])
             (d / page).unlink()
         (d / INDEX_PAGE).write_text('# Notes\n- Mine.\n')

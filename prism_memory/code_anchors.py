@@ -305,13 +305,16 @@ def _extract_brace_block(src_text: str, open_brace_idx: int) -> str:
     return src_text[open_brace_idx:]
 
 
-def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False) -> Tuple[str, bool]:
+def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False, literal_spans=None) -> Tuple[str, bool]:
     """Replace JS/TS comments (and optionally string/template/regex interiors) with spaces (preserving newlines) and check syntax balance."""
     out: list[str] = []
     n = len(text)
     i = 0
     in_str: Optional[str] = None
     in_regex = False
+    regex_start = 0
+    string_start = 0
+    template_starts = []
     in_regex_class = False
     in_line_comment = False
     in_block_comment = False
@@ -365,6 +368,8 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
                 in_regex_class = False
                 out.append(" " if blank_strings else ch)
             elif ch == "/" and not in_regex_class:
+                if literal_spans is not None:
+                    literal_spans.append((regex_start, i + 1))
                 in_regex = False
                 last_non_ws = "/"
                 out.append("/")
@@ -376,6 +381,8 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
         if in_str is not None:
             if in_str == "`" and ch == "$" and nxt == "{":
                 # Template interpolation `${ ... }` is executable code, never string content.
+                if literal_spans is not None:
+                    literal_spans.append((template_starts[-1], i + 2))
                 out.append("${")
                 stack.append("${")
                 in_str = None
@@ -393,6 +400,9 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
                     in_str = None
                 out.append("\n")
             elif ch == in_str:
+                start = template_starts.pop() if in_str == "`" else string_start
+                if literal_spans is not None:
+                    literal_spans.append((start, i + 1))
                 out.append(ch)
                 in_str = None
                 last_non_ws = ch
@@ -416,7 +426,7 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
         # Regex literal start (never after `<` or `>` or before `>` which is JSX `/>`)
         if (
             ch == "/"
-            and nxt not in ("/", "*", "=", ">", " ", "\t", "\n", "\r", "")
+            and nxt not in ("/", "*", "=", ">", "\n", "\r", "")
             and (
                 not last_non_ws
                 or last_non_ws in "=(,:[!&|?{;~+-*%^"
@@ -425,6 +435,7 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
             )
         ):
             in_regex = True
+            regex_start = i
             in_regex_class = False
             regex_after_ctrl = False
             out.append("/")
@@ -433,6 +444,9 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
 
         if ch in ("'", '"', "`"):
             in_str = ch
+            string_start = i
+            if ch == "`":
+                template_starts.append(i)
             out.append(ch)
             i += 1
             continue
@@ -441,6 +455,7 @@ def _blank_js_comments_preserve_lines(text: str, *, blank_strings: bool = False)
             stack.pop()
             out.append("}")
             in_str = "`"
+            template_starts[-1] = i
             i += 1
             continue
 
@@ -509,19 +524,24 @@ def _js_hash_tokens(text: str) -> List[str]:
     This is a lexical approximation, not a JS parser: automatic semicolon
     insertion, regex/division ambiguity and JSX prevent claiming AST exactness.
     """
-    clean, _ = _blank_js_comments_preserve_lines(text)
-    pattern = re.compile(
-        r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"
-        r"|[A-Za-z_$][\w$]*|(?:\d+(?:\.\d+)?)|===|!==|=>|==|!=|<=|>=|\+\+|--|&&|\|\||\?\?|\*\*|\.\.\.|[^\s]",
-        re.S,
-    )
+    spans = []
+    clean, _ = _blank_js_comments_preserve_lines(text, literal_spans=spans)
+    pattern = re.compile(r"[A-Za-z_$][\w$]*|(?:\d+(?:\.\d+)?)|===|!==|=>|==|!=|<=|>=|\+\+|--|&&|\|\||\?\?|\*\*|\.\.\.|[^\s]")
     tokens = []
     end = 0
-    for match in pattern.finditer(clean):
-        if tokens and "\n" in clean[end:match.start()]:
-            tokens.append("\n")  # ASI makes line breaks semantically significant.
-        tokens.append(match.group())
-        end = match.end()
+
+    def append(start, stop):
+        nonlocal end
+        if tokens and "\n" in clean[end:start]:
+            tokens.append("\n")  # Preserve automatic semicolon insertion boundaries.
+        tokens.append(clean[start:stop])
+        end = stop
+
+    for start, stop in sorted(spans) + [(len(clean), len(clean))]:
+        for match in pattern.finditer(clean, end, start):
+            append(match.start(), match.end())
+        if stop > start:
+            append(start, stop)  # Literal contents, including whitespace, are indivisible.
     return tokens
 
 
@@ -586,7 +606,7 @@ def _ts_body_start(mask: str, pos: int, arrow: bool):
         if ch == "{":
             prefix = mask[type_start:pos].rstrip()
             # An object type starts an annotation or follows a type operator.
-            is_type = annotation and (not prefix or prefix[-1:] in ("|", "&", ":", "?") or prefix.endswith("=>"))
+            is_type = annotation and (not prefix or prefix[-1:] in ("|", "&", ":", "?") or prefix.endswith("=>") or re.search(r"\b(?:extends|keyof|typeof)\s*$", prefix))
             if not is_type and not arrow:
                 return pos, pos
             if not annotation and arrow:
