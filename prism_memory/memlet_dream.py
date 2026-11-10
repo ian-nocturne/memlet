@@ -2,13 +2,15 @@
 
 Consolidates raw multi-vendor AI coding session transcripts into a verified, zero-daemon ontology graph
 with 4 typed edges (`GOVERNS`, `SUPERSEDES`, `RESOLVES`, `BLOCKS`), deterministic SHA-256 quote pins,
-dual-pin + chronological + DAG acyclicity enforcement on `SUPERSEDES`, 1-hop subgraph recall (`M2-G`),
+dual-pin + chronological + DAG acyclicity enforcement on `SUPERSEDES`, 1-hop subgraph recall,
 and Cortex lineage visualization payload (`memlet.cortex_lineage.v1`).
 
 Design invariants:
 - Never modifies live `.memlet/` ledgers or instruction files (`CLAUDE.md`, `AGENTS.md`).
 - Scrubs secrets and synthetic canary tokens BEFORE any substring truncation.
 - Enforces deterministic quote pins (`file_id:start-end` + `sha256(verbatim_lines)`).
+- Nothing is promoted automatically: built nodes/edges are `PENDING` until a human approves them
+  (`approve_queue_items`), and `run_dream_recall` re-verifies pins against the snapshot by default.
 """
 
 from __future__ import annotations
@@ -35,16 +37,23 @@ CATEGORIES = (
     "cross_session_conflict",
 )
 STATUS_KINDS = ("active_lesson", "superseded_rule", "open_trap")
+# `PENDING` is the default for every node/edge written by `run_dream_build`; only an explicit human
+# decision via `approve_queue_items` / `reject_queue_items` moves an item out of it.
+PENDING = "PENDING"
+REJECTED = "REJECTED"
 VERDICTS = (
     "SUPPORTED",
     "MISSING_CONDITION",
     "OUT_OF_EVIDENCE",
     "ALREADY_SUPERSEDED",
     "UNVERIFIED",
+    PENDING,
+    REJECTED,
 )
 ALLOWED_RECALL_VERDICTS = ("SUPPORTED", "UNVERIFIED", "ALREADY_SUPERSEDED")
-EDGE_VERDICTS = ("VALID", "WRONG_EDGE_TYPE_OR_DIR", "UNVERIFIED")
+EDGE_VERDICTS = ("VALID", "WRONG_EDGE_TYPE_OR_DIR", "UNVERIFIED", PENDING, REJECTED)
 ALLOWED_EDGE_VERDICTS = ("VALID", "UNVERIFIED")
+AUTO_CANDIDATE_CAP = 24
 RESERVED_ID_PREFIXES = ("RULE:", "SCOPE:", "BLOCKS:", "RESOLVES:", "GOVERNS:", "SUPERSEDES:")
 
 CANARY_SECRETS: Tuple[str, ...] = (
@@ -80,7 +89,9 @@ REDACTION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("BEARER_JWT", re.compile(r"(?:eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|xox[baprs]-[A-Za-z0-9-]{12,})")),
 )
 
-_SPAN_RE = re.compile(r"^([A-Za-z0-9_.-]+):(\d+)(?:-(\d+))?$")
+# file_id may be a nested relative path (`dir/sub/file.log`); absolute paths, `..`, `.`/empty
+# segments and backslashes are rejected in `parse_span`.
+_SPAN_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*):(\d+)(?:-(\d+))?$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # Anchored to the start of the line so embedded timestamps in message bodies cannot forge ordering
 _LINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
@@ -172,6 +183,15 @@ def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _is_safe_file_id(file_id: str) -> bool:
+    """A snapshot file id is a relative POSIX path: no absolute root, no `..`, no `.`/empty segments, no backslash."""
+    if not file_id or not isinstance(file_id, str):
+        return False
+    if ".." in file_id or "\\" in file_id or file_id.startswith("/") or ":" in file_id:
+        return False
+    return all(seg not in ("", ".") for seg in file_id.split("/"))
+
+
 def parse_span(span_str: str) -> Optional[Tuple[str, int, int]]:
     """Parse `file_id:start-end` or `file_id:line` into `(file_id, start_line, end_line)` (1-indexed)."""
     if not isinstance(span_str, str):
@@ -180,7 +200,7 @@ def parse_span(span_str: str) -> Optional[Tuple[str, int, int]]:
     if not m:
         return None
     file_id = m.group(1)
-    if ".." in file_id or "/" in file_id or "\\" in file_id:
+    if not _is_safe_file_id(file_id):
         return None
     start = int(m.group(2))
     end = int(m.group(3)) if m.group(3) else start
@@ -235,13 +255,37 @@ def extract_line_timestamp(text: str) -> str:
     return m.group(1) if m else ""
 
 
+_ISO_PARTS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def _normalize_iso_ts(s: str) -> str:
+    """Rewrite every form `_LINE_TS_RE` accepts into one `datetime.fromisoformat` accepts on Python 3.9/3.10:
+    `Z` -> `+00:00`, `+0900` -> `+09:00`, and any number of fraction digits -> exactly 6 (truncated, not rounded).
+    """
+    m = _ISO_PARTS_RE.match(s)
+    if not m:
+        # Not a pinned-line form; keep the previous behaviour (fromisoformat decides).
+        return s[:-1] + "+00:00" if s.endswith("Z") else s
+    date_part, time_part, frac, tz = m.groups()
+    out = f"{date_part}T{time_part}"
+    if frac:
+        out += "." + (frac + "000000")[:6]
+    if tz:
+        if tz in ("Z", "z"):
+            tz = "+00:00"
+        elif ":" not in tz:
+            tz = f"{tz[:3]}:{tz[3:]}"
+        out += tz
+    return out
+
+
 def parse_iso_dt(ts_str: str) -> Optional[datetime.datetime]:
     """Parse an ISO-8601 timestamp string into a timezone-aware UTC `datetime` for accurate comparison."""
     if not ts_str or not isinstance(ts_str, str):
         return None
-    s = ts_str.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+    s = _normalize_iso_ts(ts_str.strip())
     try:
         dt = datetime.datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -281,6 +325,14 @@ def _has_cycle(edges: Sequence[Dict[str, Any]]) -> bool:
             if in_deg[nxt] == 0:
                 queue.append(nxt)
     return visited < len(nodes)
+
+
+def _claimed(val: Any) -> Optional[str]:
+    """Record a proposer's self-reported verdict as inert, masked text (audit trail only)."""
+    if val is None or isinstance(val, (dict, list)):
+        return None
+    s = safe_truncate_masked(str(val).strip(), 32)
+    return s or None
 
 
 def dream_pin_and_validate(
@@ -530,7 +582,8 @@ def dream_pin_and_validate(
             })
 
         seen_ids.add(lid)
-        # Never trust self-reported verification from candidate proposer; always initialize UNVERIFIED
+        # Never trust self-reported verification from candidate proposer; always initialize UNVERIFIED.
+        # The proposer's claim is kept for audit only (`claimedVerdict`) and is never read as a verdict.
         node_obj = {
             "id": lid,
             "category": cat,
@@ -545,6 +598,8 @@ def dream_pin_and_validate(
             "verifiedBy": "",
             "verdict": "UNVERIFIED",
             "edgeVerdict": "UNVERIFIED",
+            "claimedVerdict": _claimed(cand.get("verdict")),
+            "claimedEdgeVerdict": _claimed(cand.get("edgeVerdict") or cand.get("edge_verdict")),
             "timestamp": src_ts,
             "edges": valid_node_edges,
         }
@@ -839,6 +894,12 @@ def _check_graph_safe_structure(graph: Dict[str, Any]) -> None:
         raise ValueError("Refusing to process ontology graph with a SUPERSEDES cycle.")
 
 
+_SQLITE_ADDED_COLUMNS: Dict[str, Tuple[str, ...]] = {
+    "ontology_nodes": ("edge_verdict", "claimed_verdict", "decision", "decided_by", "decided_at"),
+    "ontology_edges": ("edge_verdict", "decision", "decided_by", "decided_at"),
+}
+
+
 def write_ontology_sqlite(
     db_path: Path,
     graph: Dict[str, Any],
@@ -869,7 +930,12 @@ def write_ontology_sqlite(
                     superseded_by_sha256 TEXT,
                     verified_by TEXT,
                     verdict TEXT,
-                    timestamp TEXT
+                    timestamp TEXT,
+                    edge_verdict TEXT,
+                    claimed_verdict TEXT,
+                    decision TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT
                 )"""
             )
             conn.execute(
@@ -883,9 +949,19 @@ def write_ontology_sqlite(
                     src_sha256 TEXT NOT NULL,
                     target_span TEXT,
                     target_sha256 TEXT,
-                    vendor_origin TEXT
+                    vendor_origin TEXT,
+                    edge_verdict TEXT,
+                    decision TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT
                 )"""
             )
+            # Databases written before the approval columns existed are migrated in place.
+            for table, cols in _SQLITE_ADDED_COLUMNS.items():
+                have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for col in cols:
+                    if col not in have:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS dream_runs (
                     run_id TEXT PRIMARY KEY,
@@ -908,7 +984,7 @@ def write_ontology_sqlite(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     f"RUN-{graph_sha[:12]}",
-                    str(graph.get("schema") or SCHEMA_VERSION),
+                    str(graph.get("schema") or DREAM_ONTOLOGY_SCHEMA),
                     len(graph.get("nodes") or []),
                     len(graph.get("edges") or []),
                     len(graph.get("dropped") or []),
@@ -919,12 +995,14 @@ def write_ontology_sqlite(
             for n in graph.get("nodes") or []:
                 pp = n.get("primaryPin") or {}
                 sp = n.get("supersededByPin") or {}
+                n_dec = n.get("approval") if isinstance(n.get("approval"), dict) else {}
                 conn.execute(
                     """INSERT INTO ontology_nodes (
                         id, category, status_kind, scope_tag, title, importance,
                         vendor_origins, primary_span, quote_text, sha256_pin,
-                        superseded_by_span, superseded_by_sha256, verified_by, verdict, timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        superseded_by_span, superseded_by_sha256, verified_by, verdict, timestamp,
+                        edge_verdict, claimed_verdict, decision, decided_by, decided_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         n["id"],
                         n["category"],
@@ -941,16 +1019,23 @@ def write_ontology_sqlite(
                         n.get("verifiedBy", ""),
                         n.get("verdict", "UNVERIFIED"),
                         n.get("timestamp", ""),
+                        n.get("edgeVerdict"),
+                        n.get("claimedVerdict"),
+                        n_dec.get("decision"),
+                        n_dec.get("by"),
+                        n_dec.get("at"),
                     ),
                 )
             for e in graph.get("edges") or []:
                 sp = e.get("srcPin") or {}
                 tp = e.get("targetPin") or {}
+                e_dec = e.get("approval") if isinstance(e.get("approval"), dict) else {}
                 conn.execute(
                     """INSERT INTO ontology_edges (
                         edge_id, edge_type, from_id, to_id, target_label,
-                        src_span, src_sha256, target_span, target_sha256, vendor_origin
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        src_span, src_sha256, target_span, target_sha256, vendor_origin,
+                        edge_verdict, decision, decided_by, decided_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         e["edgeId"],
                         e["edgeType"],
@@ -962,6 +1047,10 @@ def write_ontology_sqlite(
                         tp.get("span") if tp else None,
                         tp.get("sha256") if tp else None,
                         e.get("vendorOrigin", ""),
+                        e.get("edgeVerdict"),
+                        e_dec.get("decision"),
+                        e_dec.get("by"),
+                        e_dec.get("at"),
                     ),
                 )
 
@@ -975,8 +1064,41 @@ def _safe_imp(val: Any, default: int = 2) -> int:
         return default
 
 
+# Generic quote-window lengths (characters). One value per role; no per-content tuning.
+_FLAT_QUOTE_CHARS = 120
+_RECALL_QUOTE_CHARS = 96
+_RECALL_REPLACEMENT_QUOTE_CHARS = 120
+
+# Generic English function words ignored by query relevance scoring.
+_QUERY_STOPWORDS = frozenset({
+    "the", "and", "for", "that", "this", "with", "from", "what", "which", "when", "where", "how",
+    "why", "who", "should", "must", "can", "may", "will", "would", "could", "are", "was", "were",
+    "been", "have", "has", "had", "does", "did", "not", "into", "onto", "upon", "before", "after",
+    "during", "while", "under", "over", "between", "through", "about", "against", "within", "without",
+    "each", "every", "any", "all", "both", "some", "such", "other", "another", "than", "then", "also",
+    "only", "just", "more", "most", "less", "least", "very", "same", "once", "even", "though",
+    "use", "used", "uses", "using", "instead",
+})
+
+
+def _query_terms(text: str, with_stems: bool = False) -> Set[str]:
+    """Lowercase word tokens for relevance scoring: >=3 chars, or >=2 chars containing a digit (e.g. `p2`)."""
+    out: Set[str] = set()
+    for t in re.findall(r"[a-z0-9_%-]+", (text or "").lower()):
+        c = t.strip("-")
+        if not c or c in _QUERY_STOPWORDS:
+            continue
+        if len(c) >= 3 or (len(c) == 2 and any(ch.isdigit() for ch in c)):
+            out.add(c)
+            if "-" in c:
+                out.add(c.replace("-", ""))
+            if with_stems and len(c) >= 6:
+                out.add(c[:5])
+    return out
+
+
 def format_flat_memory(graph: Dict[str, Any], budget_tokens: int = 1500) -> str:
-    """Format `M2-Flat`: flat importance-ordered list of verified lessons without 1-hop ontology edge
+    """Format a flat importance-ordered list of verified lessons without 1-hop ontology edge
     grouping. Includes replacement pins on superseded rules so flat readers see active replacement evidence.
     """
     _check_graph_safe_structure(graph)
@@ -990,15 +1112,13 @@ def format_flat_memory(graph: Dict[str, Any], budget_tokens: int = 1500) -> str:
         c_val = str(n_obj.get("category") or "")
         if c_val == "superseded_directive" or isinstance(n_obj.get("supersededByPin"), dict):
             return 0
-        if str(n_obj.get("id") or "") in ("LA1-04", "LA1-05", "LA1-09", "LA1-10", "LA1-11", "LA3-05", "LA3-06"):
-            return 1
-        return 2
+        return 1
 
     nodes = sorted(
         eligible,
         key=lambda n: (_safe_imp(n.get("importance"), 2), _flat_cat_rank(n), str(n.get("id") or "")),
     )
-    lines = ["# Memlet Dream Verified Lessons (M2-Flat)", ""]
+    lines = ["# Memlet Dream Verified Lessons (flat)", ""]
     for n in nodes:
         pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
         sp = n.get("supersededByPin") if isinstance(n.get("supersededByPin"), dict) else {}
@@ -1010,17 +1130,7 @@ def format_flat_memory(graph: Dict[str, Any], budget_tokens: int = 1500) -> str:
         title_lbl = safe_truncate_masked(str(n.get("title") or ""), 128)
         clean_q = re.sub(r"\s*\d{4}-\d{2}-\d{2}T[^\s]+\s+\[[^\]]+\]\s*", " ", re.sub(r"\s+", " ", str(pp.get("quoteText") or "")).strip()).strip()
         clean_q = re.sub(r"^TOOL_(?:RESULT|USE\s+\w+):\s*", "", clean_q)
-        if "1. **FIXED" in clean_q and "2. **PARTIAL" in clean_q and "3. **PARTIAL" in clean_q:
-            clean_q = "1. FIXED (stale-symbol) | 2. PARTIAL (wiki rule-pool boundary) | 3. PARTIAL (truncation safety)"
-        elif "PASS T3" in clean_q and "37:VERDICT: PASS" in clean_q:
-            p3 = clean_q[clean_q.index("PASS T3"):clean_q.index("PASS T4")].strip() if "PASS T4" in clean_q else clean_q[clean_q.index("PASS T3"):]
-            v37 = clean_q[clean_q.index("37:VERDICT: PASS"):clean_q.index("Reviewed implementation")].strip() if "Reviewed implementation" in clean_q else clean_q[clean_q.index("37:VERDICT: PASS"):]
-            clean_q = f"{p3} | {v37}"
-        elif "PASS T2" in clean_q and clean_q.startswith("PASS T1"):
-            clean_q = clean_q[clean_q.index("PASS T2"):clean_q.index("PASS T3")].strip() if "PASS T3" in clean_q else clean_q[clean_q.index("PASS T2"):]
-        if clean_q.startswith("1041:HANDOVER_TOKEN_BUDGET = 500"):
-            clean_q = "1041:HANDOVER_TOKEN_BUDGET = 500"
-        clean_q = safe_truncate_masked(clean_q, 160 if (clean_q.startswith("PASS T3") or clean_q.startswith("1. FIXED (stale-symbol")) else 108)
+        clean_q = safe_truncate_masked(clean_q, _FLAT_QUOTE_CHARS)
         raw_sp = str(pp.get("span") or "")
         safe_sp = raw_sp if parse_span(raw_sp) else "unpinned"
         safe_sha = re.sub(r"[^0-9a-f]", "", str(pp.get("sha256") or "").lower())[:8] or "none"
@@ -1071,11 +1181,15 @@ def recall_subgraph(
     query_text: str = "",
     budget_tokens: int = 1500,
     snapshot_files: Optional[Dict[str, List[str]]] = None,
+    unverified_label: bool = False,
 ) -> Dict[str, Any]:
-    """Format `M2-G`: 1-hop ontology subgraph recall with deterministic `SUPERSEDES` quarantine
+    """1-hop ontology subgraph recall with deterministic `SUPERSEDES` quarantine
     and typed sections (`GOVERNS`, `RESOLVES`, `BLOCKS`, plus explicit `SUPERSEDES` lineage warnings).
     Strictly allowlists `SUPPORTED`, `UNVERIFIED`, and `ALREADY_SUPERSEDED` verdicts and `VALID`/`UNVERIFIED`
-    edge verdicts, and computes `superseded_ids` only from surviving edges/nodes.
+    edge verdicts (so `PENDING`/`REJECTED` never surface), and computes `superseded_ids` only from surviving
+    edges/nodes. Pins are SHA-256 re-verified only when `snapshot_files` is given; the result's
+    `pinVerification` field says which. `unverified_label=True` stamps an UNVERIFIED warning into the header.
+    Shipped callers should use `run_dream_recall`, which re-verifies and requires human approval by default.
     """
     _check_graph_safe_structure(graph)
     if snapshot_files is not None:
@@ -1202,27 +1316,8 @@ def recall_subgraph(
                         if k_id:
                             superseded_ids.add(k_id)
 
-    _stopwords = {
-        "the", "and", "for", "that", "this", "with", "from", "what", "which", "when", "where", "how",
-        "why", "who", "should", "must", "can", "may", "will", "would", "could", "are", "was", "were",
-        "been", "have", "has", "had", "does", "did", "not", "into", "onto", "upon", "before", "after",
-        "during", "while", "under", "over", "between", "through", "about", "against", "within", "without",
-        "each", "every", "any", "all", "both", "some", "such", "other", "another", "than", "then", "also",
-        "only", "just", "more", "most", "less", "least", "very", "same", "used", "using", "use", "uses",
-        "agent", "joining", "project", "question", "questions", "answer", "apply", "applies", "applied",
-        "earlier", "later", "older", "newer", "once", "instead", "even", "though",
-    }
-
     def _tokenize_query(q_str: str) -> Set[str]:
-        raw_toks = re.findall(r"[a-z0-9_%-]+", (q_str or "").lower())
-        out_toks: Set[str] = set()
-        for t in raw_toks:
-            c = t.strip("-")
-            if (len(c) >= 3 or c in ("50%", "p2", "m1", "m2", "m3")) and c not in _stopwords:
-                out_toks.add(c)
-                if "-" in c:
-                    out_toks.add(c.replace("-", ""))
-        return out_toks
+        return _query_terms(q_str, with_stems=False)
 
     q_tokens = _tokenize_query(query_text)
     sub_queries = [s.strip() for s in re.split(r"[\n?]+", query_text or "") if len(s.strip()) >= 8] or [query_text or ""]
@@ -1251,16 +1346,7 @@ def recall_subgraph(
         return "governs"
 
     def _words_and_stems(s_txt: str) -> Set[str]:
-        ws: Set[str] = set()
-        for t in re.findall(r"[a-z0-9_%-]+", (s_txt or "").lower()):
-            c = t.strip("-")
-            if (len(c) >= 3 or c in ("50%", "p2", "m1", "m2", "m3")) and c not in _stopwords:
-                ws.add(c)
-                if "-" in c:
-                    ws.add(c.replace("-", ""))
-                if len(c) >= 6:
-                    ws.add(c[:5])
-        return ws
+        return _query_terms(s_txt, with_stems=True)
 
     node_meta_ws_idx: Dict[int, Set[str]] = {}
     node_quote_ws_idx: Dict[int, Set[str]] = {}
@@ -1355,10 +1441,12 @@ def recall_subgraph(
     included_order: List[Tuple[str, int, str, int]] = []
 
     included_ids: List[str] = []
-    header = (
-        "# Memlet Dream Subgraph Capsule (M2-G)\n"
-        "# Rule: Never apply [SUPERSEDED] old_pin; apply replacement_pin [ACTIVE].\n"
-    )
+    header = "# Memlet Dream Subgraph Capsule\n"
+    if unverified_label:
+        header += (
+            "# UNVERIFIED: pins were NOT re-checked against a snapshot (caller opted out of verification).\n"
+        )
+    header += "# Rule: Never apply [SUPERSEDED] old_pin; apply replacement_pin [ACTIVE].\n"
 
     def _window_quote(raw_q: str, is_replacement: bool = False) -> str:
         cleaned = re.sub(
@@ -1367,27 +1455,7 @@ def recall_subgraph(
             re.sub(r"\s+", " ", raw_q).strip(),
         ).strip()
         cleaned = re.sub(r"^TOOL_(?:RESULT|USE\s+\w+):\s*", "", cleaned)
-        if "1. **FIXED" in cleaned and "2. **PARTIAL" in cleaned and "3. **PARTIAL" in cleaned:
-            cleaned = "1. FIXED (stale-symbol) | 2. PARTIAL (wiki rule-pool boundary) | 3. PARTIAL (truncation safety)"
-        elif "PASS T3" in cleaned and "37:VERDICT: PASS" in cleaned:
-            p3 = cleaned[cleaned.index("PASS T3"):cleaned.index("PASS T4")].strip() if "PASS T4" in cleaned else cleaned[cleaned.index("PASS T3"):]
-            v37 = cleaned[cleaned.index("37:VERDICT: PASS"):cleaned.index("Reviewed implementation")].strip() if "Reviewed implementation" in cleaned else cleaned[cleaned.index("37:VERDICT: PASS"):]
-            cleaned = f"{p3} | {v37}".replace("`", "")
-        elif "PASS T2" in cleaned and cleaned.startswith("PASS T1"):
-            cleaned = cleaned[cleaned.index("PASS T2"):cleaned.index("PASS T3")].strip() if "PASS T3" in cleaned else cleaned[cleaned.index("PASS T2"):]
-        if cleaned.startswith("1041:HANDOVER_TOKEN_BUDGET = 500"):
-            cleaned = "1041:HANDOVER_TOKEN_BUDGET = 500"
-        cjk_cnt = sum(1 for ch in cleaned if ord(ch) > 127)
-        if cleaned.startswith("PASS T3") or cleaned.startswith("1. FIXED (stale-symbol"):
-            max_len = 112
-        elif cleaned.startswith("PASS T2"):
-            max_len = 78
-        elif cleaned.startswith("- 목표 예산"):
-            max_len = 89
-        elif is_replacement:
-            max_len = 124 if cjk_cnt > 8 else 120
-        else:
-            max_len = 102 if cjk_cnt > 8 else 64
+        max_len = _RECALL_REPLACEMENT_QUOTE_CHARS if is_replacement else _RECALL_QUOTE_CHARS
         if len(cleaned) <= max_len:
             return safe_truncate_masked(cleaned, max_len)
         low_c = cleaned.lower()
@@ -1561,6 +1629,7 @@ def recall_subgraph(
         "tokenBudget": budget_tokens,
         "includedNodeIds": included_ids,
         "duplicateIds": duplicate_ids,
+        "pinVerification": "sha256_verified" if snapshot_files is not None else "not_verified",
         "counts": {
             "blocks": len(sec_blocks),
             "resolves": len(sec_resolves),
@@ -1727,20 +1796,171 @@ def build_cortex_lineage_payload(
     }
 
 
+_JSONL_TEXT_ITEM_TYPES = ("text", "input_text", "output_text")
+
+
+def _jsonl_text(content: Any) -> str:
+    """Pull plain text out of a transcript `content` value (string, or list of text-bearing items)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                itype = item.get("type")
+                if (itype is None or itype in _JSONL_TEXT_ITEM_TYPES) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        return " ".join(parts)
+    return ""
+
+
+def _jsonl_record_to_line(obj: Any) -> Optional[str]:
+    """Map one transcript record to a single pin-addressable line `<ISO ts> [<role>] <text>`.
+
+    Understands Claude Code records (`{"type": "user"|"assistant", "timestamp", "message": {"role", "content"}}`),
+    Codex CLI rollout records (`{"timestamp", "type": "response_item", "payload": {"type": "message", "role",
+    "content": [{"type": "input_text"|"output_text", "text"}]}}`) and the older top-level Codex
+    `{"type": "message", "role", "content"}` form. Anything else (tool calls, metadata, summaries, events)
+    returns None. Text-bearing items only; tool payloads are not transcribed.
+    """
+    if not isinstance(obj, dict):
+        return None
+    containers: List[Dict[str, Any]] = []
+    for key in ("message", "payload"):
+        val = obj.get(key)
+        if isinstance(val, dict):
+            containers.append(val)
+    containers.append(obj)
+    role = ""
+    text = ""
+    for c in containers:
+        if c is not obj and c.get("type") not in (None, "message"):
+            continue
+        if c is obj and c.get("type") not in (None, "message") and "role" not in c:
+            continue
+        c_role = c.get("role")
+        if not isinstance(c_role, str) or not c_role.strip():
+            continue
+        c_text = _jsonl_text(c.get("content"))
+        if c_text.strip():
+            role, text = c_role, c_text
+            break
+    if not text:
+        return None
+    role = re.sub(r"[^A-Za-z0-9_-]", "", role)[:24] or "unknown"
+    ts = ""
+    for src in (obj, obj.get("payload") if isinstance(obj.get("payload"), dict) else {}):
+        raw_ts = src.get("timestamp")
+        if isinstance(raw_ts, str):
+            m = _LINE_TS_RE.match(raw_ts.strip())
+            if m and m.group(1) == raw_ts.strip():
+                ts = m.group(1)
+                break
+    body = " ".join(text.split())
+    return f"{ts} [{role}] {body}" if ts else f"[{role}] {body}"
+
+
+def read_jsonl_transcript(path: Any) -> Tuple[List[str], Dict[str, int]]:
+    """Read a Claude Code / Codex CLI `.jsonl` session transcript into pin-addressable lines.
+
+    Line N of the result always corresponds to physical line N of the file, so appended records never
+    shift existing pins. Non-message and malformed lines become empty strings, which `resolve_pin`
+    refuses to pin. Nothing is written to disk.
+    """
+    p = Path(str(path))
+    lines: List[str] = []
+    stats = {"records": 0, "messages": 0, "malformedLines": 0, "nonMessageLines": 0}
+    with p.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.rstrip("\r\n")
+            if not raw.strip():
+                lines.append("")
+                continue
+            stats["records"] += 1
+            try:
+                obj = json.loads(raw)
+            except (ValueError, RecursionError):
+                stats["malformedLines"] += 1
+                lines.append("")
+                continue
+            if not isinstance(obj, dict):
+                stats["malformedLines"] += 1
+                lines.append("")
+                continue
+            line = _jsonl_record_to_line(obj)
+            if line is None:
+                stats["nonMessageLines"] += 1
+                lines.append("")
+            else:
+                stats["messages"] += 1
+                lines.append(line)
+    return lines, stats
+
+
 def load_snapshot(snapshot_path: Any) -> Dict[str, List[str]]:
-    """Load a session snapshot from either a directory of `.log` files or a JSON snapshot map."""
+    """Load a session snapshot from a directory of `.log`/`.jsonl` files, one `.jsonl` transcript, or a JSON snapshot map."""
+    return load_snapshot_with_report(snapshot_path)[0]
+
+
+def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
+    """Like `load_snapshot`, plus a report of transcript files read and malformed/non-message lines skipped.
+
+    Directory snapshots are scanned recursively; file ids are POSIX paths relative to the directory
+    (`sub/dir/session.jsonl`) and must satisfy `parse_span`'s safety rules, otherwise the file is skipped
+    and counted under `skippedUnsafePaths`. Symlinked files and files resolving outside the directory are skipped.
+    """
     p = Path(str(snapshot_path)).expanduser().resolve()
+    report: Dict[str, Any] = {
+        "logFiles": 0,
+        "jsonlFiles": 0,
+        "jsonlMessages": 0,
+        "jsonlMalformedLines": 0,
+        "jsonlNonMessageLines": 0,
+        "skippedUnsafePaths": 0,
+    }
     if not p.exists():
         raise FileNotFoundError(f"Snapshot path does not exist: {p}")
+
+    def _add_jsonl(target: Dict[str, List[str]], key: str, f: Path) -> None:
+        lines, st = read_jsonl_transcript(f)
+        target[key] = lines
+        report["jsonlFiles"] += 1
+        report["jsonlMessages"] += st["messages"]
+        report["jsonlMalformedLines"] += st["malformedLines"]
+        report["jsonlNonMessageLines"] += st["nonMessageLines"]
+
     if p.is_dir():
         out: Dict[str, List[str]] = {}
-        for f in sorted(p.rglob("*.log")):
-            if f.is_file() and not f.is_symlink():
-                rel = f.name if f.parent == p else str(f.relative_to(p)).replace("\\", "/")
+        found = sorted(set(p.rglob("*.log")) | set(p.rglob("*.jsonl")))
+        for f in found:
+            if not f.is_file() or f.is_symlink():
+                continue
+            try:
+                f.resolve().relative_to(p)
+            except ValueError:
+                report["skippedUnsafePaths"] += 1
+                continue
+            rel = f.relative_to(p).as_posix()
+            if not _is_safe_file_id(rel) or not _SPAN_RE.match(f"{rel}:1"):
+                report["skippedUnsafePaths"] += 1
+                continue
+            if f.suffix == ".jsonl":
+                _add_jsonl(out, rel, f)
+            else:
                 out[rel] = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                report["logFiles"] += 1
         if not out:
-            raise ValueError(f"No .log files found in snapshot directory: {p}")
-        return out
+            raise ValueError(
+                f"No pinnable .log or .jsonl files found in snapshot directory: {p} "
+                f"(skipped unsafe paths: {report['skippedUnsafePaths']})"
+            )
+        return out, report
+    if p.is_file() and not p.is_symlink() and p.suffix == ".jsonl":
+        single: Dict[str, List[str]] = {}
+        _add_jsonl(single, p.name, p)
+        return single, report
     if p.is_file() and not p.is_symlink():
         raw = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -1751,9 +1971,9 @@ def load_snapshot(snapshot_path: Any) -> Dict[str, List[str]]:
                 elif isinstance(v, str):
                     res[str(k)] = v.splitlines()
             if res:
-                return res
+                return res, report
         raise ValueError(f"Invalid JSON snapshot structure in: {p}")
-    raise ValueError(f"Snapshot path must be a regular JSON file or directory: {p}")
+    raise ValueError(f"Snapshot path must be a regular JSON/.jsonl file or directory: {p}")
 
 
 def count_redactions_by_type(snapshot_files: Dict[str, List[str]]) -> Dict[str, int]:
@@ -1767,17 +1987,40 @@ def count_redactions_by_type(snapshot_files: Dict[str, List[str]]) -> Dict[str, 
     return counts
 
 
-def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-    """Deterministic zero-daemon candidate extractor scanning session logs when `--candidates` is omitted."""
+# Cue patterns for the autonomous extractor. ASCII cues use word boundaries so `ban` never matches
+# `banner` and status chatter such as `Tests pass now` is not mistaken for a workaround. Korean cues
+# stay substring matches because Korean attaches particles/suffixes directly to the stem.
+_SUPERSEDE_CUE_RE = re.compile(r"\b(?:superseded|supersedes|replaced\s+by)\b|폐기|대체", re.IGNORECASE)
+_PITFALL_CUE_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|must\s+not|forbid|forbids|forbidden|ban|bans|banned)\b|금지|절대",
+    re.IGNORECASE,
+)
+_WORKAROUND_CUE_RE = re.compile(r"\b(?:workaround|workarounds|work\s+around|fixed|resolved)\b|우회|해결", re.IGNORECASE)
+
+
+def extract_candidates_with_report(
+    snapshot_files: Dict[str, List[str]],
+    max_candidates: int = AUTO_CANDIDATE_CAP,
+) -> Dict[str, Any]:
+    """Deterministic zero-daemon candidate extractor (used when `--candidates` is omitted).
+
+    Returns `{"candidates", "cap", "truncated", "omittedCount"}`. Candidates beyond `max_candidates`
+    are counted, not silently cut. Candidates carry no verdict: every built item starts `PENDING`.
+    """
+    cap = max(0, int(max_candidates))
     candidates: List[Dict[str, Any]] = []
+    omitted = 0
     idx_counter = 0
+
+    def _room(n: int) -> bool:
+        return len(candidates) + n <= cap
+
     for fname in sorted(snapshot_files.keys()):
         lines = snapshot_files[fname]
         first_sup_line: Optional[int] = None
         for i, ln in enumerate(lines, start=1):
             if not extract_line_timestamp(ln):
                 continue
-            low = ln.lower()
             clean_body = re.sub(r"^\s*\d{4}-\d{2}-\d{2}[T ][^\s]+\s*(?:\[[^\]]+\]\s*)?", "", ln).strip()
             clean_body = mask_secrets(clean_body)
             if not clean_body:
@@ -1785,10 +2028,14 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
             scope_m = re.search(r"([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))", clean_body)
             scope_tag = scope_m.group(1) if scope_m else "project_rules"
 
-            if any(k in low for k in ("superseded", "replaced by", "폐기", "대체")):
+            if _SUPERSEDE_CUE_RE.search(clean_body):
                 if first_sup_line is None:
                     first_sup_line = i
                 elif i > first_sup_line:
+                    if not _room(2):
+                        omitted += 2
+                        first_sup_line = None
+                        continue
                     idx_counter += 1
                     lid = f"AUTO-{idx_counter:03d}"
                     act_id = f"AUTO-{idx_counter + 1:03d}"
@@ -1802,8 +2049,6 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
                         "src_spans": [f"{fname}:{first_sup_line}"],
                         "superseded_by_src": f"{fname}:{i}",
                         "superseded_by_id": act_id,
-                        "verdict": "ALREADY_SUPERSEDED",
-                        "edgeVerdict": "VALID",
                         "edges": [],
                     })
                     idx_counter += 1
@@ -1815,8 +2060,6 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
                         "title": safe_truncate_masked(clean_body, 120),
                         "importance": 1,
                         "src_spans": [f"{fname}:{i}"],
-                        "verdict": "SUPPORTED",
-                        "edgeVerdict": "VALID",
                         "edges": [{
                             "edge_type": "GOVERNS",
                             "to_id": f"SCOPE:{scope_tag}",
@@ -1827,19 +2070,19 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
                     first_sup_line = None
                     continue
 
-            if any(k in low for k in ("do not", "never ", "must not", "forbid", "ban", "금지", "절대")):
+            if _PITFALL_CUE_RE.search(clean_body):
+                if not _room(1):
+                    omitted += 1
+                    continue
                 idx_counter += 1
-                lid = f"AUTO-{idx_counter:03d}"
                 candidates.append({
-                    "lesson_id": lid,
+                    "lesson_id": f"AUTO-{idx_counter:03d}",
                     "category": "repeated_pitfall",
                     "status_kind": "active_lesson",
                     "scope_tag": scope_tag,
                     "title": safe_truncate_masked(clean_body, 120),
                     "importance": 1,
                     "src_spans": [f"{fname}:{i}"],
-                    "verdict": "SUPPORTED",
-                    "edgeVerdict": "VALID",
                     "edges": [{
                         "edge_type": "BLOCKS",
                         "to_id": f"BLOCKS:{scope_tag}",
@@ -1847,19 +2090,19 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
                         "src_span": f"{fname}:{i}",
                     }],
                 })
-            elif any(k in low for k in ("workaround", "fixed", "resolved", "pass ", "verdict: pass", "우회", "해결")):
+            elif _WORKAROUND_CUE_RE.search(clean_body):
+                if not _room(1):
+                    omitted += 1
+                    continue
                 idx_counter += 1
-                lid = f"AUTO-{idx_counter:03d}"
                 candidates.append({
-                    "lesson_id": lid,
+                    "lesson_id": f"AUTO-{idx_counter:03d}",
                     "category": "verified_workaround",
                     "status_kind": "active_lesson",
                     "scope_tag": scope_tag,
                     "title": safe_truncate_masked(clean_body, 120),
                     "importance": 2,
                     "src_spans": [f"{fname}:{i}"],
-                    "verdict": "SUPPORTED",
-                    "edgeVerdict": "VALID",
                     "edges": [{
                         "edge_type": "RESOLVES",
                         "to_id": f"RESOLVES:{scope_tag}",
@@ -1867,11 +2110,17 @@ def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> Li
                         "src_span": f"{fname}:{i}",
                     }],
                 })
-            if len(candidates) >= 24:
-                break
-        if len(candidates) >= 24:
-            break
-    return candidates
+    return {
+        "candidates": candidates,
+        "cap": cap,
+        "truncated": omitted > 0,
+        "omittedCount": omitted,
+    }
+
+
+def extract_candidates_from_snapshot(snapshot_files: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Backward-compatible list form of `extract_candidates_with_report` (see that function for truncation info)."""
+    return extract_candidates_with_report(snapshot_files)["candidates"]
 
 
 def _atomic_write_file(target: Path, content: str) -> int:
@@ -1893,6 +2142,22 @@ def _atomic_write_file(target: Path, content: str) -> int:
     return len(data)
 
 
+def _mark_pending(graph: Dict[str, Any]) -> None:
+    """Stamp every node and edge `PENDING`; only `approve_queue_items`/`reject_queue_items` change it."""
+    for n in graph.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        n["verdict"] = PENDING
+        n["edgeVerdict"] = PENDING
+        n["verifiedBy"] = ""
+        for e in n.get("edges") or []:
+            if isinstance(e, dict):
+                e["edgeVerdict"] = PENDING
+    for e in graph.get("edges") or []:
+        if isinstance(e, dict):
+            e["edgeVerdict"] = PENDING
+
+
 def run_dream_build(
     snapshot_path: str,
     candidates_path: Optional[str] = None,
@@ -1904,8 +2169,14 @@ def run_dream_build(
 ) -> Dict[str, Any]:
     """Execute `dream-build`: load snapshot, load or deterministically extract candidates, pin & validate,
     verify ontology contract, write `APPROVAL-QUEUE.json` and `ontology.sqlite`, and return a build receipt.
+
+    Every node and edge is written as `PENDING`. A candidate's self-reported `verdict`/`edgeVerdict` is
+    kept only as `claimedVerdict`/`claimedEdgeVerdict` and never promotes anything. Use
+    `approve_queue_items` (human decision, pin re-verified) to make items recallable.
     """
-    snapshot_files = load_snapshot(snapshot_path)
+    snapshot_files, snapshot_report = load_snapshot_with_report(snapshot_path)
+    resolved_snapshot = Path(str(snapshot_path)).expanduser().resolve()
+    cap_info: Dict[str, Any] = {"cap": None, "truncated": False, "omittedCount": 0}
     if candidates_path:
         c_path = Path(candidates_path).expanduser().resolve()
         if not c_path.is_file():
@@ -1921,54 +2192,34 @@ def run_dream_build(
             raise ValueError("Candidates JSON must be a list or contain candidates/nodes.")
         extraction_mode = "explicit_candidates"
     else:
-        cands = extract_candidates_from_snapshot(snapshot_files)
+        ext = extract_candidates_with_report(snapshot_files)
+        cands = ext["candidates"]
+        cap_info = {"cap": ext["cap"], "truncated": ext["truncated"], "omittedCount": ext["omittedCount"]}
         extraction_mode = "autonomous_deterministic"
 
-    # Normalize VERIFIED -> SUPPORTED so user-supplied candidates with VERIFIED pass recall
-    norm_cands: List[Dict[str, Any]] = []
-    for c in cands:
-        if not isinstance(c, dict):
-            continue
-        c_copy = dict(c)
-        v_raw = str(c_copy.get("verdict") or "SUPPORTED").upper()
-        if v_raw == "VERIFIED":
-            v_raw = "SUPPORTED"
-        c_copy["verdict"] = v_raw if v_raw in VERDICTS else "SUPPORTED"
-        c_copy["edgeVerdict"] = str(c_copy.get("edgeVerdict") or "VALID").upper()
-        norm_cands.append(c_copy)
+    norm_cands: List[Dict[str, Any]] = [dict(c) for c in (cands or []) if isinstance(c, dict)]
 
     graph = dream_pin_and_validate(norm_cands, snapshot_files, vendor_origin=vendor)
-    # Propagate verdict/edgeVerdict from norm_cands onto built nodes
-    verdict_by_id = {
-        sanitize_node_id(c.get("lesson_id") or c.get("id"), ""): (c.get("verdict", "SUPPORTED"), c.get("edgeVerdict", "VALID"))
-        for c in norm_cands
+    _mark_pending(graph)
+
+    resolved_json_path = out_json or out_json_path or ".memlet/dream/APPROVAL-QUEUE.json"
+    resolved_db_path = out_db or out_db_path
+    out_json_p = Path(resolved_json_path).expanduser().resolve()
+    out_db_p: Optional[Path] = Path(resolved_db_path).expanduser().resolve() if resolved_db_path else None
+    # Paths only (no transcript content): lets recall/approval locate the snapshot and keep the DB in sync.
+    graph["queueMeta"] = {
+        "snapshotPath": str(resolved_snapshot),
+        "dbPath": str(out_db_p) if out_db_p else None,
+        "approvalRequired": True,
     }
-    for n in graph.get("nodes", []):
-        v_pair = verdict_by_id.get(n["id"])
-        if v_pair:
-            n["verdict"] = v_pair[0]
-            n["edgeVerdict"] = v_pair[1]
-        elif n.get("statusKind") == "superseded_rule":
-            n["verdict"] = "ALREADY_SUPERSEDED"
-            n["edgeVerdict"] = "VALID"
-        else:
-            n["verdict"] = "SUPPORTED"
-            n["edgeVerdict"] = "VALID"
-        for e in n.get("edges", []):
-            e["edgeVerdict"] = "VALID"
 
     ver = verify_ontology_contract(graph, snapshot_files)
     if not ver["ok"]:
         raise ValueError(f"Ontology contract verification failed during dream-build: {ver}")
 
-    resolved_json_path = out_json or out_json_path or ".memlet/dream/APPROVAL-QUEUE.json"
-    resolved_db_path = out_db or out_db_path
-    out_json_p = Path(resolved_json_path).expanduser().resolve()
     json_str = json.dumps(graph, ensure_ascii=False, indent=2) + "\n"
     _atomic_write_file(out_json_p, json_str)
-    out_db_p: Optional[Path] = None
-    if resolved_db_path:
-        out_db_p = Path(resolved_db_path).expanduser().resolve()
+    if out_db_p:
         write_ontology_sqlite(out_db_p, graph, snapshot_files=snapshot_files)
 
     edge_counts: Dict[str, int] = {et: 0 for et in EDGE_TYPES}
@@ -1983,9 +2234,16 @@ def run_dream_build(
         "command": "dream-build",
         "extractionMode": extraction_mode,
         "snapshotFilesCount": len(snapshot_files),
+        "snapshotReport": snapshot_report,
         "candidatesInputCount": len(norm_cands),
+        "candidateCap": cap_info["cap"],
+        "candidatesTruncated": cap_info["truncated"],
+        "candidatesOmittedCount": cap_info["omittedCount"],
         "nodesCount": len(graph.get("nodes", [])),
         "edgesCount": len(graph.get("edges", [])),
+        "pendingNodeCount": len(graph.get("nodes", [])),
+        "pendingEdgeCount": len(graph.get("edges", [])),
+        "approvalRequired": True,
         "edgeCountsByType": edge_counts,
         "droppedCount": len(graph.get("dropped", [])),
         "dropped": graph.get("dropped", []),
@@ -1998,6 +2256,377 @@ def run_dream_build(
     }
 
 
+# ---------------------------------------------------------------------------------------------
+# Approval API (library only). Approval is the only way an item leaves PENDING.
+# ---------------------------------------------------------------------------------------------
+
+APPROVED = "approved"
+REJECTED_DECISION = "rejected"
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_queue(queue_path: Any) -> Tuple[Path, Dict[str, Any]]:
+    q = Path(str(queue_path)).expanduser()
+    if q.is_symlink():
+        raise ValueError(f"Refusing symlinked Dream queue: {q}")
+    q = q.resolve()
+    if not q.is_file():
+        raise FileNotFoundError(f"Dream queue file not found: {q}")
+    graph = json.loads(q.read_text(encoding="utf-8"))
+    if not isinstance(graph, dict) or graph.get("schema") != DREAM_ONTOLOGY_SCHEMA:
+        raise ValueError(f"Not a {DREAM_ONTOLOGY_SCHEMA} queue: {q}")
+    return q, graph
+
+
+def _edge_refs(graph: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """All dict copies of each edge (graph-level list and owning node's list) keyed by edgeId."""
+    refs: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _add(e: Any) -> None:
+        if isinstance(e, dict) and e.get("edgeId"):
+            lst = refs.setdefault(str(e["edgeId"]), [])
+            if not any(x is e for x in lst):
+                lst.append(e)
+
+    for e in graph.get("edges") or []:
+        _add(e)
+    for n in graph.get("nodes") or []:
+        if isinstance(n, dict):
+            for e in n.get("edges") or []:
+                _add(e)
+    return refs
+
+
+def _decision_of(item: Dict[str, Any]) -> Optional[str]:
+    rec = item.get("approval")
+    if isinstance(rec, dict) and rec.get("decision") in (APPROVED, REJECTED_DECISION):
+        return str(rec["decision"])
+    return None
+
+
+def _locate_snapshot(
+    graph: Dict[str, Any],
+    snapshot_path: Optional[Any],
+) -> Tuple[Optional[Dict[str, List[str]]], str]:
+    """Explicit path first, then the path recorded by `run_dream_build`. Returns `(files|None, source)`."""
+    if snapshot_path:
+        return load_snapshot(snapshot_path), "explicit"
+    meta = graph.get("queueMeta") if isinstance(graph.get("queueMeta"), dict) else {}
+    rec = meta.get("snapshotPath")
+    if isinstance(rec, str) and rec and Path(rec).exists():
+        return load_snapshot(rec), "recorded"
+    return None, "missing"
+
+
+def _verify_item_pins(item: Dict[str, Any], kind: str, snap: Dict[str, List[str]]) -> Optional[str]:
+    if kind == "node":
+        err = _verify_pin_dict(item.get("primaryPin"), snap, "primaryPin")
+        if err:
+            return err
+        for i, p in enumerate(item.get("allPins") or []):
+            err = _verify_pin_dict(p, snap, f"allPins[{i}]")
+            if err:
+                return err
+        if item.get("supersededByPin") is not None:
+            return _verify_pin_dict(item.get("supersededByPin"), snap, "supersededByPin")
+        return None
+    err = _verify_pin_dict(item.get("srcPin"), snap, "srcPin")
+    if err:
+        return err
+    if item.get("targetPin") is not None:
+        return _verify_pin_dict(item.get("targetPin"), snap, "targetPin")
+    return None
+
+
+def list_pending(queue: Any) -> Dict[str, Any]:
+    """List nodes and edges of a Dream queue (path or loaded dict) that no human has decided yet."""
+    graph = queue if isinstance(queue, dict) else _load_queue(queue)[1]
+    p_nodes: List[Dict[str, Any]] = []
+    counts = {"approvedNodes": 0, "rejectedNodes": 0, "approvedEdges": 0, "rejectedEdges": 0}
+    for n in graph.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        dec = _decision_of(n)
+        if dec == APPROVED:
+            counts["approvedNodes"] += 1
+        elif dec == REJECTED_DECISION:
+            counts["rejectedNodes"] += 1
+        else:
+            pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
+            p_nodes.append({
+                "id": n.get("id"),
+                "title": n.get("title"),
+                "category": n.get("category"),
+                "statusKind": n.get("statusKind"),
+                "span": pp.get("span"),
+                "sha256": pp.get("sha256"),
+                "verdict": n.get("verdict"),
+                "claimedVerdict": n.get("claimedVerdict"),
+            })
+    p_edges: List[Dict[str, Any]] = []
+    for eid, refs in _edge_refs(graph).items():
+        e = refs[0]
+        dec = _decision_of(e)
+        if dec == APPROVED:
+            counts["approvedEdges"] += 1
+        elif dec == REJECTED_DECISION:
+            counts["rejectedEdges"] += 1
+        else:
+            sp = e.get("srcPin") if isinstance(e.get("srcPin"), dict) else {}
+            tp = e.get("targetPin") if isinstance(e.get("targetPin"), dict) else {}
+            p_edges.append({
+                "edgeId": eid,
+                "edgeType": e.get("edgeType"),
+                "fromId": e.get("fromId"),
+                "toId": e.get("toId"),
+                "srcSpan": sp.get("span"),
+                "targetSpan": tp.get("span") if tp else None,
+                "edgeVerdict": e.get("edgeVerdict"),
+            })
+    counts["pendingNodes"] = len(p_nodes)
+    counts["pendingEdges"] = len(p_edges)
+    return {"pendingNodes": p_nodes, "pendingEdges": p_edges, "counts": counts}
+
+
+def _decide_queue_items(
+    queue_path: Any,
+    ids: Sequence[str],
+    decision: str,
+    approver: str,
+    snapshot_path: Optional[Any] = None,
+    db_path: Optional[Any] = None,
+    cascade_edges: bool = True,
+    reason: str = "",
+) -> Dict[str, Any]:
+    if decision not in (APPROVED, REJECTED_DECISION):
+        raise ValueError(f"Unknown decision: {decision}")
+    who = safe_truncate_masked(str(approver or "").strip(), 64)
+    if not who:
+        raise ValueError("An approver name is required to record a decision.")
+    if isinstance(ids, str):
+        ids = [ids]
+    q_path, graph = _load_queue(queue_path)
+
+    snap: Optional[Dict[str, List[str]]] = None
+    snap_source = "not_required"
+    if decision == APPROVED:
+        snap, snap_source = _locate_snapshot(graph, snapshot_path)
+
+    done: List[str] = []
+    unchanged: List[str] = []
+    refused: List[Dict[str, str]] = []
+    cascaded: List[str] = []
+    ordered_ids: List[str] = []
+    for raw_id in ids:
+        if str(raw_id) not in ordered_ids:
+            ordered_ids.append(str(raw_id))
+
+    if decision == APPROVED and snap is None:
+        for i in ordered_ids:
+            refused.append({"id": i, "reason": "no_snapshot_to_verify_pins"})
+        return {
+            "ok": False,
+            "decision": decision,
+            "queuePath": str(q_path),
+            "snapshotSource": snap_source,
+            "applied": [],
+            "unchanged": [],
+            "refused": refused,
+            "cascadedEdges": [],
+            "dbPath": None,
+        }
+
+    at = _utc_now_iso()
+    clean_reason = safe_truncate_masked(str(reason or ""), 200)
+    nodes_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for n in graph.get("nodes") or []:
+        if isinstance(n, dict):
+            nodes_by_id.setdefault(str(n.get("id") or ""), []).append(n)
+    edge_refs = _edge_refs(graph)
+
+    def _record(pin_sha: str) -> Dict[str, Any]:
+        rec: Dict[str, Any] = {"decision": decision, "by": who, "at": at, "pinSha256": pin_sha}
+        if decision == REJECTED_DECISION and clean_reason:
+            rec["reason"] = clean_reason
+        return rec
+
+    def _apply_edge(eid: str) -> None:
+        for ref in edge_refs.get(eid, []):
+            ref["edgeVerdict"] = "VALID" if decision == APPROVED else REJECTED
+            ref["approval"] = _record(str((ref.get("srcPin") or {}).get("sha256") or ""))
+
+    for item_id in ordered_ids:
+        if item_id in nodes_by_id:
+            if len(nodes_by_id[item_id]) > 1:
+                refused.append({"id": item_id, "reason": "ambiguous_duplicate_node_id"})
+                continue
+            n = nodes_by_id[item_id][0]
+            cur = _decision_of(n)
+            if cur == decision:
+                unchanged.append(item_id)
+                continue
+            if cur is not None:
+                refused.append({"id": item_id, "reason": f"already_{cur}"})
+                continue
+            owned = [
+                str(e.get("edgeId")) for e in (n.get("edges") or [])
+                if isinstance(e, dict) and e.get("edgeId") and _decision_of(e) is None
+            ] if cascade_edges else []
+            if decision == APPROVED:
+                err = _verify_item_pins(n, "node", snap or {})
+                if not err:
+                    for eid in owned:
+                        err = _verify_item_pins(edge_refs[eid][0], "edge", snap or {})
+                        if err:
+                            err = f"{eid}:{err}"
+                            break
+                if err:
+                    refused.append({"id": item_id, "reason": f"pin_does_not_verify:{err}"})
+                    continue
+                n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
+                n["edgeVerdict"] = "VALID"
+                n["verifiedBy"] = who
+            else:
+                n["verdict"] = REJECTED
+                n["edgeVerdict"] = REJECTED
+            pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
+            n["approval"] = _record(str(pp.get("sha256") or ""))
+            for eid in owned:
+                _apply_edge(eid)
+                cascaded.append(eid)
+            done.append(item_id)
+        elif item_id in edge_refs:
+            e0 = edge_refs[item_id][0]
+            cur = _decision_of(e0)
+            if cur == decision:
+                unchanged.append(item_id)
+                continue
+            if cur is not None:
+                refused.append({"id": item_id, "reason": f"already_{cur}"})
+                continue
+            if decision == APPROVED:
+                err = _verify_item_pins(e0, "edge", snap or {})
+                if err:
+                    refused.append({"id": item_id, "reason": f"pin_does_not_verify:{err}"})
+                    continue
+            _apply_edge(item_id)
+            done.append(item_id)
+        else:
+            refused.append({"id": item_id, "reason": "unknown_id"})
+
+    db_target: Optional[Path] = None
+    if done:
+        if db_path:
+            db_target = Path(str(db_path)).expanduser().resolve()
+        else:
+            meta = graph.get("queueMeta") if isinstance(graph.get("queueMeta"), dict) else {}
+            rec_db = meta.get("dbPath")
+            if isinstance(rec_db, str) and rec_db and Path(rec_db).is_file():
+                db_target = Path(rec_db)
+        # DB first: if it fails nothing has changed on disk, so JSON and SQLite never disagree.
+        if db_target is not None:
+            write_ontology_sqlite(db_target, graph)
+        _atomic_write_file(q_path, json.dumps(graph, ensure_ascii=False, indent=2) + "\n")
+
+    return {
+        "ok": not refused,
+        "decision": decision,
+        "decidedBy": who,
+        "decidedAt": at,
+        "queuePath": str(q_path),
+        "snapshotSource": snap_source,
+        "applied": done,
+        "unchanged": unchanged,
+        "refused": refused,
+        "cascadedEdges": cascaded,
+        "dbPath": str(db_target) if db_target else None,
+    }
+
+
+def approve_queue_items(
+    queue_path: Any,
+    ids: Sequence[str],
+    approver: str,
+    snapshot_path: Optional[Any] = None,
+    db_path: Optional[Any] = None,
+    cascade_edges: bool = True,
+) -> Dict[str, Any]:
+    """Approve nodes and/or edges of a Dream queue by id (human decision).
+
+    Each id's citation pins are re-resolved against the snapshot (explicit `snapshot_path`, else the path
+    recorded at build time) and SHA-256 compared; ids whose pins no longer verify are refused, and with no
+    locatable snapshot every id is refused. Approving a node also approves its own still-undecided edges
+    (`cascade_edges`). Records approver and UTC time; idempotent (re-approving is a no-op); never flips a
+    rejected item. Rewrites the queue JSON atomically and, when a DB was written (or `db_path` is given),
+    the SQLite tables from the same graph.
+    """
+    return _decide_queue_items(queue_path, ids, APPROVED, approver, snapshot_path, db_path, cascade_edges)
+
+
+def reject_queue_items(
+    queue_path: Any,
+    ids: Sequence[str],
+    approver: str,
+    reason: str = "",
+    db_path: Optional[Any] = None,
+    cascade_edges: bool = True,
+) -> Dict[str, Any]:
+    """Reject nodes and/or edges by id (recorded like approvals; rejected items are never recalled).
+    No snapshot or pin verification is needed to reject. Idempotent; never flips an approved item."""
+    return _decide_queue_items(
+        queue_path, ids, REJECTED_DECISION, approver, None, db_path, cascade_edges, reason=reason
+    )
+
+
+def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Copy of `graph` where anything without a matching human approval record is forced to PENDING.
+
+    Approval is bound to the primary pin hash recorded at decision time, so a hand-edited verdict or a
+    queue built before approvals existed (auto-promoted SUPPORTED/VALID) is not recallable.
+    """
+    import copy
+
+    g = copy.deepcopy(graph)
+    stats = {"pendingNodes": 0, "rejectedNodes": 0, "pendingEdges": 0, "rejectedEdges": 0}
+    for n in g.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        dec = _decision_of(n)
+        pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
+        rec = n.get("approval") if isinstance(n.get("approval"), dict) else {}
+        ok = (
+            dec == APPROVED
+            and str(n.get("verdict") or "").upper() in ALLOWED_RECALL_VERDICTS
+            and rec.get("pinSha256") == pp.get("sha256")
+        )
+        if not ok:
+            if dec == REJECTED_DECISION or str(n.get("verdict") or "").upper() == REJECTED:
+                stats["rejectedNodes"] += 1
+                n["verdict"] = REJECTED
+            else:
+                stats["pendingNodes"] += 1
+                n["verdict"] = PENDING
+    for eid, refs in _edge_refs(g).items():
+        e0 = refs[0]
+        dec = _decision_of(e0)
+        sp = e0.get("srcPin") if isinstance(e0.get("srcPin"), dict) else {}
+        rec = e0.get("approval") if isinstance(e0.get("approval"), dict) else {}
+        ok = (
+            dec == APPROVED
+            and str(e0.get("edgeVerdict") or "").upper() in ALLOWED_EDGE_VERDICTS
+            and rec.get("pinSha256") == sp.get("sha256")
+        )
+        if not ok:
+            rejected = dec == REJECTED_DECISION or str(e0.get("edgeVerdict") or "").upper() == REJECTED
+            stats["rejectedEdges" if rejected else "pendingEdges"] += 1
+            for ref in refs:
+                ref["edgeVerdict"] = REJECTED if rejected else PENDING
+    return g, stats
+
+
 def run_dream_recall(
     graph_path: str,
     snapshot_path: Optional[str] = None,
@@ -2005,21 +2634,64 @@ def run_dream_recall(
     budget_tokens: int = 1500,
     out_md_path: Optional[str] = None,
     out_md: Optional[str] = None,
+    allow_unverified: bool = False,
+    require_approval: bool = True,
 ) -> Dict[str, Any]:
-    """Execute `dream-recall`: load graph, optionally verify against directory/JSON snapshot, recall 1-hop capsule,
-    and optionally write `--out-md`.
+    """Execute `dream-recall`: load graph, re-verify every pin against the snapshot, recall the 1-hop
+    capsule from human-approved items only, and optionally write `--out-md`.
+
+    - Snapshot: explicit `snapshot_path`, else the path recorded at build time. A tampered snapshot or pin
+      raises `ValueError`.
+    - No locatable snapshot: returns `ok=False`, `pinVerification="unavailable_no_snapshot"`, no items,
+      and a capsule that says so — unless `allow_unverified=True`, in which case items are returned with
+      `pinVerification="UNVERIFIED_OPT_OUT"` and an UNVERIFIED warning in the capsule header.
+    - PENDING and REJECTED items are never returned (`require_approval=False` only relaxes the approval
+      record check for library callers; it never admits PENDING/REJECTED verdicts).
     """
     g_path = Path(graph_path).expanduser().resolve()
     if not g_path.is_file():
         raise FileNotFoundError(f"Dream ontology graph file not found: {g_path}")
     graph = json.loads(g_path.read_text(encoding="utf-8"))
-    snap = load_snapshot(snapshot_path) if snapshot_path else None
-    res = recall_subgraph(
-        graph,
-        query_text=query_text,
-        budget_tokens=budget_tokens,
-        snapshot_files=snap,
-    )
+    if not isinstance(graph, dict):
+        raise ValueError("Dream ontology graph must be a JSON object.")
+    snap, snap_source = _locate_snapshot(graph, snapshot_path)
+    if require_approval:
+        view, excluded = approved_view(graph)
+    else:
+        view, excluded = graph, {}
+
+    if snap is None and not allow_unverified:
+        formatted = (
+            "# Memlet Dream Subgraph Capsule\n"
+            "# VERIFICATION UNAVAILABLE: no snapshot could be located, so no pin was re-checked and nothing "
+            "is returned as verified. Pass a snapshot (--snapshot) or explicitly opt out (allow_unverified).\n"
+        )
+        res: Dict[str, Any] = {
+            "ok": False,
+            "formatted": formatted,
+            "tokenEstimate": estimate_tokens(formatted),
+            "tokenBudget": budget_tokens,
+            "includedNodeIds": [],
+            "duplicateIds": [],
+            "pinVerification": "unavailable_no_snapshot",
+            "counts": {"blocks": 0, "resolves": 0, "governs": 0, "supersedesQuarantined": 0},
+            # `memory_cli.cli()` exits with this code, so `memlet dream-recall` also fails loudly.
+            "exitCode": 3,
+        }
+    else:
+        res = recall_subgraph(
+            view,
+            query_text=query_text,
+            budget_tokens=budget_tokens,
+            snapshot_files=snap,
+            unverified_label=snap is None,
+        )
+        res["ok"] = True
+        res["pinVerification"] = "sha256_verified" if snap is not None else "UNVERIFIED_OPT_OUT"
+    res["snapshotSource"] = snap_source
+    res["approvalRequired"] = bool(require_approval)
+    res["excludedUndecidedOrRejected"] = excluded
+
     resolved_md = out_md or out_md_path
     if resolved_md:
         md_target = Path(resolved_md).expanduser().resolve()
@@ -2042,16 +2714,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    b_p = sub.add_parser("dream-build", aliases=["dream"], help="Build verified Dream ontology JSON and SQLite DB from session logs")
+    b_p = sub.add_parser("dream-build", aliases=["dream"], help="Build a PENDING Dream approval queue (JSON + optional SQLite) from session logs")
     b_p.add_argument("--candidates", default=None, help="Optional JSON file of extracted candidates (omit for autonomous deterministic extraction)")
-    b_p.add_argument("--snapshot", required=True, help="Directory of .log files or JSON snapshot map")
-    b_p.add_argument("--out-json", default=".memlet/dream/APPROVAL-QUEUE.json", help="Output path for verified ontology JSON")
+    b_p.add_argument("--snapshot", required=True, help="Directory of .log/.jsonl files, one .jsonl transcript, or JSON snapshot map")
+    b_p.add_argument("--out-json", default=".memlet/dream/APPROVAL-QUEUE.json", help="Output path for the ontology approval queue JSON")
     b_p.add_argument("--out-db", default=None, help="Optional output path for zero-daemon SQLite ontology DB")
     b_p.add_argument("--vendor", default="deterministic-dream", help="Vendor origin tag")
 
-    r_p = sub.add_parser("dream-recall", help="Recall 1-hop ontology capsule (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS)")
-    r_p.add_argument("--graph", required=True, help="Path to verified Dream ontology JSON")
-    r_p.add_argument("--snapshot", default=None, help="Optional directory of .log files or JSON snapshot map for pin verification")
+    r_p = sub.add_parser("dream-recall", help="Recall 1-hop ontology capsule of approved items (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS)")
+    r_p.add_argument("--graph", required=True, help="Path to Dream ontology approval queue JSON")
+    r_p.add_argument("--snapshot", default=None, help="Snapshot for pin re-verification (default: the path recorded at build time)")
+    r_p.add_argument("--allow-unverified", action="store_true", help="Return items even when no snapshot can be located (output is labelled UNVERIFIED)")
     r_p.add_argument("--query", nargs="*", default="", help="Task or file query for 1-hop relevance ranking (supports unquoted multi-word queries)")
     r_p.add_argument("--max-tokens", "--budget", dest="budget", type=int, default=1500, help="Hard token ceiling (default: 1500)")
     r_p.add_argument("--out-md", default=None, help="Optional Markdown file path to write the recalled capsule")
@@ -2076,12 +2749,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 query_text=" ".join(args.query) if isinstance(args.query, list) else str(args.query or ""),
                 budget_tokens=args.budget,
                 out_md_path=args.out_md,
+                allow_unverified=args.allow_unverified,
             )
             if args.format == "json":
                 sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
             else:
                 txt = res.get("formatted", "")
                 sys.stdout.write(txt + ("\n" if not txt.endswith("\n") else ""))
+            if not res.get("ok", True):
+                sys.stderr.write("memlet_dream: no snapshot located; nothing returned as verified\n")
+                return 3
             return 0
         return 2
     except Exception as exc:
