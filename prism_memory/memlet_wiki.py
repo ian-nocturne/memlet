@@ -62,7 +62,7 @@ PAGE_STATUS_BEGIN = "<!-- memlet-page-status:start -->"
 PAGE_STATUS_END = "<!-- memlet-page-status:end -->"
 PIN_RE = re.compile(
     r"<!--\s*memlet:anchor\s+(?P<path>[^\s:]+)::(?P<symbol>[A-Za-z_$][\w.$-]*)"
-    r"\s+ast=(?P<ast>[0-9a-f]{6,64})(?:\s+sig=(?P<sig>[0-9a-f]{6,64}))?(?:\s+req=(?P<req>[0-9a-f]{6,64}))?\s*-->"
+    r"\s+ast=(?P<ast>[0-9a-f]{6,64})(?:\s+sig=(?P<sig>[0-9a-f]{6,64}))?(?:\s+req=(?P<req>[0-9a-f]{6,64}))?(?:\s+basis=(?P<basis>[A-Za-z0-9_.-]+))?\s*-->"
 )
 _STATUS_BLOCK_RE = re.compile(r"<!-- memlet:status:(?:begin|start) -->.*?" + re.escape(STATUS_END), re.S)
 _PAGE_STATUS_RE = re.compile(re.escape(PAGE_STATUS_BEGIN) + r".*?" + re.escape(PAGE_STATUS_END) + r"\n?", re.S)
@@ -166,7 +166,7 @@ def _extract_anchors(text: str, source: str) -> List[Dict[str, Any]]:
     for line_no, line in enumerate(text.splitlines(), start=1):
         for m in PIN_RE.finditer(line):
             out.append({"path": m.group("path"), "symbol": m.group("symbol"), "source": source,
-                        "line": line_no, "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req")}})
+                        "line": line_no, "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req"), "basis": m.group("basis")}})
         scrubbed = PIN_RE.sub("", line)
         for m in EXPLICIT_ANCHOR_RE.finditer(scrubbed):
             if "::" not in m.group(0):
@@ -221,6 +221,8 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str) -> Dict[str, An
     ast_hash = (extract_file_symbol_hashes(target).get(symbol) or sig.get("normAstHash") or sig.get("sigHash") or "")
     return {
         "resolution": "exact",
+        "basis": ("ts-js-lexical-v3" if sig_info.get("__language__") in ("typescript", "javascript")
+                  else "python-ast-v2" if sig_info.get("__language__") == "python" else "contract-v1"),
         "hashExact": sig_info.get("__language__") not in ("typescript", "javascript"),
         "hashReason": "ts_js_lexical_scan_unverified",
         "ast": ast_hash[:_HASH_LEN],
@@ -252,6 +254,8 @@ def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
             status, reason = "active", "legacy_ast_hash_match" if legacy_match else "ast_hash_match"
         else:
             status, reason = "compatible-unverified", cur["hashReason"]
+    elif not cur.get("hashExact", True) and pin.get("basis") in (None, "legacy"):
+        status, reason = "compatible-unverified", "legacy_ts_basis_repin_required"
     elif not (pin.get("sig") and cur["sig"]) or _same_hash(cur["sig"], pin["sig"]):
         status, reason = "compatible-unverified", "body_changed_signature_compatible"
     elif pin.get("req") and _same_hash(cur.get("req"), pin["req"]):
@@ -268,6 +272,8 @@ def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
         "currentAstHash": cur.get("ast"),
         "currentSigHash": cur.get("sig"),
         "currentReqSigHash": cur.get("req"),
+        "currentHashBasis": cur.get("basis"),
+        "pinnedHashBasis": pin.get("basis") if pin else None,
         "sources": list(anchor.get("sources") or []),
     }
 
@@ -284,13 +290,13 @@ def _migrate_legacy_comments(root: Path, text: str) -> str:
     """Rewrite only Python pins that still match the legacy AST basis."""
     def replace(m):
         anchor = {"path": m.group("path"), "symbol": m.group("symbol"),
-                  "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req")}}
+                  "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req"), "basis": m.group("basis")}}
         result = classify_anchor(root, anchor)
         if result["reason"] != "legacy_ast_hash_match":
             return m.group(0)
         sig = f" sig={result['currentSigHash']}" if result.get("currentSigHash") else ""
         req = f" req={result['currentReqSigHash']}" if result.get("currentReqSigHash") else ""
-        return f"<!-- memlet:anchor {result['anchor']} ast={result['currentAstHash']}{sig}{req} -->"
+        return f"<!-- memlet:anchor {result['anchor']} ast={result['currentAstHash']}{sig}{req} basis={result['currentHashBasis']} -->"
     return PIN_RE.sub(replace, text)
 
 
@@ -354,7 +360,7 @@ def _render_index(head: Optional[str], instruction_files: List[str], anchors: Li
         if a["pin"]:
             sig = f" sig={a['pin']['sig']}" if a["pin"]["sig"] else ""
             req = f" req={a['pin']['req']}" if a["pin"].get("req") else ""
-            lines.append(f"  <!-- memlet:anchor {key} ast={a['pin']['ast']}{sig}{req} -->")
+            lines.append(f"  <!-- memlet:anchor {key} ast={a['pin']['ast']}{sig}{req} basis={a['pin'].get('basis') or 'legacy'} -->")
     lines += ["", _status_block(classified, summary), ""]
     return "\n".join(lines)
 
@@ -435,13 +441,33 @@ def _read_ledger_hashes(ledger: Path) -> Dict[str, str]:
         return {}
 
 
+def _validated_config_pins(config):
+    """Return usable pins and diagnostics for hand-edited config entries."""
+    entries = config.get("pinnedAnchors", {})
+    if not isinstance(entries, dict):
+        return {}, [{"anchor": None, "reason": "pinnedAnchors_must_be_object"}]
+    pins, skipped = {}, []
+    for key, pin in entries.items():
+        valid = isinstance(key, str) and "::" in key and isinstance(pin, dict)
+        valid = valid and isinstance(pin.get("astHash"), str) and bool(re.fullmatch(r"[0-9a-f]{6,64}", pin["astHash"]))
+        if valid:
+            valid = all(pin.get(k) is None or (isinstance(pin[k], str) and bool(re.fullmatch(r"[0-9a-f]{6,64}", pin[k])))
+                        for k in ("sigHash", "reqSigHash"))
+            valid = valid and (pin.get("hashBasis") is None or
+                              (isinstance(pin["hashBasis"], str) and bool(re.fullmatch(r"[A-Za-z0-9_.-]+", pin["hashBasis"]))))
+        if valid:
+            pins[key] = pin
+        else:
+            skipped.append({"anchor": key, "reason": "invalid_pin_shape"})
+    return pins, skipped
+
+
 def _load_config_pins(root: Path) -> Dict[str, Any]:
     try:
         config = json.loads((root / CONFIG_PATH).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    pins = config.get("pinnedAnchors") if isinstance(config, dict) else None
-    return pins if isinstance(pins, dict) else {}
+    return _validated_config_pins(config)[0] if isinstance(config, dict) else {}
 
 
 def _format_markdown(title: str, report: Dict[str, Any]) -> str:
@@ -457,6 +483,8 @@ def _format_markdown(title: str, report: Dict[str, Any]) -> str:
     ]
     if "instructionFiles" in report:
         lines.append("- **Instruction files**: " + (", ".join(f"`{f}`" for f in report["instructionFiles"]) or "(none)"))
+    if report.get("skippedPins"):
+        lines.append("- Skipped invalid pins: " + ", ".join(str(p.get("anchor") or "pinnedAnchors") for p in report["skippedPins"]))
     if report.get("pages") is not None:
         lines.append("- **Wiki pages**: " + (", ".join(f"`{p}`" for p in report["pages"]) or "(none)"))
     if report.get("actions"):
@@ -501,14 +529,25 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
         raw.extend(_extract_anchors(_read_text(root / rel), rel))
     config_path = root / CONFIG_PATH
     config = _base_config(head, instruction_files)
+    backup = None
     if config_path.is_file():
-        # Refuse to erase a malformed config, including settings owned by other commands.
-        existing = json.loads(_read_text(config_path))
-        if not isinstance(existing, dict):
-            raise ValueError("memlet config must be a JSON object")
+        try:
+            existing = json.loads(_read_text(config_path))
+            if not isinstance(existing, dict):
+                raise ValueError("config must be a JSON object")
+        except (ValueError, OSError) as exc:
+            if not force:
+                error = "Cannot read .memlet/config.json as an object; nothing changed. Use init --force to back it up and recover: " + str(exc)
+                report = {"ok": False, "exitCode": 2, "command": "init", "dryRun": bool(dry_run),
+                          "repoPath": str(root), "error": error, "actions": []}
+                if output_format == "markdown":
+                    report["formatted"] = "## Memlet Init\n\n" + error + "\n"
+                return report
+            backup = config_path.with_name("config.json.bak-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+            existing = {}
         config.update(existing)
     config.update(repoHead=head, instructionFiles=instruction_files, anchorStates=list(ANCHOR_STATES))
-    stored = dict(config.get("pinnedAnchors") or {})
+    stored, skipped_pins = _validated_config_pins(config)
     page_pins = {}
     wiki_dir = root / WIKI_DIR
     if wiki_dir.is_dir() and not wiki_dir.is_symlink():
@@ -529,25 +568,26 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
         key = f"{a['path']}::{a['symbol']}"
         cp = stored.get(key) or {}
         pin = page_pins.get(key) or a.get("pin") or (
-            {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")} if cp.get("astHash") else None)
+            {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")} if cp.get("astHash") else None)
         cur = _current_fingerprint(root, a["path"], a["symbol"])
-        if (force or not pin) and not dry_run:
-            pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]}
+        if force or not pin:
+            pin = ({"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"]}
                    if cur["resolution"] == "exact" and cur.get("ast") else None)
             if pin:
                 pinned_now.add(key)
         elif classify_anchor(root, dict(a, pin=pin))["reason"] == "legacy_ast_hash_match":
-            pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"]}
+            pin = {"ast": cur["ast"], "sig": cur["sig"] or None, "req": cur["req"], "basis": cur["basis"]}
         anchors.append(dict(a, pin=pin))
         if pin and (key not in stored or force):
-            stored[key] = dict(cp, astHash=pin["ast"], sigHash=pin.get("sig"), reqSigHash=pin.get("req"))
+            stored[key] = dict(cp, astHash=pin["ast"], sigHash=pin.get("sig"), reqSigHash=pin.get("req"), hashBasis=pin.get("basis") or "legacy")
         elif force:
             stored.pop(key, None)
         elif cp.get("astHash"):
-            stored_pin = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}
+            stored_pin = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}
             if classify_anchor(root, dict(a, pin=stored_pin))["reason"] == "legacy_ast_hash_match":
-                stored[key] = dict(cp, astHash=cur["ast"], sigHash=cur["sig"], reqSigHash=cur["req"])
-    classified = [dict(classify_anchor(root, a), pinnedNow=f"{a['path']}::{a['symbol']}" in pinned_now) for a in anchors]
+                stored[key] = dict(cp, astHash=cur["ast"], sigHash=cur["sig"], reqSigHash=cur["req"], hashBasis=cur["basis"])
+    classified = [dict(classify_anchor(root, a), pinnedNow=not dry_run and f"{a['path']}::{a['symbol']}" in pinned_now,
+                       wouldPin=dry_run and f"{a['path']}::{a['symbol']}" in pinned_now) for a in anchors]
     summary = _summarize(classified)
     audit = _audit_summary(root)
     config["pinnedAnchors"] = stored
@@ -566,12 +606,18 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
                 if pin:
                     sig = f" sig={pin['sig']}" if pin.get("sig") else ""
                     req = f" req={pin['req']}" if pin.get("req") else ""
-                    lines.append(f"  <!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} -->")
+                    lines.append(f"  <!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} basis={pin.get('basis') or 'legacy'} -->")
             index_text = old_index.rstrip() + "\n" + "\n".join(lines) + "\n"
             index_additions = True
     config_text = json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     actions: List[Dict[str, str]] = []
+    if backup is not None:
+        if not dry_run:
+            with backup.open("xb") as out:
+                out.write(config_path.read_bytes())
+        actions.append({"op": "would-backup" if dry_run else "backup", "path": _rel(root, backup)})
+
     plan = [(CONFIG_PATH, config_text, True), (INDEX_PATH, index_text, force or index_additions)]
     for rel, text, overwrite in plan:
         target = root / rel
@@ -589,6 +635,7 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
             op = "would-" + op
         actions.append({"op": op, "path": rel})
 
+    pin_migrations = {}
     if wiki_dir.is_dir() and not wiki_dir.is_symlink():
         for page in sorted(wiki_dir.rglob("*.md")):
             if page.is_symlink() or not page.is_file():
@@ -601,11 +648,12 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
                     return m.group(0)
                 sig = f" sig={cp['sigHash']}" if cp.get("sigHash") else ""
                 req = f" req={cp['reqSigHash']}" if cp.get("reqSigHash") else ""
-                return f"<!-- memlet:anchor {key} ast={cp['astHash']}{sig}{req} -->"
+                return f"<!-- memlet:anchor {key} ast={cp['astHash']}{sig}{req} basis={cp.get('hashBasis') or 'legacy'} -->"
             new = PIN_RE.sub(migrate, old) if force else _migrate_legacy_comments(root, old)
             if new != old:
                 if not dry_run:
                     page.write_text(new, encoding="utf-8")
+                    pin_migrations[_rel(root, page)] = (_page_body_sha256(old), _page_body_sha256(new))
                 actions.append({"op": "would-update" if dry_run else "update", "path": _rel(root, page)})
 
     ledger = root / LEDGER_PATH
@@ -629,6 +677,15 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
                     if last != sha and (index_written or last is None):
                         _record_page(conn, INDEX_PATH, sha, "init", now)
                         changed = True
+                for rel, (before, after) in pin_migrations.items():
+                    if rel == INDEX_PATH:
+                        continue  # The index was recorded above in this same transaction.
+                    last = _last_page_hashes(conn).get(rel)
+                    if last != before and last != after:
+                        _record_page(conn, rel, before, "user_edit", now)
+                    if last != after:
+                        _record_page(conn, rel, after, "pin_migration", now)
+                        changed = True
         op = "update" if existed and changed else ("unchanged" if existed else "create")
     actions.append({"op": op, "path": LEDGER_PATH})
 
@@ -641,6 +698,7 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
         "repoHead": head,
         "instructionFiles": instruction_files,
         "config": config,
+        "skippedPins": skipped_pins,
         "actions": actions,
         "anchorSummary": summary,
         "baselineNotice": "New pins record the current baseline; they do not verify the rule's meaning.",
@@ -651,6 +709,85 @@ def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, o
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = _format_markdown("Memlet Init" + (" (dry run)" if dry_run else ""), report)
     return report
+
+
+def repin_legacy_ts_anchors(repo_path=".", *, dry_run: bool = False) -> Dict[str, Any]:
+    """Explicitly re-pin only legacy TS/JS baselines; versioned stale pins stay untouched.
+
+    This accepts the current code as the new lexical baseline, not verification
+    of its behavior. The dry run previews identical selections without writes.
+    """
+    root = _resolve_root(repo_path)
+    config_path = root / CONFIG_PATH
+    config = json.loads(_read_text(config_path)) if config_path.is_file() else _base_config(_git_head(root), [])
+    if not isinstance(config, dict):
+        raise ValueError("memlet config must be a JSON object")
+    pins, skipped = _validated_config_pins(config)
+    selected, cache = set(), {}
+
+    def replacement(key, basis):
+        if basis not in (None, "legacy") or "::" not in key:
+            return None
+        path, symbol = key.rsplit("::", 1)
+        if Path(path).suffix.lower() not in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+            return None
+        if key not in cache:
+            cache[key] = _current_fingerprint(root, path, symbol)
+        cur = cache[key]
+        if cur["resolution"] != "exact" or not cur.get("ast"):
+            return None
+        selected.add(key)
+        return {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"]}
+
+    updated = dict(config.get("pinnedAnchors") or {}) if isinstance(config.get("pinnedAnchors", {}), dict) else {}
+    for key, cp in pins.items():
+        pin = replacement(key, cp.get("hashBasis"))
+        if pin:
+            updated[key] = dict(cp, astHash=pin["ast"], sigHash=pin["sig"], reqSigHash=pin["req"], hashBasis=pin["basis"])
+    pages = []
+    wiki_dir = root / WIKI_DIR
+    if wiki_dir.is_dir() and not wiki_dir.is_symlink():
+        for page in sorted(wiki_dir.rglob("*.md")):
+            if page.is_symlink() or not page.is_file():
+                continue
+            before = _read_text(page)
+            def replace(m):
+                key = f"{m.group('path')}::{m.group('symbol')}"
+                pin = replacement(key, m.group("basis"))
+                if not pin:
+                    return m.group(0)
+                sig = f" sig={pin['sig']}" if pin.get("sig") else ""
+                req = f" req={pin['req']}" if pin.get("req") else ""
+                return f"<!-- memlet:anchor {key} ast={pin['ast']}{sig}{req} basis={pin['basis']} -->"
+            after = PIN_RE.sub(replace, before)
+            if before != after:
+                pages.append((page, before, after))
+    actions = []
+    if updated != config.get("pinnedAnchors", {}):
+        config["pinnedAnchors"] = updated
+        if not dry_run:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        actions.append({"op": "would-update" if dry_run else "update", "path": CONFIG_PATH})
+    for page, before, after in pages:
+        if not dry_run:
+            page.write_text(after, encoding="utf-8")
+        actions.append({"op": "would-update" if dry_run else "update", "path": _rel(root, page)})
+    ledger = root / LEDGER_PATH
+    if pages and not dry_run and not ledger.is_symlink():
+        with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+            with conn:
+                _ledger_ready(conn)
+                last, now = _last_page_hashes(conn), _utc_now()
+                for page, before, after in pages:
+                    rel = _rel(root, page)
+                    old_hash, new_hash = _page_body_sha256(before), _page_body_sha256(after)
+                    if last.get(rel) != old_hash:
+                        _record_page(conn, rel, old_hash, "user_edit", now)
+                    _record_page(conn, rel, new_hash, "pin_migration", now)
+    return {"ok": True, "exitCode": 0, "dryRun": bool(dry_run), "repinnedAnchors": sorted(selected),
+            "skippedPins": skipped, "actions": actions,
+            "baselineNotice": "Current TS/JS code becomes a new lexical baseline; rule meaning is not verified."}
 
 
 def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "json") -> Dict[str, Any]:
@@ -674,6 +811,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         # Not initialized: read-only preview over instruction files, nothing is written.
         for rel in discover_instruction_files(root):
             raw.extend(_extract_anchors(_read_text(root / rel), rel))
+    original_hashes = {rel: _page_body_sha256(text) for rel, text in texts.items()}
     merged = _merge_anchors(raw)
     if initialized:
         # Pins written before `req=` existed fall back to the required-signature hash in config.json.
@@ -681,7 +819,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         for a in merged:
             cp = config_pins.get(f"{a['path']}::{a['symbol']}")
             if not a["pin"] and isinstance(cp, dict) and cp.get("astHash"):
-                a["pin"] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}
+                a["pin"] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}
             if a["pin"] and not a["pin"].get("req") and isinstance(cp, dict) and _same_hash(a["pin"]["ast"], cp.get("astHash")):
                 a["pin"] = dict(a["pin"], req=cp.get("reqSigHash"))
     classified = [classify_anchor(root, a) for a in merged]
@@ -700,6 +838,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
             actions.append({"op": "would-update", "path": INDEX_PATH})
         else:
             index.write_text(new, encoding="utf-8")
+            texts[INDEX_PATH] = new
             actions.append({"op": "update", "path": INDEX_PATH})
 
     status_by_key = {c["anchor"]: c["status"] for c in classified}
@@ -737,10 +876,10 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
                 continue
             path, symbol = key.rsplit("::", 1)
             result = classify_anchor(root, {"path": path, "symbol": symbol,
-                                            "pin": {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}})
+                                            "pin": {"ast": cp.get("astHash"), "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}})
             if result["reason"] == "legacy_ast_hash_match":
                 pins[key] = dict(cp, astHash=result["currentAstHash"], sigHash=result["currentSigHash"],
-                                 reqSigHash=result["currentReqSigHash"])
+                                 reqSigHash=result["currentReqSigHash"], hashBasis=result["currentHashBasis"])
                 migrated = True
         if migrated:
             if not dry_run:
@@ -755,7 +894,7 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
         page_hashes = {rel: _page_body_sha256(texts[rel]) for rel in pages}
         if dry_run:
             last = _read_ledger_hashes(ledger)
-            user_edited = [rel for rel in pages if last.get(rel) != page_hashes[rel] and not (rel == INDEX_PATH and rel not in last)]
+            user_edited = [rel for rel in pages if last.get(rel) != original_hashes[rel] and not (rel == INDEX_PATH and rel not in last)]
         else:
             existed = ledger.is_file()
             now = _utc_now()
@@ -765,13 +904,16 @@ def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "j
                     last = _last_page_hashes(conn)
                     changed = False
                     for rel in pages:
-                        if last.get(rel) == page_hashes[rel]:
-                            continue
-                        event = "init" if rel == INDEX_PATH and rel not in last else "user_edit"
-                        _record_page(conn, rel, page_hashes[rel], event, now)
-                        if event == "user_edit":
-                            user_edited.append(rel)
-                        changed = True
+                        before, after = original_hashes[rel], page_hashes[rel]
+                        if last.get(rel) != before:
+                            event = "init" if rel == INDEX_PATH and rel not in last else "user_edit"
+                            _record_page(conn, rel, before, event, now)
+                            if event == "user_edit":
+                                user_edited.append(rel)
+                            changed = True
+                        if before != after:
+                            _record_page(conn, rel, after, "pin_migration", now)
+                            changed = True
                     changed = _sync_snapshots(conn, classified, now) or changed
             ledger_synced = True
             actions.append({"op": "update" if existed and changed else ("unchanged" if existed else "create"), "path": LEDGER_PATH})
@@ -969,7 +1111,7 @@ def _config_pins(root: Path) -> Dict[str, Dict[str, Optional[str]]]:
     pins = {}
     for key, cp in _load_config_pins(root).items():
         if isinstance(cp, dict) and cp.get("astHash"):
-            pins[key] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash")}
+            pins[key] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}
     return pins
 
 
@@ -989,7 +1131,7 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
                     pin, src = pins.get(key), pin_source
                     entry = classify_anchor(root, {"path": path, "symbol": symbol, "pin": pin})
                     if entry["reason"] == "legacy_ast_hash_match":
-                        pin = {"ast": entry["currentAstHash"], "sig": entry["currentSigHash"], "req": entry["currentReqSigHash"]}
+                        pin = {"ast": entry["currentAstHash"], "sig": entry["currentSigHash"], "req": entry["currentReqSigHash"], "basis": entry["currentHashBasis"]}
                     entry.update(pin=pin, pinSource=src if pin else None)
                 else:
                     entry = _classify_path(root, path)
@@ -1055,7 +1197,7 @@ def _render_import_page(files: List[str], rules: List[Dict[str, Any]], by_key: D
                     pinned_here.add(k)
                     sig = f" sig={pin['sig']}" if pin.get("sig") else ""
                     req = f" req={pin['req']}" if pin.get("req") else ""
-                    lines.append(f"  <!-- memlet:anchor {k} ast={pin['ast']}{sig}{req} -->")
+                    lines.append(f"  <!-- memlet:anchor {k} ast={pin['ast']}{sig}{req} basis={pin.get('basis') or 'legacy'} -->")
     return "\n".join(lines) + "\n"
 
 
@@ -1088,23 +1230,23 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
     rules = _rules_from_files(root, files)
     pins = _config_pins(root)
     pinned_now = set()
-    if not dry_run:
-        # Import is an explicit baseline-recording event, like init. Never heal an existing pin.
-        for r in rules:
-            for raw_path, symbol in r["refs"]:
-                if not symbol:
-                    continue
-                path = _resolve_ref_path(root, r["source"], raw_path)
-                key = f"{path}::{symbol}"
-                if key in pins:
-                    continue
-                cur = _current_fingerprint(root, path, symbol)
-                if cur["resolution"] == "exact" and cur.get("ast"):
-                    pins[key] = {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"]}
-                    pinned_now.add(key)
+    # Import is an explicit baseline-recording event, like init. Never heal an existing pin.
+    for r in rules:
+        for raw_path, symbol in r["refs"]:
+            if not symbol:
+                continue
+            path = _resolve_ref_path(root, r["source"], raw_path)
+            key = f"{path}::{symbol}"
+            if key in pins:
+                continue
+            cur = _current_fingerprint(root, path, symbol)
+            if cur["resolution"] == "exact" and cur.get("ast"):
+                pins[key] = {"ast": cur["ast"], "sig": cur["sig"], "req": cur["req"], "basis": cur["basis"]}
+                pinned_now.add(key)
     anchors = _verify_rules(root, rules, pins)
     for a in anchors:
-        a["pinnedNow"] = a["anchor"] in pinned_now
+        a["pinnedNow"] = not dry_run and a["anchor"] in pinned_now
+        a["wouldPin"] = dry_run and a["anchor"] in pinned_now
     by_key = {a["anchor"]: a for a in anchors}
     counts = _rule_counts(rules)
     broken = sorted({a["path"] for a in anchors if a["reason"] in ("missing_path", "missing_file")})
@@ -1123,11 +1265,11 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
     else:
         existed = isinstance(config, dict)
         config = config if existed else _base_config(head, discover_instruction_files(root))
-        pinned = dict(config.get("pinnedAnchors") or {})
+        pinned = _validated_config_pins(config)[0]
         for a in anchors:
             # Store newly recorded baselines, including lexical TS/JS pins; migrate proven legacy matches.
             if a["symbol"] and a.get("pin") and (a["anchor"] not in pinned or a["reason"] == "legacy_ast_hash_match"):
-                pinned[a["anchor"]] = {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"]}
+                pinned[a["anchor"]] = {"astHash": a["pin"]["ast"], "sigHash": a["pin"]["sig"], "reqSigHash": a["pin"]["req"], "hashBasis": a["pin"].get("basis") or "legacy"}
         config["pinnedAnchors"] = dict(sorted(pinned.items()))
         config["imports"] = {"from": source, "page": IMPORT_PAGE, "sourceFiles": files}
         text = json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -1291,8 +1433,9 @@ def verify_handover_checksum(capsule: Dict[str, Any]) -> bool:
     """Pure integrity check of capsule content, not authentication or code verification.
 
     Both checksum aliases must agree when present. Legacy capsules containing
-    only capsuleSignature remain verifiable. Presentation/CLI metadata is outside
-    the checksum; the canonical field list is selected here, never by the input.
+    only capsuleSignature remain verifiable. If formatted Markdown is present,
+    it must exactly equal the rendering of the checksummed fields. CLI metadata
+    remains outside the checksum; this is integrity, not authentication.
     """
     if not isinstance(capsule, dict):
         return False
@@ -1308,9 +1451,48 @@ def verify_handover_checksum(capsule: Dict[str, Any]) -> bool:
     if "signedFields" in capsule and capsule["signedFields"] != list(_signed_fields(capsule)):
         return False
     try:
-        return expected == handover_signature(capsule)
-    except (TypeError, ValueError):
+        if expected != handover_signature(capsule):
+            return False
+        if "formatted" in capsule or "markdownChecksum" in capsule:
+            rendered = _render_handover(capsule, expected)
+            if "formatted" in capsule and capsule["formatted"] != rendered:
+                return False
+            if "markdownChecksum" in capsule and capsule["markdownChecksum"] != _markdown_checksum(rendered)[0]:
+                return False
+        return True
+    except (TypeError, ValueError, KeyError, AttributeError):
         return False
+
+
+_MARKDOWN_CHECKSUM_RE = re.compile(r"(?m)^- Checksum: `(sha256:[0-9a-f]{64})` \(integrity, not authentication\)$")
+_MARKDOWN_CHECKSUM_PLACEHOLDER = "sha256:" + "0" * 64
+
+
+def _markdown_checksum(text: str):
+    """Return the embedded and calculated text checksums, with the checksum slot zeroed."""
+    prefix = "# Memlet Handover\n\n"
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    if not text.startswith("## Routlet × Memlet Verified Handover Capsule\n"):
+        return None
+    matches = list(_MARKDOWN_CHECKSUM_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    canonical = text[:match.start(1)] + _MARKDOWN_CHECKSUM_PLACEHOLDER + text[match.end(1):]
+    return match.group(1), "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_handover_markdown(text: str) -> bool:
+    """Verify standalone capsule/HANDOVER.md text integrity, not authentication.
+
+    Every rendered byte except the fixed checksum slot is hashed. The optional
+    fixed file title carries no rule content. This text checksum is distinct from
+    the JSON capsule checksum, which covers canonical structured fields. Legacy
+    pages containing only that JSON checksum cannot pass this text verifier.
+    """
+    pair = _markdown_checksum(text) if isinstance(text, str) else None
+    return bool(pair and pair[0] == pair[1])
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1349,7 +1531,7 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         "## Routlet × Memlet Verified Handover Capsule",
         "",
         f"- Repo head: `{c['repoHead'] or 'n/a'}`",
-        f"- Checksum: `{signature}`",
+        f"- Checksum: `{_MARKDOWN_CHECKSUM_PLACEHOLDER}` (integrity, not authentication)",
         f"- Authority: {c['authorityBoundary']}",
         "",
         "### Active constraints (anchored symbols unchanged since pinning)",
@@ -1404,7 +1586,9 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                        ("unpinnedAnchors", "Unpinned symbols (not verified)")):
         if c.get(key):
             lines += ["", "### " + label]
-            lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c[key]]
+            lines += [(f"- {a['rule']} (`{a['source']}`; {a['reason']}"
+                       + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
+                      if "rule" in a else f"- `{a['anchor']}`: {a['reason']}" for a in c[key]]
     if c["reverifyBeforeUse"]:
         lines += ["", "### Re-verify before use (compatible-unverified)"]
         lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["reverifyBeforeUse"]]
@@ -1427,7 +1611,11 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
     if dropped:
         lines.append("- Omitted for token budget: " + ", ".join(f"{k} {v}" for k, v in sorted(dropped.items())))
     lines += ["", "### Next action", f"- {c['nextAction'] or '(not specified)'}"]
-    return "\n".join(lines) + "\n"
+    body = "\n".join(lines) + "\n"
+    # Keep a single visible checksum within the token budget. The JSON checksum
+    # argument remains accepted for compatibility; the Markdown has its own basis.
+    checksum = _markdown_checksum(body)[1]
+    return body.replace(_MARKDOWN_CHECKSUM_PLACEHOLDER, checksum, 1)
 
 
 def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
@@ -1635,6 +1823,14 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         if not complete:
             item["truncated"] = True
         return item
+    def _observation(r):
+        text, complete = _digest_compact(r["text"], _HANDOVER_TEXT_LIMIT)
+        key = next(k for k in r["anchors"] if by_key[k]["status"] == r["status"])
+        item = {"rule": text, "source": f"{r['source']}:{r['line']}", "anchors": r["anchors"],
+                "anchor": _bounded_anchor(key), "reason": by_key[key]["reason"]}
+        if not complete:
+            item["truncated"] = True
+        return item
     lists: Dict[str, List[Dict[str, Any]]] = {
         "activeConstraints": [_active(r) for r in constraints if r["status"] == "active"],
         "lexicalConstraints": [_active(r) for r in constraints
@@ -1645,10 +1841,8 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
                               for a in anchors if a["status"] == "compatible-unverified"],
         "quarantinedStaleAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
                                     for a in anchors if a["status"] == "stale"],
-        "pathExistsAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
-                              for a in anchors if a["status"] == "path-exists"],
-        "unpinnedAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
-                            for a in anchors if a["status"] == "unpinned"],
+        "pathExistsAnchors": [_observation(r) for r in constraints if r["status"] == "path-exists"],
+        "unpinnedAnchors": [_observation(r) for r in constraints if r["status"] == "unpinned"],
         "rejectedApproaches": [],
     }
     seen_rejected = set()
@@ -1801,6 +1995,7 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         **capsule,
         "capsuleSignature": signature,
         "checksum": signature,
+        "markdownChecksum": _markdown_checksum(markdown)[0],
         "signedFields": list(_signed_fields(capsule)),
         "tokenEstimate": tokens,
         "tokenBudget": token_budget,

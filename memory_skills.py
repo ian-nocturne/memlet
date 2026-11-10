@@ -343,6 +343,9 @@ def evaluate_staleness(skill_row, now=None):
                         sym for sym, old_sym_sha in tracked_syms.items()
                         if curr_syms.get(sym) != old_sym_sha
                     ]
+                    if sym_diffs and p.suffix.lower() == '.py':
+                        legacy_syms = _code_anchors.extract_file_symbol_hashes(p, legacy=True)
+                        sym_diffs = [sym for sym in sym_diffs if legacy_syms.get(sym) != tracked_syms[sym]]
                     if not sym_diffs:
                         # File changed outside the tracked symbols! Symbol anchor protects skill from false staleness.
                         symbol_anchored_saved.append(entry['path'])
@@ -1203,6 +1206,22 @@ def skill_events(db, task, skill_id=None, limit=50):
 
 
 def _write_skill_event_and_row(db, row):
+    # Upgrade only legacy hashes proven to match, immediately before persisting the skill.
+    source = row.get('source') or {}
+    refs = source.get('referencedFiles') or []
+    refreshed = []
+    for entry in refs:
+        if not isinstance(entry, dict) or Path(entry.get('path') or '').suffix.lower() != '.py':
+            refreshed.append(entry)
+            continue
+        old = entry.get('symbols') if isinstance(entry.get('symbols'), dict) else {}
+        current = extract_file_symbol_hashes(entry['path'])
+        legacy = _code_anchors.extract_file_symbol_hashes(entry['path'], legacy=True)
+        symbols = {sym: current[sym] if sym in current and legacy.get(sym) == value else value
+                   for sym, value in old.items()}
+        refreshed.append(dict(entry, symbols=symbols) if symbols != old else entry)
+    if refreshed != refs:
+        row['source'] = dict(source, referencedFiles=refreshed)
     cur = db.execute(
         '''INSERT INTO memory_skill_events(
            task,revision,event_key,skill_id,name,experience_id,version,operation,
