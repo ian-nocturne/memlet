@@ -1,6 +1,7 @@
-"""PRISM Memory v8.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
+"""PRISM Memory v8.4.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
+VERSION = "8.4.0"
+
 from .contracts import (
-    VERSION,
     EVIDENCE_STATES,
     VERIFICATION_MODES,
     MemoryScope,

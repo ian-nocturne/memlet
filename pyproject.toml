@@ -47,4 +47,4 @@ py-modules = [
 ]
 
 [tool.setuptools.package-data]
-prism_memory = ["persona-canon.json", "js_env_refs.cjs"]
+prism_memory = ["js_env_refs.cjs"]

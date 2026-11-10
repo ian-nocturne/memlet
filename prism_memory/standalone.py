@@ -28,10 +28,10 @@ def _fingerprint(value):
 
 def _text(value, limit: int = 8000, required: bool = False) -> str:
     if not isinstance(value, str) or len(value) > limit or "\x00" in value:
-        raise ValueError("입력 길이와 형식을 확인해 주세요.")
+        raise ValueError("Check the input length and format.")
     value = value.strip()
     if required and not value:
-        raise ValueError("필수 항목을 입력해 주세요.")
+        raise ValueError("Enter a value for the required field.")
     return value
 
 
@@ -75,6 +75,12 @@ class StandaloneStore:
                     updated REAL NOT NULL DEFAULT 0
                 )"""
             )
+            # Legacy WorkStore databases omit created. Named-column inserts below
+            # support either column order; ALTER preserves all existing rows.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            if "created" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN created REAL NOT NULL DEFAULT 0")
+                conn.execute("UPDATE tasks SET created = updated")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS input_leases (
                     task TEXT PRIMARY KEY,
