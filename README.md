@@ -1,8 +1,8 @@
 # Memlet (`memlet`)
 
-**Agent memory that checks whether what it remembers is still true — a self-verifying, code-anchored memory engine and instruction drift guard for coding agents.**
+**Agent memory that checks whether the code it remembers is still the code that is there — a code-anchored memory engine and instruction drift guard for coding agents.**
 
-> Twin to **Routlet** under Ian · Nocturne Lab: *Routlet picks the route. Memlet carries the verified context.*
+> Twin to **Routlet** under Ian · Nocturne Lab: *Routlet picks the route. Memlet carries the checked context.*
 > Formerly **DeltaHarness** / **Ieum Memory** / PRISM Memory. The legacy executables `ieum-memory`, `deltaharness`, and `prism-memory` still work for this release and print a one-line notice when run in a terminal.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -11,13 +11,13 @@
 
 Coding agents (`Claude Code`, `Cursor`, `Codex`, `Windsurf`) silently break when repository files move, function signatures change, `.env` keys go missing, or context compaction wipes architectural constraints. Most memory tools make this worse in one specific way: they keep injecting a memory long after the code it describes has changed.
 
-**Memlet** anchors memories and instructions to the code they talk about, and refuses to hand over context it cannot check. It is one pure-Python package (`Apache-2.0`, stdlib-only core) with six everyday commands:
+**Memlet** anchors memories and instructions to the code they talk about. It quarantines a rule whose anchored code changed, labels everything it could not check, and never presents either as current. It is one pure-Python package (`Apache-2.0`, stdlib-only core) with six everyday commands:
 
 | Command | What it does |
 | :--- | :--- |
 | `memlet init` | Records a baseline (a *pin*) for every code-anchored rule. `--hooks` installs the automatic loop. |
-| `memlet check` | Audits instruction files against the repository; `--changed` checks only what you just edited. |
-| `memlet recall "<task>"` | Returns the rules, human-approved lessons, and memories relevant to a task, each with its source. |
+| `memlet check` | Audits instruction files against the repository and reports every pinned anchor that went stale; `--changed` is the fast version for hooks. |
+| `memlet recall "<task>"` | Returns the rules, human-approved lessons, and memories relevant to a task, each with its source and anchor status; stale rules are set apart. |
 | `memlet handover` | Builds a small capsule for the next model: unchanged-since-pinned rules, with stale ones quarantined. |
 | `memlet learn` | Queues lessons from a session transcript as **pending**; nothing is used until a person approves it. |
 | `memlet ui` | Writes a self-contained HTML inspector. |
@@ -44,12 +44,12 @@ There are good agent memory tools already. Memlet is not trying to be a general 
 
 ### How Memlet combines the pieces
 
-- **Human-readable Markdown wiki, synced both ways (`.memlet/wiki/`)** — `memlet init` writes `.memlet/config.json` (pinned anchor hashes), `.memlet/wiki/INDEX.md`, and a local SQLite ledger `.memlet/ledger.sqlite3` (`anchor_snapshots` + `wiki_events`). People read, diff, and edit `.memlet/wiki/*.md` directly; `memlet wiki` compares each page body with its last recorded hash and records a changed or new page as a `user_edit` event in that ledger.
+- **Human-readable Markdown wiki, synced both ways (`.memlet/wiki/`)** — `memlet init` writes `.memlet/config.json` (pinned anchor hashes), `.memlet/wiki/INDEX.md`, and a local SQLite ledger `.memlet/ledger.sqlite3` (`anchor_snapshots` + `wiki_events`). People read, diff, and edit `.memlet/wiki/*.md` directly; `memlet admin wiki` compares each page body with its last recorded hash and records a changed or new page as a `user_edit` event in that ledger.
 - **Zero-LLM, local, bi-temporal ledger** — Every memory keeps when it was true (`at`) and when the system learned it (`known_at`), with `supersedes` / `retract` lineage. Point-in-time recall (`--at`, `--known-at`) and "why did this change?" both come from the ledger, not from a model's summary.
 - **Symbol & signature anchoring** — Rules that reference code as `path::symbol` store a hash of that symbol. `memlet init` and `memlet import` record the baseline; read commands never create one. On each check an anchor resolves to:
   - `active` — a stored pin exists and the symbol is unchanged (Python only);
-  - `compatible-unverified` — the body changed, an optional argument was added, or the match is a TS/JS lexical match; re-verify before trusting;
-  - `stale` — symbol removed, required arguments changed, or file moved; quarantined, never handed over as current;
+  - `compatible-unverified` — the body changed, an optional argument was added, a parameter type or annotation changed, or the match is a TS/JS lexical match; re-verify before trusting;
+  - `stale` — symbol removed, required arguments changed, or file moved; quarantined by `handover`, `recall`, the hooks and the MCP tools, and reported as an error by `check`;
   - `unpinned` — the symbol exists but no baseline was recorded yet;
   - `path-exists` — the rule names a path only, so nothing was hashed.
 - **Session Delta-Prompting** — Within one session, if `coreHash` is unchanged only the delta is sent; a compaction or session restart triggers a fresh baseline.
@@ -89,17 +89,19 @@ pip install -e ".[semantic]"
 ### 2. Check Your Repo Instructions (`CLAUDE.md` / `AGENTS.md` / `.cursorrules`)
 
 ```bash
-# Human-readable report (exits 1 if errors > 0, or pass --exit-zero)
+# Human-readable report (exits 1 if errors > 0, or pass --exit-zero).
+# After `memlet init`, a pinned anchor that went stale is an error here, committed or not;
+# anchors that are merely not verified are warnings.
 memlet check . --format markdown
 
 # Git-diff blast radius check (reports invalid_git_ref if a ref does not exist)
 memlet check . --base HEAD~1 --head HEAD --format markdown
 
-# Export SARIF v2.1.0 for GitHub Code Scanning
+# Export SARIF v2.1.0 for GitHub Code Scanning (stdout is the SARIF document itself)
 memlet check . --format sarif > memlet-check.sarif
 
-# Fast check of only the files you changed (working tree vs HEAD, renames and deletions included);
-# exits 1 when a rule that touches them is stale
+# Fast check of the files you changed (working tree vs HEAD, renames and deletions included).
+# With nothing changed it still lists anchors that are stale right now. Exits 1 when anything is stale.
 memlet check --changed
 
 # Accept one anchor's new state after you have re-read its rule (instead of re-pinning everything)
@@ -114,8 +116,8 @@ memlet recall "refund retry logic"
 
 One response from up to three sources, each item with a file:line or id you can open:
 
-- **Rules** from your instruction files and wiki pages. Without a built rule index they are parsed directly from the files and labelled as such.
-- **Approved lessons** from the Dream queue. Pending, rejected, or no-longer-verifiable lessons are never returned.
+- **Rules** from your instruction files and wiki pages, each with the status of its code anchors. A rule whose anchor is `stale` is never listed with the others: it appears under "anchored code changed — do not apply without re-reading the rule" and is counted in `staleAnchors`. Without a built rule index the rules are parsed directly from the files and labelled as such; that works out of the box. (`memlet admin index-build` is optional and calls the `claude` CLI, a model call.)
+- **Approved lessons** from the Dream queue. Pending, rejected, or no-longer-verifiable lessons are never returned; if some lessons fail verification the response says which and why, and the rest are still returned.
 - **Task memories**, only when you pass `--standalone` or `--task`.
 
 ### 4. Import Existing Rules & Hand Over Context (`memlet admin import` / `memlet handover`)
@@ -150,12 +152,16 @@ memlet learn --pending
 # Approve or reject by id; a name is required
 memlet learn --approve DRM-7306e549ab93 --by "ray"
 memlet learn --reject  DRM-bfd29ed9b65e --by "ray" --reason "one-off workaround"
+
+# Change your mind later: reject an approved lesson, or re-approve a rejected one
+memlet learn --reject  DRM-7306e549ab93 --by "ray" --reason "no longer true"
+memlet learn --approve DRM-7306e549ab93 --by "ray" --reconsider
 ```
 
 - Extraction is deterministic keyword matching, with no model call. Treat the queue as a draft to review, not as findings.
-- Nothing in the queue reaches `recall`, `handover`, hooks, or the MCP tools until it is approved. Approval is bound to the lesson's text and its cited transcript lines: editing either afterwards puts it back to pending.
-- Approved lessons are written to `.memlet/wiki/dream-approved.md` so `handover` and `recall` read them like any other rule.
-- Only visible user and assistant text is read from a transcript. Tool payloads and hidden reasoning are skipped, and known secret formats and private-key blocks are redacted before anything is stored. Very large inputs are skipped rather than partly stored: files over 16 MiB, and single messages or log lines over 16,384 characters; the result lists what was skipped.
+- Nothing in the queue reaches `recall`, `handover`, hooks, or the MCP tools until it is approved. Approval is bound to the lesson's text and its cited transcript lines: if either changes afterwards, that one lesson goes back to pending (`memlet learn --pending` shows the approved and the current text and the reason) while the other approved lessons keep working. After re-reading it, approve again with `--refresh-citations`.
+- Approved lessons are written to `.memlet/wiki/dream-approved.md` so `handover` and `recall` read them like any other rule. The promoted text is the text you reviewed (up to 8,192 characters, then cut with an explicit `…`). If you edit that page by hand, its rules stop being presented as verified until you approve or accept again.
+- Only visible user and assistant text is read from a transcript. Tool payloads and hidden reasoning are skipped, and these secret formats are redacted before anything is stored: OpenAI/Anthropic `sk-`, Stripe, GitHub, Slack, AWS access key ids, Google `AIza`, GitLab, npm, PyPI and Polar tokens, database connection URLs, URL credentials, JWTs, PEM/OpenSSH/PGP/PuTTY private-key blocks, and assignments whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH`. Other secret formats are not detected, and secrets stored by an earlier release are not removed. Very large inputs are skipped rather than partly stored: files over 16 MiB, and single messages or log lines over 16,384 characters; the result lists what was skipped.
 - The approval record is an integrity check, not authentication: anyone who can rewrite the whole queue file can forge one.
 
 ### 6. Make It Automatic (`memlet init --hooks`, MCP)
@@ -195,7 +201,7 @@ memlet admin rescue . --format markdown
 **Readiness States (Honest Static Classification)**:
 - `NO_TARGETS_FOUND` (exit `2`): Empty directory or zero scannable code/SQL/config files.
 - `BLOCKED` (exit `1`): One or more critical static blockers (e.g., client secret exposure, missing `.env` key when `.env` is present, table without `ENABLE ROW LEVEL SECURITY`).
-- `ENV_UNVERIFIED` (exit `0`, `ok: false`): The only warnings are environment variables that could not be checked because no local `.env` file is present. If any other warning is present the exit code is `1`.
+- `ENV_UNVERIFIED` (exit `0`, `ok: false`): The only warnings are environment variables that could not be checked because no local `.env` file is present. If any other blocking warning is present the exit code is `1`. Memlet's own `.memlet/` folder is not scanned.
 - `STATIC_CHECKS_PASSED` (exit `0`): All static code, SQL, lockfile, and instruction checks passed. This is a static result, not a guarantee that the live deployment works.
 
 ### 8. Score & Fix "AI Slop" UI and Copy (`memlet admin anti-slop`)
@@ -216,7 +222,7 @@ anti-slop lock . --archetype linear-precision
 
 ### 9. Inspect Memory, Dream Ontology & Routing in One Page (`memlet ui`)
 
-The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present; items nobody approved are shown as pending, never as supported), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out.
+The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present; items nobody approved, or whose citation no longer verifies, are shown as pending, never as supported), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out. A repository without any `path::symbol` rule shows its real, empty state and one hint on how to write such a rule.
 
 ```bash
 memlet ui .                                   # writes .memlet/inspector.html after `memlet init` (alias: memlet inspector .)
@@ -262,11 +268,11 @@ memlet admin pack --stack nextjs-supabase --output ./harness-packs
 | :--- | :--- |
 | `memlet init [.] [--force] [--dry-run]` | Zero-daemon setup and baseline pins. Re-running keeps existing pins and settings. |
 | `memlet init --hooks [--hooks-scope local\|project] [--git-hooks] [--dry-run]` / `--hooks-remove` | Opt-in Claude Code hooks (and git hooks); merge-only, removable. |
-| `memlet check [.] [--base REF --head REF] [--format json\|markdown\|sarif]` | Static instruction & memory drift audit. |
-| `memlet check --changed [--base REF]` / `--accept ANCHOR` / `--repin-legacy-ts` | Changed-files check; accept one anchor; re-pin TS/JS pins made by an earlier release. |
-| `memlet recall "<task>" [--repo DIR] [--budget N]` | Rules + approved lessons (+ task memories with `--standalone`/`--task`). |
+| `memlet check [.] [--base REF --head REF] [--format json\|markdown\|sarif]` | Static instruction audit plus the state of every pinned anchor; a stale pin exits `1`. |
+| `memlet check --changed [--base REF]` / `--accept ANCHOR` / `--repin-legacy-ts` | Changed-files check (falls back to currently stale pins); accept one anchor; re-pin TS/JS pins made by an earlier release. |
+| `memlet recall "<task>" [--repo DIR] [--budget N]` | Rules with anchor status + approved lessons (+ task memories with `--standalone`/`--task`); stale rules listed separately. |
 | `memlet handover [.] [--next-step "..."] [--rejected "..."] [--write]` / `--verify FILE` | Handover capsule with a checksum; verify a saved one. |
-| `memlet learn --transcript PATH` / `--pending` / `--approve ID... --by NAME` / `--reject ID... --by NAME` | Pending lesson queue with a human approval gate. |
+| `memlet learn --transcript PATH` / `--pending` / `--approve ID... --by NAME [--reconsider\|--refresh-citations]` / `--reject ID... --by NAME` | Pending lesson queue with a human approval gate; approvals can be revoked. |
 | `memlet ui [.] [--out\|--output FILE]` | Self-contained, escaped HTML inspector. |
 | `memlet admin --help` | Every other command, grouped: memory store, rules/wiki, Dream, rescue / anti-slop / pack, benchmarks, maintenance. |
 | `memlet --version` | Prints `8.4.0`. |
@@ -280,6 +286,14 @@ memlet admin pack --stack nextjs-supabase --output ./harness-packs
 - Read commands no longer create pins. If `memlet handover` shows rules under "unpinned", run `memlet init` once.
 - TS/JS pins made by an earlier release are reported as `compatible-unverified` (`legacy_ts_basis_repin_required`) until you run `memlet check --repin-legacy-ts`.
 - User-facing messages are English by default.
+- `memlet check` in an initialised repository now also reports pinned anchors (`pinnedAnchors` in the JSON) and exits `1` when one is stale. `--format sarif` prints the SARIF document itself; earlier releases printed a JSON envelope with the document under `sarif`.
+- `rule-recall` no longer quotes a rule whose anchor is stale.
+- Python pins are stored with a new hash basis that is identical on Python 3.9–3.13. Pins from earlier releases still match on the interpreter that made them and are migrated the next time `memlet init` or `memlet admin wiki` runs.
+- A Dream queue you built yourself at `.memlet/dream/APPROVAL-QUEUE.json` (the path earlier documentation used) keeps working for `learn --pending` and `--approve`, but `memlet learn --transcript` refuses to mix into it: move it aside first. Its items start as pending.
+- A `HANDOVER.md` written by an earlier release has no text checksum; `memlet handover --verify` says so instead of reporting a mismatch. Regenerate it with `memlet handover --write`.
+- The first time the memory store is opened it is migrated in place (one column added); a copy named `<db>.bak-pre-migration-<UTC>` is written first. An older Memlet cannot write to the migrated store.
+- Managed writes under `.memlet/` are refused when `.memlet` or anything below it is a symbolic link, and instruction files reached through a symbolic link or outside the repository are ignored.
+- Instruction files larger than 1 MB are skipped.
 
 ---
 
