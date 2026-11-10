@@ -1,4 +1,5 @@
-"""Tiered rule context built from the verified rule index (`memlet index-build`). No model call, fully deterministic.
+"""Deterministic rule recall: reads the pinned index without making model calls.
+Index creation (`memlet admin index-build`) separately invokes the `claude` CLI and makes a model call.
 
     memlet rule-context .                       # T0 safety core (verbatim quotes) + T1 topic index, for session start
     memlet rule-recall . "<task text>" --k 3    # T2: the k index spans most relevant to the task, quoted verbatim
@@ -162,11 +163,12 @@ def _index_stale_line(meta: Optional[Dict[str, Any]]) -> Optional[str]:
                          + (f" (+{len(st[key]) - 3})" if len(st[key]) > 3 else ""))
     detail = "; ".join(parts) or "instruction text differs from what was indexed"
     return (f"- WARNING: instruction files changed after the rule index was built ({detail}); rules added since are "
-            "not indexed — re-run `memlet index-build`")
+            "not indexed — re-run `memlet admin index-build` (calls the `claude` CLI; a model call)")
 
 
 def _quote_block(e: Dict[str, Any]) -> str:
-    return "\n".join([f"- [{e['topic']}] `{e['source']}`:"] + [f"  > {q}" for q in e["quote"].splitlines()])
+    status = f" [{e['anchorStatus']}: {e['anchorReason']}]" if "anchorStatus" in e else ""
+    return "\n".join([f"- [{e['topic']}] `{e['source']}`{status}:"] + [f"  > {q}" for q in e["quote"].splitlines()])
 
 
 AUTO_FULL_THRESHOLD = 8000  # spec-009/010: below this, the whole instructions beat any tiering on accuracy and cost
@@ -307,8 +309,16 @@ def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str
         shown = {e["id"] for e in picked}
         forced = [e for e in fresh if e["importance"] == 1 and not out_of(e) and e["id"] not in shown]
         picked = picked + forced[:SAFETY_EXTRA]
+    from prism_memory.memlet_wiki import classify_rule_quotes
+    classify_rule_quotes(root, picked)
+    all_picked = picked
+    picked = [e for e in picked if e["anchorStatus"] != "stale"]
     lines = ["## Rules relevant to this task (quoted verbatim from the instructions)", _GUIDE]
     lines += [_quote_block(e) for e in picked] or ["- (no indexed rule matched; consult the rule index)"]
+    stale_anchors = [e for e in all_picked if e["anchorStatus"] == "stale"]
+    if stale_anchors:
+        lines.append("- WARNING: anchored code changed — do not apply without re-reading the rule: " +
+                     "; ".join(e["source"] + " (" + e["anchorReason"] + ")" for e in stale_anchors))
     if stale:
         lines.append(_stale_line(stale))
     index_warning = _index_stale_line(meta)
@@ -317,15 +327,17 @@ def _recall(repo_path=".", query: str = "", *, k: int = 3, exclude: Iterable[str
     text = "\n".join(lines) + "\n"
     res = {"ok": True, "command": "recall", "repoPath": str(root), "k": k, "stale": len(stale),
            "spans": [e["source"] for e in picked], "spanKeys": [e["key"] for e in picked],
-           "scores": [round(-s, 4) for s, _, _ in scored[:k]], "tokenEstimate": estimate_tokens(text),
+           "scores": [round(-s, 4) for s, _, e in scored[:k] if e in picked], "tokenEstimate": estimate_tokens(text),
            "formatted": text}
     if index_warning:  # additive, only when the index is outdated: the CLI's golden key set stays unchanged otherwise
         res["indexStale"] = (meta or {}).get("staleness")
     if with_items:
+        res["staleAnchors"] = len({a["anchor"] for e in all_picked for a in e["anchors"] if a["status"] == "stale"})
         items = []
-        for e in picked:
+        for e in all_picked:
             item = {"key": e["key"], "source": e["source"], "topic": e["topic"], "quote": e["quote"],
-                    "importance": e["importance"], "match": e["id"] in matched}
+                    "importance": e["importance"], "match": e["id"] in matched,
+                    "anchorStatus": e["anchorStatus"], "anchorReason": e["anchorReason"], "anchors": e["anchors"]}
             for extra in ("dreamId", "sha256", "parsed"):
                 if e.get(extra):
                     item[extra] = e[extra]

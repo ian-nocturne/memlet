@@ -211,7 +211,8 @@ def mask_secrets(text: str) -> str:
     Multi-line key blocks keep their line count (see `redact_secret_blocks`)."""
     if not text:
         return ""
-    out = redact_secret_blocks(text)
+    from prism_memory.memlet_brief import _mask
+    out = _mask(redact_secret_blocks(text))
     for c in CANARY_SECRETS:
         if c in out:
             out = out.replace(c, "[REDACTED_CANARY]")
@@ -228,6 +229,9 @@ def has_unmasked_secret_or_canary(text: str) -> bool:
         if c in text:
             return True
     cleaned = text.replace("[REDACTED_SECRET]", "").replace("[REDACTED_CANARY]", "")
+    from prism_memory.memlet_brief import _mask
+    if _mask(cleaned) != cleaned:
+        return True
     for pat in _SECRET_PATTERNS:
         if pat.search(cleaned):
             return True
@@ -246,6 +250,9 @@ def _iter_strings(obj: Any) -> Iterator[str]:
     elif isinstance(obj, (list, tuple, set)):
         for item in obj:
             yield from _iter_strings(item)
+
+
+LESSON_TEXT_MAX_CHARS = 8192  # promoted lesson text; longer text ends with an explicit ellipsis
 
 
 def safe_truncate_masked(text: str, max_chars: int = 240) -> str:
@@ -458,9 +465,7 @@ def dream_pin_and_validate(
             status_kind = "superseded_rule"
 
         scope_tag = safe_truncate_masked(str(cand.get("scope_tag") or "general"), max_chars=48)
-        title = safe_truncate_masked(str(cand.get("title") or ""), max_chars=110)
-        if not title or len(title.split()) > 18:
-            title = " ".join(title.split()[:15])
+        title = safe_truncate_masked(str(cand.get("title") or ""), max_chars=LESSON_TEXT_MAX_CHARS)
         if not title:
             dropped.append({"lesson_id": lid, "reason": "empty_title"})
             continue
@@ -1325,7 +1330,7 @@ def format_flat_memory(
             )
         else:
             entry = (
-                f"- [{lid}] ({cat} | {scope_lbl}) {title_lbl}\n"
+                f"- [{lid}] ({category_label(cat)} | {scope_lbl}) {title_lbl}\n"
                 f"  quote [{safe_sp} {safe_sha}]: {clean_q}"
             )
         candidate = "\n".join(lines + [entry])
@@ -1406,6 +1411,7 @@ def recall_subgraph(
     unverified_label: bool = False,
     require_approval: bool = True,
     allow_unverified: bool = False,
+    verification_notice: str = "",
 ) -> Dict[str, Any]:
     """1-hop ontology subgraph recall with deterministic `SUPERSEDES` quarantine and typed sections
     (`GOVERNS`, `RESOLVES`, `BLOCKS`, plus explicit `SUPERSEDES` lineage warnings).
@@ -1441,6 +1447,8 @@ def recall_subgraph(
     if snapshot_files is None or unverified_label:
         header += UNVERIFIED_LABEL
     header += "# Rule: Never apply [SUPERSEDED] old_pin; apply replacement_pin [ACTIVE].\n"
+    if verification_notice:
+        header += "# WARNING: " + verification_notice + "\n"
     res = _recall_core(view, query_text, budget, header)
     res["pinVerification"] = "sha256_verified" if snapshot_files is not None else "UNVERIFIED_OPT_OUT"
     res["approvalRequired"] = bool(require_approval)
@@ -2561,7 +2569,7 @@ def extract_candidates_with_report(
                         "category": "verified_workaround",
                         "status_kind": "active_lesson",
                         "scope_tag": scope_tag,
-                        "title": safe_truncate_masked(clean_body, 120),
+                        "title": safe_truncate_masked(clean_body, LESSON_TEXT_MAX_CHARS),
                         "importance": 1,
                         "src_spans": [f"{fname}:{i}"],
                         "edges": [{
@@ -2584,7 +2592,7 @@ def extract_candidates_with_report(
                     "category": "repeated_pitfall",
                     "status_kind": "active_lesson",
                     "scope_tag": scope_tag,
-                    "title": safe_truncate_masked(clean_body, 120),
+                    "title": safe_truncate_masked(clean_body, LESSON_TEXT_MAX_CHARS),
                     "importance": 1,
                     "src_spans": [f"{fname}:{i}"],
                     "edges": [{
@@ -2604,7 +2612,7 @@ def extract_candidates_with_report(
                     "category": "verified_workaround",
                     "status_kind": "active_lesson",
                     "scope_tag": scope_tag,
-                    "title": safe_truncate_masked(clean_body, 120),
+                    "title": safe_truncate_masked(clean_body, LESSON_TEXT_MAX_CHARS),
                     "importance": 2,
                     "src_spans": [f"{fname}:{i}"],
                     "edges": [{
@@ -3097,10 +3105,79 @@ def _verify_item_pins(item: Dict[str, Any], kind: str, snap: Dict[str, List[str]
     return None
 
 
-def list_pending(queue: Any) -> Dict[str, Any]:
+def citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Read-only review state: a failed citation makes only its item pending."""
+    import copy
+    view = copy.deepcopy(graph)
+    for n in view.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        reason = _verify_item_pins(n, "node", snapshot)
+        for e in n.get("edges") or []:
+            reason = reason or _verify_item_pins(e, "edge", snapshot)
+        if reason and approval_state(n, "node") != "rejected":
+            n["citationReason"] = reason
+            n.pop("approval", None)
+            n["verdict"] = PENDING
+    for refs in _edge_refs(view).values():
+        for e in refs:
+            if _verify_item_pins(e, "edge", snapshot) and approval_state(e, "edge") != "rejected":
+                e.pop("approval", None)
+                e["edgeVerdict"] = PENDING
+    return view
+
+
+def citation_failures(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> List[Dict[str, str]]:
+    """Report every node excluded because its own citation or an owned edge cannot be verified."""
+    failures = []
+    for n in graph.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        reason = _verify_item_pins(n, "node", snapshot)
+        for e in n.get("edges") or []:
+            reason = reason or _verify_item_pins(e, "edge", snapshot)
+        if reason:
+            failures.append({"id": str(n.get("id", "")), "reason": reason})
+    return failures
+
+
+def citation_failure_notice(failures: List[Dict[str, str]]) -> str:
+    if not failures:
+        return ""
+    return (f"Citation verification failed for {len(failures)} lesson(s); excluded: " +
+            ", ".join(f["id"] for f in failures) + ". See `memlet learn --pending` for reasons and fresh review.")
+
+
+def citation_verified_graph(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Remove only unverifiable items before the complete structural/ontology check."""
+    view = citation_review_view(graph, snapshot)
+    view["nodes"] = [n for n in view.get("nodes", []) if not n.get("citationReason")
+                     and _verify_item_pins(n, "node", snapshot) is None]
+    ids = {n.get("id") for n in view["nodes"]}
+    removed_ids = {n.get("id") for n in graph.get("nodes", [])} - ids
+    for n in view["nodes"]:
+        n["edges"] = [e for e in n.get("edges", []) if _verify_item_pins(e, "edge", snapshot) is None
+                      and e.get("toId") not in removed_ids]
+    view["edges"] = [e for e in view.get("edges", []) if e.get("fromId") not in removed_ids
+                     and e.get("toId") not in removed_ids and _verify_item_pins(e, "edge", snapshot) is None]
+    return view
+
+
+def category_label(category: Any) -> str:
+    """Draft category names describe keyword extraction, never independent verification."""
+    return {"verified_workaround": "workaround draft", "verified_procedure": "procedure draft"}.get(
+        str(category), str(category))
+
+
+def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
     """List nodes and edges of a Dream queue (path or loaded dict) that have no valid human decision.
     An approval whose digest no longer matches the item counts as pending."""
     graph = queue if isinstance(queue, dict) else _load_queue(queue)[1]
+    if not isinstance(queue, dict) and snapshot_files is None:
+        snapshot_files, _source = _locate_snapshot(graph, None)
+        snapshot_files = snapshot_files or {}
+    if snapshot_files is not None:
+        graph = citation_review_view(graph, snapshot_files)
     p_nodes: List[Dict[str, Any]] = []
     counts = {"approvedNodes": 0, "rejectedNodes": 0, "approvedEdges": 0, "rejectedEdges": 0}
     for n in graph.get("nodes") or []:
@@ -3121,7 +3198,12 @@ def list_pending(queue: Any) -> Dict[str, Any]:
                 "span": pp.get("span"),
                 "sha256": pp.get("sha256"),
                 "claimedVerdict": n.get("claimedVerdict"),
-                "staleApproval": isinstance(n.get("approval"), dict),
+                "staleApproval": isinstance(n.get("approval"), dict) or bool(n.get("citationReason")),
+                "citationReason": n.get("citationReason"),
+                "quote": pp.get("quoteText", ""),
+                "currentQuote": ((resolve_pin(snapshot_files or {}, pp.get("span", "")) or {}).get("quoteText")
+                                 if snapshot_files is not None else None),
+                "categoryLabel": category_label(n.get("category")),
             })
     p_edges: List[Dict[str, Any]] = []
     for eid, refs in _edge_refs(graph).items():
@@ -3285,6 +3367,8 @@ def _decide_queue_items(
     db_path: Optional[Any] = None,
     cascade_edges: bool = True,
     reason: str = "",
+    reconsider: bool = False,
+    refresh_citations: bool = False,
 ) -> Dict[str, Any]:
     if decision not in (APPROVED, REJECTED_DECISION):
         raise ValueError(f"Unknown decision: {decision}")
@@ -3297,7 +3381,7 @@ def _decide_queue_items(
         raise ValueError(f"Refusing symlinked Dream queue: {queue_path}")
     # one lock from load to commit: a concurrent writer can never start from the graph this call is replacing
     with queue_lock(queue_path):
-        return _decide_locked(queue_path, ids, decision, who, snapshot_path, db_path, cascade_edges, reason)
+        return _decide_locked(queue_path, ids, decision, who, snapshot_path, db_path, cascade_edges, reason, reconsider, refresh_citations)
 
 
 def _decide_locked(
@@ -3309,6 +3393,8 @@ def _decide_locked(
     db_path: Optional[Any],
     cascade_edges: bool,
     reason: str,
+    reconsider: bool = False,
+    refresh_citations: bool = False,
 ) -> Dict[str, Any]:
     q_path, graph = _load_queue(queue_path)
     prior_sha = graph_sha256(graph)
@@ -3376,6 +3462,20 @@ def _decide_locked(
             ref["edgeVerdict"] = "VALID" if decision == APPROVED else REJECTED
             ref["approval"] = _record(edge_approval_digest(ref))
 
+    def refresh(item, kind):
+        if not refresh_citations or decision != APPROVED:
+            return
+        names = ("primaryPin", "supersededByPin") if kind == "node" else ("srcPin", "targetPin")
+        for key in names:
+            old = item.get(key)
+            new = resolve_pin(snap or {}, old.get("span", "")) if isinstance(old, dict) else None
+            if new:
+                item[key] = new
+        if kind == "node":
+            item["title"] = safe_truncate_masked(_LINE_PREFIX_RE.sub("", str((item.get("primaryPin") or {}).get("quoteText", "")), count=1).strip(), LESSON_TEXT_MAX_CHARS)
+            item["allPins"] = [resolve_pin(snap or {}, p.get("span", "")) or p for p in item.get("allPins", [])]
+        item.pop("approval", None)
+
     for item_id in ordered_ids:
         if item_id in nodes_by_id:
             if len(nodes_by_id[item_id]) > 1:
@@ -3383,15 +3483,31 @@ def _decide_locked(
                 continue
             n = nodes_by_id[item_id][0]
             cur = approval_state(n, "node")
-            if cur == decision:
-                unchanged.append(item_id)
+            if cur == "rejected" and decision == APPROVED and not reconsider:
+                refused.append({"id": item_id, "reason": "already_rejected"})
                 continue
-            if cur != "pending":
+            if decision == APPROVED and (refresh_citations or (reconsider and cur == "rejected")):
+                refresh(n, "node")
+                cur = "pending"
+                for e in n.get("edges", []):
+                    for ref in edge_refs.get(str(e.get("edgeId")), [e]):
+                        refresh(ref, "edge")
+            if cur == decision:
+                err = _verify_item_pins(n, "node", snap or {}) if decision == APPROVED else None
+                if decision == APPROVED:
+                    for edge in n.get("edges", []):
+                        err = err or _verify_item_pins(edge, "edge", snap or {})
+                if err:
+                    refused.append({"id": item_id, "reason": "pin_does_not_verify:" + err})
+                else:
+                    unchanged.append(item_id)
+                continue
+            if cur != "pending" and decision != REJECTED_DECISION and not reconsider:
                 refused.append({"id": item_id, "reason": f"already_{cur}"})
                 continue
             owned = [
                 str(e.get("edgeId")) for e in (n.get("edges") or [])
-                if isinstance(e, dict) and e.get("edgeId") and _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == "pending"
+                if isinstance(e, dict) and e.get("edgeId") and (decision == REJECTED_DECISION or reconsider or _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == "pending")
             ] if cascade_edges else []
             err = _verify_item_pins(n, "node", snap or {}) if decision == APPROVED else None
             if not err:
@@ -3416,10 +3532,14 @@ def _decide_locked(
             done.append(item_id)
         elif item_id in edge_refs:
             cur = _edge_state(edge_refs[item_id])
+            if decision == APPROVED and refresh_citations and (cur != "rejected" or reconsider):
+                for ref in edge_refs[item_id]:
+                    refresh(ref, "edge")
+                cur = "pending"
             if cur == decision:
                 unchanged.append(item_id)
                 continue
-            if cur != "pending":
+            if cur != "pending" and decision != REJECTED_DECISION and not reconsider:
                 refused.append({"id": item_id, "reason": f"already_{cur}"})
                 continue
             err = _edge_problem(item_id)
@@ -3431,6 +3551,9 @@ def _decide_locked(
         else:
             refused.append({"id": item_id, "reason": "unknown_id"})
 
+    if refused and refresh_citations:
+        refused.extend({"id": i, "reason": "batch_refresh_aborted"} for i in done)
+        done, cascaded = [], []  # a fresh-citation batch is atomic; never persist partially refreshed refused items
     if done:
         _commit_queue_and_db(
             q_path,
@@ -3463,6 +3586,8 @@ def approve_queue_items(
     snapshot_path: Optional[Any] = None,
     db_path: Optional[Any] = None,
     cascade_edges: bool = True,
+    reconsider: bool = False,
+    refresh_citations: bool = False,
 ) -> Dict[str, Any]:
     """Approve nodes and/or edges of a Dream queue by id (human decision).
 
@@ -3471,11 +3596,12 @@ def approve_queue_items(
     locatable snapshot every id is refused. Approving a node also approves its own still-undecided edges
     (`cascade_edges`). Each record stores approver, UTC time and a digest of the approved content
     (`node_approval_digest` / `edge_approval_digest`); a later edit makes the item PENDING again.
-    Idempotent; never flips a rejected item. Writes the queue JSON and the DB together (see
+    Idempotent; reconsider=True explicitly reopens rejected items. refresh_citations=True explicitly approves current citation text after review. Writes the queue JSON and the DB together (see
     `_commit_queue_and_db`); the DB written is `db_path` if given, else the recorded DB only when it lies
     inside the queue's own directory. Boundary: integrity check, not a signature (`APPROVAL_BOUNDARY`).
     """
-    return _decide_queue_items(queue_path, ids, APPROVED, approver, snapshot_path, db_path, cascade_edges)
+    return _decide_queue_items(queue_path, ids, APPROVED, approver, snapshot_path, db_path, cascade_edges,
+                               reconsider=reconsider, refresh_citations=refresh_citations)
 
 
 def reject_queue_items(
@@ -3487,7 +3613,7 @@ def reject_queue_items(
     cascade_edges: bool = True,
 ) -> Dict[str, Any]:
     """Reject nodes and/or edges by id (recorded like approvals; rejected items are never recalled).
-    No snapshot or pin verification is needed to reject. Idempotent; never flips an approved item."""
+    No snapshot or pin verification is needed to reject. Idempotent; an explicit rejection revokes an approved item and its owned edges."""
     return _decide_queue_items(
         queue_path, ids, REJECTED_DECISION, approver, None, db_path, cascade_edges, reason=reason
     )
@@ -3564,8 +3690,8 @@ def run_dream_recall(
     """Execute `dream-recall`: load the queue, re-verify every pin against the snapshot, recall the 1-hop
     capsule from human-approved items only (via `recall_subgraph`), and optionally write `--out-md`.
 
-    - Snapshot: explicit `snapshot_path`, else the path recorded at build time. A changed snapshot or pin
-      raises `ValueError`.
+    - Snapshot: explicit `snapshot_path`, else the path recorded at build time. Items with changed citations
+      are omitted individually; the surviving graph still passes the full ontology contract check.
     - No locatable snapshot: `ok=False`, `exitCode=3`, no items — unless `allow_unverified=True`
       (output labelled UNVERIFIED).
     - `require_approval=False` returns raw candidates, labelled UNAPPROVED. PENDING/REJECTED verdicts
@@ -3578,7 +3704,11 @@ def run_dream_recall(
     graph = json.loads(_read_bounded_text(g_path, QUEUE_MAX_BYTES, "Dream ontology graph"))
     if not isinstance(graph, dict):
         raise ValueError("Dream ontology graph must be a JSON object.")
+    _check_graph_safe_structure(graph)
     snap, snap_source = _locate_snapshot(graph, snapshot_path)
+    failures = citation_failures(graph, snap) if snap is not None else []
+    if snap is not None:
+        graph = citation_verified_graph(graph, snap)
     res = recall_subgraph(
         graph,
         query_text=query_text,
@@ -3586,7 +3716,11 @@ def run_dream_recall(
         snapshot_files=snap,
         require_approval=require_approval,
         allow_unverified=allow_unverified,
+        verification_notice=citation_failure_notice(failures),
     )
+    if failures:
+        res.update(unverifiableCount=len(failures), unverifiableNodeIds=[f["id"] for f in failures],
+                   unverifiableItems=failures, verificationNotice=citation_failure_notice(failures))
     res["snapshotSource"] = snap_source
     res["approvalBoundary"] = APPROVAL_BOUNDARY
 

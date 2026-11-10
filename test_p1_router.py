@@ -374,8 +374,13 @@ class RealRouterTests(unittest.TestCase):
             if content is not None:
                 path.write_text(content, encoding='utf-8')
             code, out, err = invoke(['handover', '--verify', str(path)])
-            self.assertEqual((1, ''), (code, err))
-            self.assertEqual(1, len(out.splitlines()))
+            if content is None:
+                self.assertEqual((1, ''), (code, out))
+                self.assertEqual(1, len(err.splitlines()))
+                self.assertEqual('FileNotFoundError', json.loads(err)['type'])
+            else:
+                self.assertEqual((1, ''), (code, err))
+                self.assertEqual(1, len(out.splitlines()))
 
     def test_real_bridge_cli_learning_approval_drift_and_checksum_lifecycle(self):
         def run_json(argv, expected=0):

@@ -1,6 +1,6 @@
 """Memory Cortex tab for the Nocturne Inspector (`memlet ui`).
 
-Shows what the next model will actually receive: sources -> anchored memories -> AST gate -> signed handover
+Shows current repository observations: sources -> anchored memories -> baseline comparison -> checksummed handover
 capsule, with a quarantine-orbit hero banner on top. One instance is rendered per workspace (live / demo).
 
 Safety contract (same as the rest of the inspector):
@@ -212,8 +212,8 @@ def tab_cortex(payload: Dict[str, Any]) -> str:
         data = _cortex_data(ws)
         has_anchors = bool(data["anchors"])
         empty = ("" if has_anchors else
-                 '<p class="notice">No <code>file::Symbol</code> anchors in this workspace yet. Run '
-                 '<code>memlet init</code>, or switch to the Interactive Showcase.</p>')
+                 '<p class="notice">No code anchors yet. Add a rule such as '
+                 '<code>Use `app/billing.py::charge` for billing.</code> to CLAUDE.md, then run <code>memlet init</code>.</p>')
         sim = '<span class="pill acc">[SIMULATED] showcase data</span>' if wid == "demo" else \
             '<span class="pill">live · read-only</span>'
         parts.append(
@@ -221,7 +221,7 @@ def tab_cortex(payload: Dict[str, Any]) -> str:
             f'<script type="application/json" data-cx="data">{_json_for_html(data)}</script>'
             f'{_hero(ws, wid)}{empty}'
             f'<div class="cx-bar"><div><h3 class="cx-title">What your next model will actually remember</h3>'
-            f'<p class="sub" style="margin:0">Every rule passes the AST gate before it may steer an agent. '
+            f'<p class="sub" style="margin:0">Active Python anchors are unchanged since pinned; this does not verify the rule’s meaning. '
             f'The status filter above applies here too.</p></div>'
             f'<div class="cx-btns">{sim}'
             f'<label class="cx-tog"><input type="checkbox" data-cx="sigfirst" checked> signature-break first</label>'
@@ -241,7 +241,7 @@ def tab_cortex(payload: Dict[str, Any]) -> str:
             f'<div class="cx-out dead" data-out="dead"><span>DEAD-END</span><span data-cx="o-dead"></span></div>'
             f'</div></div>'
             f'<div><div class="cx-colh">Capsule → next model</div><div class="cx-capsule" data-cx="capsule">'
-            f'<div class="cx-seal" data-cx="seal"><span>SIGNED<br>&lt;{_e((ws.get("handover") or {}).get("tokenBudget") or 500)}<br>TOKENS</span></div>'
+            f'<div class="cx-seal" data-cx="seal"><span>CHECKSUM<br>&lt;{_e((ws.get("handover") or {}).get("tokenBudget") or 500)}<br>TOKENS</span></div>'
             f'<h4 class="cx-caph">Handover capsule</h4><div class="cx-meta" data-cx="meta"></div>'
             f'<div class="cx-gauge"><i data-cx="gauge"></i></div>'
             f'<div class="cx-gline"><span data-cx="gl"></span><span data-cx="gr"></span></div>'
@@ -256,7 +256,7 @@ def tab_cortex(payload: Dict[str, Any]) -> str:
             f'<dl class="cx-kv" data-cx="d-kv"></dl><div data-cx="d-verdict"></div><div data-cx="d-rule"></div>'
             f'<div class="cx-legend"><div><i class="cx-g ok"></i>active · travels</div><div><i class="cx-g warn"></i>re-verify first</div>'
             f'<div><i class="cx-g bad"></i>stale · blocked</div><div><i class="cx-g dead"></i>dead-end · carried as warning</div></div>'
-            f'<p class="sub" style="margin:10px 0 0">Token count and signature come from the capsule. Per-item token shares are not recorded, so none are shown.</p>'
+            f'<p class="sub" style="margin:10px 0 0">Token count and checksum come from the capsule. Per-item token shares are not recorded, so none are shown.</p>'
             f'</aside></div>'
             f'<section class="card cx-lineage" data-cx="lineage" hidden>'
             f'<div class="cx-bar"><div><h3 class="cx-title">Dream Ontology Lineage · 4 Typed Edges (GOVERNS · SUPERSEDES · RESOLVES · BLOCKS)</h3>'
@@ -407,6 +407,7 @@ JS = r"""
   var REVERIFY={
     'unpinned':'Re-verify first — anchor is unpinned, so no baseline hash exists to compare',
     'optional_args_added_signature_compatible':'Re-verify first — an optional argument was added; required signature unchanged',
+    'parameter_type_or_annotation_changed_signature_compatible':'Re-verify first — parameter type or annotation changed; required arguments unchanged',
     'body_changed_signature_compatible':'Re-verify first — function body changed; signature still compatible'
   };
   function el(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=String(text); return e; }
@@ -499,7 +500,7 @@ JS = r"""
       [['c-active','active','activeConstraints'],['c-warn','warn','reverifyBeforeUse'],['c-bad','bad','quarantinedStaleAnchors'],['c-dead','dead','rejectedApproaches']]
         .forEach(function(r){ q(r[0]).textContent=nIn[r[1]]+(omitted[r[2]]?' (+'+omitted[r[2]]+' trimmed)':''); });
       q('meta').textContent='head '+String(H.repoHead||'').slice(0,12)+' · '+String(H.authorityBoundary||'');
-      q('sig').textContent='signature '+String(H.capsuleSignature||'—');
+      q('sig').textContent='checksum '+String(H.checksum||H.capsuleSignature||'—');
     } else {
       ['s-active','s-warn','s-bad','s-dead'].forEach(function(k){ q(k).appendChild(el('div','cx-empty','no capsule')); });
       q('meta').textContent='No handover capsule for this workspace — nothing travels to the next model yet.';

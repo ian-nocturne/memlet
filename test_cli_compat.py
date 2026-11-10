@@ -75,6 +75,8 @@ class Sandbox:
         (self.repo / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
         (self.repo / "mod.py").write_text(MOD_PY, encoding="utf-8")
         (self.repo / "api.ts").write_text(API_TS, encoding="utf-8")
+        # A real copy target: anti-slop must not rely on generated .memlet pages as its scan input.
+        (self.repo / "PRODUCT.md").write_text("# Billing helper\n\nReview the release before deployment.\n", encoding="utf-8")
         (self.repo / "docs" / "release.md").write_text("# Release\n\nCheck the gate.\n", encoding="utf-8")
         (self.logs / "s1.log").write_text(LOG, encoding="utf-8")
         _git(self.repo, "init", "-q", ".")

@@ -460,7 +460,7 @@ def scan_anti_slop(
         for dirpath, dirnames, filenames in os.walk(root_dir):
             dirnames[:] = [
                 d for d in dirnames
-                if d not in EXCLUDED_DIRS
+                if d != ".memlet" and d not in EXCLUDED_DIRS
                 and d not in {"tests", "docs", "artifacts", "backups", "logs", "deployment", "dogfood-sandbox", "archive", "before_rescue", "after_rescue"}
             ]
             for fname in sorted(filenames):

@@ -415,6 +415,15 @@ def _program_name():
     return name if name in PROGRAM_NAMES else 'memlet'
 
 
+class _InvokedSubParsers(argparse._SubParsersAction):
+    """Keep argparse parsing unchanged; render help using the alias the caller actually typed."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        child = self.choices.get(values[0]) if values else None
+        if child is not None:
+            child.prog = parser.prog + ' ' + values[0]
+        return super().__call__(parser, namespace, values, option_string)
+
+
 PRODUCT_COMMANDS = {
     'init': 'Set up repository memory and code anchors.',
     'check': 'Check repository rules and changed code anchors.',
@@ -494,7 +503,7 @@ def _configure_help(parser, sub):
     _add_global_options(admin)
     _reserve_legacy_prefixes(admin)
     admin.set_defaults(_admin=True)
-    nested = admin.add_subparsers(dest='action', required=True, metavar='COMMAND')
+    nested = admin.add_subparsers(dest='action', required=True, metavar='COMMAND', action=_InvokedSubParsers)
     # These are the very same parsers and handlers, including hidden experiments.
     nested.choices.update(commands)
     sub.metavar = '{' + ','.join(list(PRODUCT_COMMANDS) + ['admin']) + '}'
@@ -545,6 +554,20 @@ def _bridge_call(name, *args, **kwargs):
     return getattr(memlet_bridge, name)(*args, **kwargs)
 
 
+def _refresh_managed_promotion(graph_path, result):
+    """Legacy decisions on the managed queue refresh the same promoted page as `learn` decisions."""
+    path = Path(graph_path).expanduser().resolve()
+    if (path.name == 'APPROVAL-QUEUE.json' and path.parent.name == 'dream'
+            and path.parent.parent.name == '.memlet' and path.is_file()):
+        from prism_memory.memlet_bridge import promote_approved
+        promotion = promote_approved(path.parent.parent.parent)
+        result['promotion'] = promotion
+        if not promotion.get('ok'):
+            result.update(ok=False, exitCode=1, error='Decision recorded, but promotion failed: ' +
+                          str(promotion.get('error')))
+    return result
+
+
 def _route_new(args):
     """New flags take explicit routes; flag-less legacy handlers below stay intact."""
     if args.action in ('check', 'audit'):
@@ -563,6 +586,10 @@ def _route_new(args):
             task = args.task or _standalone_task_id()
             if args.standalone:
                 store.ensure_standalone_task(task, session=args.session or 'standalone-owner')
+                if not args.task:
+                    notice = legacy_standalone_notice(store, task)
+                    if notice:
+                        print(notice, file=sys.stderr)
             kwargs.update(store=store, task=task)
         return _bridge_call('unified_recall', args.repo,
                             args.positional_query if args.positional_query is not None else args.query, **kwargs)
@@ -572,7 +599,12 @@ def _route_new(args):
         if args.pending:
             return _bridge_call('learn_pending', args.repo)
         if args.approve:
-            return _bridge_call('learn_approve', args.repo, ids=args.approve, approver=args.by)
+            options = {}
+            if args.reconsider:
+                options['reconsider'] = True
+            if args.refresh_citations:
+                options['refresh_citations'] = True
+            return _bridge_call('learn_approve', args.repo, ids=args.approve, approver=args.by, **options)
         if args.reject:
             return _bridge_call('learn_reject', args.repo, ids=args.reject, approver=args.by, reason=args.reason)
     if args.action == 'handover' and args.verify:
@@ -583,7 +615,11 @@ def _route_new(args):
             ok = (verify_handover_checksum(json.loads(content)) if path.suffix.lower() == '.json'
                   else verify_handover_markdown(content))
             reason = 'checksum verified' if ok else 'checksum mismatch or missing checksum'
-        except (OSError, ValueError) as exc:
+            if path.suffix.lower() != '.json' and 'Checksum:' not in content:
+                reason = 'legacy capsule: no text checksum to verify; regenerate with memlet handover --write'
+        except OSError:
+            raise
+        except ValueError as exc:
             ok, reason = False, 'cannot verify capsule: ' + ' '.join(str(exc).splitlines())
         result = {'ok': ok, 'exitCode': 0 if ok else 1, 'reason': reason}
         if not (getattr(args, '_format_explicit', False) and args.format == 'json'):
@@ -594,11 +630,18 @@ def _route_new(args):
         return list_pending(args.graph)
     if args.action == 'dream-approve':
         from prism_memory.memlet_dream import approve_queue_items
-        return approve_queue_items(args.graph, args.ids, approver=args.by,
-                                   snapshot_path=args.snapshot, db_path=args.db)
+        options = {}
+        if args.reconsider:
+            options['reconsider'] = True
+        if args.refresh_citations:
+            options['refresh_citations'] = True
+        result = approve_queue_items(args.graph, args.ids, approver=args.by,
+                                     snapshot_path=args.snapshot, db_path=args.db, **options)
+        return _refresh_managed_promotion(args.graph, result)
     if args.action == 'dream-reject':
         from prism_memory.memlet_dream import reject_queue_items
-        return reject_queue_items(args.graph, args.ids, approver=args.by, reason=args.reason, db_path=args.db)
+        result = reject_queue_items(args.graph, args.ids, approver=args.by, reason=args.reason, db_path=args.db)
+        return _refresh_managed_promotion(args.graph, result)
     return None
 
 
@@ -709,7 +752,7 @@ def _build_parser():
     parser.add_argument('--version',action='version',version=VERSION)
     _add_global_options(parser, defaults=True)
     _reserve_legacy_prefixes(parser)
-    sub=parser.add_subparsers(dest='action',required=True)
+    sub=parser.add_subparsers(dest='action',required=True,action=_InvokedSubParsers)
     sub.add_parser('schema'); sub.add_parser('brief'); sub.add_parser('stats'); sub.add_parser('scenes'); sub.add_parser('doctor')
     bak_p=sub.add_parser('backup');bak_p.add_argument('--dest-dir',default=None);bak_p.add_argument('--include-models',action='store_true')
     res_p=sub.add_parser('restore');res_p.add_argument('--backup-dir',required=True)
@@ -759,7 +802,7 @@ def _build_parser():
     index_p=sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)')
     index_p.add_argument('repo_positional',nargs='?',default=None)
     index_p.add_argument('--via',default='claude',choices=['claude'])
-    brief_p=sub.add_parser('brief-build',help='EXPERIMENTAL (failed its faithfulness evaluation): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified')
+    brief_p=sub.add_parser('brief-build',help='EXPERIMENTAL (meaning is not verified; calls the claude CLI, a model call): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified')
     brief_p.description='EXPERIMENTAL: failed its faithfulness evaluation; meaning is NOT verified.'
     brief_p.add_argument('repo_positional',nargs='?',default=None)
     brief_p.add_argument('--via',default='claude',choices=['claude'],help='Runner: claude only (tool-free, claude.ai subscription verified before the call; refuses API-key auth)')
@@ -838,6 +881,8 @@ def _build_parser():
             p.add_argument('--db',default=None,help='Optional SQLite ontology database')
             if name=='dream-approve':
                 p.add_argument('--snapshot',default=None,help='Snapshot used to verify citation pins')
+                p.add_argument('--reconsider',action='store_true',help='Fresh approval of a previously rejected item')
+                p.add_argument('--refresh-citations',action='store_true',help='Approve current citation text after review')
             else:
                 p.add_argument('--reason',default='')
     hand_p.add_argument('--verify',metavar='FILE',help='Verify a JSON or Markdown capsule checksum')
@@ -851,6 +896,8 @@ def _build_parser():
     learn_mode.add_argument('--approve',nargs='+',metavar='ID',help='Approve lessons as a human reviewer')
     learn_mode.add_argument('--reject',nargs='+',metavar='ID',help='Reject lessons as a human reviewer')
     learn.add_argument('--by',action=_ExplicitValue,default='',help='Name of the human reviewer (required for decisions)')
+    learn.add_argument('--reconsider',action='store_true',help='Fresh approval of a previously rejected lesson')
+    learn.add_argument('--refresh-citations',action='store_true',help='Approve current citation text after reading it in --pending')
     learn.add_argument('--reason',action=_ExplicitValue,default='')
     learn.add_argument('--repo',action=_ExplicitValue,default='.')
     learn.add_argument('--vendor',action=_ExplicitValue,default='autonomous-deterministic')
@@ -969,7 +1016,7 @@ def _main(args, parser):
     if args.action in ('audit','check'):
         target_repo=args.repo_path or args.repo_positional or '.'
         res=memory.audit_repo(target_repo,base_ref=args.base,head_ref=args.head,output_format=args.format)
-        if args.format=='markdown' and isinstance(res,dict) and isinstance(res.get('formatted'),str):
+        if args.format in ('markdown', 'sarif') and isinstance(res,dict) and isinstance(res.get('formatted'),str):
             res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
         if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
         return res

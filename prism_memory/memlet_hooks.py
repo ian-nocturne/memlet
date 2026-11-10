@@ -1469,7 +1469,7 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     pending_part = ("" if pending is None else
                     f", {pending} lesson(s) pending human approval (`memlet learn --pending`)")
     status = (f"Not verified, do not rely on: {stale} stale anchor(s), {reverify} to re-verify{pending_part}; "
-              "see `memlet check`.")
+              "see `memlet check .`.")
     items = [f"- {_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
 
     def render(n: int) -> str:
@@ -1487,7 +1487,7 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
         return None  # even the counts do not fit the configured budget
     out: Dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     if stale:
-        out["systemMessage"] = f"Memlet: {stale} stale rule anchor(s); run `memlet check` to review."
+        out["systemMessage"] = f"Memlet: {stale} stale rule anchor(s); run `memlet check .` to review."
     return out
 
 
@@ -1589,7 +1589,7 @@ def _git_check(root: Path, event: str) -> Optional[str]:
             return None
         return "\n".join([f"memlet: warning: {len(flagged)} code-anchored rule(s) touched by the staged files are not "
                           "verified (the commit continues):"] + _flag_lines(flagged)
-                         + ["memlet: details: `memlet check --changed`"]) + "\n"
+                         + ["memlet: details: `memlet check .`"]) + "\n"
     res = mb.changed_check(root, base="ORIG_HEAD")
     if res.get("exitCode") == 2:
         return "memlet: post-merge check skipped (no ORIG_HEAD to compare with)\n"

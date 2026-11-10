@@ -157,6 +157,12 @@ def _node_call_signature(node):
             "hasKwarg": has_kwarg,
             "normAstHash": normalized_symbol_ast_hash(node),
         }
+        sig_payload["annotationHash"] = _digest({
+            "args": {a.arg: ast.dump(a.annotation, include_attributes=False) if a.annotation else None
+                     for a in list(getattr(node.args, "posonlyargs", [])) + list(node.args.args) + list(node.args.kwonlyargs)
+                     + [a for a in (node.args.vararg, node.args.kwarg) if a is not None]},
+            "returns": ast.dump(node.returns, include_attributes=False) if node.returns else None,
+        })
         sig_payload["sigHash"] = _digest({
             "kind": "function",
             "isAsync": is_async,
@@ -667,6 +673,24 @@ def _ts_body_start(mask: str, pos: int, arrow: bool):
     return None
 
 
+def _ts_annotation_hash(raw_params: str, return_type: str, type_parameters: str) -> str:
+    annotations = []
+    for token in _split_top_level_commas(raw_params):
+        mask = _blank_js_comments_preserve_lines(token, blank_strings=True)[0]
+        depth = 0
+        for i, c in enumerate(mask):
+            if c in "<({[":
+                depth += 1
+            elif c in ">)}]" and depth and not (c == ">" and i and mask[i - 1] == "="):
+                depth -= 1
+            elif c == "=" and depth == 0 and mask[i:i + 2] not in ("=>", "=="):
+                token = token[:i]
+                break
+        annotations.append(_js_hash_tokens(token.split(":", 1)[1] if ":" in token else ""))
+    return _digest({"parameters": annotations, "return": _js_hash_tokens(return_type),
+                    "generics": _js_hash_tokens(type_parameters)})
+
+
 def _build_ts_func_sig(is_async: bool, raw_params: str, body_text: str, return_type: str = "", type_parameters: str = "") -> dict:
     req_args, opt_args, all_args, has_vararg = _parse_ts_js_params(raw_params)
     contract = {"kind": "function", "isAsync": bool(is_async),
@@ -678,6 +702,7 @@ def _build_ts_func_sig(is_async: bool, raw_params: str, body_text: str, return_t
         "kwonlyReq": [], "kwonlyAll": [], "hasVararg": has_vararg, "hasKwarg": False,
         "normAstHash": _digest({"contract": contract, "body": _js_hash_tokens(body_text)}),
         "sigHash": _digest(contract),
+        "annotationHash": _ts_annotation_hash(raw_params, return_type, type_parameters),
         "hashExact": False, "hashReason": "ts_js_lexical_scan_unverified",
     }
     return sig

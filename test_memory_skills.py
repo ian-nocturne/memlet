@@ -3884,14 +3884,14 @@ class MemletInitWikiTests(unittest.TestCase):
             html = memlet_inspector.render_inspector_html(payload)
         # Memory Cortex is the first, selected tab, rendered once per workspace, and the other tabs survive.
         self.assertIn('id="t-cortex-tab" aria-controls="t-cortex" aria-selected="true"', html)
-        self.assertEqual(2, html.count(' data-cx-root>'))
+        self.assertEqual(1, html.count(' data-cx-root>'))
         for section_id in ('t-health', 't-bench', 't-handover', 't-routing'):
             self.assertIn(f'id="{section_id}"', html)
         self.assertIn('stopped steering your agent', html)
         self.assertIn('QUARANTINE ORBIT', html)
         # Embedded client data never contains raw markup characters, so no tag or </script> can break out.
         blocks = re.findall(r'<script type="application/json" data-cx="data">(.*?)</script>', html, re.S)
-        self.assertEqual(2, len(blocks))
+        self.assertEqual(1, len(blocks))
         for block in blocks:
             self.assertNotRegex(block, r'[<>&]')
             json.loads(block)

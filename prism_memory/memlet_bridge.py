@@ -65,7 +65,7 @@ _MAX_TRANSCRIPT_FILES = 200
 _MAX_BASENAME_WALK = 20000
 _SPLITLINES_CHARS_RE = re.compile("[\r\n\x0b\x0c\x1c\x1d\x1e\x85  ]")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
-_SECTIONS = ("rules", "safety", "dream", "memory")
+_SECTIONS = ("rules", "safety", "staleRules", "dream", "memory")
 _STATUS_ORDER = ("stale", "compatible-unverified", "unpinned", "path-exists", "active")
 
 
@@ -497,25 +497,28 @@ def learn_pending(repo_path=".") -> Dict[str, Any]:
         return _fail(f"cannot read the Dream queue: {exc}", 1)
     if graph is None:
         return {"ok": True, "exitCode": 0, "command": "learn-pending", "pendingNodes": [], "pendingEdges": [],
-                "counts": empty_counts, "notices": [reason], "formatted": f"- {reason}\n"}
-    res = md.list_pending(graph)
+                "counts": empty_counts, "notices": [reason], "formatted": f"- {reason}; run `memlet learn --transcript PATH`\n"}
     snap, _why = _load_snapshot(root)
+    res = md.list_pending(graph, snapshot_files=snap or {})
     by_id = {str(n.get("id")): n for n in graph.get("nodes") or [] if isinstance(n, dict)}
     for item in res["pendingNodes"]:
         node = by_id.get(str(item.get("id")))
-        item["pinsVerify"] = bool(snap is not None and node is not None and md._verify_item_pins(node, "node", snap) is None)
+        item["pinsVerify"] = bool(snap is not None and node is not None and _node_edges_verify(node, snap) is None)
     lines = [f"## Pending Dream items ({res['counts']['pendingNodes']} node(s), {res['counts']['pendingEdges']} edge(s))", ""]
     for item in res["pendingNodes"]:
-        flag = "" if item["pinsVerify"] else " — citation does NOT verify"
-        lines.append(f"- `{item['id']}` [{item['category']}] {item['title']} (cites `{SNAPSHOT_REL}/{item['span']}`){flag}")
+        flag = "" if item["pinsVerify"] else " — citation does NOT verify: " + str(item.get("citationReason") or "snapshot unavailable")
+        lines.append(f"- `{item['id']}` [{item['categoryLabel']}] {item['quote']} (cites `{SNAPSHOT_REL}/{item['span']}`){flag}")
+        if item.get("citationReason") and item.get("currentQuote"):
+            lines.append("  Current citation for fresh review: " + item["currentQuote"])
+            lines.append("  After review: `memlet learn --approve " + str(item["id"]) + " --by NAME --refresh-citations`")
     if not res["pendingNodes"]:
-        lines.append("- (none)")
+        lines.append("- (none); add candidates with `memlet learn --transcript PATH`")
     return {"ok": True, "exitCode": 0, "command": "learn-pending", "pendingNodes": res["pendingNodes"],
             "pendingEdges": res["pendingEdges"], "counts": res["counts"], "approvalBoundary": res["approvalBoundary"],
             "notices": [], "formatted": "\n".join(lines) + "\n"}
 
 
-def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[str, Any]:
+def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, reconsider=False, refresh_citations=False) -> Dict[str, Any]:
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
@@ -540,7 +543,8 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
                 snap = root / SNAPSHOT_REL
                 if not snap.is_dir():
                     return _fail("no transcript snapshot (.memlet/dream/snapshot/) to verify pins against", 1)
-                res = md.approve_queue_items(q, wanted, who, snapshot_path=str(snap), db_path=str(root / DB_REL))
+                res = md.approve_queue_items(q, wanted, who, snapshot_path=str(snap), db_path=str(root / DB_REL),
+                                             reconsider=reconsider, refresh_citations=refresh_citations)
             else:
                 res = md.reject_queue_items(q, wanted, who, reason=reason, db_path=str(root / DB_REL))
             promotion = promote_approved(root)
@@ -571,10 +575,10 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
     return out
 
 
-def learn_approve(repo_path=".", ids=(), *, approver="") -> Dict[str, Any]:
+def learn_approve(repo_path=".", ids=(), *, approver="", reconsider=False, refresh_citations=False) -> Dict[str, Any]:
     """The only path out of PENDING: `memlet_dream.approve_queue_items` with the snapshot and DB passed explicitly
     (pins re-verified, approval bound to a content digest), then `promote_approved`."""
-    return _decide(repo_path, ids, approver, md.APPROVED)
+    return _decide(repo_path, ids, approver, md.APPROVED, reconsider=reconsider, refresh_citations=refresh_citations)
 
 
 def learn_reject(repo_path=".", ids=(), *, approver="", reason="") -> Dict[str, Any]:
@@ -752,10 +756,21 @@ def _approved_lessons(root: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     return out, notes
 
 
+def lesson_text(node: Dict[str, Any]) -> str:
+    """The reviewed pinned quote, capped at 8192 characters with an explicit ellipsis.
+
+    Preserve code anchors/backticks. Escape HTML comment delimiters so transcript text cannot inject pin metadata.
+    """
+    text = (node.get("primaryPin") or {}).get("quoteText") or node.get("title") or ""
+    text = md._LINE_PREFIX_RE.sub("", str(text), count=1).strip()
+    text = md.safe_truncate_masked(text, md.LESSON_TEXT_MAX_CHARS)
+    return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;").replace("\n", " ")
+
+
 def _render_rule(node: Dict[str, Any], anchor: Optional[Tuple[str, Dict[str, Any]]]) -> Tuple[str, List[str]]:
     pp = node.get("primaryPin") if isinstance(node.get("primaryPin"), dict) else {}
-    text = _defuse(node.get("title"), 160)
-    meta = (f"dream {node.get('id')} · {_defuse(node.get('category'), 40)} · scope {_defuse(node.get('scopeTag'), 48)}"
+    text = lesson_text(node)
+    meta = (f"dream {node.get('id')} · {md.category_label(node.get('category'))} · scope {_defuse(node.get('scopeTag'), 48)}"
             f" · cites {_defuse(SNAPSHOT_REL + '/' + str(pp.get('span') or ''), 120)}")
     body = f"{text} (`{anchor[0]}`) — {meta}" if anchor else f"{text} — {meta}"
     lines = [f"- {body}"]
@@ -818,7 +833,7 @@ def _promote_locked(root: Path) -> Dict[str, Any]:
                 pin = config_pins.get(key)
                 if not pin:
                     fp = mw._current_fingerprint(root, found[0], found[1])
-                    pin = {"ast": fp["ast"], "sig": fp.get("sig"), "req": fp.get("req"), "basis": fp.get("basis")}
+                    pin = {"ast": fp["ast"], "sig": fp.get("sig"), "req": fp.get("req"), "basis": fp.get("basis"), "types": fp.get("types"), "shape": fp.get("shape")}
                 anchor = (key, pin)
         body, lines = _render_rule(n, anchor)
         dead = n.get("category") == "repeated_pitfall" and anchor is None
@@ -885,7 +900,7 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
     fresh, stale = [], []
     for r in rules:
         node = by_id.get(r["id"])
-        topic = f"approved lesson · {(node or {}).get('category') or 'dream'}"
+        topic = f"approved lesson · {md.category_label((node or {}).get('category') or 'dream')}"
         imp = md._safe_imp((node or {}).get("importance"), 2)
         entry = {"topic": topic, "importance": max(1, min(3, imp)), "source": f"{PROMOTED_PAGE}:{r['line']}",
                  "dreamId": r["id"]}
@@ -922,28 +937,31 @@ def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]
     if res.get("stale"):
         notices.append(f"{res['stale']} indexed rule(s) changed since the index was built and are not quoted")
     if (res.get("indexStale") or {}).get("stale"):
-        notices.append("instruction files changed after the rule index was built; re-run `memlet index-build`")
-    out: Dict[str, List[Dict[str, Any]]] = {"rules": [], "safety": []}
+        notices.append("instruction files changed after the rule index was built; re-run `memlet admin index-build` (calls the `claude` CLI; a model call)")
+    out: Dict[str, List[Dict[str, Any]]] = {"rules": [], "safety": [], "staleRules": []}
     for it in picked:
         head = f"- [{it['topic']}] `{it['source']}`" + (f" (sha256 {it['sha256'][:12]})" if it.get("sha256") else "")
+        head += f" [{it['anchorStatus']}: {it['anchorReason']}]"
         text = "\n".join([head + ":"] + [f"  > {q}" for q in it["quote"].splitlines()])
-        item = {"key": it["key"], "source": it["source"], "topic": it["topic"], "quote": it["quote"], "text": text}
+        item = {"key": it["key"], "source": it["source"], "topic": it["topic"], "quote": it["quote"], "text": text,
+                "anchorStatus": it["anchorStatus"], "anchorReason": it["anchorReason"], "anchors": it["anchors"]}
         for extra in ("dreamId", "sha256"):
             if it.get(extra):
                 item[extra] = it[extra]
-        out["rules" if it.get("match") else "safety"].append(item)
+        out["staleRules" if it["anchorStatus"] == "stale" else "rules" if it.get("match") else "safety"].append(item)
     if mode == "parsed" and not res.get("spans") and not mr.parsed_rule_entries(root):
         rules_src = {"available": False, "mode": mode, "reason": "no rule index and no instruction files with rules"}
     else:
-        rules_src = {"available": True, "mode": mode, "staleEntries": res.get("stale", 0),
+        rules_src = {"available": True, "mode": mode, "staleEntries": res.get("stale", 0), "staleAnchors": res.get("staleAnchors", 0),
                      "reason": "" if out["rules"] else "no rule matches the query"}
     if mode == "index":
         safety_src = {"available": True, "mode": mode, "reason": "importance-1 rules from the rule index, shown "
                       "regardless of the query (not query matches)"}
     else:
-        safety_src = {"available": False, "mode": mode, "reason": "parsed rules carry no reviewed importance; "
-                      "run `memlet index-build` for an always-on safety core"}
-    return out, {"rules": rules_src, "safety": safety_src}, notices
+        safety_src = {"available": False, "mode": mode, "reason": "parsed rules are already being used; they carry no reviewed importance; "
+                      "run `memlet admin index-build` (calls the `claude` CLI; a model call) for an always-on safety core"}
+    return out, {"rules": rules_src, "safety": safety_src,
+                 "staleRules": {"available": True, "reason": "anchored code changed"}}, notices
 
 
 def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
@@ -963,7 +981,7 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         return [], {"available": False, "reason": f"Dream snapshot or queue does not verify; nothing returned ({exc})"[:300]}, []
     if not res.get("ok"):
         return [], {"available": False, "reason": str(res.get("error") or "Dream recall failed")}, []
-    view, stats = md.approved_view(graph)
+    view, stats = md.approved_view(md.citation_review_view(graph, md.load_snapshot(snap)))
     by_id = {md.sanitize_node_id(n.get("id"), ""): n for n in view.get("nodes") or [] if isinstance(n, dict)}
     items = []
     for nid in res.get("includedNodeIds") or []:
@@ -973,16 +991,38 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
         source = f"{SNAPSHOT_REL}/{pp.get('span')}"
         label = "SUPERSEDED — do not apply as current; " if n.get("statusKind") == "superseded_rule" else ""
-        text = (f"- [{nid}] ({_defuse(n.get('category'), 40)}; {_defuse(n.get('scopeTag'), 48)}) {label}"
-                f"{_defuse(n.get('title'), 160)} — cites `{source}`")
+        text = (f"- [{nid}] ({md.category_label(n.get('category'))}; {_defuse(n.get('scopeTag'), 48)}) {label}"
+                f"{lesson_text(n)} — cites `{source}`")
         items.append({"id": nid, "category": n.get("category"), "statusKind": n.get("statusKind"),
-                      "title": n.get("title"), "source": source, "text": text})
+                      "title": n.get("title"), "quote": lesson_text(n), "source": source, "text": text})
+    promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root)[0]}
+    entries = []
+    for it in items:
+        entry = promoted_by_id.get(it["id"])
+        if entry is None:
+            node = by_id[it["id"]]
+            resolved = _resolve_lesson_anchor(root, node)
+            quote = lesson_text(node)
+            if resolved:
+                quote += f" (`{resolved[0]}::{resolved[1]}`)"
+            entry = {"quote": quote, "source": PROMOTED_PAGE + ":1"}
+        entries.append(dict(entry))
+    mw.classify_rule_quotes(root, entries)
+    for item, entry in zip(items, entries):
+        for key in ("anchorStatus", "anchorReason", "anchors"):
+            item[key] = entry[key]
+        item["text"] += f" [{entry['anchorStatus']}: {entry['anchorReason']}]"
     notices = []
     held = stats.get("pendingNodes", 0) + stats.get("rejectedNodes", 0)
     if held:
         notices.append(f"{stats.get('pendingNodes', 0)} pending and {stats.get('rejectedNodes', 0)} rejected Dream "
                        "item(s) are never recalled")
-    return items, {"available": True, "reason": "", "pinVerification": res.get("pinVerification")}, notices
+    failures = res.get("unverifiableItems", [])
+    if failures:
+        notices.append(md.citation_failure_notice(failures))
+    return items, {"available": True, "reason": md.citation_failure_notice(failures),
+                   "pinVerification": res.get("pinVerification"), "unverifiableCount": len(failures),
+                   "unverifiableNodeIds": [f["id"] for f in failures], "unverifiableItems": failures}, notices
 
 
 def _memory_items(store: Any, task: Any, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1021,6 +1061,7 @@ _SECTION_HEADS = {
     "rules": "### Project rules matching the query (quoted verbatim from the instruction files; unchanged since indexed)",
     "rules-parsed": ("### Project rules matching the query (parsed from instruction files; not an indexed/reviewed "
                      "rule index — each cites file:lines and the SHA-256 of that text)"),
+    "staleRules": "### anchored code changed — do not apply without re-reading the rule",
     "safety": "### Always-on safety rules (importance 1 in the rule index; shown regardless of the query)",
     "dream": "### Approved lessons (human-approved Dream items; transcript citations re-verified)",
     "memory": "### Task memory (bi-temporal store)",
@@ -1031,8 +1072,10 @@ def _head_for(section: str, rules_mode: str) -> str:
     return _SECTION_HEADS["rules-parsed" if section == "rules" and rules_mode == "parsed" else section]
 
 
-def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str], rules_mode: str = "index") -> str:
+def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str], rules_mode: str = "index", verification_notice: str = "") -> str:
     lines = [_HEAD]
+    if verification_notice:
+        lines.append("- WARNING: " + verification_notice)
     for s in _SECTIONS:
         if chosen.get(s):
             lines += ["", _head_for(s, rules_mode)] + [it["text"] for it in chosen[s]]
@@ -1057,7 +1100,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         include = [s.strip() for s in include.split(",")]
     asked = set(include or ())
     if "rules" in asked:
-        asked.add("safety")  # the always-on safety list belongs to the rules source
+        asked.update(("safety", "staleRules"))  # the always-on safety list belongs to the rules source
     wanted = [s for s in _SECTIONS if s in asked]
     notices: List[str] = [f"unknown section ignored: {s}" for s in (include or ()) if s and s not in _SECTIONS]
     query = str(query or "")
@@ -1069,6 +1112,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
             got, srcs, extra = _rules_items(root, query)
             cands["rules"], cands["safety"] = got["rules"], got["safety"]
             sources["rules"], sources["safety"] = srcs["rules"], srcs["safety"]
+            cands["staleRules"], sources["staleRules"] = got["staleRules"], srcs["staleRules"]
             rules_mode = srcs["rules"]["mode"]
             notices += extra
         except (OSError, ValueError) as exc:
@@ -1077,18 +1121,26 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
     if "dream" in wanted:
         cands["dream"], sources["dream"], extra = _dream_items(root, query)
         notices += extra
+        stale_dream = [it for it in cands["dream"] if it["anchorStatus"] == "stale"]
+        cands["staleRules"].extend(stale_dream)
+        cands["dream"] = [it for it in cands["dream"] if it["anchorStatus"] != "stale"]
+        if stale_dream:
+            sources["staleRules"] = {"available": True, "reason": "anchored code changed"}
     if "memory" in wanted:
         cands["memory"], sources["memory"] = _memory_items(store, task, query)
     for s in _SECTIONS:
         sources[s]["candidates"] = len(cands[s])
 
     est = mw.estimate_tokens
+    failures = sources["dream"].get("unverifiableItems", [])
+    verification_notice = md.citation_failure_notice(failures)
+    fixed_heading = _render_recall({}, None, rules_mode, verification_notice)
     unavailable = [f"{s} ({sources[s]['reason']})" for s in wanted if not sources[s]["available"]]
     footer = ("- Not consulted: " + "; ".join(unavailable)) if unavailable else None
     chosen: Dict[str, List[Dict[str, Any]]] = {s: [] for s in _SECTIONS}
     order: List[str] = []
     active = [s for s in _SECTIONS if cands[s]]
-    room = budget - est(_HEAD + "\n")
+    room = budget - est(fixed_heading)
     if active and room > 0:
         share = room // len(active)
         used = {s: 0 for s in _SECTIONS}
@@ -1119,13 +1171,13 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
                         spare -= c
                         nxt[s] += 1
                         progress = True
-    text = _render_recall(chosen, footer, rules_mode)
+    text = _render_recall(chosen, footer, rules_mode, verification_notice)
     if est(text) > budget:
-        text = _render_recall(chosen, None, rules_mode)
+        text = _render_recall(chosen, None, rules_mode, verification_notice)
         footer = None
     while est(text) > budget and order:  # the estimator is not additive across joins: trim until it truly fits
         chosen[order.pop()].pop()
-        text = _render_recall(chosen, None, rules_mode)
+        text = _render_recall(chosen, None, rules_mode, verification_notice)
     budget_too_small = est(text) > budget
     if budget_too_small:
         text = ""
@@ -1135,10 +1187,13 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         sources[s]["omittedForBudget"] = omitted[s]
     sections = {s: [{k: v for k, v in it.items() if k != "text"} for it in chosen[s]] for s in _SECTIONS}
     res = {"ok": not budget_too_small, "exitCode": 2 if budget_too_small else 0, "command": "recall",
-           "repoPath": str(root), "query": query, "sections": sections, "sources": sources, "notices": notices,
+           "repoPath": str(root), "query": query, "sections": sections,
+           "staleAnchors": len({a["anchor"] for it in cands["staleRules"] for a in it.get("anchors", []) if a["status"] == "stale"}), "sources": sources, "notices": notices,
+           "unverifiableCount": len(failures), "unverifiableNodeIds": [f["id"] for f in failures],
+           "unverifiableItems": failures,
            "tokenBudget": budget, "tokenEstimate": est(text), "formatted": text}
     if budget_too_small:
-        res["error"] = f"budget {budget} is below the fixed recall heading ({est(_HEAD + chr(10))} tokens)"
+        res["error"] = f"budget {budget} is below the fixed recall heading and verification notice ({est(fixed_heading)} tokens)"
     return res
 
 
@@ -1200,7 +1255,7 @@ def _accept_locked(root: Path, names: List[str], dry_run: bool) -> Dict[str, Any
         if fp.get("resolution") != "exact" or not fp.get("ast"):
             refused.append({"anchor": a, "reason": fp.get("reason") or fp.get("resolution") or "unresolvable"})
             continue
-        new_pins[a] = {"ast": fp["ast"], "sig": fp.get("sig"), "req": fp.get("req"), "basis": fp.get("basis")}
+        new_pins[a] = {"ast": fp["ast"], "sig": fp.get("sig"), "req": fp.get("req"), "basis": fp.get("basis"), "types": fp.get("types"), "shape": fp.get("shape")}
         accepted.append(a)
     changed_pages: Dict[str, Tuple[str, str]] = {}
     for rel, text in pages.items():
@@ -1225,7 +1280,7 @@ def _accept_locked(root: Path, names: List[str], dry_run: bool) -> Dict[str, Any
             pins = mw._validated_config_pins(cfg)[0]
             for a in accepted:
                 p = new_pins[a]
-                pins[a] = {"astHash": p["ast"], "sigHash": p["sig"], "reqSigHash": p["req"], "hashBasis": p["basis"]}
+                pins[a] = {"astHash": p["ast"], "sigHash": p["sig"], "reqSigHash": p["req"], "hashBasis": p["basis"], "annotationHash": p.get("types"), "parameterShapeHash": p.get("shape")}
             cfg["pinnedAnchors"] = dict(sorted(pins.items()))
             cfg_path = root / mw.CONFIG_PATH
             _write_text_atomic(cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
@@ -1359,6 +1414,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
     """Fast hook check: classify only the anchors / referenced paths of rules that touch the changed files (`files`,
     else `git diff --name-status <base or HEAD>` with both rename ends, plus untracked files). Memlet's own generated
     state is ignored (`ignoredFiles`); a deleted instruction file is listed in `removedInstructionFiles`.
+    With no changed files, recorded pins are still checked for committed drift.
     exitCode 0 = nothing stale, 1 = stale."""
     try:
         root = mw._resolve_root(repo_path)
@@ -1376,8 +1432,6 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                            "affected": [], "staleCount": 0, "formatted": ""}
     notes = [f"REMOVED instruction file `{f}`: its rules no longer apply; check nothing still relies on them\n"
              for f in removed]
-    if not changed:
-        return res
     cfg, _err = _load_config(root)
     changed_set = set(changed)
     rules = mw._rules_from_files(root, _cheap_rule_sources(root, cfg, changed))
@@ -1417,9 +1471,17 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
             a = by_key[worst]
             res["affected"].append({"anchor": worst, "status": a["status"], "reason": a["reason"],
                                     "rule": mw._clip(r["text"], 160), "source": f"{r['source']}:{r['line']}"})
+    if not changed and (root / mw.CONFIG_PATH).is_file():
+        res["pinnedAnchors"] = mw.pinned_anchor_report(root)
+        shown = {a["anchor"] for a in res["affected"]}
+        for a in res["pinnedAnchors"]["anchors"]:
+            if not changed and a["pinned"] and a["status"] == "stale" and a["anchor"] not in shown:
+                res["affected"].append({"anchor": a["anchor"], "status": a["status"], "reason": a["reason"],
+                                        "rule": "pinned anchor (including committed changes)",
+                                        "source": ", ".join(a["sources"]) or mw.CONFIG_PATH})
     res["staleCount"] = sum(1 for a in res["affected"] if a["status"] == "stale")
     if res["staleCount"]:
-        res.update(ok=False, exitCode=1, error=f"{res['staleCount']} rule(s) touching the changed files have stale anchors")
+        res.update(ok=False, exitCode=1, error=f"{res['staleCount']} rule(s) or recorded pins have stale anchors")
     res["formatted"] = "".join(f"{a['status'].upper()} `{a['anchor']}` ({a['reason']}) — {a['source']}: "
                                f"{mw._clip(a['rule'], 100)}\n" for a in res["affected"]) + "".join(notes)
     return res

@@ -269,7 +269,7 @@ def _demo_workspace() -> Dict[str, Any]:
         try:
             markdown = memlet_wiki._render_handover(capsule, signature)
         except Exception:
-            markdown = "## Routlet × Memlet Handover\n\nSignature: `%s`\n" % signature
+            markdown = "## Routlet × Memlet Handover\n\nChecksum: `%s`\n" % signature
             break
         victim = next((k for k in drop_order if capsule[k]), None)
         if memlet_wiki.estimate_tokens(markdown) < memlet_wiki.HANDOVER_TOKEN_BUDGET or victim is None:
@@ -350,7 +350,7 @@ ROUTLET_MATRIX: Dict[str, Any] = {
         {"id": "performance", "label": "Performance", "summary": "Highest-effort lane per role; Memlet re-verifies every hop.",
          "lanes": [("Plan / spec", "Claude Opus 5.5", "high"), ("Implement", "Codex GPT-6 Astra", "xhigh"),
                    ("Review", "Claude Fable 5.1", "high"), ("Browser / OS QA", "Antigravity", "always"),
-                   ("Memory gate", "Memlet signed capsule", "full re-verify per hop")]},
+                   ("Memory gate", "Memlet checksummed capsule", "full re-verify per hop")]},
         {"id": "balanced", "label": "Balanced", "summary": "Default: strong implementer, lighter review, QA on UI diffs.",
          "lanes": [("Plan / spec", "Claude Opus 5.5", "medium"), ("Implement", "Codex GPT-6.1 Sol", "high"),
                    ("Review", "Claude Opus 5.5", "medium"), ("Browser / OS QA", "Antigravity", "on UI diff"),
@@ -376,11 +376,11 @@ HARNESS_PACKS = [
 ]
 
 
-def build_inspector_payload(repo_path: str = ".") -> Dict[str, Any]:
-    """Collect live, read-only telemetry for `repo_path` plus the bundled showcase workspace.
+def build_inspector_payload(repo_path: Optional[str] = None) -> Dict[str, Any]:
+    """Collect live, read-only telemetry for `repo_path`; show the bundled demo only when no repo is given.
 
     All strings are scrubbed: the repo root and any home-directory path become `<repo>`."""
-    root = Path(repo_path).expanduser().resolve()
+    root = Path(repo_path or ".").expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"repository path not found: {root.name or root}")
     errors: List[str] = []
@@ -393,10 +393,9 @@ def build_inspector_payload(repo_path: str = ".") -> Dict[str, Any]:
         "memletVersion": memlet_wiki.MEMLET_VERSION,
         "repoName": root.name,
         "repoPath": REPO_PLACEHOLDER,
-        "defaultWorkspace": "live" if live_total else "demo",
-        "showcaseReason": None if live_total else
-            "Live repository has 0 file::Symbol anchors (run `memlet init`); opening the showcase workspace.",
-        "workspaces": {"live": live, "demo": demo},
+        "defaultWorkspace": "live" if repo_path is not None else "demo",
+        "showcaseReason": None,
+        "workspaces": {"live": live} if repo_path is not None else {"demo": demo},
         "benchmark": _benchmark_block(errors),
         "simulator": dict(SIMULATOR_DEFAULTS),
         "routletMatrix": ROUTLET_MATRIX,
@@ -836,7 +835,7 @@ def render_inspector_html(payload: Dict[str, Any]) -> str:
                  f"{len(demo.get('scenarios') or [])} Refactor Scenarios)"
     ws_buttons = "".join(
         f'<button type="button" data-value="{v}" aria-pressed="{"true" if v == default_ws else "false"}">{_e(label)}</button>'
-        for v, label in (("live", "Live Repository"), ("demo", demo_label)))
+        for v, label in (("live", "Live Repository"), ("demo", demo_label)) if v in payload["workspaces"])
     filters = "".join(
         f'<button type="button" data-value="{v}" aria-pressed="{"true" if v == "all" else "false"}">{_e(label)}</button>'
         for v, label in (("all", "All"), ("active", "🟢 Active"), ("compatible-unverified", "🟡 Compatible-Unverified"),
@@ -935,7 +934,7 @@ def export_inspector_html(repo_path: str = ".", output_path: Optional[str] = Non
         "written": target is not None,
         "defaultWorkspace": payload["defaultWorkspace"],
         "anchorSummary": live.get("anchorSummary"),
-        "showcaseAnchorSummary": payload["workspaces"]["demo"].get("anchorSummary"),
+        "showcaseAnchorSummary": (payload["workspaces"].get("demo") or {}).get("anchorSummary"),
         "benchmarkDigest": (payload.get("benchmark") or {}).get("resultDigest"),
         "bytesWritten": bytes_written,
         "htmlBytes": len(doc.encode("utf-8")),
