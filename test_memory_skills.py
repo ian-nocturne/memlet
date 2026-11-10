@@ -5349,8 +5349,8 @@ class DreamOntologyTests(unittest.TestCase):
         self.assertEqual(0, rc_recall)
         self.assertTrue(out_md.is_file())
         md_text = out_md.read_text(encoding="utf-8")
-        self.assertIn("[SUPERSEDED — DO NOT APPLY AS CURRENT]", md_text)
-        self.assertIn("[ACTIVE — APPLY THIS]", md_text)
+        self.assertNotIn("[SUPERSEDED — DO NOT APPLY AS CURRENT]", md_text)  # P0-6: unapproved PENDING items are never recalled
+        self.assertNotIn("[ACTIVE — APPLY THIS]", md_text)  # P0-6: approve->recall path is covered in test_p0_dream.py
         self.assertNotIn("sk-ant-", md_text)
         self.assertNotIn("AKIA1234567890ABCDEF", md_text)
         self.assertNotIn("ghp_1234567890", md_text)
