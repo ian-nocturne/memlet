@@ -2,7 +2,7 @@
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import json
 from memlet.cli_plugins import add_format_option
-from memlet.memlet_dreamcycle import dream_ingest, dream_run, dream_status
+from memlet.memlet_dreamcycle import REJECTION_MEANINGS, dream_ingest, dream_run, dream_status
 
 COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or inspect waiting sessions", "product": True}}
 
@@ -23,31 +23,45 @@ def register(sub):
 def _rejections(result):
     lines = []
     for item in result.get("rejections", []):
-        lines.append("- Rejected [%s] %s (%s; %s; cites %s): %s" % (
-            item["reasonCode"], item["title"], item["category"], ", ".join(item["edgeTypes"]),
+        lines.append("- Rejected [%s]: %s. %s (%s; %s; cites %s): %s" % (
+            item["reasonCode"], REJECTION_MEANINGS.get(item["reasonCode"], REJECTION_MEANINGS["invalid_candidate"]),
+            item["title"], item["category"], ", ".join(item["edgeTypes"]),
             ", ".join(item["spans"]), item.get("note", "")))
     if result.get("rejectionsOmitted"):
         lines.append("- %s more rejection record(s) omitted by the count/byte bounds" % result["rejectionsOmitted"])
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def _rejection_summary(result):
+    if not result.get("rejectedCandidates"):
+        return ""
+    text = "- Rejected candidates: %s\n" % result["rejectedCandidates"]
+    text += _rejections(result)
+    for run in result.get("runs", []):
+        if run.get("rejectedCandidates"):
+            text += "- Run %s (%s):\n" % (run["runId"], run["lane"])
+            text += _rejections(run)
+    return text + "\n"
+
+
 def _markdown(result):
+    rejections = _rejection_summary(result)
     if not result["ok"]:
-        text = "## Dream failed\n\n- ERROR: " + result["error"] + "\n"
+        text = "## Dream failed\n\n" + rejections + "- ERROR: " + result["error"] + "\n"
         if result.get("droppedOutput"):
             text += "- Dropped output: %s\n" % result["droppedOutput"]
-        return text + _rejections(result)
+        return text
     if "waiting" in result:
         counts = result.get("counts", {})
-        text = "## Dream status\n\n- %s session(s) waiting to dream\n" % result["waiting"]
+        text = "## Dream status\n\n" + rejections + "- %s session(s) waiting to dream\n" % result["waiting"]
         text += "- Approved: %s; unreviewed hints: %s; pending: %s\n" % tuple(counts.get(k, 0) for k in (TIER_APPROVED, TIER_HINT, TIER_PENDING))
         text += "- Failed batches: %s\n" % result.get("failedBatches", 0)
         for run in result.get("runs", []):
             text += "- [%s] %s: %s completed; %s failed\n" % (run["lane"], run["runId"], run["completedBatches"], run["failedBatches"])
-            text += _rejections(run)
     else:
-        text = "## Dream %s\n\n- Batches: %s; calls: %s; failed batches: %s\n" % (
-            "preview" if result.get("dryRun") else "run", result.get("batches", 0), result.get("calls", 0), result.get("failedBatches", 0))
+        text = "## Dream %s\n\n" % ("preview" if result.get("dryRun") else "run")
+        text += rejections + "- Batches: %s; calls: %s; failed batches: %s\n" % (
+            result.get("batches", 0), result.get("calls", 0), result.get("failedBatches", 0))
         if result.get("dryRun"):
             text += "- Planned proposer calls: %s; existing verifier calls: %s\n" % (result.get("plannedProposalCalls", 0), result.get("plannedExistingVerificationCalls", 0))
             for prompt in result.get("prompts", []):
@@ -56,8 +70,8 @@ def _markdown(result):
                 text += "\n".join("    " + line for line in (prompt["prompt"] + "\n\n" + prompt["stdinText"]).splitlines()) + "\n"
     if result.get("droppedOutput"):
         text += "- Dropped output: %s\n" % result["droppedOutput"]
-    text += "- Rejected candidates: %s\n" % result.get("rejectedCandidates", 0)
-    text += _rejections(result)
+    if not rejections:
+        text += "- Rejected candidates: 0\n"
     text += "\n" + result.get("trustBoundary", "") + "\n"
     text += "".join("\n- " + notice + "\n" for notice in result.get("notices", []))
     return text
@@ -78,5 +92,10 @@ def dispatch(args):
     result.setdefault("exitCode", 0 if result["ok"] else 2)
     if not result["ok"]:
         result.setdefault("error", "; ".join(result.get("errors", [])) or "Dream failed")
+    if result.get("rejectedCandidates"):
+        records = result.get("rejections", []) + [r for run in result.get("runs", []) for r in run.get("rejections", [])]
+        reasons = {r["reasonCode"]: REJECTION_MEANINGS.get(r["reasonCode"], REJECTION_MEANINGS["invalid_candidate"]) for r in records}
+        # Insertion order puts counts and plain-language reasons first in CLI JSON.
+        result = {"rejectedCandidates": result["rejectedCandidates"], "rejectionSummary": reasons, **result}
     result["formatted"] = _markdown(result)
     return result

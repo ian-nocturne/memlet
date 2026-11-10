@@ -361,7 +361,7 @@ class MultiLineLessons(Scratch):
         bad=dict(candidate,category='repeated_pitfall',title='Withdraw force option',src_spans=candidate['src_spans'][:1],
                  edges=[{'edge_type':'SUPERSEDES','target':'old advice'}], narrative='UNSTORED MODEL NARRATIVE')
         result=dc.dream_run(self.root,runner=lambda *a,**k:json.dumps([bad]))
-        self.assertTrue(result['ok'],result)
+        self.assertFalse(result['ok'],result)
         self.assertEqual(1,result['rejectedCandidates'])
         record=result['rejections'][0]
         self.assertEqual('supersedes_missing_target_pin',record['reasonCode'])
@@ -387,6 +387,317 @@ class MultiLineLessons(Scratch):
                      mb.changed_check(self.root,files=['export.py'])['formatted']]:
             self.assertIn('### '+HINT_LABEL+'\n'+HINT_HELP+'\n',text)
             self.assertEqual(1,text.count(HINT_HELP))
+
+
+class DreamPromptIntegration(Scratch):
+    lines = [
+        '2026-11-11T10:00:00Z [user] Deploys go out with make release.',
+        '2026-11-11T10:05:00Z [assistant] The deploy failed because the image tag was stale.',
+        '2026-11-11T10:06:00Z [user] Replace make release with scripts/deploy.sh for deploys.',
+        '2026-11-11T10:09:00Z [assistant] Refreshing the image tag fixed the deploy failure.',
+        '2026-11-11T10:10:00Z [user] Never retry deploys with a stale image tag.',
+    ]
+    meaning = 'the cited id does not match a line that was shown'
+
+    def prepare(self, name='dream', lines=None):
+        repo = self.root / name
+        repo.mkdir()
+        (repo / 'AGENTS.md').write_text('# Fixture\n', encoding='utf-8')
+        self.assertTrue(mw.init_project(repo)['ok'])
+        config, _ = mb._load_config(repo)
+        config['dream'] = {'agreement': 'model', 'models': {'claude': 'haiku', 'verifier': {'claude': 'sonnet'}}}
+        mw.write_managed_text(repo, mw.CONFIG_PATH, json.dumps(config))
+        source = repo / 'session2.log'
+        source.write_text('\n'.join(self.lines if lines is None else lines) + '\n', encoding='utf-8')
+        self.assertTrue(dc.dream_ingest(repo, source)['ok'])
+        batch = dc.dream_next(repo)
+        return repo, batch, batch['rows'][0][0]
+
+    def candidates(self, fid, tails=True):
+        def span(n):
+            return '%s:%d' % (fid, n) + (' ' + self.lines[n-1].split(' ')[0] if tails else '')
+        return [
+            {'category': 'superseded_directive', 'title': 'Deploy with scripts/deploy.sh, not make release',
+             'scope_tag': 'deploy', 'src_spans': [span(1), span(3)], 'superseded_by_src': span(3),
+             'edges': [{'edge_type': 'SUPERSEDES', 'target': 'make release', 'src_span': span(3), 'target_span': span(1)}]},
+            {'category': 'verified_workaround', 'title': 'Refresh the image tag before deployment',
+             'scope_tag': 'deploy', 'src_spans': [span(2), span(4)],
+             'edges': [{'edge_type': 'RESOLVES', 'target': 'stale image tag', 'src_span': span(4), 'target_span': span(2)}]},
+            {'category': 'repeated_pitfall', 'title': 'Do not retry with a stale image tag',
+             'scope_tag': 'deploy', 'src_spans': [span(5)],
+             'edges': [{'edge_type': 'BLOCKS', 'target': 'stale image tag', 'src_span': span(5)}]},
+        ]
+
+    def submit(self, repo, candidates, lane, verify=False, seen=None):
+        if lane == 'host':
+            batch = dc.dream_next(repo)
+            return dc.dream_submit(repo, batch['runId'], batch['batchId'], candidates, proposer='host')
+        def runner(vendor, prompt, **kwargs):
+            if seen is not None:
+                seen.append((prompt, kwargs['stdin_text']))
+            return '{"verdict":"SUPPORTED"}' if prompt == dc.VERIFY_PROMPT else json.dumps(candidates)
+        return dc.dream_run(repo, runner=runner, verify_with='claude' if verify else None)
+
+    def state(self, repo, result):
+        return json.loads((repo / dc.RUNS_REL / (result['runId'] + '.json')).read_text())
+
+    def test_real_model_timestamp_spans_proposer_and_host(self):
+        for lane in ('trusted', 'host'):
+            with self.subTest(lane=lane):
+                repo, batch, fid = self.prepare(lane)
+                candidates = self.candidates(fid)
+                before = copy.deepcopy(candidates)
+                result = self.submit(repo, candidates, lane, verify=True)
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(before, candidates, 'normalization must not mutate caller data')
+                self.assertEqual((11, 0, 0), (result['normalizedSpans'], result['rejectedCandidates'], result['failedBatches']))
+                state = self.state(repo, result)
+                self.assertEqual(11, state['normalizedSpans'])
+                self.assertEqual(1, len(state['completed']))
+                graph, _ = mb._load_queue(repo)
+                self.assertEqual(3, len(graph['nodes']))
+                snapshot, _ = mb._load_snapshot(repo)
+                self.assertTrue(md.verify_ontology_contract(graph, snapshot)['ok'])
+                for node in graph['nodes']:
+                    for pin in dc.evidence_pins(node):
+                        self.assertIsNotNone(md.parse_span(pin['span']))
+                        self.assertNotIn(' ', pin['span'])
+                        self.assertIsNone(md._verify_pin_dict(pin, snapshot, 'test'))
+                supersedes = next(n for n in graph['nodes'] if n['category'] == 'superseded_directive')
+                self.assertEqual(fid + ':3', supersedes['supersededByPin']['span'])
+                self.assertEqual(fid + ':1', supersedes['primaryPin']['span'])
+                if lane == 'trusted':
+                    # Replacement directives retain the existing human-review gate.
+                    self.assertEqual(3, result['calls'])
+                    self.assertEqual(2, mb.dream_items(repo)['counts']['hint'])
+                else:
+                    self.assertEqual(0, mb.dream_items(repo)['counts']['hint'])
+
+    def test_mixed_all_invalid_and_empty_batches_both_lanes(self):
+        for lane in ('trusted', 'host'):
+            for case in ('mixed', 'all_invalid', 'empty'):
+                with self.subTest(lane=lane, case=case):
+                    repo, batch, fid = self.prepare(lane + '-' + case)
+                    good = self.candidates(fid)[2]
+                    bad = copy.deepcopy(good)
+                    bad['src_spans'] = ['missing.log:1 2026-11-11T10:10:00Z']
+                    candidates = [good, bad] if case == 'mixed' else [bad] if case == 'all_invalid' else []
+                    result = self.submit(repo, candidates, lane)
+                    failed = case == 'all_invalid'
+                    self.assertEqual(not failed, result['ok'], result)
+                    self.assertEqual(int(case != 'empty'), result['rejectedCandidates'])
+                    self.assertEqual(int(failed), result['failedBatches'])
+                    self.assertEqual(2 if failed else 0, result['exitCode'])
+                    state = self.state(repo, result)
+                    self.assertEqual(not failed, bool(state.get('completed')))
+                    self.assertEqual(failed, bool(state.get('failed')))
+                    progress_path = repo / (dc.STATE_REL if lane == 'trusted' else dc.HOST_STATE_REL)
+                    sessions = json.loads(progress_path.read_text())['sessions'] if progress_path.exists() else {}
+                    self.assertEqual(0 if failed else 5, sessions.get(fid, {}).get('dreamed', 0))
+                    graph, _ = mb._load_queue(repo)
+                    self.assertEqual(1 if case == 'mixed' else 0, len((graph or {}).get('nodes', [])))
+                    if failed:
+                        self.assertIn('remains undreamed', result['error'])
+                        failure = next(iter(state['failed'].values()))
+                        self.assertEqual(result['rejections'], failure['rejections'])
+                        self.assertNotIn('rawOutput', failure)
+                        self.assertEqual(1, dc.dream_status(repo)['failedBatches'])
+                        if lane == 'trusted':
+                            self.assertEqual(1, result['calls'], 'no retry within the failed invocation')
+                            self.assertEqual(1, dc.dream_status(repo)['waiting'])
+                        retried = self.submit(repo, [good], lane)
+                        self.assertTrue(retried['ok'], retried)
+                        self.assertEqual(result['runId'], retried['runId'])
+                        self.assertFalse(self.state(repo, retried).get('failed'))
+                        self.assertEqual(0, dc.dream_status(repo)['failedBatches'])
+
+    def test_span_tail_never_stored_or_output_even_on_rejection(self):
+        from memlet.cli_dream import _markdown
+        for lane in ('trusted', 'host'):
+            with self.subTest(lane=lane):
+                repo, batch, fid = self.prepare(lane)
+                good = self.candidates(fid, tails=False)[2]
+                good['src_spans'] = [fid + ':5 DISCARDED_SOURCE_TAIL']
+                good['edges'][0].update(src_span=fid + ':5 DISCARDED_EDGE_TAIL', target_span=fid + ':4 DISCARDED_TARGET_TAIL')
+                supersedes = self.candidates(fid, tails=False)[0]
+                supersedes['superseded_by_src'] += ' DISCARDED_SUPERSEDED_TAIL'
+                missing = copy.deepcopy(good)
+                missing['src_spans'] = ['missing.log:1 DISCARDED_MISSING_TAIL']
+                schema = copy.deepcopy(good)
+                schema['title'] = 'word ' * 16
+                schema['src_spans'] = [fid + ':5 DISCARDED_SCHEMA_TAIL']
+                unsafe = copy.deepcopy(good)
+                unsafe['src_spans'] = [fid + ':5 DISCARDED_UNSAFE_TAIL\u200b']
+                invalid = copy.deepcopy(good)
+                invalid['src_spans'] = ['bad-id DISCARDED_MALFORMED_TAIL']
+                result = self.submit(repo, [good, supersedes, missing, schema, unsafe, invalid], lane, verify=True)
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(4, result['rejectedCandidates'])
+                status = dc.dream_status(repo)
+                outputs = [json.dumps(result), _markdown(result), json.dumps(status), _markdown(status),
+                           mb.learn_pending(repo)['formatted'], mb.unified_recall(repo, 'deploy', budget=4000)['formatted'],
+                           mw.build_handover(repo, output_format='markdown')['formatted']]
+                for output in outputs:
+                    self.assertNotIn('DISCARDED_', output)
+                for path in (repo / '.memlet').rglob('*'):
+                    if path.is_file():
+                        self.assertNotIn(b'DISCARDED_', path.read_bytes(), str(path))
+
+    def test_first_id_only_never_searches_tail_or_partial_id(self):
+        for lane in ('trusted', 'host'):
+            repo, batch, fid = self.prepare(lane)
+            valid = self.candidates(fid, tails=False)[2]
+            valid['src_spans'] = [fid + ':1-2 ' + fid + ':4']
+            valid['edges'] = [{'edge_type': 'BLOCKS', 'target': 'deploy'}]
+            bad = []
+            for value in ('missing.log:1 ' + fid + ':5', 'prefix ' + fid + ':5', fid + ':1x ' + fid + ':5',
+                          fid + ':0 ' + fid + ':5', fid + ':3-2 ' + fid + ':5', ' ' + fid + ':5',
+                          fid + ':1-5 ' + fid + ':5', fid + ':999 ' + fid + ':5', '../' + fid + ':1 ' + fid + ':5'):
+                candidate = copy.deepcopy(valid)
+                candidate['src_spans'] = [value]
+                bad.append(candidate)
+            result = self.submit(repo, [valid] + bad, lane)
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(len(bad), result['rejectedCandidates'])
+            graph, _ = mb._load_queue(repo)
+            self.assertEqual([fid + ':1', fid + ':2'], [p['span'] for p in graph['nodes'][0]['allPins']])
+            self.assertEqual(4, result['normalizedSpans'])
+
+    def test_unsafe_characters_in_tail_still_fail_every_span_field(self):
+        for lane in ('trusted', 'host'):
+            repo, batch, fid = self.prepare(lane)
+            bad = []
+            for field in ('src_spans', 'superseded_by_src', 'src_span', 'target_span'):
+                for char in ('\n', '\t', '\x1b', '\u200b', '\U000e0041'):
+                    candidate = self.candidates(fid, tails=False)[0]
+                    value = fid + ':3 harmless tail' + char
+                    if field == 'src_spans':
+                        candidate[field] = [value]
+                    elif field == 'superseded_by_src':
+                        candidate[field] = value
+                    else:
+                        candidate['edges'][0][field] = value
+                    bad.append(candidate)
+            result = self.submit(repo, bad, lane)
+            self.assertFalse(result['ok'], result)
+            self.assertEqual(0, result['normalizedSpans'])
+            self.assertEqual(len(bad), result['rejectedCandidates'])
+            self.assertEqual({'candidate_schema_invalid'}, {r['reasonCode'] for r in result['rejections']})
+            self.assertFalse(self.state(repo, result).get('completed'))
+
+    def test_proposer_preview_mcp_and_verifier_rows_match(self):
+        repo, batch, fid = self.prepare()
+        response = self.server.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                   'params': {'name': 'memlet_dream_next', 'arguments': {'repo_path': str(repo)}}})
+        mcp = response['result']['structuredContent']
+        expected = [{'id': '%s:%d' % (f, n), 'text': t} for f, n, t in mcp['rows'] if t is not None]
+        self.assertEqual(expected, [json.loads(row) for row in mcp['stdinText'].splitlines()])
+        before = {str(p): p.read_bytes() for p in (repo / '.memlet').rglob('*') if p.is_file()}
+        preview = dc.dream_run(repo, dry_run=True)
+        self.assertEqual(before, {str(p): p.read_bytes() for p in (repo / '.memlet').rglob('*') if p.is_file()})
+        self.assertEqual(mcp['stdinText'], preview['prompts'][0]['stdinText'])
+        seen = []
+        result = self.submit(repo, self.candidates(fid), 'trusted', verify=True, seen=seen)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(3, len(seen))
+        for prompt, data in seen:
+            self.assertIn('cite the `id` values exactly', prompt)
+            rows = json.loads(data)['context'] if prompt == dc.VERIFY_PROMPT else [json.loads(row) for row in data.splitlines()]
+            self.assertEqual(expected, rows)
+            # Each rendered row occupies its own line, even inside verifier's JSON envelope.
+            for row in expected:
+                self.assertIn(json.dumps(row, ensure_ascii=False), data.splitlines() if prompt == dc.PROPOSE_PROMPT
+                              else [line.rstrip(',') for line in data.splitlines()])
+
+    def test_json_rows_keep_bounds_masks_omissions_and_determinism(self):
+        lines = ['Quote "data" \\ path. Never retry. sk-' + 'x' * 30, 'oversize ' * 150] + ['Short row %d' % n for n in range(12)]
+        repo, _, fid = self.prepare(lines=lines)
+        batch = dc.dream_next(repo, batch_tokens=128)
+        self.assertEqual(batch, dc.dream_next(repo, batch_tokens=128))
+        seen, omitted = [], 0
+        while not batch['done']:
+            rows = [json.loads(row) for row in batch['stdinText'].splitlines()]
+            self.assertEqual([{'id': '%s:%d' % (f, n), 'text': t} for f, n, t in batch['rows'] if t is not None], rows)
+            self.assertLessEqual(mw.estimate_tokens(batch['stdinText']), 128)
+            self.assertNotIn('sk-' + 'x' * 30, batch['stdinText'])
+            omitted += batch['omittedLines']
+            seen.extend(rows)
+            if any(t is None for _, _, t in batch['rows']):
+                candidate = self.candidates(fid, tails=False)[2]
+                candidate['src_spans'] = [fid + ':2 unused tail']
+                candidate['edges'] = [{'edge_type': 'BLOCKS', 'target': 'deploy'}]
+                failed = dc.dream_submit(repo, batch['runId'], batch['batchId'], [candidate], proposer='host')
+                self.assertFalse(failed['ok'])
+                self.assertEqual('citation_outside_batch', failed['rejections'][0]['reasonCode'])
+            self.assertTrue(dc.dream_submit(repo, batch['runId'], batch['batchId'], [], proposer='host')['ok'])
+            batch = dc.dream_next(repo, run_id=batch['runId'])
+        self.assertEqual(1, omitted)
+        self.assertEqual(len(lines) - 1, len(seen))
+        self.assertNotIn(fid + ':2', [row['id'] for row in seen])
+
+    def test_second_proposer_all_rejected_does_not_advance(self):
+        repo, batch, fid = self.prepare()
+        good = self.candidates(fid)[2]
+        bad = dict(good, src_spans=['missing.log:1 timestamp'])
+        result = dc.dream_run(repo, via=('claude', 'codex'), runner=lambda v, p, **k: json.dumps([good if v == 'claude' else bad]))
+        self.assertFalse(result['ok'])
+        self.assertEqual(2, result['calls'])
+        self.assertEqual(1, len(result['items']))
+        self.assertFalse(self.state(repo, result).get('completed'))
+        self.assertEqual(1, dc.dream_status(repo)['waiting'])
+
+    def test_mcp_host_all_rejected_then_timestamp_retry(self):
+        repo, batch, fid = self.prepare()
+        good = self.candidates(fid)[2]
+        for candidates, expected in (([dict(good, src_spans=['missing.log:1 discarded'])], False), ([good], True)):
+            response = self.server.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                'params': {'name': 'memlet_dream_submit', 'arguments': {'repo_path': str(repo),
+                           'run_id': batch['runId'], 'batch_id': batch['batchId'], 'candidates': candidates}}})
+            result = response['result']['structuredContent']
+            self.assertEqual(expected, result['ok'], response)
+            self.assertEqual(expected, bool(self.state(repo, result).get('completed')))
+        self.assertEqual(2, result['normalizedSpans'])
+        self.assertFalse(self.state(repo, result).get('failed'))
+
+    def test_cli_json_markdown_rejections_first_and_exit_codes_with_fake_cli(self):
+        # Exercise the actual CLI boundary using only a fake /bin/sh executable.
+        fake = self.base / 'bin/claude'
+        config = self.base / 'home/claude'
+        config.mkdir(exist_ok=True)
+        auth = json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', 'apiProvider': 'firstParty',
+                           'subscriptionType': 'fixture', 'configDirectory': str(config)})
+        fake.write_text('#!/bin/sh\ncase "$1" in\n--version) printf "fixture-claude 1\\n";;\nauth) printf "%s\\n" ' + shlex.quote(auth) + ';;\n*) /bin/cat ' +
+                        shlex.quote(str(self.base / 'answer.json')) + ';;\nesac\n', encoding='utf-8')
+        fake.chmod(0o700)
+        for case in ('failed', 'mixed', 'empty'):
+            for fmt in ('json', 'markdown'):
+                with self.subTest(case=case, format=fmt):
+                    repo, batch, fid = self.prepare(case + '-' + fmt)
+                    good = self.candidates(fid)[2]
+                    bad = dict(good, src_spans=['missing.log:1 CLI_DISCARDED_TAIL'])
+                    answer = [] if case == 'empty' else [bad] if case == 'failed' else [good, bad]
+                    (self.base / 'answer.json').write_text(json.dumps(answer), encoding='utf-8')
+                    with mock.patch.dict(os.environ, {'PATH': str(self.base / 'bin') + ':/usr/bin:/bin'}):
+                        command = self.cli('dream', str(repo), '--via', 'claude', '--format', fmt)
+                    self.assertEqual(2 if case == 'failed' else 0, command.returncode, command.stderr + command.stdout)
+                    self.assertEqual('', command.stderr)
+                    self.assertNotIn('CLI_DISCARDED_TAIL', command.stdout)
+                    if fmt == 'json':
+                        output = json.loads(command.stdout)
+                        if case != 'empty':
+                            self.assertEqual(['rejectedCandidates', 'rejectionSummary'], list(output)[:2])
+                            self.assertEqual(self.meaning, output['rejectionSummary']['unpinnable_citation'])
+                        text = output['formatted']
+                    else:
+                        text = command.stdout
+                    if case != 'empty':
+                        self.assertIn(self.meaning, text)
+                        self.assertLess(text.index('Rejected candidates:'), text.index('ERROR:' if case == 'failed' else 'Batches:'))
+                        status = self.cli('dream', str(repo), '--status', '--format', 'json')
+                        report = json.loads(status.stdout)
+                        self.assertEqual(['rejectedCandidates', 'rejectionSummary'], list(report)[:2])
+                        self.assertIn(self.meaning, report['formatted'])
+                        self.assertLess(report['formatted'].index('Rejected candidates:'), report['formatted'].index('waiting to dream'))
 
 
 if __name__ == '__main__':
