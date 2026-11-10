@@ -282,7 +282,87 @@ def mcp_tools():
                 },
             },
         },
+    ] + memlet_tools()
+
+
+def memlet_tools():
+    """Bounded repository tools. Protocol 2024-11-05 predates tool annotations."""
+    def string(limit=4096):
+        return {'type': 'string', 'minLength': 1, 'maxLength': limit}
+
+    def strings(limit, count, enum=None):
+        item = string(limit)
+        if enum:
+            item['enum'] = enum
+        return {'type': 'array', 'maxItems': count, 'uniqueItems': True, 'items': item}
+
+    budget = {'type': 'integer', 'minimum': 1, 'maximum': 16000, 'default': 1200}
+    specs = [
+        ('memlet_check', 'Read-only: check changed anchors (default) or run the full repository audit.',
+         {'changed': {'type': 'boolean', 'default': True}, 'base': string(256),
+          'files': strings(4096, 256)}, []),
+        ('memlet_recall', 'Read-only: recall project rules, approved verified lessons, and this server task memory.',
+         {'query': string(8192), 'budget': budget,
+          'include': strings(16, 3, ['rules', 'dream', 'memory'])}, ['query']),
+        ('memlet_handover', 'Read-only: build a handover capsule; never writes HANDOVER.md.',
+         {'next_step': string(8192), 'rejected': strings(4096, 64),
+          'budget': {'type': 'integer', 'minimum': 500, 'maximum': 2000,
+                     'description': 'Optional token budget; defaults to repository config or 500, as in the CLI.'},
+          'mode': {'type': 'string', 'enum': ['verified', 'index'], 'default': 'verified',
+                   'minLength': 1, 'maxLength': 16}}, []),
+        ('memlet_learn', 'Non-destructive, not read-only: extract pending lessons from a transcript file or list pending lessons. '
+         'Approval is CLI-only: memlet learn --approve ID --by NAME. No approve or reject action or approval arguments are allowed.',
+         {'action': {'type': 'string', 'enum': ['transcript', 'pending'], 'minLength': 1, 'maxLength': 16},
+          'transcript_path': string()}, ['action']),
     ]
+    tools = [{'name': name, 'description': description,
+             'inputSchema': {'type': 'object', 'properties': dict(repo_path=string(), **props),
+                             'required': required, 'additionalProperties': False}}
+            for name, description, props, required in specs]
+    tools[-1]['inputSchema']['allOf'] = [
+        {'if': {'properties': {'action': {'const': 'transcript'}}, 'required': ['action']},
+         'then': {'required': ['transcript_path']}}]
+    return tools
+
+
+def _validate_memlet_arguments(name, args):
+    schema = next(t['inputSchema'] for t in memlet_tools() if t['name'] == name)
+    if not isinstance(args, dict):
+        raise ValueError('arguments must be an object')
+    unknown = set(args) - set(schema['properties'])
+    if name == 'memlet_learn' and (unknown or args.get('action') not in ('transcript', 'pending')):
+        raise ValueError('Approval is CLI-only (memlet learn --approve ID --by NAME); MCP allows only transcript and pending, with no extra approval/rejection arguments')
+    if unknown:
+        raise ValueError('Unknown arguments: ' + ', '.join(sorted(unknown)))
+    for key in schema['required']:
+        if key not in args:
+            raise ValueError('Missing required argument: ' + key)
+
+    def validate(value, spec, key):
+        kind = spec['type']
+        valid = ((kind == 'string' and isinstance(value, str)) or
+                 (kind == 'boolean' and type(value) is bool) or
+                 (kind == 'integer' and type(value) is int) or
+                 (kind == 'array' and isinstance(value, list)))
+        if not valid:
+            raise ValueError(key + ' must be ' + kind)
+        if 'enum' in spec and value not in spec['enum']:
+            raise ValueError(key + ' must be one of ' + ', '.join(spec['enum']))
+        if kind == 'string' and not spec['minLength'] <= len(value) <= spec['maxLength']:
+            raise ValueError(key + ' length is out of range')
+        if kind == 'integer' and not spec['minimum'] <= value <= spec['maximum']:
+            raise ValueError('{} is out of range ({}..{})'.format(key, spec['minimum'], spec['maximum']))
+        if kind == 'array':
+            if len(value) > spec['maxItems']:
+                raise ValueError(key + ' has too many items')
+            for item in value:
+                validate(item, spec['items'], key + ' item')
+            if len(set(value)) != len(value):
+                raise ValueError(key + ' must contain unique items')
+    for key, value in args.items():
+        validate(value, schema['properties'][key], key)
+    if name == 'memlet_learn' and args['action'] == 'transcript' and 'transcript_path' not in args:
+        raise ValueError('Missing required argument: transcript_path')
 
 
 class PrismMemoryMCPServer:
@@ -315,6 +395,8 @@ class PrismMemoryMCPServer:
         return task, session
 
     def call_tool(self, name, arguments):
+        if name in {tool['name'] for tool in memlet_tools()}:
+            return self._call_memlet_tool(name, arguments if arguments is not None else {})
         result = self._call_tool(name, arguments)
         tid = (arguments or {}).get('task') or self.default_task
         if self._uses_derived_task and tid == self.default_task and isinstance(result, dict):
@@ -322,6 +404,36 @@ class PrismMemoryMCPServer:
             if notice:
                 result['notice'] = notice
         return result
+
+    def _call_memlet_tool(self, name, args):
+        from prism_memory import memlet_bridge as bridge
+        from prism_memory.memlet_wiki import build_handover
+        _validate_memlet_arguments(name, args)
+        repo = Path(args.get('repo_path', Path.cwd())).expanduser().resolve()
+        if not repo.is_dir():
+            raise ValueError('repository path not found: ' + str(repo))
+        if (repo / '.memlet').is_symlink():
+            raise ValueError('refusing symlinked path .memlet')
+        if name == 'memlet_check':
+            if args.get('changed', True):
+                return bridge.changed_check(repo, base=args.get('base'), files=args.get('files'))
+            return memory.audit_repo(repo, base_ref=args.get('base'), head_ref='HEAD', output_format='json')
+        if name == 'memlet_recall':
+            return bridge.unified_recall(repo, args['query'], budget=args.get('budget', 1200),
+                                         include=args.get('include', ('rules', 'dream', 'memory')),
+                                         store=self.store, task=self.default_task)
+        if name == 'memlet_handover':
+            return build_handover(repo, next_step=args.get('next_step'), rejected=args.get('rejected'),
+                                  budget=args.get('budget'), mode=args.get('mode', 'verified'),
+                                  output_format='json', write=False)
+        if args['action'] == 'pending':
+            return bridge.learn_pending(repo)
+        source = Path(args['transcript_path']).expanduser().absolute()
+        if any(p.is_symlink() for p in (source,) + tuple(source.parents)):
+            raise ValueError('refusing symlinked transcript path')
+        if not source.is_file():
+            raise ValueError('transcript_path must be an existing file')
+        return bridge.learn_from_transcript(repo, source, vendor='autonomous-deterministic')
 
     def _call_tool(self, name, arguments):
         args = arguments or {}
@@ -544,9 +656,9 @@ class PrismMemoryMCPServer:
                 tool_args = params.get('arguments') or {}
                 payload = self.call_tool(tool_name, tool_args)
                 result = {
-                    'content': [{'type': 'text', 'text': json.dumps(payload, ensure_ascii=False)}],
+                    'content': [{'type': 'text', 'text': (payload.get('formatted') if tool_name.startswith('memlet_') and isinstance(payload.get('formatted'), str) else json.dumps(payload, ensure_ascii=False))}],
                     'structuredContent': payload,
-                    'isError': False,
+                    'isError': payload.get('ok') is False if tool_name.startswith('memlet_') else False,
                 }
             elif method == 'resources/list':
                 result = {'resources': self.list_resources()}
