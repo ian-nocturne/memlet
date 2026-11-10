@@ -818,6 +818,28 @@ class MemletMCPTests(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertNotIn('PRIVATE_CANARY', json.dumps(self.payload('memlet_learn', action='pending')))
 
+    def test_symlinked_agent_folder_is_accepted_but_other_symlinked_paths_are_not(self):
+        real = self.root / 'real-agent-projects'
+        real.mkdir()
+        (real / 'session.jsonl').write_bytes(self.transcript.read_bytes())
+        profile = self.root / 'profile-home'
+        profile.mkdir()
+        (profile / 'projects').symlink_to(real, target_is_directory=True)
+        through_link = profile / 'projects' / 'session.jsonl'
+        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': str(real), 'PRISM_TRANSCRIPT_DIRS': ''}):
+            result = self.rpc('memlet_learn', action='transcript', transcript_path=str(through_link))
+            self.assertFalse(result.get('isError'), result)
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        (elsewhere / 'session.jsonl').write_bytes(self.transcript.read_bytes())
+        (profile / 'other').symlink_to(elsewhere, target_is_directory=True)
+        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': str(real), 'PRISM_TRANSCRIPT_DIRS': ''}), \
+                patch.object(bridge, 'learn_from_transcript') as learn:
+            result = self.rpc('memlet_learn', action='transcript', transcript_path=str(profile / 'other' / 'session.jsonl'))
+            learn.assert_not_called()
+        self.assertTrue(result['isError'])
+        self.assertIn('symlink', result['structuredContent']['error'])
+
     def test_known_agent_roots_and_trusted_environment_override(self):
         home = self.root / 'home'
         with patch('prism_memory_mcp.Path.home', return_value=home), \

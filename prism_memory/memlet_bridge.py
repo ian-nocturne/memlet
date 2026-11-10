@@ -353,6 +353,52 @@ def _merge(old: Optional[Dict[str, Any]], built: Dict[str, Any], snap: Dict[str,
     return merged, info
 
 
+AGENT_TRANSCRIPT_DIRS = (".prism-memory/sessions", ".codex/sessions", ".claude/projects", ".muse/sessions")
+
+
+def agent_transcript_roots() -> Tuple[Path, ...]:
+    """Folders where coding agents keep session transcripts on this machine.
+
+    `DELTAHARNESS_TRANSCRIPT_DIRS` / `PRISM_TRANSCRIPT_DIRS` (os.pathsep-separated) replace the defaults. The
+    defaults are the usual per-user folders plus `$CLAUDE_CONFIG_DIR/projects`, because a relocated Claude Code
+    config directory (managed profiles, dotfile setups) keeps its transcripts there, often as a symlink back to
+    `~/.claude/projects`.
+    """
+    custom = os.environ.get("DELTAHARNESS_TRANSCRIPT_DIRS") or os.environ.get("PRISM_TRANSCRIPT_DIRS") or ""
+    if custom.strip():
+        return tuple(Path(p).expanduser() for p in custom.split(os.pathsep) if p.strip())
+    roots = [Path.home() / rel for rel in AGENT_TRANSCRIPT_DIRS]
+    config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if config_dir:
+        roots.append(Path(config_dir).expanduser() / "projects")
+    return tuple(roots)
+
+
+def transcript_symlink_problem(path: Any) -> Optional[str]:
+    """Why a transcript path must be refused because of symbolic links, or None.
+
+    The file itself may never be a symlink. A symlinked folder on the way is accepted only when the real file
+    lives inside one of `agent_transcript_roots()`: that is how a relocated agent config directory looks, while a
+    link that leads anywhere else is refused, so a path cannot be used to pull in an arbitrary file.
+    """
+    p = Path(path)
+    try:
+        if p.is_symlink():
+            return "the transcript file is a symbolic link"
+        if not any(q.is_symlink() for q in p.parents):
+            return None
+        real = Path(os.path.realpath(str(p)))
+        for root in agent_transcript_roots():
+            try:
+                real.relative_to(Path(os.path.realpath(str(root))))
+                return None
+            except ValueError:
+                continue
+    except OSError:
+        return "the transcript path could not be inspected"
+    return "a symlink in the transcript path leads outside the known agent transcript folders"
+
+
 def learn_from_transcript(repo_path=".", transcript_path=None, *, vendor="autonomous-deterministic") -> Dict[str, Any]:
     """Build or extend the PENDING queue `.memlet/dream/APPROVAL-QUEUE.json` (+ `ontology.sqlite3`) from a `.jsonl`
     / `.log` transcript or a directory of them. Nothing is approved; existing approvals are kept untouched."""

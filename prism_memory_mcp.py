@@ -334,12 +334,8 @@ def memlet_tools():
 
 def _allowed_transcript_roots():
     """Same trusted host-configured roots as the CLI; tool arguments cannot expand them."""
-    custom = os.environ.get('DELTAHARNESS_TRANSCRIPT_DIRS') or os.environ.get('PRISM_TRANSCRIPT_DIRS') or ''
-    if custom.strip():
-        return tuple(Path(p).expanduser() for p in custom.split(os.pathsep) if p.strip())
-    home = Path.home()
-    return tuple(home / rel for rel in ('.prism-memory/sessions', '.codex/sessions',
-                                       '.claude/projects', '.muse/sessions'))
+    from prism_memory import memlet_bridge
+    return memlet_bridge.agent_transcript_roots()
 
 
 def _within(path, root):
@@ -459,8 +455,9 @@ class PrismMemoryMCPServer:
         if args['action'] == 'pending':
             return bridge.learn_pending(repo)
         source = Path(args['transcript_path']).expanduser().absolute()
-        if any(p.is_symlink() for p in (source,) + tuple(source.parents)):
-            raise ValueError('refusing symlinked transcript path')
+        problem = bridge.transcript_symlink_problem(source)
+        if problem:
+            raise ValueError('refusing symlinked transcript path: ' + problem)
         source = source.resolve()
         roots = (repo,) + tuple(p.resolve() for p in _allowed_transcript_roots())
         if not any(_within(source, root) for root in roots):

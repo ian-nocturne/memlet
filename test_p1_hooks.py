@@ -1237,6 +1237,43 @@ class ReviewRound1Tests(_Case):
         self.assertFalse((self.repo / mb.QUEUE_REL).exists())
         self.assertIn("symlink in the transcript path", (self.repo / mh.LOG_REL).read_text())
 
+    def test_transcript_under_a_symlinked_agent_folder_is_learned(self):
+        # Found in a live Claude Code session: a managed profile keeps `<config>/projects` as a symlink to
+        # `~/.claude/projects`, so every real transcript path contains a symlink. The real file is inside a
+        # known agent transcript folder, so it is learned; nothing is approved.
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        t = self.write_transcript()
+        config_dir = self.tmp / "profile-home"
+        config_dir.mkdir()
+        (config_dir / "projects").symlink_to(t.parent, target_is_directory=True)
+        env = dict(self.env(), DELTAHARNESS_TRANSCRIPT_DIRS=str(t.parent))
+        out = self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(config_dir / "projects" / t.name)}, env=env)
+        self.assertIn("queued as PENDING", out["systemMessage"])
+        pend = mb.learn_pending(self.repo)
+        self.assertGreaterEqual(pend["counts"]["pendingNodes"], 1)
+        self.assertEqual(0, pend["counts"]["approvedNodes"])
+
+    def test_claude_config_dir_projects_is_an_agent_folder_by_default(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        t = self.write_transcript()
+        config_dir = self.tmp / "profile-home2"
+        config_dir.mkdir()
+        (config_dir / "projects").symlink_to(t.parent, target_is_directory=True)
+        env = {k: v for k, v in self.env().items() if k not in ("DELTAHARNESS_TRANSCRIPT_DIRS", "PRISM_TRANSCRIPT_DIRS")}
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        out = self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(config_dir / "projects" / t.name)}, env=env)
+        self.assertIn("queued as PENDING", out["systemMessage"])
+
+    def test_transcript_file_that_is_itself_a_symlink_is_rejected_even_inside_an_agent_folder(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        t = self.write_transcript()
+        link = t.parent / "alias.jsonl"
+        link.symlink_to(t)
+        env = dict(self.env(), DELTAHARNESS_TRANSCRIPT_DIRS=str(t.parent))
+        self.assertIsNone(self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(link)}, env=env))
+        self.assertFalse((self.repo / mb.QUEUE_REL).exists())
+        self.assertIn("transcript file is a symbolic link", (self.repo / mh.LOG_REL).read_text())
+
     def test_lock_directory_override_is_used(self):
         from prism_memory import memlet_dream as md
         p = md.queue_lock_path(self.repo / "q.json")

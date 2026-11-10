@@ -1548,8 +1548,9 @@ def _learn(root: Path, payload: Dict[str, Any], st: Dict[str, Any], event: str) 
     p = Path(tp)
     if p.suffix != ".jsonl" or p.name.startswith(".env"):
         return None
-    if any(q.is_symlink() for q in (p,) + tuple(p.parents)):  # same rule as the MCP tool: no symlink anywhere
-        _log(root, event, "skip: a symlink in the transcript path")
+    problem = mb.transcript_symlink_problem(p)  # same rule as the MCP tool
+    if problem:
+        _log(root, event, "skip: " + problem)
         return None
     if not p.is_file():
         return None
