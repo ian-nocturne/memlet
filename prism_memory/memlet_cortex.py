@@ -54,7 +54,12 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
             g = json.loads(q_file.read_text(encoding="utf-8"))
             if not isinstance(g, dict):
                 return None
-            return build_cortex_lineage_payload(g, recall_subgraph(g, query_text="", budget_tokens=1500))
+            # The capsule only ever contains human-approved items (approval digest re-checked). The UI does
+            # not follow the queue's recorded snapshot path (untrusted input; could point anywhere), so the
+            # capsule is reported as UNVERIFIED_OPT_OUT. Pending items are shown for review only, labelled
+            # PENDING / awaiting review and never "in capsule".
+            sub = recall_subgraph(g, query_text="", budget_tokens=1500, require_approval=True, allow_unverified=True)
+            return build_cortex_lineage_payload(g, sub)
     except Exception:
         return None
     return None
@@ -650,7 +655,8 @@ JS = r"""
         var card=el("div","cx-lnode");
         var head=el("div",null);
         head.appendChild(el("span","cx-badge "+(n.status==="superseded"?"SUPERSEDES":"GOVERNS"),String(n.status||"active")));
-        head.appendChild(el("span","cx-badge RESOLVES",String(n.verdict||"UNVERIFIED")));
+        if(n.reviewState==="approved") head.appendChild(el("span","cx-badge RESOLVES",String(n.verdict||"UNVERIFIED")));
+        else head.appendChild(el("span","cx-badge SUPERSEDES","PENDING · AWAITING REVIEW"));
         if(n.inRecallCapsule) head.appendChild(el("span","cx-badge GOVERNS","IN CAPSULE"));
         head.appendChild(el("b",null,String(n.id||"")+" · "+String(n.title||"")));
         card.appendChild(head);
