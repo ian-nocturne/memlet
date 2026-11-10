@@ -188,7 +188,7 @@ ADMIN_GROUPS = (
     ('Memory store', 'schema brief stats scenes capture recall read skills skill cases links learn feedback '
      'skill-manage skill-sync index backfill preflight capsule consolidate sync-md export'),
     ('Rules/wiki', 'init check audit wiki import slim-plan rule-context rule-recall index-build handover'),
-    ('Dream', 'dream-build dream dream-recall dream-pending dream-approve dream-reject'),
+    ('Dream', 'dream-build dream-recall dream-pending dream-approve dream-reject'),
     ('Benchmarks', 'repo-benchmark compare-bench benchmark-compare benchmark'),
     ('Maintenance', 'doctor backup restore heal-skills verify-skill inspector ui'),
 )
@@ -241,6 +241,46 @@ def _add_global_options(parser, *, defaults=False):
         parser.add_argument(flag, **kwargs)
 
 
+_PLUGINS = None
+_PLUGIN_COMMANDS = {}
+
+
+def _register_plugins(sub):
+    """Commands from optional modules (see memlet/cli_plugins.py). They are added after the legacy option
+    prefixes are frozen, so they cannot change how an older command parses."""
+    global _PLUGINS
+    from memlet import cli_plugins
+    _PLUGINS = cli_plugins.load()
+    _PLUGIN_COMMANDS.clear()
+    _PLUGIN_COMMANDS.update(cli_plugins.commands(_PLUGINS))
+    for name in _PLUGIN_COMMANDS:
+        if name in sub.choices:
+            raise ValueError('CLI plug-in command collides with a built-in command: ' + name)
+    for plugin in _PLUGINS:
+        plugin.register(sub)
+
+
+def _product_commands():
+    out = dict(PRODUCT_COMMANDS)
+    for name, meta in _PLUGIN_COMMANDS.items():
+        if meta.get('product'):
+            out[name] = meta.get('help') or ''
+    return out
+
+
+def _admin_groups():
+    groups = [list(g) for g in ADMIN_GROUPS]
+    for name, meta in _PLUGIN_COMMANDS.items():
+        label = meta.get('group') or 'More'
+        for g in groups:
+            if g[0] == label:
+                g[1] = g[1] + ' ' + name
+                break
+        else:
+            groups.append([label, name])
+    return groups
+
+
 def _configure_help(parser, sub):
     """Keep the legacy parser map intact; limit only argparse's display entries."""
     commands = dict(sub.choices)
@@ -250,16 +290,16 @@ def _configure_help(parser, sub):
                            allow_abbrev=False,
                            formatter_class=argparse.RawDescriptionHelpFormatter,
                            description='Advanced and legacy Memlet commands.',
-                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in ADMIN_GROUPS))
+                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in _admin_groups()))
     _add_global_options(admin)
     _reserve_legacy_prefixes(admin)
     admin.set_defaults(_admin=True)
     nested = admin.add_subparsers(dest='action', required=True, metavar='COMMAND', action=_InvokedSubParsers)
     # These are the very same parsers and handlers, including hidden experiments.
     nested.choices.update(commands)
-    sub.metavar = '{' + ','.join(list(PRODUCT_COMMANDS) + ['admin']) + '}'
+    sub.metavar = '{' + ','.join(list(_product_commands()) + ['admin']) + '}'
     sub._choices_actions = [sub._ChoicesPseudoAction(name, (), description)
-                           for name, description in list(PRODUCT_COMMANDS.items()) +
+                           for name, description in list(_product_commands().items()) +
                            [('admin', 'Advanced and legacy commands.')]]
     parser.epilog = 'For advanced and legacy commands, run: memlet admin --help'
 
@@ -294,6 +334,16 @@ def _deprecated(name, replacement):
     if _deprecation_enabled():
         print("memlet: '{}' is now '{}'; the short form will be removed in a future release."
               .format(name, replacement), file=sys.stderr)
+
+
+def _open_store(args):
+    """Open the task-memory store. Only commands that use the store mention an older store on this machine;
+    repository commands (check, recall, handover, ...) stay quiet and their stderr stays machine-readable."""
+    from memlet.compatibility import existing_store_notice
+    notice = existing_store_notice(args.root)
+    if notice:
+        print(notice, file=sys.stderr)
+    return WorkStore(args.root)
 
 
 def _bridge_call(name, *args, **kwargs):
@@ -333,7 +383,7 @@ def _route_new(args):
     if args.action == 'recall' and (args.unified or args.positional_query is not None):
         kwargs = {'budget': args.budget}
         if args.standalone or args.task:
-            store = WorkStore(args.root)
+            store = _open_store(args)
             task = args.task or _standalone_task_id()
             if args.standalone:
                 store.ensure_standalone_task(task, session=args.session or 'standalone-owner')
@@ -473,7 +523,7 @@ def main():
     parser = _build_parser()
     argv = sys.argv[1:]
     command = _top_command(argv, parser)
-    if command and command not in PRODUCT_COMMANDS and command != 'admin':
+    if command and command not in _product_commands() and command != 'admin':
         sub = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
         if command in sub.choices:
             _deprecated(command, 'memlet admin ' + command)
@@ -481,14 +531,10 @@ def main():
     for name in ('root', 'task', 'session', 'standalone'):
         if not hasattr(args, name):
             setattr(args, name, getattr(args, '_global_' + name))
-    from memlet.compatibility import existing_store_notice
-    notice = existing_store_notice(args.root)
-    if notice:
-        print(notice, file=sys.stderr)
     _validate_modes(args, parser)
     if args.action == 'recall' and args.budget is None:
         args.budget = 1200 if args.unified or args.positional_query is not None else 6000
-    human = args.action in PRODUCT_COMMANDS
+    human = args.action in _product_commands()
     if human and not getattr(args, '_format_explicit', False) and sys.stdout.isatty():
         args.format = 'markdown'
     result = _main(args, parser)
@@ -528,7 +574,7 @@ def _build_parser():
     slim_p=sub.add_parser('slim-plan',help='Propose a slimmer AGENTS.md by moving (never rewriting) older directives into an indexed log; writes only to --out, with a preservation proof')
     slim_p.add_argument('repo_positional',nargs='?',default=None);slim_p.add_argument('--out',required=True)
     slim_p.add_argument('--keep-recent',type=int,default=2);slim_p.add_argument('--split-rules',action='store_true')
-    dream_b=sub.add_parser('dream-build',aliases=['dream'],help='Build a PENDING approval queue from session logs and optional candidates (no model call)')
+    dream_b=sub.add_parser('dream-build',help='Build a PENDING approval queue from session logs and optional candidates (no model call)')
     dream_b.add_argument('--candidates',default=None,help='Optional path to raw candidate JSON; if omitted, deterministically extracts candidates from --snapshot')
     dream_b.add_argument('--snapshot',required=True,help='Path to a .log/.jsonl transcript, log directory, or JSON snapshot map')
     dream_b.add_argument('--out-json',required=True,help='Output path for the PENDING approval queue JSON')
@@ -646,11 +692,15 @@ def _build_parser():
     learn.add_argument('--repo',action=_ExplicitValue,default='.')
     learn.add_argument('--vendor',action=_ExplicitValue,default='autonomous-deterministic')
     learn.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
+    _register_plugins(sub)
     _configure_help(parser, sub)
     return parser
 
 
 def _main(args, parser):
+    if args.action in _PLUGIN_COMMANDS:
+        from memlet import cli_plugins
+        return cli_plugins.dispatch(_PLUGINS, args)
     routed = _route_new(args)
     if routed is not None:
         return routed
@@ -682,7 +732,7 @@ def _main(args, parser):
         if res.get('why')=='nothing to move (no dated directive blocks beyond the kept ones)':
             res['exitCode']=0
         return res
-    if args.action in ('dream-build','dream'):
+    if args.action=='dream-build':
         from memlet.memlet_dream import run_dream_build
         return run_dream_build(
             snapshot_path=args.snapshot,
@@ -750,7 +800,7 @@ def _main(args, parser):
             res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
         if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
         return res
-    store=WorkStore(args.root)
+    store=_open_store(args)
     if args.action=='doctor':return memory.doctor(store)
     if args.action=='backup':return memory.backup(store,dest_dir=args.dest_dir,include_models=args.include_models)
     if args.action=='restore':return memory.restore(store,backup_dir=args.backup_dir)

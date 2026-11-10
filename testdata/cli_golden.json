@@ -333,40 +333,6 @@
     "kind": "json"
    }
   },
-  "dream-alias": {
-   "exit": 0,
-   "stderr": {
-    "kind": "empty"
-   },
-   "stdout": {
-    "keys": [
-     "approvalRequired",
-     "candidateCap",
-     "candidatesInputCount",
-     "candidatesOmittedCount",
-     "candidatesTruncated",
-     "command",
-     "contractVerification",
-     "dropped",
-     "droppedCount",
-     "edgeCountsByType",
-     "edgesCount",
-     "extractionMode",
-     "nodesCount",
-     "ok",
-     "outDbPath",
-     "outDbSha256",
-     "outJsonPath",
-     "outJsonSha256",
-     "pendingEdgeCount",
-     "pendingNodeCount",
-     "redactionCountsByType",
-     "snapshotFilesCount",
-     "snapshotReport"
-    ],
-    "kind": "json"
-   }
-  },
   "dream-build": {
    "exit": 0,
    "stderr": {
@@ -1383,7 +1349,6 @@
   "compare-bench": 0,
   "consolidate": 0,
   "doctor": 0,
-  "dream": 0,
   "dream-build": 0,
   "dream-recall": 0,
   "export": 0,
