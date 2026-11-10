@@ -4936,7 +4936,7 @@ class DreamOntologyTests(unittest.TestCase):
         self.assertEqual(0, ver["cycleOrTimeInversionCount"])
 
         # Subgraph recall quarantines L-001 as SUPERSEDED and surfaces BLOCKS/RESOLVES
-        sub = md.recall_subgraph(graph, query_text="zsh patch handover budget", budget_tokens=1500)
+        sub = md.recall_subgraph(graph, query_text="zsh patch handover budget", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[SUPERSEDED — DO NOT APPLY AS CURRENT]", sub["formatted"])
         self.assertIn("[BLOCKS ->", sub["formatted"])
         self.assertIn("[RESOLVES ->", sub["formatted"])
@@ -5047,7 +5047,7 @@ class DreamOntologyTests(unittest.TestCase):
             },
         ], snap_sub)
         g_valid_cross["nodes"][1]["verdict"] = "OUT_OF_EVIDENCE"
-        sub_after_rej = md.recall_subgraph(g_valid_cross, query_text="zsh", budget_tokens=1500)
+        sub_after_rej = md.recall_subgraph(g_valid_cross, query_text="zsh", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[L-OLD]", sub_after_rej["formatted"])
         self.assertNotIn("SUPERSEDED — DO NOT APPLY", sub_after_rej["formatted"])
         # M1: tampered supersededByPin caught by verify_ontology_contract
@@ -5059,7 +5059,7 @@ class DreamOntologyTests(unittest.TestCase):
         # M6: recall_subgraph filters out non-SUPPORTED/bogus verdicts
         g_rej = copy.deepcopy(g_sub)
         g_rej["nodes"][0]["verdict"] = "BOGUS_VERDICT"
-        sub_rej = md.recall_subgraph(g_rej, query_text="subsec", budget_tokens=1500)
+        sub_rej = md.recall_subgraph(g_rej, query_text="subsec", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertEqual(0, len(sub_rej["includedNodeIds"]))
         # M7: XSS payload in ontologyLineage is escaped with \u003c / \u0026 and no innerHTML in lineage JS
         xss_ws = {
@@ -5098,6 +5098,10 @@ class DreamOntologyTests(unittest.TestCase):
         cx_data = mc._cortex_data({"id": "ws-auto", "path": str(ws_dir), "anchors": [], "anchorSummary": {}})
         self.assertIsNotNone(cx_data["ontologyLineage"])
         self.assertEqual(1, len(cx_data["ontologyLineage"]["nodes"]))
+        # F2: an unapproved queue still renders for review, but only as PENDING / awaiting review
+        self.assertEqual("PENDING", cx_data["ontologyLineage"]["nodes"][0]["verdict"])
+        self.assertEqual("pending", cx_data["ontologyLineage"]["nodes"][0]["reviewState"])
+        self.assertFalse(cx_data["ontologyLineage"]["nodes"][0]["inRecallCapsule"])
         # Round 3 MUST-FIX 3: superseded_rule node whose bound SUPERSEDES edge is WRONG_EDGE_TYPE_OR_DIR (even with a valid BLOCKS edge) is dropped from recall
         g_sup_mixed = md.dream_pin_and_validate([{
             "lesson_id": "L-SUP-MIX",
@@ -5112,7 +5116,7 @@ class DreamOntologyTests(unittest.TestCase):
         for e in g_sup_mixed["nodes"][0]["edges"]:
             if e["edgeType"] == "SUPERSEDES":
                 e["edgeVerdict"] = "WRONG_EDGE_TYPE_OR_DIR"
-        sub_mixed = md.recall_subgraph(g_sup_mixed, query_text="subsec", budget_tokens=1500)
+        sub_mixed = md.recall_subgraph(g_sup_mixed, query_text="subsec", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertEqual(0, len(sub_mixed["includedNodeIds"]))
         # NICE 4: direct parse_span traversal checks for "..:1" and "a..b:1"
         for dot_sp in ("..:1", "a..b:1"):
@@ -5136,7 +5140,7 @@ class DreamOntologyTests(unittest.TestCase):
             },
         ], snap_sub)
         g_cross_active["nodes"][0]["verdict"] = "ALREADY_SUPERSEDED"
-        sub_cross_active = md.recall_subgraph(g_cross_active, query_text="zsh", budget_tokens=1500)
+        sub_cross_active = md.recall_subgraph(g_cross_active, query_text="zsh", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[L-OLD]", sub_cross_active["formatted"])
         self.assertIn("SUPERSEDED — DO NOT APPLY", sub_cross_active["formatted"])
         self.assertIn("SUPERSEDES: old_pin(sub.log:1) replaced by replacement_pin(sub.log:2)", sub_cross_active["formatted"])
@@ -5160,7 +5164,7 @@ class DreamOntologyTests(unittest.TestCase):
         ], snap_sub)
         g_bc["nodes"][0]["verdict"] = "ALREADY_SUPERSEDED"
         g_bc["nodes"][1]["verdict"] = "ALREADY_SUPERSEDED"
-        sub_bc = md.recall_subgraph(g_bc, query_text="zsh", budget_tokens=1500)
+        sub_bc = md.recall_subgraph(g_bc, query_text="zsh", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[L-C]", sub_bc["formatted"])
         self.assertIn("SUPERSEDED — DO NOT APPLY", sub_bc["formatted"])
         self.assertNotIn("Hard Bans", sub_bc["formatted"])
@@ -5217,7 +5221,7 @@ class DreamOntologyTests(unittest.TestCase):
         }
         mal_lineage = md.build_cortex_lineage_payload(malformed_g)
         self.assertEqual(1, len(mal_lineage["nodes"]))
-        mal_recall = md.recall_subgraph(malformed_g, query_text="zsh", budget_tokens=1500)
+        mal_recall = md.recall_subgraph(malformed_g, query_text="zsh", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[L-MAL]", mal_recall["formatted"])
         ws_mal_dir = Path(tempfile.mkdtemp(prefix="dream-mal-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(ws_mal_dir, ignore_errors=True))
@@ -5235,6 +5239,8 @@ class DreamOntologyTests(unittest.TestCase):
         live_ws_payload = mi._live_workspace(ws_live_dir, [])
         self.assertIsNotNone(live_ws_payload.get("ontologyLineage"))
         self.assertEqual(1, len(live_ws_payload["ontologyLineage"]["nodes"]))
+        self.assertEqual("PENDING", live_ws_payload["ontologyLineage"]["nodes"][0]["verdict"])  # F2
+        self.assertFalse(live_ws_payload["ontologyLineage"]["nodes"][0]["inRecallCapsule"])  # F2
         # Round 4 NICE 3: build_cortex_lineage_payload filters out OUT_OF_EVIDENCE nodes and rejected edges and JS renders verdict badge
         g_filter_cx = copy.deepcopy(g_cross_active)
         g_filter_cx["nodes"][0]["verdict"] = "SUPPORTED"
@@ -5242,7 +5248,8 @@ class DreamOntologyTests(unittest.TestCase):
         cx_filtered = md.build_cortex_lineage_payload(g_filter_cx)
         self.assertEqual(["L-OLD"], [n["id"] for n in cx_filtered["nodes"]])
         self.assertFalse(cx_filtered["nodes"][0]["isSuperseded"])
-        self.assertTrue(cx_filtered["nodes"][0]["inRecallCapsule"])
+        self.assertFalse(cx_filtered["nodes"][0]["inRecallCapsule"])  # F2: unapproved (hand-set SUPPORTED) is never in the capsule
+        self.assertEqual("PENDING", cx_filtered["nodes"][0]["verdict"])
         self.assertIn("n.verdict", mc.JS)
         # Round 4 NICE 4: distinct >48-char lesson IDs with shared 48-char prefix get deterministic hash suffixes and match SUPERSEDES to_id
         shared_prefix = "shared-forty-eight-character-prefix-for-lessons-"
@@ -5268,7 +5275,7 @@ class DreamOntologyTests(unittest.TestCase):
         self.assertEqual(g_long_pair["nodes"][0]["id"], sup_edges_long[0]["toId"])
         # N8 Remediation checks: self-bound SUPERSEDES header clarity (F4), BLOCKS section edge label matching (F6), and M2-Flat replacement quote rendering (F9)
         self.assertIn("replaced by replacement_pin(", sub_cross_active["formatted"])
-        flat_sub = md.format_flat_memory(g_sub, budget_tokens=1500)
+        flat_sub = md.format_flat_memory(g_sub, budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[SUPERSEDED — DO NOT APPLY]", flat_sub)
         self.assertIn("[ACTIVE — APPLY THIS]", flat_sub)
         # SQLite persistence
@@ -5390,7 +5397,7 @@ class DreamOntologyTests(unittest.TestCase):
         ], snap_dup)
         g_dup["nodes"][0]["id"] = "L-SAME"
         g_dup["nodes"][1]["id"] = "L-SAME"
-        rec_dup = md.recall_subgraph(g_dup, query_text="dup", budget_tokens=1500)
+        rec_dup = md.recall_subgraph(g_dup, query_text="dup", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertEqual(2, len(rec_dup["includedNodeIds"]))
         self.assertIn("L-SAME", rec_dup["duplicateIds"])
         self.assertIn("L-SAME#2", rec_dup["includedNodeIds"])
@@ -5422,7 +5429,7 @@ class DreamOntologyTests(unittest.TestCase):
                 "edges": [{"edge_type": "SUPERSEDES", "to_id": "L-V2", "src_span": "s1.log:3-3", "target_span": "s1.log:2-2"}],
             },
         ], snap_chain)
-        rec_chain = md.recall_subgraph(g_chain, query_text="Rule v1", budget_tokens=1500)
+        rec_chain = md.recall_subgraph(g_chain, query_text="Rule v1", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("[SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY]", rec_chain["formatted"])
 
         # 6. Leftover 3 pin-aware supersession isolation when duplicate IDs share L-SAME
@@ -5452,14 +5459,14 @@ class DreamOntologyTests(unittest.TestCase):
             for e_item in n_item["edges"]:
                 if e_item["toId"] == "L-A":
                     e_item["toId"] = "L-SAME"
-        rec_dup3 = md.recall_subgraph(g_dup3_shared, query_text="bravo", budget_tokens=1500)
+        rec_dup3 = md.recall_subgraph(g_dup3_shared, query_text="bravo", budget_tokens=1500, require_approval=False, allow_unverified=True)
         bravo_lines = [ln for ln in rec_dup3["formatted"].splitlines() if "Bravo unrelated rule" in ln]
         self.assertTrue(bravo_lines and all("[SUPERSEDES:" not in ln for ln in bravo_lines))
 
         # 7. Leftover 6 budget-dropped superseding source labeled [SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY]
         budget_dropped = None
         for b_tok in range(80, 600):
-            r_b = md.recall_subgraph(g_dup3, query_text="alpha", budget_tokens=b_tok)
+            r_b = md.recall_subgraph(g_dup3, query_text="alpha", budget_tokens=b_tok, require_approval=False, allow_unverified=True)
             if "L-A" in r_b["includedNodeIds"] and "L-C" not in r_b["includedNodeIds"]:
                 budget_dropped = r_b
                 break
@@ -5468,7 +5475,7 @@ class DreamOntologyTests(unittest.TestCase):
 
         # 7b. Post-relabel budget enforcement: tokenEstimate <= tokenBudget even after RE-VERIFY label expansion
         for b_tok in range(80, 600):
-            r_b = md.recall_subgraph(g_dup3, query_text="alpha", budget_tokens=b_tok)
+            r_b = md.recall_subgraph(g_dup3, query_text="alpha", budget_tokens=b_tok, require_approval=False, allow_unverified=True)
             self.assertLessEqual(r_b["tokenEstimate"], r_b["tokenBudget"])
 
         # 7c. Duplicate ID + supersession chain: L-A's replacement source (L-B renamed to L-SAME) superseded by L-D -> L-A shows RE-VERIFY while unrelated L-SAME#3 stays active
@@ -5507,7 +5514,7 @@ class DreamOntologyTests(unittest.TestCase):
             for f_k in ("fromId", "toId"):
                 if e_item[f_k] in ("L-B", "L-C"):
                     e_item[f_k] = "L-SAME"
-        rec_dup4 = md.recall_subgraph(g_dup4, query_text="alpha", budget_tokens=1500)
+        rec_dup4 = md.recall_subgraph(g_dup4, query_text="alpha", budget_tokens=1500, require_approval=False, allow_unverified=True)
         self.assertIn("replacement_pin [SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY] [s1.log:2", rec_dup4["formatted"])
         self.assertIn("- [L-SAME#3] (charlie) [RESOLVES -> charlie]", rec_dup4["formatted"])
 
