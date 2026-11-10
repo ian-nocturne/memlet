@@ -91,8 +91,8 @@ class StandaloneSurfaceTests(unittest.TestCase):
             server = MemletMCPServer(root=tmp)
             result = server.handle_rpc({'id': 1, 'method': 'tools/list'})['result']
             names = [t['name'] for t in result['tools']]
-            self.assertEqual(23, len(names))
-            self.assertEqual(23, len(set(names)))
+            self.assertEqual(25, len(names))
+            self.assertEqual(25, len(set(names)))
             self.assertTrue(all(n.startswith('memlet_') for n in names))
             self.assertEqual(19, sum(n.startswith('memlet_store_') for n in names))
             init = server.handle_rpc({'id': 2, 'method': 'initialize'})['result']

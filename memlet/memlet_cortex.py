@@ -83,7 +83,16 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
                                          require_approval=True)
             except ValueError:
                 sub = {"includedNodeIds": [], "pinVerification": "unavailable_snapshot_mismatch"}
-        return md.build_cortex_lineage_payload(g, sub, citation_snapshot=snap, require_citations=True)
+        result = md.build_cortex_lineage_payload(g, sub, citation_snapshot=snap, require_citations=True)
+        tiers = {it["id"]: it for it in mb.dream_items(root_p, tiers=("approved", "hint", "pending"))["items"]}
+        for node in result["nodes"]:
+            node["tier"] = tiers.get(node["id"], {}).get("tier", "pending")
+            node["agreementBasis"] = tiers.get(node["id"], {}).get("agreementBasis")
+            node["agreementLabel"] = tiers.get(node["id"], {}).get("agreementLabel", "no trusted agreement")
+            for key in ("title", "scopeTag"):
+                node[key] = mb.safe_lesson_display(node.get(key, ""))
+            node["quoteLines"] = [mb.safe_lesson_display(line) for line in node.get("quoteLines", [])]
+        return result
     except Exception:
         return None
 
@@ -679,6 +688,7 @@ JS = r"""
         var card=el("div","cx-lnode");
         var head=el("div",null);
         head.appendChild(el("span","cx-badge "+(n.status==="superseded"?"SUPERSEDES":"GOVERNS"),String(n.status||"active")));
+        head.appendChild(el("span","cx-badge",String(n.tier||n.reviewState||"pending")+" · "+String(n.agreementLabel||"no trusted agreement")));
         if(n.reviewState==="approved") head.appendChild(el("span","cx-badge RESOLVES",String(n.verdict||"UNVERIFIED")));
         else head.appendChild(el("span","cx-badge SUPERSEDES","PENDING · AWAITING REVIEW"));
         if(n.inRecallCapsule) head.appendChild(el("span","cx-badge GOVERNS","IN CAPSULE"));

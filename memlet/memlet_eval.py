@@ -545,7 +545,10 @@ def build_contexts(root, m, q):
     if provider is None:
         provider = _approved_items_fallback
     if provider:
-        result = provider(str(root), tiers=('approved', 'hint') if m['hints'] else ('approved',), query=q['text'])
+        # Query-independent on purpose: `flat` and `handover` are the "all eligible lessons" baselines.
+        # Filtering them by the question's words would hand `graph` a retrieval advantage that is not
+        # part of what the experiment compares; the shared token budget is the only limit.
+        result = provider(str(root), tiers=('approved', 'hint') if m['hints'] else ('approved',), query='')
         if not result.get('ok'):
             raise ValueError('dream_items failed')
         for item in result.get('items', []):
@@ -971,9 +974,9 @@ def eval_selftest(*, context_builder=None, _protocol=None):
                     else:
                         text = 'Unknown.'
                 return {'ok': True, 'vendor': vendor, 'model': 'deterministic-fixture', 'text': text}
-            module = types.ModuleType('memlet.vendor_cli')
-            module.run_vendor = fake
-            with patch.dict('sys.modules', {'memlet.vendor_cli': module}):
+            # Swap only the call boundary: the real module stays importable for everything else.
+            from . import vendor_cli as real_vendor_cli
+            with patch.object(real_vendor_cli, 'run_vendor', fake):
                 init_eval(root, dream_until='2026-01-01', sessions='sessions', run='selftest', budget=1200,
                           allow_post_split_memory=_protocol == 'retrospective')
                 seal_questions(root, run='selftest', source='.memlet/eval/fixture/questions.json')
@@ -991,7 +994,7 @@ def eval_selftest(*, context_builder=None, _protocol=None):
                 m = _manifest(root, 'selftest')
                 q = _questions(root, 'selftest')[0]
                 provider = getattr(bridge, 'dream_items', _approved_items_fallback)
-                sample = provider(str(root), tiers=('approved',), query=q['text'])['items'][0]
+                sample = provider(str(root), tiers=('approved',), query='')['items'][0]
                 guards_ok = True
                 import copy
                 for mutant in ('tier', 'sha256', 'verified'):

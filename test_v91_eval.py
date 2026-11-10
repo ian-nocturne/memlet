@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
-from memlet import memlet_eval as ev, memlet_wiki as wiki, memlet_bridge as bridge
+from memlet import memlet_eval as ev, memlet_wiki as wiki, memlet_bridge as bridge, vendor_cli
 
 
 class EvalTests(unittest.TestCase):
@@ -23,13 +23,12 @@ class EvalTests(unittest.TestCase):
         self.put('sessions/a.json', [{'timestamp': '2026-01-01', 'text': 'Repair uses cedar.'}])
         self.put('sessions/b.json', [{'timestamp': '2026-01-03', 'text': 'Repair cedar succeeded. HELDOUT_CANARY_739'}])
         self.calls = []
-        mod = types.ModuleType('memlet.vendor_cli')
         def vendor(v, prompt, **kw):
             self.assertNotIn('/eval/r/locks', os.environ.get('MEMLET_LOCK_DIR', ''))
             self.calls.append((v, prompt))
             return {'ok': True, 'vendor': v, 'model': 'fake', 'text': self.output}
-        mod.run_vendor = vendor
-        self.patch = patch.dict('sys.modules', {'memlet.vendor_cli': mod})
+        # Replace only the call boundary; the real module must stay importable (memlet_brief uses it).
+        self.patch = patch.object(vendor_cli, 'run_vendor', vendor)
         self.patch.start()
         self.addCleanup(self.patch.stop)
         self.output = 'cedar'

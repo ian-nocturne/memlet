@@ -499,7 +499,7 @@ def _validate_modes(args, parser):
             parser.error('learn --approve/--reject requires --by NAME')
     if args.action == 'init':
         if not (args.hooks or args.hooks_remove):
-            flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else [])
+            flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else []) + (['--dream'] if args.dream else [])
             if flags:
                 parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove')
         elif args.hooks_remove and args.force:
@@ -655,6 +655,7 @@ def _build_parser():
     hooks_mode.add_argument('--hooks',action='store_true',help='Opt-in: also install Memlet hooks for Claude Code (merged into .claude settings, never replacing them; all-or-nothing, with a compare-and-swap check before each write. A program that replaces the same file at that very instant cannot be excluded without a shared lock)')
     hooks_mode.add_argument('--hooks-remove',action='store_true',help='Remove only the hook entries Memlet installed')
     init_p.add_argument('--hooks-scope',choices=['local','project'],default=None,help='local (default): .claude/settings.local.json; project: shared .claude/settings.json (needs memlet on PATH)')
+    init_p.add_argument('--dream',action='store_true',help='With --hooks: Stop only snapshots sessions for an explicit dream command')
     init_p.add_argument('--git-hooks',action='store_true',help='With --hooks / --hooks-remove: also the git pre-commit (warn only) and post-merge hooks')
     check_mode=aud_p.add_mutually_exclusive_group()
     check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
@@ -716,7 +717,7 @@ def _main(args, parser):
         target_repo=args.repo_path or args.repo_positional or '.'
         if args.action=='init' and (args.hooks or args.hooks_remove):
             from memlet.memlet_hooks import init_hooks_command
-            res=init_hooks_command(target_repo,remove=args.hooks_remove,scope=args.hooks_scope or 'local',git_hooks=args.git_hooks,
+            res=init_hooks_command(target_repo,remove=args.hooks_remove,scope=args.hooks_scope or 'local',git_hooks=args.git_hooks,dream=args.dream,
                                    dry_run=args.dry_run,force=args.force,output_format=args.format)
         elif args.action=='init':
             res=init_project(target_repo,dry_run=args.dry_run,force=args.force,output_format=args.format)

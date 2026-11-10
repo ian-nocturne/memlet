@@ -339,7 +339,21 @@ def memlet_tools():
     tools[-1]['inputSchema']['allOf'] = [
         {'if': {'properties': {'action': {'const': 'transcript'}}, 'required': ['action']},
          'then': {'required': ['transcript_path']}}]
-    return tools
+    return tools + _dream_tools()
+
+
+def _dream_tools():
+    from memlet.memlet_dreamcycle import CANDIDATE_SCHEMA
+    string = lambda limit: {"type": "string", "minLength": 1, "maxLength": limit}
+    common = {"repo_path": string(4096), "run_id": string(24)}
+    return [
+        {"name": "memlet_dream_next", "description": "Read-only: next un-dreamed snapshot batch and candidate schema; initialized repository required.",
+         "inputSchema": {"type": "object", "properties": dict(common, batch_tokens={"type": "integer", "minimum": 128, "maximum": 16000}), "required": [], "additionalProperties": False},
+         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+        {"name": "memlet_dream_submit", "description": "Non-destructive: submit cited pending candidates as untrusted proposer host; cannot verify, approve, reject or set trust tiers.",
+         "inputSchema": {"type": "object", "properties": dict(common, batch_id=string(24), candidates=CANDIDATE_SCHEMA),
+                         "required": ["run_id", "batch_id", "candidates"], "additionalProperties": False},
+         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}}]
 
 
 def _allowed_transcript_roots():
@@ -374,12 +388,13 @@ def _validate_memlet_arguments(name, args):
         valid = ((kind == 'string' and isinstance(value, str)) or
                  (kind == 'boolean' and type(value) is bool) or
                  (kind == 'integer' and type(value) is int) or
-                 (kind == 'array' and isinstance(value, list)))
+                 (kind == 'array' and isinstance(value, list)) or
+                 (kind == 'object' and isinstance(value, dict)))
         if not valid:
             raise ValueError(key + ' must be ' + kind)
         if 'enum' in spec and value not in spec['enum']:
             raise ValueError(key + ' must be one of ' + ', '.join(spec['enum']))
-        if kind == 'string' and not spec['minLength'] <= len(value) <= spec['maxLength']:
+        if kind == 'string' and not spec.get('minLength', 0) <= len(value) <= spec.get('maxLength', 8192):
             raise ValueError(key + ' length is out of range')
         if kind == 'integer' and not spec['minimum'] <= value <= spec['maximum']:
             raise ValueError('{} is out of range ({}..{})'.format(key, spec['minimum'], spec['maximum']))
@@ -388,8 +403,13 @@ def _validate_memlet_arguments(name, args):
                 raise ValueError(key + ' has too many items')
             for item in value:
                 validate(item, spec['items'], key + ' item')
-            if len(set(value)) != len(value):
+            if spec.get('uniqueItems') and len(set(value)) != len(value):
                 raise ValueError(key + ' must contain unique items')
+        if kind == 'object':
+            if set(value) - set(spec['properties']) or not set(spec.get('required', [])) <= set(value):
+                raise ValueError(key + ' has missing or unknown properties')
+            for field, item in value.items():
+                validate(item, spec['properties'][field], key + '.' + field)
     for key, value in args.items():
         validate(value, schema['properties'][key], key)
     if name == 'memlet_learn' and args['action'] == 'transcript' and 'transcript_path' not in args:
@@ -469,7 +489,12 @@ class MemletMCPServer:
                                   budget=args.get('budget'), mode=mode,
                                   output_format='json', write=False)
         if not (repo / '.memlet').is_dir():
-            raise ValueError('Repository is not initialized; run memlet init before memlet_learn')
+            raise ValueError('Repository is not initialized; run memlet init before ' + name)
+        if name in ('memlet_dream_next', 'memlet_dream_submit'):
+            from memlet.memlet_dreamcycle import dream_next, dream_submit
+            if name == 'memlet_dream_next':
+                return dream_next(repo, run_id=args.get('run_id'), batch_tokens=args.get('batch_tokens', 6000))
+            return dream_submit(repo, args['run_id'], args['batch_id'], args['candidates'], proposer='host')
         if args['action'] == 'pending':
             return bridge.learn_pending(repo)
         source = Path(args['transcript_path']).expanduser().absolute()

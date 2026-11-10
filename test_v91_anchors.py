@@ -559,7 +559,7 @@ class CliAndInitTests(_Repo):
     def test_anchors_is_an_admin_command_in_the_rules_group(self):
         code, out, _ = self.run_cli(["--help"])
         self.assertEqual(0, code)
-        self.assertIn("{init,check,recall,handover,learn,ui,admin}", out)
+        self.assertIn("{init,check,recall,handover,learn,ui,dream,admin}", out)
         code, out, _ = self.run_cli(["admin", "--help"])
         rules_group = out.split("Rules/wiki:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("anchors", rules_group)

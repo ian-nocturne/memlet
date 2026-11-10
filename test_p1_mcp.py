@@ -604,11 +604,12 @@ class MemletMCPTests(unittest.TestCase):
         result = self.server.handle_rpc({'id': 1, 'method': 'tools/list'})['result']['tools']
         self.assertEqual(19, len(BASE_TOOLS))
         self.assertEqual(BASE_TOOLS, result[:19])  # descriptions and all other fields too
-        self.assertEqual({'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn'},
+        self.assertEqual({'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn',
+                          'memlet_dream_next', 'memlet_dream_submit'},
                          {t['name'] for t in result[19:]})
-        self.assertEqual(23, len(result))
+        self.assertEqual(25, len(result))
         self.assertEqual('9.0.0', SERVER_VERSION)
-        self.assertIn('Approval is CLI-only', result[-1]['description'])
+        self.assertIn('Approval is CLI-only', result[22]['description'])
 
     def test_check_edit_and_rename_stale(self):
         (self.repo / 'app.py').write_text('def main(required):\n    return 1\n')
