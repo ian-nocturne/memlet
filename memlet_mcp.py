@@ -734,8 +734,12 @@ class MemletMCPServer:
                 tool_name = params.get('name', '')
                 tool_args = params.get('arguments') or {}
                 payload = self.call_tool(tool_name, tool_args)
+                rendered = payload.get('formatted')
+                if tool_name == 'memlet_handover' and 'executionProof' in payload:
+                    from memlet.memlet_wiki import _render_handover
+                    rendered = _render_handover(payload, payload['capsuleSignature'])
                 result = {
-                    'content': [{'type': 'text', 'text': (payload.get('formatted') if tool_name in {tool['name'] for tool in memlet_tools()} and isinstance(payload.get('formatted'), str) else json.dumps(payload, ensure_ascii=False))}],
+                    'content': [{'type': 'text', 'text': (rendered if tool_name in {tool['name'] for tool in memlet_tools()} and isinstance(rendered, str) else json.dumps(payload, ensure_ascii=False))}],
                     'structuredContent': payload,
                     'isError': payload.get('ok') is False if tool_name in {tool['name'] for tool in memlet_tools()} else False,
                 }

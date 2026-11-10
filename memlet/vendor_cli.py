@@ -78,6 +78,13 @@ def _claude_argv(model="claude-sonnet-5-5"):
             "--disable-slash-commands", "--no-session-persistence"]
 
 
+def launch_plan(vendor, prompt, model=None):
+    """The same argv/isolation description for Dream and eval previews; never launches."""
+    model = DEFAULT_MODELS.get(vendor, "") if model is None else model
+    return {"vendor": vendor, "model": model, "isolation": "tool-free",
+            "argv": _claude_argv(model) + [prompt] if vendor == "claude" else None}
+
+
 def _settings_risks(config_dir):
     from memlet.memlet_wiki import read_regular_text
     if not isinstance(config_dir, str) or not config_dir:

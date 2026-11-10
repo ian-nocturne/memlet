@@ -1,5 +1,6 @@
 """CLI plug-in for sealed memory experiments."""
 import argparse
+from .vocabulary import JUDGE_UNAVAILABLE
 from . import cli_plugins
 from . import memlet_eval as ev
 
@@ -35,7 +36,7 @@ def register(sub):
             p.add_argument('--via', required=True, help="Calls a model through your own vendor CLI.")
             p.add_argument('--arms', nargs='+', choices=ev.ARMS)
         if name == 'score':
-            p.add_argument('--judge', help="Calls a judge model through your own vendor CLI.")
+            p.add_argument('--judge', help=JUDGE_UNAVAILABLE)
         if name == 'resolve':
             p.add_argument('--resolve', required=True)
             p.add_argument('--by', required=True)

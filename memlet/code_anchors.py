@@ -1112,6 +1112,137 @@ def extract_file_symbol_signatures(file_path):
     return res
 
 
+def python_symbol_rebound(file_path, symbol):
+    """Fresh module binding scan, independent of the stat-keyed symbol hash caches.
+
+    Hashes still describe a definition, not subsequent bindings. An overload stub
+    is not an implementation: as before, one implementation after typing-style
+    overload stubs can be active. No execution or import resolution is attempted.
+    """
+    p = Path(file_path)
+    try:
+        if p.is_symlink() or p.stat().st_size > 2 * 1024 * 1024:
+            return True
+        tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return True  # never affirm a cached definition when the fresh scan failed
+    definitions = _collect_scoped_ast_nodes(tree.body)
+    qualified = {q for q, short, _, _ in definitions if q == symbol}
+    if not qualified:
+        qualified = {q for q, short, _, _ in definitions if short == symbol}
+    if not qualified:
+        return False
+    bindings = {}
+
+    def overload_stub(node):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        decorated = any(isinstance(d, ast.Name) and d.id == "overload" or
+                        isinstance(d, ast.Attribute) and d.attr == "overload" for d in node.decorator_list)
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            body = body[1:]
+        return decorated and all(isinstance(n, ast.Pass) or isinstance(n, ast.Expr) and
+                                 isinstance(n.value, ast.Constant) and n.value.value is Ellipsis for n in body)
+
+    class Bindings(ast.NodeVisitor):
+        def __init__(self, prefix="", globals_=()):
+            self.prefix, self.globals = prefix, set(globals_)
+
+        def bind(self, name):
+            key = name if name.split(".")[0] in self.globals or not self.prefix else self.prefix + "." + name
+            bindings[key] = bindings.get(key, 0) + 1
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.bind(node.id)
+
+        def visit_Attribute(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                parts, cur = [node.attr], node.value
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    self.bind(".".join([cur.id] + list(reversed(parts))))
+            self.visit(node.value)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                self.bind(alias.asname or alias.name.split(".")[0])
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                if alias.name == "*":
+                    # A wildcard may overwrite any name in this scope.
+                    for key in qualified:
+                        if not self.prefix or key.startswith(self.prefix + "."):
+                            bindings[key] = bindings.get(key, 0) + 1
+                else:
+                    self.bind(alias.asname or alias.name)
+
+        def visit_ExceptHandler(self, node):
+            if node.name:
+                self.bind(node.name)
+            self.generic_visit(node)
+
+        def scope(self, node, function):
+            if not overload_stub(node):
+                self.bind(node.name)
+            # Defaults, decorators and bases are evaluated in the enclosing scope.
+            for d in node.decorator_list:
+                self.visit(d)
+            if function:
+                for d in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                    self.visit(d)
+            else:
+                for d in node.bases + [k.value for k in node.keywords]:
+                    self.visit(d)
+            name = node.name if not self.prefix or node.name in self.globals else self.prefix + "." + node.name
+            prefix = name + ".<locals>" if function else name
+            globals_ = set()
+            def declarations(n):
+                if isinstance(n, ast.Global):
+                    globals_.update(n.names)
+                elif not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    for child in ast.iter_child_nodes(n):
+                        declarations(child)
+            for n in node.body:
+                declarations(n)
+            child = Bindings(prefix, globals_)
+            if function:
+                for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs + [a for a in (node.args.vararg, node.args.kwarg) if a]:
+                    child.bind(a.arg)
+            for n in node.body:
+                child.visit(n)
+
+        def visit_FunctionDef(self, node):
+            self.scope(node, True)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            self.scope(node, False)
+
+        def visit_Lambda(self, node):
+            for d in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                self.visit(d)
+            # Lambda bindings cannot rebind the surrounding scope.
+
+        def visit_ListComp(self, node):
+            # Comprehension iteration variables have their own scope; walrus
+            # bindings escape to this scope, including inside the expression.
+            for n in ast.walk(node):
+                if isinstance(n, ast.NamedExpr):
+                    self.visit(n.target)
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+    Bindings().visit(tree)
+    return any(bindings.get(q, 0) > 1 for q in qualified)
+
+
 def previous_python_symbol_hashes(file_path) -> List[Dict[str, str]]:
     """Per-symbol hashes of a Python file under every previous basis (`PYTHON_PREVIOUS_BASES` order), computed on
     the running interpreter, to recognise a pin or tracked hash made with an older basis."""

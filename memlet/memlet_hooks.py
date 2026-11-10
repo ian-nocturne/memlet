@@ -28,6 +28,9 @@ Runtime
 
 from __future__ import annotations
 
+from .vocabulary import (HINT as TIER_HINT)
+from .vocabulary import suggested_label
+
 import contextlib
 import copy
 import difflib
@@ -1475,7 +1478,7 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     from memlet.memlet_dreamcycle import dream_status
     status_result = dream_status(root) if st.get("dream") else {}
     waiting = status_result.get("waiting", 0)
-    hints = status_result.get("counts", {}).get("hint", 0)
+    hints = status_result.get("counts", {}).get(TIER_HINT, 0)
     if not active and not stale and not reverify and not pending and not waiting and not hints:
         return None
     head = "Memlet verified rules (code anchors match; source cited):"
@@ -1488,7 +1491,7 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
                                 f"{pending} unapproved lesson(s), of which {hints} shown as unreviewed hint(s) (`memlet learn --pending`)")
     if waiting:
         status += f" {waiting} session(s) waiting to dream; run `memlet dream --via …`."
-    items = [f"- {_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
+    items = [f"- {suggested_label(a)}{_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
 
     def render(n: int) -> str:
         body = items[:n] if items else ["- (none)"]
@@ -1527,7 +1530,7 @@ def _edited_file(payload: Dict[str, Any], root: Path) -> Optional[Path]:
 
 def _flag_lines(affected: List[Dict[str, Any]]) -> List[str]:
     return [f"- {str(a.get('status', '')).upper()} `{_clean(a.get('anchor'), 120)}` ({_clean(a.get('reason'), 60)}): "
-            f"\"{_clean(a.get('rule'), 160)}\" — source {_clean(a.get('source'), 80)}" for a in affected[:_MAX_LISTED]]
+            f"{suggested_label(a)}\"{_clean(a.get('rule'), 160)}\" — source {_clean(a.get('source'), 80)}" for a in affected[:_MAX_LISTED]]
 
 
 def _post_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:

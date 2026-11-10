@@ -31,6 +31,9 @@ starts a daemon, calls a network or LLM, or opens `.env*` files or other secret 
 
 from __future__ import annotations
 
+from .vocabulary import (HINT as TIER_HINT, REJECTED as TIER_REJECTED)
+from .vocabulary import suggested_label
+
 import contextlib
 import fnmatch
 import hashlib
@@ -598,12 +601,12 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str, basis: Any = NE
     pin made by an exact provider is re-checked only by that same provider (same basis name); when it is unavailable
     the result carries `basisUnavailable` and is never compared."""
     if rel_path.startswith("/") or ".." in Path(rel_path).parts or _is_secret_path(rel_path):
-        return {"resolution": "rejected", "reason": "path_outside_repo_or_secret"}
+        return {"resolution": TIER_REJECTED, "reason": "path_outside_repo_or_secret"}
     target = root / rel_path
     try:
         target.resolve().relative_to(root)
     except (OSError, ValueError):
-        return {"resolution": "rejected", "reason": "path_outside_repo_or_secret"}
+        return {"resolution": TIER_REJECTED, "reason": "path_outside_repo_or_secret"}
     sig_info = extract_file_symbol_signatures(target)
     if not sig_info.get("__file_exists__"):
         return {"resolution": "missing", "reason": "missing_file"}
@@ -615,6 +618,10 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str, basis: Any = NE
     sig = (sig_info.get("symbols") or {}).get(symbol)
     if sig is None:
         return {"resolution": "missing", "reason": "missing_symbol"}
+    if target.suffix.lower() == ".py":
+        from .code_anchors import python_symbol_rebound
+        if python_symbol_rebound(target, symbol):
+            return {"resolution": "rebound", "reason": "symbol_rebound_in_module"}
     ast_hash = (extract_file_symbol_hashes(target).get(symbol) or sig.get("normAstHash") or sig.get("sigHash") or "")
     language = sig_info.get("__language__")
     lexical_ts = language in ("typescript", "javascript")
@@ -671,7 +678,7 @@ def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
         # recomputed on this interpreter, gives the pinned hash: unchanged code never turns stale by a basis bump
         legacy_match = any(_same_hash(h.get(anchor["symbol"]), pin.get("ast"))
                            for h in previous_python_symbol_hashes(root / anchor["path"]))
-    if cur["resolution"] in ("missing", "parse_error", "rejected"):
+    if cur["resolution"] in ("missing", "parse_error", TIER_REJECTED):
         status, reason = "stale", cur["reason"]
     elif cur["resolution"] != "exact":
         status, reason = "compatible-unverified", cur["reason"]
@@ -1416,7 +1423,7 @@ def _wiki_status(root: Path, *, dry_run: bool, output_format: str) -> Dict[str, 
         "anchors": classified,
     }
     if not initialized:
-        report["hint"] = "Run `memlet init` to create .memlet/wiki/; showing a read-only preview of instruction-file anchors."
+        report[TIER_HINT] = "Run `memlet init` to create .memlet/wiki/; showing a read-only preview of instruction-file anchors."
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = _format_markdown("Memlet Wiki", report)
     return report
@@ -1675,6 +1682,8 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
     Observing a symbol does not establish a baseline; only stored pins are compared. Accepted sidecar anchors are
     attached first; an anchor that only sidecar entries supply is marked `suggested: true`."""
     _attach_sidecar(root, rules)
+    from .memlet_bridge import enrich_promoted_rules
+    enrich_promoted_rules(root, rules)
     cache: Dict[str, Dict[str, Any]] = {}
     for r in rules:
         keys: List[str] = []
@@ -1756,14 +1765,40 @@ def classify_rule_quotes(root: Path, entries: List[Dict[str, Any]]) -> None:
         e["anchorReason"] = "; ".join(dict.fromkeys(a["reason"] for a in e["anchors"])) or "no_code_anchor"
 
 
+def _suggested_fields(rule, key=None):
+    keys = rule.get("suggestedAnchors") or []
+    if not keys:
+        return {}
+    ids = rule.get("sidecarIds") or {}
+    return {"suggested": True, "suggestedAnchors": list(keys), "sidecarIds": dict(ids),
+            "sidecarId": ids.get(key or keys[0])}
+
+
+def _anchor_rule_rows(rules, key):
+    return [{"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "source": f"{r['source']}:{r['line']}",
+             **_suggested_fields(r, key)} for r in rules if key in r.get("anchors", [])]
+
+
+def _anchor_lines(items):
+    lines = []
+    for a in items:
+        if a.get("rules"):
+            lines.extend(f"- `{a['anchor']}`: {a['reason']} — {suggested_label(r)}{r['rule']} (`{r['source']}`)"
+                         for r in a["rules"])
+        else:
+            lines.append(f"- {suggested_label(a)}`{a['anchor']}`: {a['reason']}")
+    return lines
+
+
 def pinned_anchor_report(root: Path) -> Dict[str, Any]:
     """Read-only current classification of all recorded pins and discovered symbol anchors."""
     pins = rule_anchor_pins(root)
-    raw = []
-    for rel, text in _source_texts(root, discover_instruction_files(root)):
+    raw, rules = [], []
+    for rel, text in list(_source_texts(root, discover_instruction_files(root))) + list(trusted_wiki_pages(root)):
         raw.extend(_extract_anchors(text, rel))
-    for rel, text in trusted_wiki_pages(root):
-        raw.extend(_extract_anchors(text, rel))
+        if not _is_generated_page(rel, text):
+            rules.extend(_extract_rules(_STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text)), rel))
+    _verify_rules(root, rules, pins, pin_source="pinned")
     merged = {f"{a['path']}::{a['symbol']}": a for a in _merge_anchors(raw)}
     for key, pin in pins.items():
         if "::" in key:
@@ -1783,6 +1818,7 @@ def pinned_anchor_report(root: Path) -> Dict[str, Any]:
             written = bool(a["sources"])
             a["sources"] = a["sources"] + [s for s in side_sources[k] if s not in a["sources"]]
             a["sidecarIds"] = sorted(side_ids[k])
+            a["rules"] = _anchor_rule_rows(rules, k)
             if not written:
                 a["suggested"] = True
         anchors.append(a)
@@ -2219,15 +2255,24 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         "",
         "### Active constraints (anchored symbols unchanged since pinning)",
     ]
-    lines += [f"- {a['rule']} (`{a['source']}`" + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "")
-              + ")" for a in c["activeConstraints"]] or ["- (none)"]
+    from .memlet_bridge import _lesson_quote_block
+    for a in c["activeConstraints"]:
+        if a.get("quoteLines"):
+            lines.append(f"- {suggested_label(a)}(`{a['source']}`)\n" + _lesson_quote_block(a))
+        else:
+            lines.append(f"- {suggested_label(a)}{a['rule']} (`{a['source']}`" +
+                         ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
+    if not c["activeConstraints"]:
+        lines.append("- (none)")
     if c.get("hints"):
         from memlet.memlet_bridge import hint_label, hint_item_label
-        lines += ["", "### " + hint_label(c["hints"])]
-        lines += ["- [hint; " + hint_item_label(h) + "] " + h["text"] + " (`" + "{file}:{start}-{end}".format(**h["cites"][0]) + "`)" for h in c["hints"]]
+        from .vocabulary import HINT_HELP
+        lines += ["", "### " + hint_label(c["hints"]), HINT_HELP]
+        lines += ["- [hint; " + hint_item_label(h) + "]" + ("\n" + _lesson_quote_block(h) if h.get("quoteLines") else
+                  " " + h["text"] + " (`" + "{file}:{start}-{end}".format(**h["cites"][0]) + "`)") for h in c["hints"]]
     if c.get("lexicalConstraints"):
         lines += ["", "### TS/JS constraints (lexical hash match only; re-check before use)"]
-        lines += [f"- {a['rule']} (`{a['source']}`)" for a in c["lexicalConstraints"]]
+        lines += [f"- {suggested_label(a)}{a['rule']} (`{a['source']}`)" for a in c["lexicalConstraints"]]
     if c.get("mode") == "index":
         src = c.get("indexSource") or {}
         lines += ["", "### Key rules (quoted verbatim from the instruction files; source unchanged since the index was built)"]
@@ -2254,7 +2299,7 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         lines += ["", f"### Project brief (LLM-written by {src.get('via') or 'n/a'} at {src.get('builtAt') or 'n/a'}; cited "
                   "instruction text unchanged since then — meaning and code behaviour are NOT verified; follow unless current "
                   "instructions say otherwise)"]
-        lines += [f"- {a['rule']} (`{a['source']}`)" for a in c.get("briefRules") or []] or [
+        lines += [f"- {suggested_label(a)}{a['rule']} (`{a['source']}`)" for a in c.get("briefRules") or []] or [
             "- (none — run `memlet brief-build` to create one)"]
         if c["omitted"].get("briefRules"):
             lines.append(f"- {c['omitted']['briefRules']} lower-priority brief line(s) omitted for the token budget; read the "
@@ -2265,7 +2310,7 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                          + "; ".join(f"`{a['source']}`" for a in (c.get("staleBrief") or [])) + " — re-read those lines")
     if c.get("mode") == "digest":
         lines += ["", "### Project rules (from instructions; not code-anchored — follow unless current instructions say otherwise)"]
-        lines += [f"- {a['rule']} (`{a['source']}`" + (f"; path not found: {', '.join(a['pathNotFound'])}" if a.get("pathNotFound")
+        lines += [f"- {suggested_label(a)}{a['rule']} (`{a['source']}`" + (f"; path not found: {', '.join(a['pathNotFound'])}" if a.get("pathNotFound")
                   else "") + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")"
                   for a in c.get("projectRules") or []] or ["- (none)"]
         if c["omitted"].get("projectRules"):
@@ -2275,14 +2320,14 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                        ("unpinnedAnchors", "Unpinned symbols (not verified)")):
         if c.get(key):
             lines += ["", "### " + label]
-            lines += [(f"- {a['rule']} (`{a['source']}`; {a['reason']}"
+            lines += [(f"- {suggested_label(a)}{a['rule']} (`{a['source']}`; {a['reason']}"
                        + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
                       if "rule" in a else f"- `{a['anchor']}`: {a['reason']}" for a in c[key]]
     if c["reverifyBeforeUse"]:
         lines += ["", "### Re-verify before use (compatible-unverified)"]
-        lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["reverifyBeforeUse"]]
+        lines += _anchor_lines(c["reverifyBeforeUse"])
     lines += ["", "### Quarantined stale anchors (not handed over)"]
-    lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["quarantinedStaleAnchors"]] or ["- (none)"]
+    lines += _anchor_lines(c["quarantinedStaleAnchors"]) or ["- (none)"]
     hidden_stale = c["omitted"].get("quarantinedStaleAnchors", 0)
     if hidden_stale:
         lines.append(f"- WARNING: {hidden_stale} more stale anchor(s) are quarantined but not listed here; do not follow any "
@@ -2464,10 +2509,12 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
                 item["suggestedAnchors"] = [_bounded_anchor(k) for k in r["suggestedAnchors"]]
                 item["sidecarIds"] = [r["sidecarIds"][k] for k in r["suggestedAnchors"] if k in (r.get("sidecarIds") or {})]
             elif "reason" in item and "anchor" in item and (by_key.get(item["anchor"]) or {}).get("sidecarIds"):
-                a = by_key[item["anchor"]]
-                if a.get("suggested"):
+                rows = _anchor_rule_rows(constraints, item["anchor"])
+                if rows and all(row.get("suggested") for row in rows):
                     item["suggested"] = True
-                item["sidecarIds"] = list(a["sidecarIds"])
+                item["sidecarIds"] = sorted({sid for row in rows for sid in row.get("sidecarIds", {}).values()})
+                if any(not row.get("suggested") for row in rows):
+                    item["rules"] = rows
 
 
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
@@ -2516,7 +2563,13 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     by_key = {a["anchor"]: a for a in anchors}
     def _active(r):
         if not digest:
-            return {"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
+            item = {"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
+            if r.get("quoteLines"):
+                from .vocabulary import LESSON_SEPARATOR
+                item.update({k: r[k] for k in ("quoteLines", "cites", "edgeSources")})
+                item["quoteLines"] = [_clip(line, _HANDOVER_TEXT_LIMIT) for line in r["quoteLines"]]
+                item["rule"] = LESSON_SEPARATOR.join(item["quoteLines"])
+            return item
         text, complete = _digest_compact(r["text"])
         item = {"rule": text, "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
         if not complete:
@@ -2547,8 +2600,9 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     _mark_suggested_items(lists, constraints, by_key)
     from memlet.memlet_bridge import dream_items
     # Only items the tier computation itself calls a hint, whatever a caller's provider returns.
-    lists["hints"] = [{"id": h["id"], "text": h["text"], "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint"}
-                      for h in dream_items(root, tiers=("hint",)).get("items", []) if h.get("tier") == "hint"]
+    lists["hints"] = [{"id": h["id"], "text": h["text"], "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint",
+                         **{k: h[k] for k in ("quoteLines", "edgeSources") if k in h}}
+                      for h in dream_items(root, tiers=(TIER_HINT,)).get("items", []) if h.get("tier") == TIER_HINT]
     seen_rejected = set()
     for text, src in [(t, "user") for t in (rejected or [])] + [(r["text"], f"{r['source']}:{r['line']}") for r in dead_ends]:
         text = _clip(str(text), _HANDOVER_TEXT_LIMIT)
@@ -2803,7 +2857,7 @@ def _days_between(a: str, b: str) -> int:
 def _bench_raw(root: Path, sc: Dict[str, Any]) -> Dict[str, Any]:
     text = _read_text(root / "CLAUDE.md")
     injected = [r["text"] for r in _extract_rules(text, "CLAUDE.md")]
-    return {"injected": injected, "handoverContext": text, "handoverActive": injected, "rejected": []}
+    return {"injected": injected, "handoverContext": text, "handoverActive": injected, TIER_REJECTED: []}
 
 
 def _bench_unverified_wiki(root: Path, sc: Dict[str, Any]) -> Dict[str, Any]:
@@ -2817,18 +2871,18 @@ def _bench_unverified_wiki(root: Path, sc: Dict[str, Any]) -> Dict[str, Any]:
             kept.append(e)
     injected = [e["text"] for e in kept if e["kind"] == "rule"]
     context = "\n".join(e["text"] for e in kept)
-    return {"injected": injected, "handoverContext": context, "handoverActive": injected, "rejected": []}
+    return {"injected": injected, "handoverContext": context, "handoverActive": injected, TIER_REJECTED: []}
 
 
 def _bench_memlet(root: Path, sc: Dict[str, Any]) -> Dict[str, Any]:
     imported = import_rules(root, source="claude-md", dry_run=True)
     injected = [r["text"] for r in imported["rules"] if r["status"] != "stale"]
-    out: Dict[str, Any] = {"injected": injected, "handoverContext": "", "handoverActive": injected, "rejected": []}
+    out: Dict[str, Any] = {"injected": injected, "handoverContext": "", "handoverActive": injected, TIER_REJECTED: []}
     if sc.get("handover"):
         cap = build_handover(root, next_step="Finish the refund flow refactor.")
         out["handoverContext"] = _render_handover(cap, cap["capsuleSignature"])
         out["handoverActive"] = [a["rule"] for a in cap["activeConstraints"]]
-        out["rejected"] = [a["approach"] for a in cap["rejectedApproaches"]]
+        out[TIER_REJECTED] = [a["approach"] for a in cap["rejectedApproaches"]]
         out["tokenEstimate"] = cap["tokenEstimate"]
     return out
 
@@ -2853,7 +2907,7 @@ def _score_mode(mode: str, sc: Dict[str, Any], result: Dict[str, Any]) -> Dict[s
         prevented = 0
         for dead_end in sc.get("deadEnds", []):
             hazards += 1
-            carried = dead_end in result["rejected"] if mode == "memlet" else dead_end in result["handoverContext"]
+            carried = dead_end in result[TIER_REJECTED] if mode == "memlet" else dead_end in result["handoverContext"]
             prevented += int(carried)
         for anchor in stale:
             hazards += 1

@@ -8,6 +8,8 @@ Every quoted line comes from the instruction file itself (masked), and only from
 current source (`load_verified_index`). Changed entries are reported, never quoted.
 """
 
+from .vocabulary import suggested_label
+
 import math
 import re
 from collections import Counter
@@ -167,7 +169,7 @@ def _index_stale_line(meta: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 def _quote_block(e: Dict[str, Any]) -> str:
-    status = f" [{e['anchorStatus']}: {e['anchorReason']}]" if "anchorStatus" in e else ""
+    status = " " + suggested_label(e) + f"[{e['anchorStatus']}: {e['anchorReason']}]" if "anchorStatus" in e else ""
     return "\n".join([f"- [{e['topic']}] `{e['source']}`{status}:"] + [f"  > {q}" for q in e["quote"].splitlines()])
 
 

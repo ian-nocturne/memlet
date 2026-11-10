@@ -20,7 +20,7 @@ from memlet import memlet_wiki as mw, memlet_hooks as mh, vendor_cli as vc
 
 class DreamFixture(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="memlet-d1-test-", dir="/private/tmp")
+        self.tmp = tempfile.TemporaryDirectory(prefix="memlet-d1-test-")
         self.base = Path(self.tmp.name).resolve()
         self.repo = self.base / "repo"
         self.repo.mkdir()
@@ -1006,7 +1006,7 @@ class ReviewRegressionTests(DreamFixture):
                        "Fix cache.py by checking the key first.", "Require CI before merging.", "Force pushing is not allowed.", "Tests are not optional.", "검증 우회를 허용하지 않는다.", "테스트를 생략하지 마세요.", "캐시 키를 검사해서 오류를 수정한다."):
             with self.subTest(negative=phrase): self.assertFalse(mb.permission_phrase(phrase))
         self.assertIn("phrase list",dc.TRUST_BOUNDARY)
-        self.assertIn("list of permission phrases",mb.HINT_LABEL)
+        self.assertIn("list of permission phrases",mb.HINT_HELP)
 
     def test_recall_notice_counts_only_hints_actually_returned(self):
         self.run_hint()

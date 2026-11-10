@@ -69,8 +69,10 @@ from .audit import BACKTICK_FILE_RE, EXCLUDED_DIRS, IGNORED_FILE_TOKENS, PYTHON_
 from .code_anchors import (_TS_JS_EXTS, _balanced_end, _blank_js_comments_preserve_lines, _collect_scoped_ast_nodes,
                            _extract_ts_js_signatures)
 
+from .vocabulary import FILE_SYMBOL, SINGLE_DEFINITION_FOUND
+
 SIDECAR_KEY = "sidecarAnchors"
-CONFIDENCES = ("file+symbol", "single-definition-found")  # strongest first; only the first is accepted in bulk
+CONFIDENCES = (FILE_SYMBOL, SINGLE_DEFINITION_FOUND)  # strongest first; only the first is accepted in bulk
 LEDGER_TABLE = "sidecar_anchor_events"
 _LEDGER_SCHEMA = ("CREATE TABLE IF NOT EXISTS sidecar_anchor_events (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id TEXT,"
                   " entry_sha256 TEXT, event_type TEXT, recorded_at TEXT)")
@@ -1138,7 +1140,7 @@ def _resolve(index: SymbolIndex, rule: Dict[str, Any]) -> Tuple[List[Dict[str, A
             if others:
                 amb.append(_ambiguous(rule, name, "several_bindings_in_named_file", [t] + others))
                 continue
-            sugg.append(_suggestion(rule, t, "file+symbol", name,
+            sugg.append(_suggestion(rule, t, FILE_SYMBOL, name,
                                     f"the rule names `{t['path']}` and `{name}`, defined there once at line {t['line']} ({t['kind']})"))
             continue
         cands = sorted(index.lookup(name), key=lambda e: (e["path"], e["line"], e["symbol"]))
@@ -1172,7 +1174,7 @@ def _resolve(index: SymbolIndex, rule: Dict[str, Any]) -> Tuple[List[Dict[str, A
                   + (", ".join(ns["paths"]) + (f" (+{ns['count'] - len(ns['paths'])} more)" if ns["count"] > len(ns["paths"]) else "")
                      if ns["count"] else "nothing")
                   + ("; that definition is in a test file" if t["test"] else "") + ". A proposal: check it before accepting.")
-        sg = _suggestion(rule, t, "single-definition-found", name, reason)
+        sg = _suggestion(rule, t, SINGLE_DEFINITION_FOUND, name, reason)
         sg["notScanned"] = ns
         sugg.append(sg)
     return sugg, amb, unresolved
@@ -1308,8 +1310,8 @@ def format_suggestions(res: Dict[str, Any]) -> str:
             lines.append(f"- `{a['source']}:{a['line']}` `{a['mention']}`: {a['reason']}"
                          + (f" — candidates: {cands}" if cands else "") + (f" (+{more} more)" if more > 0 else ""))
     lines += ["", "### Accepting", "",
-              f"- {levels.get('file+symbol', 0)} file+symbol: `memlet admin anchors accept --all-unique` (accepts only these)",
-              f"- {levels.get('single-definition-found', 0)} single-definition-found: by id only, after checking each: "
+              f"- {levels.get(FILE_SYMBOL, 0)} {FILE_SYMBOL}: `memlet admin anchors accept --all-unique` (accepts only these)",
+              f"- {levels.get(SINGLE_DEFINITION_FOUND, 0)} {SINGLE_DEFINITION_FOUND}: by id only, after checking each: "
               "`memlet admin anchors accept ID…`",
               "- Nothing is changed by this command. Accepting stores the anchor in `.memlet/config.json`; your files are "
               "never edited."]
@@ -1687,8 +1689,8 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
     current = {s["id"]: s for s in found["suggestions"]}
     attached = {e["id"]: e for e in sidecar_index(root, config)["attached"]}
     # bulk acceptance takes only file+symbol; a single-definition-found proposal needs its id (a human look)
-    selected_new = [i for i, s in current.items() if s["confidence"] == "file+symbol"] if all_unique else []
-    not_bulk = sorted(i for i, s in current.items() if s["confidence"] != "file+symbol") if all_unique else []
+    selected_new = [i for i, s in current.items() if s["confidence"] == FILE_SYMBOL] if all_unique else []
+    not_bulk = sorted(i for i, s in current.items() if s["confidence"] != FILE_SYMBOL) if all_unique else []
     repins, unknown = [], []
     for i in ids:
         if i in current:
@@ -1787,8 +1789,8 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
     lines += [f"- UNKNOWN `{i}` (not a current suggestion or attached entry; run `memlet admin anchors suggest`)" for i in unknown]
     lines += [f"- REFUSED `{r['id']}` `{r['anchor']}`: {r['reason']}" for r in refused]
     if not_bulk:
-        lines.append(f"- {len(not_bulk)} single-definition-found suggestion(s) were not accepted: --all-unique takes "
-                     "only file+symbol; check each and accept it by id (`memlet admin anchors accept ID…`)")
+        lines.append(f"- {len(not_bulk)} {SINGLE_DEFINITION_FOUND} suggestion(s) were not accepted: --all-unique takes "
+                     f"only {FILE_SYMBOL}; check each and accept it by id (`memlet admin anchors accept ID…`)")
     if not (accepted or repinned or unknown or refused):
         lines.append("- Nothing to accept.")
     lines.append("- Your files were not edited" + (" and nothing was written." if dry_run else "; the anchors live in `.memlet/config.json`."))
