@@ -88,6 +88,11 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
         tiers = {it["id"]: it for it in mb.dream_items(root_p, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING))["items"]}
         for node in result["nodes"]:
             node["tier"] = tiers.get(node["id"], {}).get("tier", TIER_PENDING)
+            node["reviewState"] = node["tier"]
+            node["inRecallCapsule"] = node["tier"] == TIER_APPROVED and node.get("inRecallCapsule", False)
+            node["verdict"] = ("ALREADY_SUPERSEDED" if node.get("isSuperseded") else "SUPPORTED") if node["tier"] == TIER_APPROVED else "PENDING"
+            if node["tier"] != TIER_APPROVED and node.get("verifiedBy") not in ("awaiting review", "citation not verified"):
+                node["verifiedBy"] = "awaiting review" if node.get("citationVerified") else "citation not verified"
             node["agreementBasis"] = tiers.get(node["id"], {}).get("agreementBasis")
             node["agreementLabel"] = tiers.get(node["id"], {}).get("agreementLabel", "no trusted agreement")
             for key in ("title", "scopeTag"):

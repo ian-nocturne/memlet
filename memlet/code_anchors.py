@@ -1181,6 +1181,18 @@ def python_symbol_rebound(file_path, symbol):
                 else:
                     self.bind(alias.asname or alias.name)
 
+        def visit_MatchAs(self, node):
+            if node.name:
+                self.bind(node.name)
+            self.generic_visit(node)
+
+        visit_MatchStar = visit_MatchAs
+
+        def visit_MatchMapping(self, node):
+            if node.rest:
+                self.bind(node.rest)
+            self.generic_visit(node)
+
         def visit_ExceptHandler(self, node):
             if node.name:
                 self.bind(node.name)
@@ -1240,7 +1252,8 @@ def python_symbol_rebound(file_path, symbol):
         visit_GeneratorExp = visit_ListComp
 
     Bindings().visit(tree)
-    return any(bindings.get(q, 0) > 1 for q in qualified)
+    return (any(bindings.get(q, 0) > 1 for q in qualified)
+            or symbol not in qualified and bindings.get(symbol, 0) > 0)
 
 
 def previous_python_symbol_hashes(file_path) -> List[Dict[str, str]]:

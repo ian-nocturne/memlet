@@ -2,10 +2,12 @@
 
 `memlet admin eval init --repo . --sessions session_logs --dream-until 2026-01-01`
 creates a run. Seal user-authored questions with `questions --run RUN --from questions.json`,
-answer with `run --run RUN --via codex --max-calls 20`, score with `score --run RUN`,
+answer with `run --run RUN --via claude --max-calls 20`, score with `score --run RUN`,
 and print `report --run RUN --format markdown`. `--repo` works before or after the action.
 `run`, `questions --via`, and `score --judge` explicitly call a model through your own CLI.
-They support `--dry-run` and `--max-calls` (per invocation). No model is called by default.
+They support `--dry-run` and `--max-calls` (per invocation). No model is called by default. Only `--via claude` currently has a verified tool-free launch;
+`--via codex` and `--via gemini` are refused, including dry runs. Use keyed questions for
+deterministic scoring: a different-vendor judge is currently unavailable.
 
 The default protocol is **prospective**. Items, nodes and their edges are admitted only
 when every recorded creation/proposal, verification and approval timestamp is usable

@@ -2137,7 +2137,7 @@ def estimate_tokens(text: str) -> int:
 def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
     # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
     extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
-    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints") if k in capsule)
+    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints", "approvedLessons", "listCapOmitted") if k in capsule)
     return HANDOVER_SIGNED_FIELDS + extra + observations
 
 
@@ -2264,6 +2264,10 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                          ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
     if not c["activeConstraints"]:
         lines.append("- (none)")
+    if c.get("approvedLessons"):
+        from .memlet_bridge import render_approved_lesson
+        lines += ["", "### Approved lessons (human-approved; transcript citations re-verified)"]
+        lines += [render_approved_lesson(i) for i in c["approvedLessons"]]
     if c.get("hints"):
         from memlet.memlet_bridge import hint_label, hint_item_label
         from .vocabulary import HINT_HELP
@@ -2288,7 +2292,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         if c["omitted"].get("ruleIndex"):
             lines.append(f"- {c['omitted']['ruleIndex']} more index entr(y/ies) omitted for the token budget; read the "
                          "project instructions for anything not listed here")
-        held = len(c.get("staleIndex") or []) + c["omitted"].get("staleIndex", 0)
+        held = (len(c.get("staleIndex") or []) + c["omitted"].get("staleIndex", 0)
+                + c.get("listCapOmitted", {}).get("staleIndex", {}).get("count", 0))
         if held:
             lines.append(f"- WARNING: {held} indexed rule(s) changed since the index was built (re-read before relying on "
                          "them): " + "; ".join(f"{a['topic']} `{a['source']}`" for a in (c.get("staleIndex") or [])))
@@ -2304,7 +2309,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         if c["omitted"].get("briefRules"):
             lines.append(f"- {c['omitted']['briefRules']} lower-priority brief line(s) omitted for the token budget; read the "
                          "project instructions for anything not listed here")
-        held = len(c.get("staleBrief") or []) + c["omitted"].get("staleBrief", 0)
+        held = (len(c.get("staleBrief") or []) + c["omitted"].get("staleBrief", 0)
+                + c.get("listCapOmitted", {}).get("staleBrief", {}).get("count", 0))
         if held:
             lines.append(f"- WARNING: {held} brief line(s) held back because their cited instructions changed: "
                          + "; ".join(f"`{a['source']}`" for a in (c.get("staleBrief") or [])) + " — re-read those lines")
@@ -2328,7 +2334,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         lines += _anchor_lines(c["reverifyBeforeUse"])
     lines += ["", "### Quarantined stale anchors (not handed over)"]
     lines += _anchor_lines(c["quarantinedStaleAnchors"]) or ["- (none)"]
-    hidden_stale = c["omitted"].get("quarantinedStaleAnchors", 0)
+    hidden_stale = (c["omitted"].get("quarantinedStaleAnchors", 0)
+                    + c.get("listCapOmitted", {}).get("quarantinedStaleAnchors", {}).get("count", 0))
     if hidden_stale:
         lines.append(f"- WARNING: {hidden_stale} more stale anchor(s) are quarantined but not listed here; do not follow any "
                      "rule whose anchor is not in the active list (run `memlet wiki` for the full list)")
@@ -2341,6 +2348,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         f"{health['compatible-unverified']} compatible-unverified · {health['stale']} stale",
         f"- Rules blocked as stale: {proof['staleRulesBlocked']} · unanchored rules not carried: {proof['unanchoredRulesOmitted']}",
     ]
+    for key, value in sorted(c.get("listCapOmitted", {}).items()):
+        lines.append("- Omitted over the %d-item cap: %s %d" % (value["cap"], key, value["count"]))
     dropped = {k: v for k, v in c["omitted"].items() if v}
     if dropped:
         lines.append("- Omitted for token budget: " + ", ".join(f"{k} {v}" for k, v in sorted(dropped.items())))
@@ -2518,7 +2527,7 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
 
 
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
-                   output_format: str = "json", write: bool = False, budget=None, mode=None) -> Dict[str, Any]:
+                   output_format: str = "json", write: bool = False, budget=None, mode=None, _lesson_items=None) -> Dict[str, Any]:
     """`memlet handover`: deterministic, checksummed (<500 token) Memlet handover capsule.
 
     Only rules whose anchors are all `active` are carried as constraints; `stale` anchors are quarantined
@@ -2599,10 +2608,13 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     }
     _mark_suggested_items(lists, constraints, by_key)
     from memlet.memlet_bridge import dream_items
+    lesson_items = (dream_items(root, tiers=("approved", TIER_HINT)).get("items", [])
+                    if _lesson_items is None else _lesson_items)
+    lists["approvedLessons"] = [i for i in lesson_items if i.get("tier") == "approved"]
     # Only items the tier computation itself calls a hint, whatever a caller's provider returns.
     lists["hints"] = [{"id": h["id"], "text": h["text"], "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint",
                          **{k: h[k] for k in ("quoteLines", "edgeSources") if k in h}}
-                      for h in dream_items(root, tiers=(TIER_HINT,)).get("items", []) if h.get("tier") == TIER_HINT]
+                      for h in lesson_items if h.get("tier") == TIER_HINT]
     seen_rejected = set()
     for text, src in [(t, "user") for t in (rejected or [])] + [(r["text"], f"{r['source']}:{r['line']}") for r in dead_ends]:
         text = _clip(str(text), _HANDOVER_TEXT_LIMIT)
@@ -2668,14 +2680,15 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
                 for f in ("anchors", "pathNotFound"):
                     if isinstance(a.get(f), list):
                         a[f] = [_mask(x) if isinstance(x, str) else x for x in a[f]]
-    omitted = {k: max(0, len(v) - caps[k]) for k, v in lists.items()}
+    capped = {k: max(0, len(v) - caps[k]) for k, v in lists.items()}
+    omitted = {k: 0 for k in lists}
     lists = {k: v[:caps[k]] for k, v in lists.items()}
     counts = _rule_counts(constraints)
     proof = {
         "modifiedFilesCount": _git_modified_count(root),
         "anchorHealth": _summarize(anchors),
         "staleRulesBlocked": counts["stale"],
-        "unanchoredRulesOmitted": counts["unanchored"],
+        "unanchoredRulesOmitted": sum(r["status"] == "unanchored" and r["source"] != DREAM_PROMOTED_PAGE for r in constraints),
     }
     next_action = _clip(next_step, _NEXT_ACTION_LIMIT) if next_step else None
     # Trim the least safety-critical items first until the rendered capsule fits the token budget. Quarantined stale
@@ -2690,11 +2703,13 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         drop_order = ("reverifyBeforeUse", "projectRules", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
     else:
         drop_order = ("reverifyBeforeUse", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
-    drop_order = ("hints", "lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
+    drop_order = ("hints", "approvedLessons", "lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
     floors = {"quarantinedStaleAnchors": min(_HANDOVER_QUARANTINE_FLOOR, caps["quarantinedStaleAnchors"])}
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
                    "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
+        if any(capped.values()):
+            capsule["listCapOmitted"] = {k: {"count": v, "cap": caps[k]} for k, v in capped.items() if v}
         if digest:
             capsule["mode"] = "digest"
         if index:

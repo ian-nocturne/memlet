@@ -881,7 +881,7 @@ class ReviewRegressionTests(DreamFixture):
                                dc.seal_receipt(dict(dc._receipt("gemini",n,"a"*24,{"model":"m"}),verdict="SUPPORTED"))]
             self.assertEqual("pending",mb.item_tier(n,snapshot=snap,config={}))
         hand=mw.build_handover(self.repo)
-        self.assertEqual({"id","text","cites","label"},set(hand["hints"][0]))
+        self.assertEqual({"id","text","cites","label","quoteLines","edgeSources"},set(hand["hints"][0]))
 
     def test_control_strings_rejected_and_snapshot_render_neutralized_without_rehash(self):
         b=self.ingest(); invalid=[]
@@ -1245,7 +1245,7 @@ class FinalReviewTests(DreamFixture):
         self.veto(node, "OUT_OF_EVIDENCE")
         self.veto(node, "SUPPORTED")
         self.save_graph(graph)
-        label = "vetoed by claude/sonnet: OUT_OF_EVIDENCE"
+        label = "vetoed by claude/sonnet: OUT_OF_EVIDENCE. The lesson makes a claim outside the cited evidence."
         self.assertEqual(label, mb.dream_items(self.repo, tiers=("pending",))["items"][0]["agreementLabel"])
         self.assertIn(label, mb.learn_pending(self.repo)["formatted"])
         from memlet.cli_dream import _markdown

@@ -12,7 +12,13 @@ HINT_LABEL = "Unreviewed hints — not approved by a person"
 HINT_HELP = ("Agreement basis is labelled per item; citations check out, but verify in code before relying on them. "
              "Screened against a list of permission phrases, never shown among verified items; "
              "the phrase list is not a proof that a hint cannot loosen a rule. "
-             "A trusted non-SUPPORTED verdict permanently vetoes the hint tier for that content; human approval still wins")
+             "A trusted non-SUPPORTED verdict permanently vetoes the hint tier for that content; human approval still wins.")
+VERDICT_HELP = {
+    "SUPPORTED": "The cited evidence supports the lesson and its relation.",
+    "MISSING_CONDITION": "The lesson omits a condition required by the cited evidence.",
+    "OUT_OF_EVIDENCE": "The lesson makes a claim outside the cited evidence.",
+    "WRONG_EDGE": "The cited evidence does not support the proposed relation.",
+}
 MODEL_AGREEMENT = "two models of the same vendor agreed"
 VENDOR_AGREEMENT = "two vendors agreed"
 JUDGE_UNAVAILABLE = ("Only claude can currently be launched, so a judge from a different vendor cannot exist in practice; "

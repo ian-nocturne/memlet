@@ -1464,12 +1464,13 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     from memlet import memlet_bridge as mb
     from memlet import memlet_wiki as mw
     cap = mw.build_handover(root, output_format="json", write=False, budget=2000, mode="verified")
-    active = [a for a in cap.get("activeConstraints") or [] if isinstance(a, dict)]
+    active = [a for a in cap.get("activeConstraints") or [] if isinstance(a, dict)
+              and not str(a.get("source", "")).startswith(mb.PROMOTED_PAGE + ":")]
     health = (cap.get("executionProof") or {}).get("anchorHealth") or {}
     stale = int(health.get("stale") or 0)
     reverify = int(health.get("compatible-unverified") or 0)
     omitted = int((cap.get("omitted") or {}).get("activeConstraints") or 0)
-    pend = mb.learn_pending(root)
+    pend = mb.learn_pending(root, _record_review=False)
     pending: Optional[int] = None
     if isinstance(pend, dict) and pend.get("ok") and isinstance(pend.get("counts"), dict):
         pending = int(pend["counts"].get("pendingNodes") or 0)
@@ -1479,7 +1480,8 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     status_result = dream_status(root) if st.get("dream") else {}
     waiting = status_result.get("waiting", 0)
     hints = status_result.get("counts", {}).get(TIER_HINT, 0)
-    if not active and not stale and not reverify and not pending and not waiting and not hints:
+    approved = mb.dream_items(root)["counts"]["approved"]
+    if not active and not stale and not reverify and not pending and not waiting and not hints and not approved:
         return None
     head = "Memlet verified rules (code anchors match; source cited):"
     pending_part = ("" if pending is None else
@@ -1489,6 +1491,8 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     if st.get("dream") and pending is not None:
         status = status.replace(f"{pending} lesson(s) pending human approval (`memlet learn --pending`)",
                                 f"{pending} unapproved lesson(s), of which {hints} shown as unreviewed hint(s) (`memlet learn --pending`)")
+    if approved:
+        status += f" {approved} approved lesson(s); read `memlet recall` or `memlet handover`."
     if waiting:
         status += f" {waiting} session(s) waiting to dream; run `memlet dream --via …`."
     items = [f"- {suggested_label(a)}{_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
@@ -1543,7 +1547,9 @@ def _post_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
         _log(root, "post-tool-use", "check failed: exitCode=2")
         return None
     flagged = [a for a in res.get("affected") or [] if isinstance(a, dict) and a.get("status") in _FLAG_STATES]
-    if not flagged:
+    approved = res.get("approvedLessons", [])
+    hints = res.get("hints", [])
+    if not flagged and not approved and not hints:
         return None
     rel = (res.get("changedFiles") or [p.name])[0]
     stale = sum(1 for a in flagged if a.get("status") == "stale")
@@ -1554,6 +1560,15 @@ def _post_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
         + _flag_lines(flagged) + ([f"- (+{more} more: `memlet check --changed`)"] if more > 0 else [])
         + ["Re-read each rule at its source and tell the user. If the change is intended, the user decides whether to "
            "re-pin with `memlet check --accept <anchor>`; do not re-pin on your own."])
+    if not flagged:
+        text = "Memlet: lessons touching `" + _clean(rel, 200) + "`:"
+    if approved:
+        text += "\n\n### Approved lessons\n" + "\n".join(mb.render_approved_lesson(i) for i in approved[:_MAX_LISTED])
+    if hints:
+        text += "\n\n### " + mb.HINT_LABEL + "\n" + mb.HINT_HELP + "\n" + "\n".join(
+            "- [hint; " + mb.hint_item_label(i) + "]\n" + mb._lesson_quote_block(i) for i in hints[:_MAX_LISTED])
+    if not flagged:
+        return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}
     first = flagged[0]
     msg = (f"Memlet: {stale} stale / {len(flagged) - stale} re-verify rule(s) after editing {_clean(rel, 80)} "
            f"(e.g. {_clean(first.get('source'), 60)})")

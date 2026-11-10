@@ -228,7 +228,9 @@ class EvalIntegration(Scratch):
         self.assertEqual([], ev._state(self.root, 'questions')['calls'])
         for args in [('--help',), ('admin', '--help')]:
             help_text = self.cli(*args).stdout
-            for command in ('memlet dream:', 'memlet admin anchors:', 'memlet admin eval:'):
+            self.assertIn('dream', help_text)
+            self.assertNotIn('memlet dream:', help_text)
+            for command in ('memlet admin anchors:', 'memlet admin eval:'):
                 self.assertIn(command, help_text)
         from memlet import vocabulary as v
         self.assertIs(mb.HINT_LABEL, v.HINT_LABEL)
@@ -560,7 +562,8 @@ class DreamPromptIntegration(Scratch):
             self.assertTrue(result['ok'], result)
             self.assertEqual(len(bad), result['rejectedCandidates'])
             graph, _ = mb._load_queue(repo)
-            self.assertEqual([fid + ':1', fid + ':2'], [p['span'] for p in graph['nodes'][0]['allPins']])
+            self.assertEqual([fid + ':1-2'], [p['span'] for p in graph['nodes'][0]['allPins']])
+            self.assertEqual([fid + ':1', fid + ':2'], [p['span'] for p in md.lesson_lines(graph['nodes'][0])])
             self.assertEqual(4, result['normalizedSpans'])
 
     def test_unsafe_characters_in_tail_still_fail_every_span_field(self):
@@ -698,6 +701,574 @@ class DreamPromptIntegration(Scratch):
                         self.assertEqual(['rejectedCandidates', 'rejectionSummary'], list(report)[:2])
                         self.assertIn(self.meaning, report['formatted'])
                         self.assertLess(report['formatted'].index('Rejected candidates:'), report['formatted'].index('waiting to dream'))
+
+
+
+
+class ApprovedReadersIntegration(Scratch):
+    """The live five-line queue shape, built by ingest + injected proposers, never copied."""
+    kinds = ('RESOLVES', 'BLOCKS', 'GOVERNS', 'SUPERSEDES', 'multi-line', 'single-line',
+             'cross_session_conflict', 'open_trap')
+
+    def save_graph(self,repo,graph):
+        previous=md.graph_sha256(mb._load_queue(repo)[0])
+        md._commit_queue_and_db(repo/mb.QUEUE_REL,json.dumps(graph),repo/mb.DB_REL,graph,replaces_sha=previous)
+
+    def fixture(self, state='approved', kinds=None):
+        repo = self.root / state
+        repo.mkdir()
+        (repo / 'AGENTS.md').write_text('# Fixture\n- Always keep `anchor.py::guard` enabled.\n')
+        (repo / 'anchor.py').write_text('def guard():\n    return True\n')
+        (repo / 'deploy.py').write_text('# scope file with no symbol anchor\n')
+        self.assertTrue(mw.init_project(repo)['ok'])
+        subprocess.run(['git','-C',str(repo),'init','-q'],check=True,capture_output=True)
+        subprocess.run(['git','-C',str(repo),'add','AGENTS.md','anchor.py','deploy.py'],check=True,capture_output=True)
+        subprocess.run(['git','-C',str(repo),'-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+                        '-c','core.hooksPath='+str(self.base/'no-hooks'),'commit','-qm','fixture'],check=True,capture_output=True)
+        (repo/'deploy.py').write_text('# changed scope file\n')
+        config, _ = mb._load_config(repo)
+        config['dream'] = {'agreement': 'model', 'models': {'claude':'haiku', 'verifier':{'claude':'sonnet'}}}
+        mw.write_managed_text(repo, mw.CONFIG_PATH, json.dumps(config))
+        lines, specs = [], []
+        for kind in kinds or self.kinds:
+            start = len(lines) + 1
+            text = 'Deploy %s requires a warm cache before the smoke check.' % kind
+            if kind == 'SUPERSEDES':
+                text = 'Deploys go out with `make release` from the main branch.'
+            lines.append('2026-11-11T10:%02d:00Z [user] %s' % (len(lines), text))
+            if kind in ('RESOLVES', 'multi-line', 'SUPERSEDES'):
+                text = ('From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first.'
+                        if kind == 'SUPERSEDES' else 'Deploy %s succeeds after warming the cache; the smoke test passed.' % kind)
+                lines.append('2026-11-11T10:%02d:00Z [assistant] %s' % (len(lines), text))
+            specs.append((kind, start, len(lines)))
+        if kinds == ('RESOLVES','BLOCKS'):
+            lines = [line + ' Preserve the warm cache through the entire smoke test.' * 18 for line in lines]
+        source = repo / 'session.log'
+        source.write_text('\n'.join(lines) + '\n')
+        self.assertTrue(dc.dream_ingest(repo, source)['ok'])
+        fid = dc.dream_next(repo)['rows'][0][0]
+        candidates = []
+        for kind, start, end in specs:
+            edge = kind if kind in ('RESOLVES','BLOCKS','GOVERNS','SUPERSEDES') else 'RESOLVES'
+            cat = {'SUPERSEDES':'superseded_directive', 'BLOCKS':'repeated_pitfall',
+                   'GOVERNS':'repeated_pitfall', 'cross_session_conflict':'cross_session_conflict',
+                   'open_trap':'verified_workaround'}.get(kind, 'verified_workaround')
+            spans = ['%s:%d' % (fid, n) for n in range(start, end + 1)]
+            item = {'category':cat, 'title':kind, 'scope_tag':'deploy.py', 'src_spans':spans,
+                    'edges':[{'edge_type':edge, 'target':'deploy cache ' + kind, 'src_span':spans[-1]}]}
+            if start != end:
+                item['edges'][0]['target_span'] = spans[0]
+            if kind == 'SUPERSEDES': item['superseded_by_src'] = spans[-1]
+            candidates.append(item)
+        def runner(vendor, prompt, **kwargs):
+            return json.dumps(candidates)
+        self.assertTrue(dc.dream_run(repo, via=('claude',) if state in ('pending','vetoed') else ('claude','codex'),
+                                     runner=runner)['ok'])
+        graph = mb._load_queue(repo)[0]
+        self.assertEqual(len(candidates), len(graph['nodes']))
+        for node in graph['nodes']:
+            if node['title']=='open_trap': node['statusKind']='open_trap'
+        self.save_graph(repo,graph)
+        ids = [n['id'] for n in graph['nodes']]
+        if state in ('approved','edge-rejected'):
+            self.assertTrue(mb.learn_approve(repo, ids, approver='Fixture reviewer')['ok'])
+        if state == 'rejected':
+            self.assertTrue(mb.learn_reject(repo, ids, approver='Fixture reviewer')['ok'])
+        if state == 'edge-rejected':
+            self.assertTrue(mb.learn_reject(repo, [n['edges'][0]['edgeId'] for n in graph['nodes']], approver='Fixture reviewer')['ok'])
+        if state == 'vetoed':
+            for n in graph['nodes']:
+                record = dc._receipt('claude', n, 'f'*24, {'model':'sonnet'})
+                n['verification'] = [dc.seal_receipt(dict(record, verdict='MISSING_CONDITION'))]
+            self.save_graph(repo,graph)
+        return repo, {n['title']:n for n in mb._load_queue(repo)[0]['nodes']}
+
+    def test_kind_state_reader_matrix(self):
+        for state in ('approved','hint','pending','rejected','edge-rejected','vetoed'):
+            with self.subTest(state=state):
+                repo, nodes = self.fixture(state)
+                before = {n['id']:(md.node_approval_digest(n), dc.trust_digest(n), copy.deepcopy(n['allPins'])) for n in nodes.values()}
+                projection = mb.dream_items(repo, tiers=('approved','hint','pending'))
+                actual = {i['id']:i for i in projection['items']}
+                approved = set(n['id'] for n in nodes.values()) if state == 'approved' else set()
+                recall = mb.unified_recall(repo, 'deploy release make', budget=32000)
+                handovers = {mode:mw.build_handover(repo, mode=mode, budget=32000, output_format='markdown')
+                             for mode in ('verified','digest')}
+                changed = mb.changed_check(repo, files=['deploy.py'])
+                pending = mb.learn_pending(repo)
+                promotion = mb.promote_approved(repo)
+                self.assertTrue(promotion['ok'], promotion)
+                page = (repo / mb.PROMOTED_PAGE).read_text() if (repo / mb.PROMOTED_PAGE).exists() else ''
+                session = mh._session_start(repo, {}, {'dream':True, 'tokens':4000})
+                session_text = (session or {}).get('hookSpecificOutput', {}).get('additionalContext','')
+                post = mh._post_tool_use(repo, {'tool_input':{'file_path':str(repo / 'deploy.py')}}, {})
+                post_text = (post or {}).get('hookSpecificOutput', {}).get('additionalContext','')
+                snap = mb._load_snapshot(repo)[0]
+                contexts = ev.build_contexts(repo, {'run':'matrix', 'protocol':'retrospective', 'hints':False,
+                    'budget':32000,'dreamUntil':'2026-12-01','dream':[{'file':f,'lines':ls} for f,ls in snap.items()]},
+                    {'text':'deploy release make cache'})
+                groups = {'dream_items': [i for i in actual.values() if i['tier']=='approved'],
+                          'recall JSON':recall['sections']['dream'], 'check --changed':changed['approvedLessons']}
+                for mode, hand in handovers.items():
+                    groups['handover '+mode] = hand['approvedLessons']
+                    self.assertTrue(mw.verify_handover_checksum(hand), mode)
+                    self.assertTrue(mw.verify_handover_markdown(hand['formatted']), mode)
+                    self.assertEqual(0,hand['executionProof']['unanchoredRulesOmitted'])
+                    self.assertFalse(any('make release' in i['rule'] for i in hand['activeConstraints']+hand.get('projectRules', [])))
+                for reader, items in groups.items():
+                    with self.subTest(reader=reader): self.assertEqual(approved, {i['id'] for i in items})
+                texts = {'recall markdown':recall['formatted'], 'promoted page':page, 'PostToolUse':post_text,
+                         'check markdown':changed['formatted']}
+                texts.update({'handover '+mode:hand['formatted'] for mode, hand in handovers.items()})
+                texts.update({arm:contexts[arm]['text'] for arm in ('flat','graph','handover')})
+                for kind, node in nodes.items():
+                    with self.subTest(kind=kind):
+                        expected_tier = ('approved' if state=='approved' else 'hint' if state=='hint' and kind not in ('GOVERNS','SUPERSEDES')
+                                         else 'pending')
+                        if state=='rejected': self.assertNotIn(node['id'],actual)
+                        else: self.assertEqual(expected_tier,actual[node['id']]['tier'])
+                        fields = md.lesson_display_fields(node)
+                        for reader, text in texts.items():
+                            if state=='approved':
+                                for quote in fields['quoteLines']:
+                                    self.assertIn(quote,text,(kind,reader))
+                            elif reader in ('promoted page','flat','graph','handover'):
+                                self.assertNotIn(fields['quoteLines'][0],text,(kind,reader))
+                        if state=='approved': self.assertNotIn(node['id'], {i['id'] for i in pending['pendingNodes']})
+                        if state in ('hint','pending','vetoed'):
+                            self.assertIn(node['id'], {i['id'] for i in pending['pendingNodes']})
+                        if state=='approved' and kind=='SUPERSEDES':
+                            for reader,text in texts.items():
+                                self.assertIn('replaced — do not apply as current',text,reader)
+                                self.assertIn('current instruction',text,reader)
+                                self.assertIn('SUPERSEDES source',text,reader)
+                            self.assertEqual(['replaced','current'],actual[node['id']]['lineRoles'])
+                            self.assertTrue(actual[node['id']]['quarantined'])
+                        if node['id'] in actual:
+                            for cite in actual[node['id']]['cites']:
+                                self.assertTrue(cite['verified'])
+                                full_line=snap[Path(cite['file']).name][cite['start']-1]
+                                self.assertEqual(md.sha256_hex(full_line),cite['sha256'])
+                self.assertEqual(approved,set(promotion['promoted']))
+                if approved:
+                    self.assertIn('%d approved lesson(s)' % len(approved),session_text)
+                    self.assertIn('## Replaced instructions (do not apply as current)',page)
+                    self.assertIn('<!-- memlet:dream-page ',page)
+                for node in nodes.values(): self.assertNotIn(md.lesson_text(node),session_text)
+                self.assertEqual([],mb.changed_check(repo,files=['unrelated.py'])['approvedLessons'])
+                self.assertFalse(any('make release' in i['quote'] for i in recall['sections']['rules']))
+                for node in mb._load_queue(repo)[0]['nodes']:
+                    self.assertEqual(before[node['id']],(md.node_approval_digest(node),dc.trust_digest(node),node['allPins']))
+                if state=='pending': self.assertIn('verification=none',pending['formatted'])
+                if state=='approved':
+                    for args in [('recall','deploy release make','--repo',str(repo),'--budget','32000'),
+                                 ('handover',str(repo),'--budget','32000'),
+                                 ('handover',str(repo),'--mode','digest','--budget','32000'),
+                                 ('check',str(repo),'--changed')]:
+                        for fmt in ('json','markdown'):
+                            result = self.cli(*args,'--format',fmt)
+                            self.assertEqual(0,result.returncode,(args,fmt,result.stdout,result.stderr))
+                            self.assertIn('scripts/deploy.sh',result.stdout)
+                            if fmt=='json': json.loads(result.stdout)
+
+    def test_budget_order_checksum_and_omissions(self):
+        repo,nodes=self.fixture('approved',('RESOLVES','BLOCKS'))
+        # Return one item to the trusted hint tier by removing its human decision.
+        graph=mb._load_queue(repo)[0]
+        graph['nodes'][1].pop('approval')
+        graph['nodes'][1]['verdict']='PENDING'
+        self.save_graph(repo,graph)
+        self.assertTrue(mb.promote_approved(repo)['ok'])
+        for mode in ('verified','digest'):
+            full=mw.build_handover(repo,mode=mode,budget=10000,output_format='markdown')
+            self.assertEqual((1,1,1),(len(full['hints']),len(full['approvedLessons']),len(full['activeConstraints'])))
+            self.assertLess(full['formatted'].index('### Active constraints'),full['formatted'].index('### Approved lessons'))
+            self.assertLess(full['formatted'].index('### Approved lessons'),full['formatted'].index('### '+HINT_LABEL))
+            previous=full
+            seen=set()
+            for budget in range(full['tokenEstimate'],300,-30):
+                hand=mw.build_handover(repo,mode=mode,budget=budget,output_format='markdown')
+                seen.add((len(hand['hints']),len(hand['approvedLessons']),len(hand['activeConstraints'])))
+                if hand['omitted']['approvedLessons']: self.assertFalse(hand['hints'])
+                if hand['omitted']['activeConstraints']: self.assertFalse(hand['approvedLessons'])
+                for key in ('hints','approvedLessons','activeConstraints'):
+                    self.assertEqual(len(full[key]),len(hand[key])+hand['omitted'][key])
+                self.assertTrue(mw.verify_handover_checksum(hand))
+                self.assertTrue(mw.verify_handover_markdown(hand['formatted']))
+                previous=hand
+            self.assertIn((0,1,1),seen)
+            self.assertIn((0,0,1),seen)
+            tampered=copy.deepcopy(full);tampered['approvedLessons'][0]['text']='tampered'
+            self.assertFalse(mw.verify_handover_checksum(tampered))
+            self.assertFalse(mw.verify_handover_markdown(full['formatted'].replace('warm cache','cold cache')))
+
+    def test_verdict_vocabulary_help_and_selftest_markdown(self):
+        from memlet.vocabulary import VERDICT_HELP
+        self.assertEqual(set(dc.VERDICTS),set(VERDICT_HELP))
+        self.assertTrue(HINT_HELP.endswith('.'))
+        repo,nodes=self.fixture('pending',('BLOCKS',))
+        graph=mb._load_queue(repo)[0]; node=graph['nodes'][0]
+        for verdict,sentence in VERDICT_HELP.items():
+            record=dc._receipt('claude',node,'a'*24,{'model':'sonnet'})
+            node['verification']=[dc.seal_receipt(dict(record,verdict=verdict))]
+            self.save_graph(repo,graph)
+            if verdict!='SUPPORTED':
+                for text in (mb.learn_pending(repo)['formatted'],json.dumps(mb.dream_items(repo,tiers=('pending',))),
+                             json.dumps(dc.dream_status(repo))): self.assertIn(sentence,text)
+        for command in ('anchors','eval'):
+            self.assertIn('usage: memlet admin '+command,self.cli('admin',command,'--help').stdout)
+        help_text=' '.join(self.cli('init','--help').stdout.split())
+        self.assertIn('Stop and PreCompact snapshot',help_text)
+        result=self.cli('admin','eval','selftest','--format','markdown')
+        self.assertEqual(0,result.returncode,result.stdout+result.stderr)
+        self.assertTrue(result.stdout.startswith('## Memlet eval selftest'),result.stdout[:200])
+        self.assertIn('prospective',result.stdout)
+        self.assertIn('retrospective',result.stdout)
+        self.assertIn('Arm | n | accuracy',result.stdout)
+
+    def test_legacy_cross_node_supersession_uses_the_same_quarantine(self):
+        repo,_=self.fixture('pending',('multi-line',))
+        snap=mb._load_snapshot(repo)[0];fid=next(iter(snap))
+        graph=md.dream_pin_and_validate([
+            {'lesson_id':'OLD','category':'repeated_pitfall','scope_tag':'deploy.py','title':'Old deploy rule',
+             'src_spans':[fid+':1']},
+            {'lesson_id':'NEW','category':'verified_workaround','scope_tag':'deploy.py','title':'Current deploy rule',
+             'src_spans':[fid+':2'],'edges':[{'edge_type':'SUPERSEDES','to_id':'OLD',
+                'src_span':fid+':2','target_span':fid+':1'}]}],snap)
+        self.save_graph(repo,graph)
+        self.assertTrue(mb.learn_approve(repo,['OLD','NEW'],approver='Reviewer')['ok'])
+        items={i['id']:i for i in mb.dream_items(repo)['items']}
+        self.assertTrue(items['OLD']['quarantined'])
+        self.assertNotIn('quarantined',items['NEW'])
+        self.assertEqual(['replaced','current'],items['OLD']['lineRoles'])
+        self.assertNotIn('OLD',{e['dreamId'] for e in mb.promoted_rule_entries(repo)[0]})
+        for result in (mb.unified_recall(repo,'deploy',budget=5000),
+                       mw.build_handover(repo,budget=2000,output_format='markdown')):
+            self.assertIn('replaced — do not apply as current',result['formatted'])
+            self.assertIn('SUPERSEDES source',result['formatted'])
+        # A changed replacement cannot leave its old rule active in the approved group.
+        (repo/mb.SNAPSHOT_REL/fid).write_text(snap[fid][0]+'\nchanged replacement\n')
+        self.assertEqual([],mb.dream_items(repo)['items'])
+
+
+class FinalAuditIntegration(Scratch):
+    fixture = ApprovedReadersIntegration.fixture
+    save_graph = ApprovedReadersIntegration.save_graph
+    kinds = ApprovedReadersIntegration.kinds
+    prepare = DreamPromptIntegration.prepare
+    lines = DreamPromptIntegration.lines
+
+    def test_primary_pin_cross_session_and_per_candidate_ontology(self):
+        self.write('AGENTS.md', '# Fixture\n')
+        mw.init_project(self.root)
+        for name, text in [('b-old.log','2026-01-01T00:00:00Z [user] Deploy with make release.'),
+                           ('a-new.log','2026-02-01T00:00:00Z [user] Deploy only with scripts/deploy.sh.')]:
+            dc.dream_ingest(self.root, self.write(name, text+'\n'))
+        batch = dc.dream_next(self.root)
+        files = {f.split('-')[0]: f for f, _, _ in batch['rows']}
+        old, new = files['b']+':1', files['a']+':1'
+        pair = {'category':'superseded_directive','title':'replace deployment','scope_tag':'deploy',
+                'src_spans':[old,new], 'superseded_by_src':new,
+                'edges':[{'edge_type':'SUPERSEDES','target':'old deploy','src_span':new,'target_span':old}]}
+        good = {'category':'repeated_pitfall','title':'keep checks','scope_tag':'deploy','src_spans':[new],
+                'edges':[{'edge_type':'BLOCKS','target':'cold cache','src_span':new}]}
+        invalid = dict(good, title='ontology rejection')
+        real = md.verify_ontology_contract
+        def verify(graph, snapshot):
+            if len(graph['nodes']) == 1 and graph['nodes'][0]['title']=='ontology rejection':
+                return {'ok':False}
+            return real(graph, snapshot)
+        with mock.patch.object(md,'verify_ontology_contract',side_effect=verify):
+            result=dc.dream_run(self.root, runner=lambda *a,**k:json.dumps([pair,invalid,good]))
+        self.assertTrue(result['ok'],result)
+        self.assertEqual(1,result['rejectedCandidates'])
+        node=next(n for n in mb._load_queue(self.root)[0]['nodes'] if n['category']=='superseded_directive')
+        self.assertEqual(old,node['primaryPin']['span'])
+        self.assertEqual(node['primaryPin'],node['allPins'][0])
+        self.assertTrue(node['timestamp'].startswith('2026-01-01'))
+        self.assertEqual(new,node['supersededByPin']['span'])
+        self.assertTrue(mb.learn_approve(self.root,[node['id']],approver='reviewer')['ok'])
+        item=mb.dream_items(self.root)['items'][0]
+        self.assertIn('replaced — do not apply as current',mb.render_approved_lesson(item))
+        # Active sources with an inline OLD endpoint must label the old and new pins correctly too.
+        source=copy.deepcopy(node)
+        source.update(statusKind='active_lesson',category='verified_workaround',verdict='SUPPORTED',
+                      primaryPin=node['supersededByPin'],supersededByPin=None)
+        source['edges'][0].update(fromId=source['id'],toId=source['id']+':OLD')
+        projected=md.supersession_display_node(source,{'nodes':[source],'edges':source['edges']})
+        fields=md.lesson_display_fields(projected)
+        roles=dict(zip(fields['quoteLines'],fields['lineRoles']))
+        self.assertEqual('replaced',roles['Deploy with make release.'])
+        self.assertEqual('current',roles['Deploy only with scripts/deploy.sh.'])
+        inline_repo,_,fid=self.prepare('inline',lines=['2026-01-01T00:00:00Z [user] Deploy with make release.',
+                                                     '2026-02-01T00:00:00Z [user] Deploy only with scripts/deploy.sh.'])
+        active={'category':'verified_workaround','title':'current deploy','scope_tag':'deploy', 'src_spans':[fid+':2'],
+                'edges':[{'edge_type':'SUPERSEDES','target':'old deploy','src_span':fid+':2','target_span':fid+':1'}]}
+        result=dc.dream_run(inline_repo,runner=lambda *a,**kw:json.dumps([active]))
+        self.assertTrue(result['ok'],result)
+        current=mb._load_queue(inline_repo)[0]['nodes'][0]
+        self.assertEqual(fid+':2',current['primaryPin']['span'])
+        self.assertTrue(current['timestamp'].startswith('2026-02-01'))
+        self.assertTrue(mb.learn_approve(inline_repo,[current['id']],approver='reviewer')['ok'])
+        snapshot=mb._load_snapshot(inline_repo)[0]
+        contexts=ev.build_contexts(inline_repo,{'run':'inline','protocol':'retrospective','hints':False,'budget':32000,
+            'dreamUntil':'2026-12-01','dream':[{'file':f,'lines':ls} for f,ls in snapshot.items()]},{'text':'deploy'})
+        texts=[mb.unified_recall(inline_repo,'deploy',budget=4000)['formatted'],
+               mw.build_handover(inline_repo,budget=4000,output_format='markdown')['formatted'],
+               md.run_dream_recall(inline_repo/mb.QUEUE_REL,snapshot_path=inline_repo/mb.SNAPSHOT_REL,query_text='deploy',budget_tokens=4000)['formatted']]
+        texts += [contexts[arm]['text'] for arm in ('flat','graph','handover')]
+        for text in texts:
+            self.assertIn('replaced — do not apply as current: Deploy with make release.',text)
+            self.assertIn('current instruction: Deploy only with scripts/deploy.sh.',text)
+
+    def test_fresh_review_lists_every_line_and_binds_the_displayed_digest(self):
+        repo,nodes=self.fixture('approved',('multi-line',))
+        node=nodes['multi-line']; path=repo/mb.SNAPSHOT_REL/Path(node['primaryPin']['span'].split(':')[0])
+        original=path.read_text().splitlines()
+        def change(text):
+            path.write_text(original[0]+'\n2026-11-11T10:01:00Z [assistant] '+text+'\n')
+        change('Never skip the required deploy safety check.')
+        mh._session_start(repo,{}, {'dream':True,'tokens':4000})
+        self.assertFalse((repo/mb.DREAM_DIR/md.CITATION_REVIEWS_FILE).exists())
+        self.assertFalse(mb.learn_approve(repo,[node['id']],approver='reviewer',refresh_citations=True)['ok'])
+        stale=mb.learn_pending(repo)
+        row=stale['pendingNodes'][0]
+        self.assertEqual([False,True],[c['changed'] for c in row['currentCitations']])
+        self.assertIn('[unchanged]',stale['formatted']); self.assertIn('[changed]',stale['formatted'])
+        self.assertIn('Never skip the required deploy safety check.',stale['formatted'])
+        digest=row['reviewDigest']
+        change('Never bypass the updated safety check either.')
+        mh._session_start(repo,{}, {'dream':True,'tokens':4000})  # counts cannot silently refresh the review receipt
+        refused=mb.learn_approve(repo,[node['id']],approver='reviewer',refresh_citations=True)
+        self.assertFalse(refused['ok'],refused)
+        self.assertIn('fresh_review_required_or_changed',str(refused))
+        fresh=mb.learn_pending(repo)
+        self.assertNotEqual(digest,fresh['pendingNodes'][0]['reviewDigest'])
+        approved=mb.learn_approve(repo,[node['id']],approver='reviewer',refresh_citations=True)
+        self.assertTrue(approved['ok'],approved)
+        current=mb.dream_items(repo)['items'][0]
+        self.assertIn('updated safety check',current['text'])
+        self.assertEqual('approved',current['tier'])
+
+    def test_legacy_keyword_supersession_and_rejected_edge_cortex(self):
+        from memlet import memlet_cortex as cortex
+        self.write('AGENTS.md','# Fixture\n'); mw.init_project(self.root)
+        transcript=self.write('legacy.log','2026-01-01T00:00:00Z [user] The deploy instruction using make release is superseded.\n'
+                              '2026-01-02T00:00:00Z [user] The deploy instruction is replaced by scripts/deploy.sh.\n')
+        learned=mb.learn_from_transcript(self.root,transcript)
+        ids=learned['addedNodeIds']; self.assertTrue(ids,learned)
+        self.assertTrue(mb.learn_approve(self.root,ids,approver='legacy reviewer')['ok'])
+        items=mb.dream_items(self.root)['items']
+        self.assertTrue(any(i.get('quarantined') for i in items),items)
+        self.assertEqual(len(ids),dc.dream_status(self.root)['counts']['approved'])
+        self.assertFalse(mb.learn_pending(self.root)['pendingNodes'])
+        self.assertIn('Superseded Quarantine',mb.unified_recall(self.root,'deploy release',budget=4000)['formatted'])
+        lineage=cortex._load_dream_lineage({'path':str(self.root)})
+        self.assertTrue(all(n['reviewState']=='approved' for n in lineage['nodes']))
+        repo,nodes=self.fixture('edge-rejected',('BLOCKS',))
+        item=next(iter(nodes.values()))
+        pending=mb.learn_pending(repo)
+        self.assertEqual(item['id'],pending['pendingNodes'][0]['id'])
+        self.assertIn('rejected edge',pending['formatted'])
+        lineage=cortex._load_dream_lineage({'path':str(repo)})['nodes'][0]
+        self.assertEqual(('pending','PENDING',False),(lineage['reviewState'],lineage['verdict'],lineage['inRecallCapsule']))
+        admin=md.run_dream_recall(repo/mb.QUEUE_REL,snapshot_path=repo/mb.SNAPSHOT_REL,query_text='deploy',budget_tokens=4000)
+        self.assertNotIn(item['id'],admin['includedNodeIds'])
+
+    def test_recall_hints_only_use_leftover_budget_and_handover_caps_are_separate(self):
+        repo,nodes=self.fixture('approved')
+        hint_repo,hint_nodes=self.fixture('hint',('single-line',))
+        hint=mb.dream_items(hint_repo,tiers=('hint',))['items'][0]
+        approved=mb.dream_items(repo)['items']
+        original=mb.dream_items
+        def provider(path,*args,**kwargs):
+            result=original(path,*args,**kwargs)
+            if 'hint' in kwargs.get('tiers',()): result['items'].append(hint)
+            return result
+        baseline={b:mb.unified_recall(repo,'deploy',budget=b) for b in (400,600,2000)}
+        with mock.patch.object(mb,'dream_items',side_effect=provider):
+            for budget in baseline:
+                actual=mb.unified_recall(repo,'deploy',budget=budget)
+                self.assertEqual([i['id'] for i in baseline[budget]['sections']['dream']],
+                                 [i['id'] for i in actual['sections']['dream']],budget)
+        for mode in ('verified','digest'):
+            lessons=[dict(approved[-1],id='A%d'%n) for n in range(55)]+[dict(hint,id='H%d'%n) for n in range(53)]
+            cap=mw.build_handover(repo,budget=32000,mode=mode,output_format='markdown',_lesson_items=lessons)
+            limit=mw._HANDOVER_LIST_CAP
+            self.assertEqual({'count':55-limit,'cap':limit},cap['listCapOmitted']['approvedLessons'])
+            self.assertEqual({'count':53-limit,'cap':limit},cap['listCapOmitted']['hints'])
+            self.assertEqual(55,len(cap['approvedLessons'])+cap['omitted']['approvedLessons']+55-limit)
+            self.assertEqual(53,len(cap['hints'])+cap['omitted']['hints']+53-limit)
+            self.assertIn('over the %d-item cap' % limit,cap['formatted'])
+            self.assertTrue(mw.verify_handover_checksum(cap))
+            tampered=copy.deepcopy(cap); tampered['listCapOmitted']['hints']['count']+=1
+            self.assertFalse(mw.verify_handover_checksum(tampered))
+
+    def test_failed_batches_continue_stop_after_three_retry_and_explicit_skip(self):
+        repo,_,_=self.prepare(lines=['2026-01-01T00:00:00Z [user] Never drop cache checks '+('words '*50)]*6)
+        real_plan=dc._plan
+        # Use the library planner with a small bound to exercise multiple batches cheaply.
+        with mock.patch.object(dc,'_plan',side_effect=lambda snap,starts,tokens:real_plan(snap,starts,128)):
+            calls=[]
+            def runner(*a,**kw):
+                calls.append(kw['stdin_text'])
+                return 'bad json' if len(calls)==1 else '[]'
+            result=dc.dream_run(repo,runner=runner,max_batches=4)
+            self.assertEqual(4,result['calls'],result)
+            self.assertEqual(1,result['failedBatches'])
+            status=dc.dream_status(repo); failed=status['runs'][0]['failedBatchIds'][0]
+            self.assertIn(failed,dc.dream_run(repo,dry_run=True)['retryFailedBatches'])
+            seen=[]
+            again=dc.dream_run(repo,runner=lambda *a,**k:seen.append(k['stdin_text']) or '[]',max_batches=1)
+            self.assertTrue(again['ok'],again); self.assertEqual(calls[0],seen[0])
+        other,_,_=self.prepare('all-fail',lines=['2026-01-01T00:00:00Z [user] Never drop cache checks '+('words '*50)]*6)
+        with mock.patch.object(dc,'_plan',side_effect=lambda snap,starts,tokens:real_plan(snap,starts,128)):
+            bad=dc.dream_run(other,runner=lambda *a,**k:'bad',max_batches=6)
+        self.assertEqual(3,bad['calls']); self.assertTrue(bad['consecutiveFailureStopped'])
+        failed=dc.dream_status(other)['runs'][0]['failedBatchIds'][0]
+        with mock.patch.object(vc,'run_vendor',side_effect=AssertionError('no model')) as no_model:
+            skip=dc.dream_skip_failed(other,failed)
+            self.assertTrue(skip['ok'],skip); no_model.assert_not_called()
+        entry=dc.dream_status(other)['runs'][0]['skippedBatches'][0]
+        self.assertEqual('completed-with-rejections',entry['status']); self.assertTrue(md._valid_utc_stamp(entry['at']))
+        self.assertIn('completed-with-rejections',__import__('memlet.cli_dream',fromlist=['_markdown'])._markdown(dc.dream_status(other)))
+
+    def test_symbol_only_anchor_changed_consumers_and_pattern_bindings(self):
+        self.write('auth.py',CODE); self.write('AGENTS.md','# Fixture\n'); mw.init_project(self.root)
+        self.write('.memlet/wiki/auth.md','# Auth\n- Always use `validate_token()` before accepting a token.\n')
+        suggestion=ma.suggest_anchors(self.root)['suggestions'][0]
+        self.assertEqual('single-definition-found',suggestion['confidence'])
+        self.assertTrue(ma.accept_suggestions(self.root,[suggestion['id']])['ok'])
+        subprocess.run(['git','add','.'],cwd=self.root,check=True,capture_output=True)
+        subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+                        '-c','core.hooksPath='+str(self.base/'no-hooks'),'commit','-qm','baseline'],cwd=self.root,check=True,capture_output=True)
+        self.write('auth.py',CODE.replace('(token)','(token, issuer)',1))
+        cli=self.cli('check','--changed','--format','json')
+        self.assertEqual(1,cli.returncode,cli.stderr); self.assertIn('signature_drift',cli.stdout)
+        self.assertIn('[suggested anchor]',self.hook('post-tool-use',tool_name='Edit',tool_input={'file_path':str(self.root/'auth.py')}))
+        self.assertIn('signature_drift',self.rpc('memlet_check',files=['auth.py'])['content'][0]['text'])
+        base='class C:\n    def foo(self):\n        return 1\n'
+        cases=[('foo = lambda self: 999\n',True),('for foo in []:\n    pass\n',True),('import x as foo\n',True),
+               ('def other():\n    foo = 1\n',False),('def unrelated():\n    return 2\n',False),
+               ('class D:\n    def foo(self):\n        return 2\n',False)]
+        if sys.version_info >= (3,10):
+            cases += [('match 1:\n    case foo:\n        pass\n',True),
+                      ('match []:\n    case [*foo]:\n        pass\n',True),
+                      ('match {}:\n    case {**foo}:\n        pass\n',True)]
+        self.write('method.py',base)
+        self.write('AGENTS.md','# Rules\n- Always use `method.py::foo`.\n')
+        mw.init_project(self.root)
+        for suffix,rebound in cases:
+            path=self.write('method.py',base+suffix)
+            self.assertEqual(rebound,ca.python_symbol_rebound(path,'foo'),suffix)
+            anchor=next(a for a in audit.audit_repository(self.root)['pinnedAnchors']['anchors'] if a['symbol']=='foo')
+            if rebound:
+                self.assertEqual(('compatible-unverified','symbol_rebound_in_module'),(anchor['status'],anchor['reason']),suffix)
+            elif 'class D:' not in suffix:
+                self.assertEqual('active',anchor['status'],suffix)
+        # Multiple class methods retain the existing composite short-symbol hash.
+        self.write('method.py',base+'class D:\n    def foo(self):\n        return 2\n')
+        hashes=ca.extract_file_symbol_hashes(self.root/'method.py')
+        self.assertEqual(ca._digest({name:hashes[name] for name in ('C.foo','D.foo')}),hashes['foo'])
+
+    def test_all_hooks_are_model_free_and_span_numbers_are_ascii(self):
+        self.write('AGENTS.md','# Fixture\n'); mw.init_project(self.root)
+        source=self.write('session.log','2026-01-01T00:00:00Z [user] Never bypass cache checks.\n')
+        with mock.patch.object(vc,'run_vendor',side_effect=AssertionError('hook launched a model')) as vendor, \
+             mock.patch.object(mh,'find_root',return_value=self.root), \
+             mock.patch.object(mh,'_dispatch',wraps=mh._dispatch) as dispatched:
+            for event in mh.RUNTIME_EVENTS+mh.GIT_EVENTS:
+                out=io.StringIO()
+                self.assertEqual(0,mh.run_hook([event],stdin=io.StringIO(json.dumps({'cwd':str(self.root),
+                    'transcript_path':str(source),'tool_name':'Edit','tool_input':{'file_path':str(self.root/'auth.py')}})),
+                    stdout=out,stderr=io.StringIO(),hard_exit=False),event)
+            for event in ('stop','pre-compact'):
+                mh._learn(self.root,{'transcript_path':str(source)},{'dream':True},event)
+            mh._session_start(self.root,{}, {'dream':True,'tokens':4000})
+            self.assertEqual(list(mh.RUNTIME_EVENTS+mh.GIT_EVENTS),[call.args[0] for call in dispatched.call_args_list])
+            vendor.assert_not_called()
+        for span in ('x.log:١','x.log:１','x.log:1-٢','x.log:1-２'):
+            self.assertIsNone(md.parse_span(span),span)
+        self.assertEqual(('x.log',1,2),md.parse_span('x.log:1-2'))
+
+    def test_eval_one_queue_snapshot_fixed_stdin_and_input_errors(self):
+        repo,nodes=self.fixture('approved',('multi-line',))
+        snap=mb._load_snapshot(repo)[0]
+        manifest={'run':'frozen','protocol':'retrospective','hints':False,'budget':32000,'dreamUntil':'2026-12-01',
+                  'dream':[{'file':f,'lines':ls} for f,ls in snap.items()]}
+        real_read=mw.read_managed_text; reads=[]
+        def read(root,path,*args,**kw):
+            result=real_read(root,path,*args,**kw)
+            if str(root)==str(repo) and str(path)==mb.QUEUE_REL: reads.append(result)
+            return result
+        with mock.patch.object(mw,'read_managed_text',side_effect=read):
+            contexts=ev.build_contexts(repo,manifest,{'text':'deploy'})
+        self.assertEqual(1,len(reads))
+        quote=md.lesson_text(nodes['multi-line']).split(LESSON_SEPARATOR)[0]
+        for arm in ('flat','graph','handover'): self.assertIn(quote,contexts[arm]['text'])
+        self.write('sessions/a.json',json.dumps([{'timestamp':'2026-01-01','text':'Repair uses cedar.'}]))
+        self.write('sessions/b.json',json.dumps([{'timestamp':'2026-01-03','text':'Repair cedar succeeded.'}]))
+        ev.init_eval(self.root,run='r',sessions='sessions',dream_until='2026-01-02',budget=30000)
+        question={'id':'q','text':'What repaired the cache?','citation':{'file':'sessions/b.json','start':1,'end':1}}
+        self.write('questions.json',json.dumps([question])); ev.seal_questions(self.root,run='r',source='questions.json')
+        evidence=('cedar '*15000).strip()
+        def builder(root,m,q):
+            return {a:{'text':evidence if a!='none' else '', 'budget':m['budget'],'omittedItems':[]} for a in ev.ARMS}
+        preview=ev.run_eval(self.root,run='r',via='claude',arms=['flat'],dry_run=True,context_builder=builder)
+        self.assertEqual(ev.ANSWER_PREFIX,preview['launches'][0]['argv'][-1])
+        self.assertGreater(preview['launches'][0]['stdinBytes'],65536)
+        seen=[]
+        result=ev.run_eval(self.root,run='r',via='claude',arms=['flat'],context_builder=builder,
+                           runner=lambda v,p,**kw:seen.append((p,kw['stdin_text'])) or 'cedar')
+        self.assertTrue(result['ok']); self.assertEqual(ev.ANSWER_PREFIX,seen[0][0])
+        self.assertEqual(evidence,json.loads(seen[0][1])['evidence'])
+        self.assertEqual(ev.digest({'prompt':seen[0][0],'stdin':seen[0][1]}),ev._state(self.root,'r')['calls'][0]['promptDigest'])
+        with mock.patch.object(vc,'static_vendor_refusal',return_value=None):
+            judge=ev.score_eval(self.root,run='r',judge='codex',dry_run=True)
+        self.assertEqual(ev.JUDGE_PROMPT,judge['prompts'][0]); self.assertIn('reference',json.loads(judge['stdinInputs'][0]))
+        self.assertLessEqual(len(json.dumps(ev._clip('x'+' '*1100000,32000)).encode()),ev.EVAL_CONTEXT_WIRE_LIMIT)
+        ev.init_eval(self.root,run='validation',sessions='sessions',dream_until='2026-01-02')
+        for field in ('timestamp','text'):
+            self.write('malformed/a.json',json.dumps([{k:v for k,v in {'timestamp':'2026-01-01','text':'cedar'}.items() if k!=field}]))
+            with self.assertRaisesRegex(ValueError,'record 1 requires field '+field):
+                ev.init_eval(self.root,run='invalid',sessions='malformed',dream_until='2026-01-02')
+        for field in ('id','text','citation'):
+            for value in ('missing',None,True,[]):
+                bad=dict(question)
+                if value=='missing': bad.pop(field)
+                else: bad[field]=value
+                self.write('bad.json',json.dumps([bad]))
+                cli=self.cli('admin','eval','questions','--run','validation','--from','bad.json','--format','markdown')
+                self.assertEqual(2,cli.returncode,cli.stderr)
+                self.assertIn('record 1',cli.stdout); self.assertIn(field,cli.stdout)
+                self.assertTrue(cli.stdout.startswith('- ERROR:'),cli.stdout)
+
+    def test_eval_markdown_every_action_platform_refusal_and_help(self):
+        from argparse import Namespace
+        from memlet import cli_eval
+        actions={'init':('init_eval',{'dream_until':'2026-01-01','sessions':'sessions','budget':1200,'hints':False,'allow_post_split_memory':False}),
+                 'questions':('seal_questions',{'source':'q','via':None,'count':1,'max_calls':0,'dry_run':False}),
+                 'run':('run_eval',{'via':'claude','arms':None,'max_calls':0,'dry_run':False}),
+                 'score':('score_eval',{'judge':None,'max_calls':0,'dry_run':False}),
+                 'report':('report_eval',{}),'resolve':('resolve_call',{'resolve':'q','as_status':'failed','by':'tester','reason':'known'}),
+                 'selftest':('eval_selftest',{})}
+        for action,(function,options) in actions.items():
+            args=Namespace(eval_action=action,repo=str(self.root),run='r',format='markdown',**options)
+            for fail in (False,True):
+                with mock.patch.object(ev,function,side_effect=ValueError('clear error') if fail else None,
+                                       return_value={'ok':True,'calls':0}):
+                    result=cli_eval.dispatch(args)
+                self.assertIn('_cli_text',result,(action,fail)); self.assertFalse(result['_cli_text'].startswith('{'))
+                if fail: self.assertIn('ERROR:',result['_cli_text'])
+        with mock.patch.object(vc,'_posix_runner_available',return_value=False), \
+             mock.patch.object(subprocess,'Popen') as popen, mock.patch.object(subprocess,'run') as run:
+            self.assertEqual(vc.PLATFORM_REFUSAL,vc.check_vendor('claude')['reason'])
+            self.assertEqual(vc.PLATFORM_REFUSAL,vc.run_vendor('claude','prompt')['error'])
+            with self.assertRaisesRegex(ValueError,'POSIX'): vc._capture(['fake'],b'',1,10,str(self.root))
+            popen.assert_not_called(); run.assert_not_called()
+        top=self.cli('--help').stdout; admin=self.cli('admin','--help').stdout
+        self.assertNotIn('memlet dream:',top+admin); self.assertIn('Dream:\n  dream',admin)
+        self.assertNotIn('More:\n  dream',admin)
 
 
 if __name__ == '__main__':

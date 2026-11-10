@@ -345,7 +345,7 @@ class EvalTests(unittest.TestCase):
 
     def test_bad_timestamps_and_duplicate_windows(self):
         self.put('sessions/a.json', [{'text': 'missing'}])
-        with self.assertRaises(KeyError): self.init()
+        with self.assertRaisesRegex(ValueError, 'record 1 requires field timestamp'): self.init()
         self.put('sessions/a.json', [{'timestamp': '2026-01-01', 'text': 'one'}, {'timestamp': '2025-01-01', 'text': 'two'}])
         with self.assertRaisesRegex(ValueError, 'out-of-order'): self.init()
         self.put('sessions/a.json', [{'timestamp': '2026-01-01', 'text': 'Repair cedar succeeded. HELDOUT_CANARY_739'}])

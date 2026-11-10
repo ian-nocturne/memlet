@@ -20,7 +20,7 @@ COMMANDS = {"anchors": {"help": "Suggest code anchors for rules that mention cod
 
 def register(sub) -> None:
     import argparse
-    p = sub.add_parser("anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
+    p = sub.add_parser("anchors", prog="memlet admin anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
                        description="Rules that mention code in backticks or as name() but carry no `path::symbol` "
                                    "anchor can be anchored without editing your files. Suggestions are proposals for "
                                    f"you to check: {FILE_SYMBOL} (the rule names the file, which has one definition) or "

@@ -2,9 +2,9 @@
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import json
 from memlet.cli_plugins import add_format_option
-from memlet.memlet_dreamcycle import REJECTION_MEANINGS, dream_ingest, dream_run, dream_status
+from memlet.memlet_dreamcycle import REJECTION_MEANINGS, dream_ingest, dream_run, dream_status, dream_skip_failed
 
-COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or inspect waiting sessions", "product": True}}
+COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or inspect waiting sessions", "product": True, "group": "Dream"}}
 
 
 def register(sub):
@@ -17,6 +17,7 @@ def register(sub):
     parser.add_argument("--max-batches", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--skip-failed", metavar="BATCH_ID", help="Record a failed batch as completed-with-rejections; no model call")
     add_format_option(parser)
 
 
@@ -68,6 +69,11 @@ def _markdown(result):
                 text += "\n### %s / %s / %s\n\n" % (prompt["kind"], prompt["vendor"], prompt["model"])
                 text += "- Isolation: " + prompt["isolation"] + "\n- argv: " + json.dumps(prompt["argv"]) + "\n"
                 text += "\n".join("    " + line for line in (prompt["prompt"] + "\n\n" + prompt["stdinText"]).splitlines()) + "\n"
+    for bid in result.get("retryFailedBatches", []):
+        text += "- Would retry failed batch: " + bid + "\n"
+    for run in [result] + result.get("runs", []):
+        for entry in run.get("skippedBatches", []):
+            text += "- Batch %s: completed-with-rejections at %s\n" % (entry["batchId"], entry["at"])
     if result.get("droppedOutput"):
         text += "- Dropped output: %s\n" % result["droppedOutput"]
     if not rejections:
@@ -78,7 +84,12 @@ def _markdown(result):
 
 
 def dispatch(args):
-    if args.status:
+    if args.skip_failed:
+        if args.status or args.via or args.transcript or args.verify_with:
+            result = {"ok": False, "exitCode": 2, "error": "--skip-failed cannot be combined with proposal/status options"}
+        else:
+            result = dream_skip_failed(args.repo, args.skip_failed, dry_run=args.dry_run)
+    elif args.status:
         if args.via or args.transcript or args.verify_with:
             result = {"ok": False, "exitCode": 2, "error": "--status cannot be combined with proposal options"}
         else:

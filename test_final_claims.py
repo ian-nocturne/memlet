@@ -319,7 +319,7 @@ class ClaimsCase(unittest.TestCase):
         quote = 'RULE: Never charge before review. ' + 'Read the documented conditions carefully. ' * 20 + 'Use `app/billing.py::charge`.'
         ids = self.learn([quote])
         pending = mb.learn_pending(self.repo)
-        self.assertEqual('[user] ' + quote, pending['pendingNodes'][0]['quote'])
+        self.assertEqual(quote, pending['pendingNodes'][0]['quote'])
         self.assertIn(quote, pending['formatted'])
         self.approve(ids)
         self.assertIn(quote, (self.repo / mb.PROMOTED_PAGE).read_text())
