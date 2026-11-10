@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Cross-platform local memory tool for the already-authorized task owner."""
 import argparse
+import hashlib
+import subprocess
 import json
 import os
 import sys
 import time
 from pathlib import Path
 
-try:
-    from work_store import WorkStore
-except ImportError:
-    from prism_memory.standalone import StandaloneStore as WorkStore
+from prism_memory.standalone import StandaloneStore as WorkStore
 import work_memory
 import memory_intelligence as memory
 
@@ -416,8 +415,22 @@ def _program_name():
     return name if name in PROGRAM_NAMES else 'memlet'
 
 
+def _standalone_task_id():
+    cwd = Path.cwd().resolve()
+    try:
+        proc = subprocess.run(['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
+                              capture_output=True, text=True, check=True)
+        root = Path(proc.stdout.strip()).resolve()
+    except (OSError, subprocess.CalledProcessError):
+        root = cwd
+    digest = hashlib.sha1(os.fsencode(str(root))).hexdigest()[:8]
+    return 'standalone/' + root.name + '-' + digest
+
+
 def main():
     parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet (formerly Ieum Memory / DeltaHarness / PRISM Memory): '+__doc__)
+    from prism_memory import VERSION
+    parser.add_argument('--version',action='version',version=VERSION)
     parser.add_argument('--root',default=_default_cli_root())
     parser.add_argument('--task',default='')
     parser.add_argument('--session',default='')
@@ -465,7 +478,9 @@ def main():
     rctx_p.add_argument('--core-budget',type=int,default=600);rctx_p.add_argument('--index-budget',type=int,default=600)
     rctx_p.add_argument('--auto',action='store_true',help='Return the whole instructions when they fit --threshold tokens, else the tiered context');rctx_p.add_argument('--threshold',type=int,default=8000)
     rrec_p=sub.add_parser('rule-recall',help='T2: rules most relevant to a task, quoted verbatim from the instructions (deterministic BM25, no model call)')
-    rrec_p.add_argument('repo_positional',nargs='?',default=None);rrec_p.add_argument('task',nargs='?',default='')
+    rrec_p.add_argument('query_or_repo',nargs='?',default=None);rrec_p.add_argument('legacy_query',nargs='?',default=None)
+    rrec_p.add_argument('--repo',default='.')
+    rrec_p.add_argument('--task',dest='rule_task',default=None)
     rrec_p.add_argument('--k',type=int,default=3);rrec_p.add_argument('--safety',action='store_true',help='Add up to 4 importance-1 rules not already shown (not a guarantee of full coverage)')
     index_p=sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)')
     index_p.add_argument('repo_positional',nargs='?',default=None)
@@ -578,7 +593,15 @@ def main():
         from prism_memory.memlet_recall import build_context, recall
         if args.action=='rule-context':
             return build_context(args.repo_positional or '.',core_budget=args.core_budget,index_budget=args.index_budget,auto=args.auto,threshold=args.threshold)
-        return recall(args.repo_positional or '.',args.task,k=args.k,safety=args.safety)
+        query=args.query_or_repo or ''
+        repo=args.repo
+        legacy_task=args.rule_task if args.rule_task is not None else (args.legacy_query if args.legacy_query is not None else args.task)
+        if legacy_task and args.query_or_repo and Path(args.query_or_repo).is_dir():
+            repo=args.query_or_repo
+            query=legacy_task
+        elif legacy_task and not args.query_or_repo:
+            query=legacy_task
+        return recall(repo,query,k=args.k,safety=args.safety)
     if args.action=='index-build':
         from prism_memory.memlet_index import build_index
         return build_index(args.repo_positional or '.',via=args.via)
@@ -615,6 +638,7 @@ def main():
         pos_repo=args.extra_positional if args.repo_positional in ('pack','scan') else args.repo_positional
         target_repo=args.repo_path or pos_repo or '.'
         res=build_rescue_bundle(target_repo,write_files=args.write,output_dir=args.output_dir,output_format=args.format)
+        if args.format in ('markdown','prompt') and isinstance(res.get('formatted'),str):res['_cli_text']=res['formatted']
         if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
         return res
     if args.action=='anti-slop':
@@ -626,6 +650,7 @@ def main():
             res=lock_design_system(target_repo,archetype=args.archetype,write_files=True,force=args.force)
         else:
             res=scan_anti_slop(target_repo,output_format=args.format)
+        if args.format in ('markdown','prompt') and isinstance(res.get('formatted'),str):res['_cli_text']=res['formatted']
         if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
         return res
     store=WorkStore(args.root)
@@ -634,7 +659,7 @@ def main():
     if args.action=='restore':return memory.restore(store,backup_dir=args.backup_dir)
     if not args.task:
         if args.standalone:
-            args.task='standalone/main'
+            args.task=_standalone_task_id()
         else:
             raise ValueError('task is required (--task <taskId>)')
     if args.standalone:
@@ -688,7 +713,7 @@ def main():
         return memory.export_rules(store,args.task,targets=args.targets,target_dir=args.target_dir,write_files=False,lang=args.lang)
     if task['owner']!=args.session:raise ValueError('current responsible session ID is required')
     runtime=os.environ.get('CODEX_THREAD_ID')
-    if runtime and not os.environ.get('ANTIGRAVITY_AGENT') and args.session!='codex:'+runtime:
+    if runtime and not args.standalone and not os.environ.get('ANTIGRAVITY_AGENT') and args.session!='codex:'+runtime:
         raise ValueError('CLI actor does not match the current native Codex session')
     if os.environ.get('PRISM_PARENT_SESSION_ID'):
         raise ValueError('background worker memory writes must be returned to the responsible session')
@@ -749,9 +774,11 @@ def cli():
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         if not exit_zero and isinstance(result, dict) and 'exitCode' in result:
             return int(result['exitCode'])
+        if not exit_zero and isinstance(result, dict) and result.get('ok') is False:
+            return 1
         return 0
     except Exception as exc:
-        print(json.dumps({'ok': False, 'error': str(exc), 'type': type(exc).__name__}, ensure_ascii=False))
+        print(json.dumps({'ok': False, 'error': str(exc), 'type': type(exc).__name__}, ensure_ascii=False), file=sys.stderr)
         return 1
 
 

@@ -10,10 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    from work_store import WorkStore
-except ImportError:
-    from prism_memory.standalone import StandaloneStore as WorkStore
+from prism_memory.standalone import StandaloneStore as WorkStore
 import work_memory
 import memory_intelligence as memory
 from memory_cli import read_item, schema as cli_schema

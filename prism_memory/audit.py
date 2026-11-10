@@ -359,8 +359,8 @@ def _check_inline_call_vs_signature(
         total_documented = pos_count + len(kw_names)
         if total_documented < min_pos + len(kwonly_req):
             return (
-                f"문서 시그니처 `{sym_name}` 인자 수({total_documented}개)가 현재 코드 필수 인자 "
-                f"(필수 위치 인자 {min_pos}개: {req_args}, 필수 키워드 인자 {sorted(kwonly_req)})와 일치하지 않아요."
+                f"Documented signature `{sym_name}` has {total_documented} arguments; the current code requires "
+                f"{min_pos} positional arguments ({req_args}) and keyword arguments {sorted(kwonly_req)}."
             )
         return None
 
@@ -371,17 +371,17 @@ def _check_inline_call_vs_signature(
         return None
     if effective_pos < min_pos:
         return (
-            f"`{sym_name}` 호출의 위치 인자({effective_pos}개)가 최소 필수 인자({min_pos}개: {req_args})보다 적어요."
+            f"Call to `{sym_name}` supplies {effective_pos} positional arguments, fewer than the required {min_pos}: {req_args}."
         )
     if not has_varargs and pos_count > max_pos:
         return (
-            f"`{sym_name}` 호출의 위치 인자({pos_count}개)가 최대 허용 위치 인자({max_pos}개: {all_args})를 초과해요."
+            f"Call to `{sym_name}` supplies {pos_count} positional arguments, exceeding the maximum {max_pos}: {all_args}."
         )
 
     missing_req_kw = [k for k in sorted(kwonly_req) if k not in kw_names]
     if missing_req_kw:
         return (
-            f"`{sym_name}` 호출에 필수 키워드 전용 인자({missing_req_kw})가 누락되었어요."
+            f"Call to `{sym_name}` is missing required keyword-only arguments: {missing_req_kw}."
         )
 
     if kw_names and not has_varkw and pos_names:
@@ -389,7 +389,7 @@ def _check_inline_call_vs_signature(
         unknown_kw = [k for k in kw_names if k not in allowed_kw]
         if unknown_kw:
             return (
-                f"`{sym_name}` 호출에 존재하지 않는 키워드 인자({unknown_kw})가 사용되었어요."
+                f"Call to `{sym_name}` uses unknown keyword arguments: {unknown_kw}."
             )
     return None
 
@@ -615,7 +615,7 @@ def audit_repository(
     t0 = time.perf_counter()
     root = Path(repo_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise ValueError(f"감사할 저장소 경로를 찾지 못했어요: {root}")
+        raise ValueError(f"Repository path to audit not found: {root}")
 
     docs = _discover_instruction_docs(root)
     sig_cache: Dict[str, Dict[str, Any]] = {}
@@ -714,8 +714,8 @@ def audit_repository(
             line_no=1,
             target_path=str(base_ref or ""),
             symbol=str(head_ref or "HEAD"),
-            message=f"Git diff 참조(`{base_ref}..{head_ref}`)를 해석할 수 없어요: {git_diff_data['error']}",
-            remediation="존재하는 Git 브랜치·태그·커밋 SHA를 `--base` 및 `--head`에 지정하세요.",
+            message=f"Cannot resolve Git diff references (`{base_ref}..{head_ref}`): {git_diff_data['error']}",
+            remediation="Specify existing Git branches, tags, or commit SHAs with `--base` and `--head`.",
         )
 
     cd_cmd_re = re.compile(r"(?:^|[`;&|]\s*|\$\s*)cd\s+([A-Za-z0-9_./-]+)")
@@ -824,8 +824,8 @@ def audit_repository(
                     line_no=idx,
                     target_path=doc_rel,
                     symbol=None,
-                    message=f"`{doc_rel}:{idx}`의 `{m_dyn.group(0).strip()[:60]}`는 실행 시점 값(`${{{{ }}}}`)이라 정적으로 확인하지 못했어요.",
-                    remediation="matrix 값 목록을 문서나 워크플로우에 명시하거나, 각 스크립트 이름을 직접 적어 검사 대상이 되게 하세요.",
+                    message=f"`{doc_rel}:{idx}` uses runtime value `{m_dyn.group(0).strip()[:60]}` (`${{{{ }}}}`), which cannot be checked statically.",
+                    remediation="List matrix values in the document or workflow, or name each script explicitly so it can be checked.",
                 )
 
             # 1. Check npm / pnpm / yarn / bun script references against active_cwd or root package.json
@@ -861,8 +861,8 @@ def audit_repository(
                             line_no=idx,
                             target_path=target_pkg_rel,
                             symbol=scr,
-                            message=f"`{doc_rel}:{idx}`에서 참조한 스크립트 `{scr}`가 `{target_pkg_rel}`의 `scripts`에 존재하지 않아요.",
-                            remediation=f"`{target_pkg_rel}`의 `scripts` 목록({avail_keys})에 맞춰 문서의 실행 명령을 수정하세요.",
+                            message=f"Script `{scr}` referenced at `{doc_rel}:{idx}` is absent from `scripts` in `{target_pkg_rel}`.",
+                            remediation=f"Update documented commands to match `scripts` in `{target_pkg_rel}`: {avail_keys}.",
                         )
 
             # 2. Check `make <target>` references against Makefile
@@ -881,8 +881,8 @@ def audit_repository(
                             line_no=idx,
                             target_path="Makefile",
                             symbol=tgt,
-                            message=f"`{doc_rel}:{idx}`에서 참조한 Make 타겟 `{tgt}`가 `Makefile`에 정의되어 있지 않아요.",
-                            remediation=f"`Makefile`의 정의된 타겟({sorted(make_targets.keys())[:8]})과 문서 명령을 동기화하세요.",
+                            message=f"Make target `{tgt}` referenced at `{doc_rel}:{idx}` is not defined in `Makefile`.",
+                            remediation=f"Align documented commands with the targets in `Makefile`: {sorted(make_targets.keys())[:8]}.",
                         )
 
             # Skip file reference extraction on Markdown reference-link definitions, code fence title headers, prohibitive/anti-pattern lines, or explicit external-repo lines
@@ -1029,8 +1029,8 @@ def audit_repository(
                             line_no=idx,
                             target_path=clean_p,
                             symbol=exp_sym,
-                            message=f"`{doc_rel}:{idx}`의 `{clean_p}`는 저장소에 없지만 의도된 참조일 수 있어요 ({verdict[1]}).",
-                            remediation="예시·계획·생성물·과거 기록이면 그대로 두고, 현재 지침이라면 경로를 고치세요.",
+                            message=f"`{clean_p}` at `{doc_rel}:{idx}` is absent from the repository but may be intentional ({verdict[1]}).",
+                            remediation="Keep examples, plans, generated outputs, and historical references; correct the path if it is a current instruction.",
                         )
                         continue
                     _add_finding(
@@ -1040,8 +1040,8 @@ def audit_repository(
                         line_no=idx,
                         target_path=clean_p,
                         symbol=exp_sym,
-                        message=f"`{doc_rel}:{idx}`에서 참조한 파일 `{clean_p}`를 저장소에서 찾을 수 없어요.",
-                        remediation=f"삭제되었거나 이동된 경로 `{clean_p}`를 최신 파일 경로로 교체하세요.",
+                        message=f"File `{clean_p}` referenced at `{doc_rel}:{idx}` was not found in the repository.",
+                        remediation=f"Replace deleted or moved path `{clean_p}` with the current file path.",
                     )
                     continue
 
@@ -1068,8 +1068,8 @@ def audit_repository(
                             line_no=idx,
                             target_path=rel_target,
                             symbol=exp_sym,
-                            message=f"`{rel_target}`는 Node가 문법을 통과시켰지만 Memlet 경량 파서는 해석하지 못했어요.",
-                            remediation="심볼 앵커는 수동 검토 대상으로 두세요.",
+                            message=f"`{rel_target}` passed the Node syntax check but could not be parsed by the Memlet lightweight parser.",
+                            remediation="Review symbol anchors manually.",
                         )
                         continue
                     _add_finding(
@@ -1079,8 +1079,8 @@ def audit_repository(
                         line_no=idx,
                         target_path=rel_target,
                         symbol=exp_sym,
-                        message=f"`{doc_rel}:{idx}`에서 참조한 코드 파일 `{rel_target}`에 구문 오류(Syntax/Parse Error)가 있어요.",
-                        remediation=f"`{rel_target}`의 괄호/문자열/구문 오류를 먼저 수리하세요.",
+                        message=f"Code file `{rel_target}` referenced at `{doc_rel}:{idx}` has a syntax/parse error.",
+                        remediation=f"Fix parentheses, strings, or syntax errors in `{rel_target}` first.",
                     )
                     continue
 
@@ -1093,8 +1093,8 @@ def audit_repository(
                             line_no=idx,
                             target_path=rel_target,
                             symbol=exp_sym,
-                            message=f"`{doc_rel}:{idx}`의 `{rel_target}::{exp_sym}` 앵커는 현재 AST/계약 파서가 지원하지 않는 언어(`{sig_info.get('__language__', 'unknown')}`)예요.",
-                            remediation="해당 언어 파일은 파일 해시 변경 시 수동 검토 대상(`unsupported_anchor`)으로 분류돼요.",
+                            message=f"Anchor `{rel_target}::{exp_sym}` at `{doc_rel}:{idx}` uses a language unsupported by the AST/contract parser (`{sig_info.get('__language__', 'unknown')}`).",
+                            remediation="Files in this language require manual review (`unsupported_anchor`) when their hash changes.",
                         )
                     elif exp_sym not in symbols_map:
                         _add_finding(
@@ -1104,8 +1104,8 @@ def audit_repository(
                             line_no=idx,
                             target_path=rel_target,
                             symbol=exp_sym,
-                            message=f"`{doc_rel}:{idx}`에서 참조한 심볼 `{exp_sym}`이(가) `{rel_target}` 파일에 존재하지 않아요.",
-                            remediation=f"`{rel_target}`의 현재 심볼({sorted(symbols_map.keys())[:8]})에 맞게 문서를 갱신하세요.",
+                            message=f"Symbol `{exp_sym}` referenced at `{doc_rel}:{idx}` does not exist in `{rel_target}`.",
+                            remediation=f"Update the document to match current symbols in `{rel_target}`: {sorted(symbols_map.keys())[:8]}.",
                         )
 
             # 4. If at least one supported code file was referenced on this line, inspect inline `func(...)` calls on the same line!
@@ -1135,8 +1135,8 @@ def audit_repository(
                                 line_no=idx,
                                 target_path=rel_target,
                                 symbol=call_name,
-                                message=f"`{doc_rel}:{idx}`의 `{rel_target}::{call_name}` 호출 계약 불일치: {drift_msg}",
-                                remediation=f"`{rel_target}`의 최신 `{call_name}` 시그니처에 맞춰 인자 목록을 업데이트하세요.",
+                                message=f"Call contract mismatch for `{rel_target}::{call_name}` at `{doc_rel}:{idx}`: {drift_msg}",
+                                remediation=f"Update arguments to match the current `{call_name}` signature in `{rel_target}`.",
                             )
                     else:
                         # Only flag `missing_symbol` for inline calls when explicitly qualified with target module stem
@@ -1150,8 +1150,8 @@ def audit_repository(
                                 line_no=idx,
                                 target_path=rel_target,
                                 symbol=call_name,
-                                message=f"`{doc_rel}:{idx}`에서 호출한 `{call_name}(...)` 심볼을 `{rel_target}`에서 찾을 수 없어요.",
-                                remediation=f"`{rel_target}`에서 이름이 변경되었거나 삭제된 함수 `{call_name}` 참조를 수정하세요.",
+                                message=f"Symbol `{call_name}(...)` called at `{doc_rel}:{idx}` was not found in `{rel_target}`.",
+                                remediation=f"Correct the reference to renamed or deleted function `{call_name}` in `{rel_target}`.",
                             )
 
                 # 5. Git-diff blast radius mapping for this line
@@ -1168,8 +1168,8 @@ def audit_repository(
                                 line_no=idx,
                                 target_path=rel_target,
                                 symbol=del_sym,
-                                message=f"Git diff(`{base_ref}..{head_ref}`)에서 삭제된 `{rel_target}::{del_sym}` 심볼을 `{doc_rel}:{idx}`가 여전히 참조하고 있어요.",
-                                remediation=f"`{doc_rel}:{idx}`에서 삭제된 `{del_sym}` 절차를 제거하거나 대체 API로 갱신하세요.",
+                                message=f"`{doc_rel}:{idx}` still references `{rel_target}::{del_sym}`, deleted in Git diff (`{base_ref}..{head_ref}`).",
+                                remediation=f"Remove the deleted `{del_sym}` procedure at `{doc_rel}:{idx}` or update it to a replacement API.",
                             )
                     for brk_sym, brk_reason in (f_delta.get("breakingSymbols") or {}).items():
                         if re.search(rf"\b{re.escape(brk_sym)}\b", line):
@@ -1181,8 +1181,8 @@ def audit_repository(
                                 line_no=idx,
                                 target_path=rel_target,
                                 symbol=brk_sym,
-                                message=f"Git diff(`{base_ref}..{head_ref}`)에서 `{rel_target}::{brk_sym}`의 호출 계약이 변경(`{brk_reason}`)되어 `{doc_rel}:{idx}` 절차가 깨졌어요.",
-                                remediation=f"`{doc_rel}:{idx}`의 `{brk_sym}` 사용법을 최신 커밋 계약에 맞게 갱신하고 재검증하세요.",
+                                message=f"Git diff (`{base_ref}..{head_ref}`) changed the call contract of `{rel_target}::{brk_sym}` (`{brk_reason}`), breaking the procedure at `{doc_rel}:{idx}`.",
+                                remediation=f"Update `{brk_sym}` usage at `{doc_rel}:{idx}` to the current commit contract and verify it again.",
                             )
                     blast_radius.append({
                         "docPath": doc_rel,
@@ -1220,8 +1220,8 @@ def audit_repository(
                                 line_no=1,
                                 target_path=rel_ref,
                                 symbol=None,
-                                message=f"`{doc_rel}`(`provenance.json`)이 추적 중인 파일 `{rel_ref}`이(가) 존재하지 않아요.",
-                                remediation="스킬의 참조 파일 경로를 갱신하거나 스킬을 재생성하세요.",
+                                message=f"File `{rel_ref}` tracked by `{doc_rel}` (`provenance.json`) does not exist.",
+                                remediation="Update the skill reference path or regenerate the skill.",
                             )
                             continue
                         sig_info = _get_sigs(p_ref)
@@ -1239,8 +1239,8 @@ def audit_repository(
                                     line_no=1,
                                     target_path=rel_ref,
                                     symbol=s_name,
-                                    message=f"`{doc_rel}`의 `{rel_ref}::{s_name}` 앵커는 지원되지 않는 언어(`{sig_info.get('__language__', 'unknown')}`)예요.",
-                                    remediation="지원 언어(Python/TS/JS/Makefile/package.json) 앵커 또는 실행 검증 명령을 연결하세요.",
+                                    message=f"Anchor `{rel_ref}::{s_name}` in `{doc_rel}` uses an unsupported language (`{sig_info.get('__language__', 'unknown')}`).",
+                                    remediation="Link an anchor in a supported language (Python/TS/JS/Makefile/package.json) or an execution verification command.",
                                 )
                         for s_name, old_sha in tracked_syms.items():
                             if s_name not in curr_hashes:
@@ -1251,8 +1251,8 @@ def audit_repository(
                                     line_no=1,
                                     target_path=rel_ref,
                                     symbol=s_name,
-                                    message=f"`{doc_rel}`(`provenance.json`)이 추적 중인 심볼 `{rel_ref}::{s_name}`이(가) 삭제되었어요.",
-                                    remediation=f"`{doc_rel}` 절차를 최신 심볼에 맞게 수정하세요.",
+                                    message=f"Symbol `{rel_ref}::{s_name}` tracked by `{doc_rel}` (`provenance.json`) was deleted.",
+                                    remediation=f"Update the procedure in `{doc_rel}` to match current symbols.",
                                 )
                             elif curr_hashes.get(s_name) != old_sha and s_name in tracked_sigs and s_name in curr_sigs:
                                 is_brk, brk_reason = is_breaking_symbol_change(tracked_sigs[s_name], curr_sigs[s_name])
@@ -1264,8 +1264,8 @@ def audit_repository(
                                         line_no=1,
                                         target_path=rel_ref,
                                         symbol=s_name,
-                                        message=f"`{doc_rel}`(`provenance.json`)의 `{rel_ref}::{s_name}` 시그니처가 호환되지 않게 변경(`{brk_reason}`)되었어요.",
-                                        remediation=f"`{doc_rel}` 절차를 업데이트하고 `verify`를 다시 실행하세요.",
+                                        message=f"Signature `{rel_ref}::{s_name}` in `{doc_rel}` (`provenance.json`) changed incompatibly (`{brk_reason}`).",
+                                        remediation=f"Update the procedure in `{doc_rel}` and run `verify` again.",
                                     )
                 except (OSError, json.JSONDecodeError):
                     pass
@@ -1323,7 +1323,7 @@ def format_audit_markdown(report: Dict[str, Any]) -> str:
     ]
     findings = report.get("findings") or []
     if not findings:
-        lines.append("모든 지침 문서(`CLAUDE.md`, `AGENTS.md`, `SKILL.md` 등)와 실제 코드·스크립트 시그니처가 일치해요.")
+        lines.append("All instruction documents (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, etc.) match the current code and script signatures.")
     else:
         lines.extend([
             "| Severity | Rule | Location | Target | Message |",
