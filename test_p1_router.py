@@ -76,7 +76,7 @@ class RouterHelpTests(unittest.TestCase):
         code, out, err = invoke(['--help'])
         self.assertEqual((0, ''), (code, err))
         entries = re.findall(r'^    ([a-z][a-z-]*)\s{2,}\S', out, re.M)
-        self.assertEqual(['init', 'check', 'recall', 'handover', 'learn', 'ui', 'admin'], entries)
+        self.assertEqual(['init', 'check', 'recall', 'handover', 'learn', 'ui', 'dream', 'admin'], entries)
         self.assertIn('memlet admin --help', out)
         for hidden in ('brief-build', 'dream-build', 'digest'):
             self.assertNotIn(hidden, out)

@@ -430,6 +430,7 @@ def dream_pin_and_validate(
     candidates: Sequence[Dict[str, Any]],
     snapshot_files: Dict[str, List[str]],
     vendor_origin: str = "unknown",
+    *, add_governs: bool = True,
 ) -> Dict[str, Any]:
     """Deterministic `dream pin` + ontology edge & DAG validator (LLM 0).
 
@@ -652,7 +653,7 @@ def dream_pin_and_validate(
                 "edgeVerdict": "UNVERIFIED",
             })
 
-        if status_kind != "superseded_rule" and not any(e["edgeType"] == "GOVERNS" for e in valid_node_edges):
+        if add_governs and status_kind != "superseded_rule" and not any(e["edgeType"] == "GOVERNS" for e in valid_node_edges):
             safe_s_id = re.sub(r"[^A-Za-z0-9_.-]", "_", scope_tag)[:40] or "scope"
             eid = f"E-{lid}-GOV"
             seen_edge_ids.add(eid)

@@ -1073,7 +1073,7 @@ def _preflight(root: Path, cplan: Dict[str, Any], gplan: Optional[Dict[str, Any]
 def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                   dry_run: bool = False, which: Callable[[str], Optional[str]] = shutil.which,
                   interpreter: Optional[str] = None, cli_path: Optional[str] = None,
-                  run_init: Optional[Callable[[], Dict[str, Any]]] = None) -> Dict[str, Any]:
+                  run_init: Optional[Callable[[], Dict[str, Any]]] = None, dream: bool = False) -> Dict[str, Any]:
     """Install or remove Memlet's hooks as one transaction. Every destination is checked before the first write;
     when a later write fails, exactly this run's writes are undone (including what `run_init`, the implicit
     `memlet init` of `init --hooks`, created), unless another program changed them meanwhile; whatever had to be
@@ -1081,6 +1081,10 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
     from memlet import memlet_wiki as mw
     rep: Dict[str, Any] = {"ok": True, "exitCode": 0, "command": "init --hooks-remove" if remove else "init --hooks",
                            "dryRun": bool(dry_run), "remove": bool(remove), "scope": scope, "notices": []}
+
+    if dream:
+        rep["dream"] = True
+        rep["notices"].append("Stop and PreCompact only ingest; no automatic model calls. Run memlet dream explicitly.")
 
     def fail(code: int, error: str) -> Dict[str, Any]:
         rep.update(ok=False, exitCode=code, error=error)
@@ -1113,7 +1117,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
         git_changes = gplan is not None and any(it["op"] in ("create", "update", "delete", "chmod")
                                                 for it in gplan["items"])
         problems = _preflight(root, cplan, gplan, init_runs=run_init is not None,
-                              record_changes=(cplan["op"] != "unchanged" or git_changes)
+                              record_changes=(cplan["op"] != "unchanged" or git_changes or dream)
                               and (cfg is not None or run_init is not None))
         if problems:
             raise Refused("cannot install safely, nothing was changed: " + "; ".join(problems))
@@ -1157,7 +1161,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             rep["actions"] += [{"op": "would-" + it["op"] if it["op"] in ("create", "update", "delete", "chmod")
                                 else it["op"], "path": it["path"]} for it in gplan["items"]]
             changes = changes or git_changes
-        if changes and cfg is not None and not cfg_problem:
+        if (changes or dream) and cfg is not None and not cfg_problem:
             rep["actions"].append({"op": "would-update", "path": ".memlet/config.json"})
         rep["formatted"] = _render(rep)
         return rep
@@ -1200,6 +1204,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             actions += apply_git(gplan, txn)
         if cfg is not None and not cfg_problem:
             new_cfg = copy.deepcopy(cfg)
+            if dream and not remove:
+                new_cfg.setdefault("hooks", {})["dream"] = True
             if remove:
                 _set_record(new_cfg, "claude", scope, None)
                 if gplan is not None:
@@ -1394,7 +1400,7 @@ def _hook_settings(root: Path) -> Dict[str, Any]:
 
     return {"tokens": int(number("sessionStartTokenBudget", DEFAULT_SESSION_TOKENS, 50, 4000)),
             "maxTranscriptBytes": int(number("maxTranscriptBytes", DEFAULT_MAX_TRANSCRIPT_BYTES, 1, 1 << 30)),
-            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0)}
+            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0), "dream": raw.get("dream") is True}
 
 
 def _log(root: Optional[Path], event: str, message: str) -> None:
@@ -1464,13 +1470,21 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
         pending = int(pend["counts"].get("pendingNodes") or 0)
     else:  # unknown is not zero: the count is left out, never printed as 0
         _log(root, "session-start", "pending lessons unavailable: queue not readable")
-    if not active and not stale and not reverify and not pending:
+    from memlet.memlet_dreamcycle import dream_status
+    status_result = dream_status(root)
+    waiting = status_result.get("waiting", 0)
+    hints = status_result.get("counts", {}).get("hint", 0)
+    if not active and not stale and not reverify and not pending and not waiting and not hints:
         return None
     head = "Memlet verified rules (code anchors match; source cited):"
     pending_part = ("" if pending is None else
                     f", {pending} lesson(s) pending human approval (`memlet learn --pending`)")
     status = (f"Not verified, do not rely on: {stale} stale anchor(s), {reverify} to re-verify{pending_part}; "
               "see `memlet check .`.")
+    if hints:
+        status += f" {hints} unreviewed hint(s); verify in code before use."
+    if waiting:
+        status += f" {waiting} session(s) waiting to dream; run `memlet dream --via …`."
     items = [f"- {_clean(a.get('rule'), 160)} ({_clean(a.get('source'), 80)})" for a in active]
 
     def render(n: int) -> str:
@@ -1564,13 +1578,19 @@ def _learn(root: Path, payload: Dict[str, Any], st: Dict[str, Any], event: str) 
     previous = md.QUEUE_LOCK_TIMEOUT
     md.QUEUE_LOCK_TIMEOUT = min(float(previous), 3.0)  # never wait long for a concurrent `memlet learn`
     try:
-        res = mb.learn_from_transcript(root, str(p))
+        if st.get("dream"):
+            from memlet.memlet_dreamcycle import dream_ingest
+            res = dream_ingest(root, str(p))
+        else:
+            res = mb.learn_from_transcript(root, str(p))
     finally:
         md.QUEUE_LOCK_TIMEOUT = previous
     if not isinstance(res, dict) or not res.get("ok"):
         code = res.get("exitCode") if isinstance(res, dict) else "?"
         _log(root, event, f"learn failed: exitCode={code}")
         return None
+    if st.get("dream"):
+        return {"systemMessage": f"Memlet: {res.get('waiting', 0)} session(s) waiting to dream; run `memlet dream --via …`."}
     added = len(res.get("addedNodeIds") or [])
     if not added:
         return None
@@ -1624,6 +1644,8 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
         with contextlib.suppress(Exception):
             out.write(json.dumps({"memletHook": HOOK_PROTOCOL}) + "\n")
             out.flush()
+        return 0
+    if os.environ.get("MEMLET_DREAMING") == "1":
         return 0
     if event not in RUNTIME_EVENTS + GIT_EVENTS or len(argv) != 1:
         return 0

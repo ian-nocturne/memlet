@@ -1968,7 +1968,7 @@ def estimate_tokens(text: str) -> int:
 def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
     # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
     extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
-    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints") if k in capsule)
+    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints") if k in capsule)
     return HANDOVER_SIGNED_FIELDS + extra + observations
 
 
@@ -2088,6 +2088,10 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
     ]
     lines += [f"- {a['rule']} (`{a['source']}`" + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "")
               + ")" for a in c["activeConstraints"]] or ["- (none)"]
+    if c.get("hints"):
+        from memlet.memlet_bridge import hint_label, hint_item_label
+        lines += ["", "### " + hint_label(c["hints"])]
+        lines += ["- [hint; " + hint_item_label(h) + "] " + h["text"] + " (`" + "{file}:{start}-{end}".format(**h["cites"][0]) + "`)" for h in c["hints"]]
     if c.get("lexicalConstraints"):
         lines += ["", "### TS/JS constraints (lexical hash match only; re-check before use)"]
         lines += [f"- {a['rule']} (`{a['source']}`)" for a in c["lexicalConstraints"]]
@@ -2388,6 +2392,8 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         "unpinnedAnchors": [_observation(r) for r in constraints if r["status"] == "unpinned"],
         "rejectedApproaches": [],
     }
+    from memlet.memlet_bridge import dream_items
+    lists["hints"] = dream_items(root, tiers=("hint",))["items"]
     seen_rejected = set()
     for text, src in [(t, "user") for t in (rejected or [])] + [(r["text"], f"{r['source']}:{r['line']}") for r in dead_ends]:
         text = _clip(str(text), _HANDOVER_TEXT_LIMIT)
@@ -2475,7 +2481,7 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         drop_order = ("reverifyBeforeUse", "projectRules", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
     else:
         drop_order = ("reverifyBeforeUse", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
-    drop_order = ("lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
+    drop_order = ("hints", "lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
     floors = {"quarantinedStaleAnchors": min(_HANDOVER_QUARANTINE_FLOOR, caps["quarantinedStaleAnchors"])}
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
