@@ -6,6 +6,8 @@ without requiring an external web server.
 """
 import argparse
 import json
+import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -19,6 +21,7 @@ from prism_memory.standalone import default_standalone_task_id, legacy_standalon
 SERVER_NAME = 'prism-memory-mcp'
 SERVER_VERSION = '8.0.0'
 PROTOCOL_VERSION = '2024-11-05'
+MAX_MCP_TRANSCRIPT_BYTES = 8 * 1024 * 1024  # Reject before parsing or creating any state.
 
 
 def mcp_tools():
@@ -308,9 +311,13 @@ def memlet_tools():
          {'next_step': string(8192), 'rejected': strings(4096, 64),
           'budget': {'type': 'integer', 'minimum': 500, 'maximum': 2000,
                      'description': 'Optional token budget; defaults to repository config or 500, as in the CLI.'},
-          'mode': {'type': 'string', 'enum': ['verified', 'index'], 'default': 'verified',
+          'mode': {'type': 'string', 'enum': ['verified', 'index'],
+                   'description': 'Defaults to repository handover.mode, else verified; experimental defaults are refused.',
                    'minLength': 1, 'maxLength': 16}}, []),
-        ('memlet_learn', 'Non-destructive, not read-only: extract pending lessons from a transcript file or list pending lessons. '
+        ('memlet_learn', 'Non-destructive, not read-only: requires an initialized repository (memlet init). Extract pending lessons from a regular '
+         '.log/.jsonl file of at most 8 MiB, with no symlink components, inside the repository or known agent transcript roots '
+         '(~/.prism-memory/sessions, ~/.codex/sessions, ~/.claude/projects, ~/.muse/sessions; '
+         'DELTAHARNESS_TRANSCRIPT_DIRS or PRISM_TRANSCRIPT_DIRS overrides agent roots), or list pending lessons. '
          'Approval is CLI-only: memlet learn --approve ID --by NAME. No approve or reject action or approval arguments are allowed.',
          {'action': {'type': 'string', 'enum': ['transcript', 'pending'], 'minLength': 1, 'maxLength': 16},
           'transcript_path': string()}, ['action']),
@@ -323,6 +330,24 @@ def memlet_tools():
         {'if': {'properties': {'action': {'const': 'transcript'}}, 'required': ['action']},
          'then': {'required': ['transcript_path']}}]
     return tools
+
+
+def _allowed_transcript_roots():
+    """Same trusted host-configured roots as the CLI; tool arguments cannot expand them."""
+    custom = os.environ.get('DELTAHARNESS_TRANSCRIPT_DIRS') or os.environ.get('PRISM_TRANSCRIPT_DIRS') or ''
+    if custom.strip():
+        return tuple(Path(p).expanduser() for p in custom.split(os.pathsep) if p.strip())
+    home = Path.home()
+    return tuple(home / rel for rel in ('.prism-memory/sessions', '.codex/sessions',
+                                       '.claude/projects', '.muse/sessions'))
+
+
+def _within(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _validate_memlet_arguments(name, args):
@@ -407,7 +432,7 @@ class PrismMemoryMCPServer:
 
     def _call_memlet_tool(self, name, args):
         from prism_memory import memlet_bridge as bridge
-        from prism_memory.memlet_wiki import build_handover
+        from prism_memory.memlet_wiki import build_handover, resolve_handover_mode
         _validate_memlet_arguments(name, args)
         repo = Path(args.get('repo_path', Path.cwd())).expanduser().resolve()
         if not repo.is_dir():
@@ -423,16 +448,30 @@ class PrismMemoryMCPServer:
                                          include=args.get('include', ('rules', 'dream', 'memory')),
                                          store=self.store, task=self.default_task)
         if name == 'memlet_handover':
+            mode = resolve_handover_mode(repo, args.get('mode'))
+            if mode not in ('verified', 'index'):
+                raise ValueError('Configured handover mode ' + mode + ' is experimental; explicitly choose verified or index')
             return build_handover(repo, next_step=args.get('next_step'), rejected=args.get('rejected'),
-                                  budget=args.get('budget'), mode=args.get('mode', 'verified'),
+                                  budget=args.get('budget'), mode=mode,
                                   output_format='json', write=False)
+        if not (repo / '.memlet').is_dir():
+            raise ValueError('Repository is not initialized; run memlet init before memlet_learn')
         if args['action'] == 'pending':
             return bridge.learn_pending(repo)
         source = Path(args['transcript_path']).expanduser().absolute()
         if any(p.is_symlink() for p in (source,) + tuple(source.parents)):
             raise ValueError('refusing symlinked transcript path')
-        if not source.is_file():
-            raise ValueError('transcript_path must be an existing file')
+        source = source.resolve()
+        roots = (repo,) + tuple(p.resolve() for p in _allowed_transcript_roots())
+        if not any(_within(source, root) for root in roots):
+            raise ValueError('transcript_path must be inside the repository or a known agent transcript root')
+        info = source.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('transcript_path must be an existing regular file')
+        if info.st_size > MAX_MCP_TRANSCRIPT_BYTES:
+            raise ValueError('transcript_path exceeds the 8 MiB MCP transcript limit')
+        if source.suffix not in ('.jsonl', '.log'):
+            raise ValueError('transcript_path must be a .jsonl or .log file')
         return bridge.learn_from_transcript(repo, source, vendor='autonomous-deterministic')
 
     def _call_tool(self, name, arguments):
