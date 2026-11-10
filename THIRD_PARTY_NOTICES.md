@@ -1,6 +1,6 @@
 # Third-Party Open Source & Model Notices
 
-DeltaHarness (`prism-memory`) is a 100% clean-room original Python implementation built on the Python standard library (`sqlite3`, `ast`, `re`, `hashlib`, `math`). No source code from third-party memory frameworks or GPL/AGPL repositories is included.
+Memlet (`memlet`) is a 100% clean-room original Python implementation built on the Python standard library (`sqlite3`, `ast`, `re`, `hashlib`, `math`). No source code from third-party memory frameworks or GPL/AGPL repositories is included.
 
 When using optional local vector acceleration or bundled model weights, the following permissive third-party components may be loaded at runtime:
 

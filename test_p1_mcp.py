@@ -4,7 +4,7 @@ import json
 BASE_TOOLS = json.loads(r'''
 [
   {
-    "name": "prism_memory_brief",
+    "name": "memlet_store_brief",
     "description": "Get current task memory brief, revision number, core invariants (goal/decisions/constraints), active skills, pitfall cases, and recent source originals.",
     "inputSchema": {
       "type": "object",
@@ -17,7 +17,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_recall",
+    "name": "memlet_store_recall",
     "description": "Hybrid recall (Inverted Index + BM25 + Multi-Intent Facet Decomposition + Prospective Memory Triggers + local Int8 E5 + Entity + 2-hop PPR [[links]] + Coverage Reranker + Lateral Diversity Filter + Grounded Abstention Gate) with 2-stage Progressive Disclosure & Sufficiency Check.",
     "inputSchema": {
       "type": "object",
@@ -57,7 +57,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_read",
+    "name": "memlet_store_read",
     "description": "Read full content, [[links]], and version history of a specific memory item or Stage-2 index item.",
     "inputSchema": {
       "type": "object",
@@ -84,7 +84,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_capture",
+    "name": "memlet_store_capture",
     "description": "2-Tier Write Gear (Auto-Draft Mode + Tri-Factor Admission Control Gate + Contrastive Failure-to-Case Synthesizer): frictionless capture of raw observations, terminal errors, or multi-step troubleshooting without manual sourceRefs or revision.",
     "inputSchema": {
       "type": "object",
@@ -144,14 +144,14 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_learn",
+    "name": "memlet_store_learn",
     "description": "2-Tier Write Gear (Strict Mode): source-hash verified learning of core constraints, facts, experiences (auto-synthesizing SKILL.md), and pitfall cases, with automatic contradiction/supersession resolution, Prospective Memory cue extraction, and Bidirectional Link Graph Evolution.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "revision": {
           "type": "integer",
-          "description": "Current task revision from prism_memory_brief"
+          "description": "Current task revision from memlet_store_brief"
         },
         "operationId": {
           "type": "string",
@@ -175,7 +175,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_skills",
+    "name": "memlet_store_skills",
     "description": "List or search domain procedural skills (SKILL.md) with AST signature-aware self-healing & file-hash staleness detection and optional federated cross-project archetype transfer.",
     "inputSchema": {
       "type": "object",
@@ -207,7 +207,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_skill_manage",
+    "name": "memlet_store_skill_manage",
     "description": "Create, improve, consolidate, promote, degrade, or retract a procedural skill (SKILL.md).",
     "inputSchema": {
       "type": "object",
@@ -233,7 +233,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_feedback",
+    "name": "memlet_store_feedback",
     "description": "Record grounded feedback (used/helpful/incorrect/irrelevant/missing) on a recalled item or skill. Triggers 2-stage skill promotion or auto-synthesizes a pitfall case on incorrect feedback.",
     "inputSchema": {
       "type": "object",
@@ -277,7 +277,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_preflight",
+    "name": "memlet_store_preflight",
     "description": "Active Pre-Flight Guardrail & Constraint Verifier: deterministically verify a proposed action/plan and target files against active constraints, pitfall cases, hierarchical causal dependencies, and Prospective Memory triggers before execution.",
     "inputSchema": {
       "type": "object",
@@ -307,7 +307,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_capsule",
+    "name": "memlet_store_capsule",
     "description": "Subagent Scoped Memory Capsule: generate an ultra-compact (<1,200 chars default) read-only memory capsule (Pre-Flight status + Pitfall cases + Prospective triggers + Scoped skills) tailored to a delegated worker plan and target files.",
     "inputSchema": {
       "type": "object",
@@ -341,7 +341,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_inspector",
+    "name": "memlet_store_inspector",
     "description": "Visual Inspector & Quantitative Benchmark: returns memory/skill/case [[links]] graph nodes & edges, thematic episode clusters, domain hierarchy tree, Mermaid diagram, prompt budget gauge, staleness alerts, and ROI scorecard.",
     "inputSchema": {
       "type": "object",
@@ -357,7 +357,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_scenes",
+    "name": "memlet_store_scenes",
     "description": "Get thematic episode clusters and 4-level domain hierarchy (L0 Task -> L1 Pillar -> L2 Scene -> L3 Node) with directed causal triples.",
     "inputSchema": {
       "type": "object",
@@ -369,7 +369,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_consolidate",
+    "name": "memlet_store_consolidate",
     "description": "Lossless Sleep Consolidation: merge fragmented hypothesis/draft clusters into consolidated semantic items while strictly protecting core invariants and user-confirmed rules (Identity Drift = 0.0).",
     "inputSchema": {
       "type": "object",
@@ -389,7 +389,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_sync_markdown",
+    "name": "memlet_store_sync_markdown",
     "description": "Bi-directional Markdown Co-Editing Sync: ingest direct human edits from SKILL.md files on disk (promoting to user-confirmed) and optional Markdown notes.",
     "inputSchema": {
       "type": "object",
@@ -404,7 +404,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_export_rules",
+    "name": "memlet_store_export_rules",
     "description": "Export or synchronize verified constraints, pitfall cases, and domain SKILL.md index into CLAUDE.md, AGENTS.md, .cursorrules, .windsurfrules, and MCP config.",
     "inputSchema": {
       "type": "object",
@@ -444,7 +444,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_heal_skills",
+    "name": "memlet_store_heal_skills",
     "description": "Strict AST Call-Contract Self-Healing for SKILL.md: inspect stale skills, re-anchor backward-compatible internal edits with verificationStatus=compatible-unverified, and block breaking call-contract changes.",
     "inputSchema": {
       "type": "object",
@@ -460,7 +460,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_verify_skill",
+    "name": "memlet_store_verify_skill",
     "description": "Execution-Backed Skill Verification: run a verification test/command or record a structured executionProof (exitCode, command, output) to promote or re-verify a skill and bind verificationEvidence.",
     "inputSchema": {
       "type": "object",
@@ -494,7 +494,7 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_doctor",
+    "name": "memlet_store_doctor",
     "description": "Cross-Platform Environment, SQLite WAL, & Embedding Model Health Doctor: inspect data root writability, SQLite WAL state, and E5 ONNX model availability.",
     "inputSchema": {
       "type": "object",
@@ -502,8 +502,8 @@ BASE_TOOLS = json.loads(r'''
     }
   },
   {
-    "name": "prism_memory_audit",
-    "description": "Zero-Setup Repository Procedure & Instruction Drift Auditor (deltaharness audit): scan CLAUDE.md, AGENTS.md, .cursorrules, docs, and SKILL.md for missing paths, missing scripts, missing symbols, and breaking call-signature drift.",
+    "name": "memlet_store_audit",
+    "description": "Zero-Setup Repository Procedure & Instruction Drift Auditor (memlet audit): scan CLAUDE.md, AGENTS.md, .cursorrules, docs, and SKILL.md for missing paths, missing scripts, missing symbols, and breaking call-signature drift.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -544,10 +544,10 @@ from unittest.mock import patch
 
 import memory_cli
 import memory_intelligence
-from prism_memory import memlet_bridge as bridge
-from prism_memory import memlet_dream as dream
-from prism_memory.memlet_wiki import init_project
-from prism_memory_mcp import PrismMemoryMCPServer, SERVER_VERSION, mcp_tools
+from memlet import memlet_bridge as bridge
+from memlet import memlet_dream as dream
+from memlet.memlet_wiki import init_project
+from memlet_mcp import MemletMCPServer, SERVER_VERSION, mcp_tools
 
 
 class MemletMCPTests(unittest.TestCase):
@@ -563,7 +563,7 @@ class MemletMCPTests(unittest.TestCase):
         self.git('add', '.')
         self.git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')
         self.assertTrue(init_project(self.repo)['ok'])
-        self.server = PrismMemoryMCPServer(self.root / 'store', default_task='mcp/test')
+        self.server = MemletMCPServer(self.root / 'store', default_task='mcp/test')
         self.transcript = self.repo / 'session.jsonl'
         records = [
             {'type': 'user', 'timestamp': '2026-11-09T09:00:00Z',
@@ -607,7 +607,7 @@ class MemletMCPTests(unittest.TestCase):
         self.assertEqual({'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn'},
                          {t['name'] for t in result[19:]})
         self.assertEqual(23, len(result))
-        self.assertEqual('8.0.0', SERVER_VERSION)
+        self.assertEqual('9.0.0', SERVER_VERSION)
         self.assertIn('Approval is CLI-only', result[-1]['description'])
 
     def test_check_edit_and_rename_stale(self):
@@ -808,7 +808,7 @@ class MemletMCPTests(unittest.TestCase):
         external = self.root / 'external.log'
         external.write_text('2026-11-09T10:00:00Z RULE: never call main() in app.py; PRIVATE_CANARY\n')
         before = self.snapshot()
-        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': ''}), \
+        with patch.dict(os.environ, {'MEMLET_TRANSCRIPT_DIRS': ''}), \
                 patch.object(bridge, 'learn_from_transcript') as learn:
             result = self.rpc('memlet_learn', action='transcript', transcript_path=str(external))
             learn.assert_not_called()
@@ -826,14 +826,14 @@ class MemletMCPTests(unittest.TestCase):
         profile.mkdir()
         (profile / 'projects').symlink_to(real, target_is_directory=True)
         through_link = profile / 'projects' / 'session.jsonl'
-        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': str(real), 'PRISM_TRANSCRIPT_DIRS': ''}):
+        with patch.dict(os.environ, {'MEMLET_TRANSCRIPT_DIRS': str(real)}):
             result = self.rpc('memlet_learn', action='transcript', transcript_path=str(through_link))
             self.assertFalse(result.get('isError'), result)
         elsewhere = self.root / 'elsewhere'
         elsewhere.mkdir()
         (elsewhere / 'session.jsonl').write_bytes(self.transcript.read_bytes())
         (profile / 'other').symlink_to(elsewhere, target_is_directory=True)
-        with patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': str(real), 'PRISM_TRANSCRIPT_DIRS': ''}), \
+        with patch.dict(os.environ, {'MEMLET_TRANSCRIPT_DIRS': str(real)}), \
                 patch.object(bridge, 'learn_from_transcript') as learn:
             result = self.rpc('memlet_learn', action='transcript', transcript_path=str(profile / 'other' / 'session.jsonl'))
             learn.assert_not_called()
@@ -843,7 +843,7 @@ class MemletMCPTests(unittest.TestCase):
     def test_tool_annotations_mark_the_three_read_only_tools_and_not_learn(self):
         # A live Codex session blocked every memlet tool in non-interactive mode because none carried
         # `readOnlyHint`; hosts gate tool calls on these annotations.
-        tools = {tool['name']: tool for tool in mcp_tools() if tool['name'].startswith('memlet_')}
+        tools = {tool['name']: tool for tool in mcp_tools() if tool['name'] in {'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn'}}
         self.assertEqual({'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn'}, set(tools))
         for name in ('memlet_check', 'memlet_recall', 'memlet_handover'):
             self.assertIs(True, tools[name]['annotations']['readOnlyHint'], name)
@@ -851,14 +851,14 @@ class MemletMCPTests(unittest.TestCase):
         self.assertIs(False, tools['memlet_learn']['annotations']['readOnlyHint'])
         self.assertIs(False, tools['memlet_learn']['annotations']['destructiveHint'])
         for tool in mcp_tools():
-            if not tool['name'].startswith('memlet_'):
+            if tool['name'].startswith('memlet_store_'):
                 self.assertNotIn('annotations', tool, tool['name'])
 
     def test_known_agent_roots_and_trusted_environment_override(self):
         home = self.root / 'home'
-        with patch('prism_memory_mcp.Path.home', return_value=home), \
-                patch.dict(os.environ, {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': ''}):
-            for relative in ('.prism-memory/sessions', '.codex/sessions', '.claude/projects', '.muse/sessions'):
+        with patch('memlet_mcp.Path.home', return_value=home), \
+                patch.dict(os.environ, {'MEMLET_TRANSCRIPT_DIRS': ''}):
+            for relative in ('.codex/sessions', '.claude/projects', '.muse/sessions'):
                 directory = home / relative
                 directory.mkdir(parents=True)
                 transcript = directory / 'session.jsonl'
@@ -868,8 +868,8 @@ class MemletMCPTests(unittest.TestCase):
         custom.mkdir()
         transcript = custom / 'session.jsonl'
         transcript.write_bytes(self.transcript.read_bytes())
-        for variable in ('DELTAHARNESS_TRANSCRIPT_DIRS', 'PRISM_TRANSCRIPT_DIRS'):
-            env = {'DELTAHARNESS_TRANSCRIPT_DIRS': '', 'PRISM_TRANSCRIPT_DIRS': '', variable: str(custom)}
+        for variable in ('MEMLET_TRANSCRIPT_DIRS',):
+            env = {'MEMLET_TRANSCRIPT_DIRS': '', variable: str(custom)}
             with patch.dict(os.environ, env):
                 self.payload('memlet_learn', action='transcript', transcript_path=str(transcript))
                 # The repository remains allowed alongside a host-configured root.

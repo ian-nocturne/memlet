@@ -1,13 +1,13 @@
 name: "Memlet Check (Instruction & Memory Drift Guard)"
-description: "Memlet Check: zero-setup instruction & memory drift guard (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `SKILL.md`) with VibeRescue preflight and Anti-Slop UI/copy gate. Formerly DeltaHarness / Ieum Check; inputs and outputs unchanged."
-author: "Ian · Nocturne Lab"
+description: "Memlet Check: instruction and memory drift audit for agent rule files."
+author: "Ian"
 branding:
   icon: "shield"
   color: "blue"
 
 inputs:
   mode:
-    description: "Gate mode to execute: 'audit' (instruction/symbol drift), 'rescue' (env/deploy cliff bundle), 'anti-slop' (UI/copy slop score), or 'all'."
+    description: "Only 'audit' is supported (default). Every other mode was removed in 9.0 and is a configuration error (exit 2)."
     required: false
     default: "audit"
   repo-path:
@@ -23,17 +23,17 @@ inputs:
     required: false
     default: "HEAD"
   format:
-    description: "Format of the report printed to the job log and step summary: 'markdown' (default, all gates), 'json' (one JSON document with the verdict and each active gate's result), or 'sarif' (the audit SARIF v2.1.0 document; needs mode 'audit' or 'all', other gates are reported in the step summary only)."
+    description: "Report format: 'markdown' (default), 'json', or 'sarif' (SARIF v2.1.0)."
     required: false
     default: "markdown"
   fail-on-drift:
-    description: "Exit with non-zero code if high-severity drift or deploy blockers are detected ('true' or 'false'). Only 'true' or 'false' is accepted (empty means 'true'); any other value is a configuration error (exit 2). Warnings (rescue ENV_UNVERIFIED, anti-slop with no UI/copy files) never fail the job. A malformed checker result always fails (exit 2)."
+    description: "Fail on drift: 'true' or 'false' only (empty means 'true'). Invalid values or malformed audit results always fail with exit 2."
     required: false
     default: "true"
   sarif-file:
-    description: "Optional path to write SARIF v2.1.0 output for GitHub Code Scanning. The file is never written through a symbolic link: a symlink at this path is refused (exit 2). The default file name keeps its legacy value for backward compatibility; the SARIF tool.driver.name is set by the bundled checker and may show a legacy name (Ieum Memory / DeltaHarness) depending on the release."
+    description: "Optional SARIF output path. A symlink at this path is refused (exit 2)."
     required: false
-    default: "deltaharness-audit.sarif"
+    default: "memlet-check.sarif"
   python-version:
     description: "Python version to install with actions/setup-python (for example '3.11'). Default is empty: the Action does not change the caller's Python and uses the interpreter already on the runner, which must be >= 3.9. Releases before this input existed always installed Python 3.11; set '3.11' to keep that behaviour."
     required: false
@@ -41,7 +41,7 @@ inputs:
 
 outputs:
   status:
-    description: "Overall gate status: 'PASS', 'DRIFT_DETECTED' (real findings), or 'UNVERIFIED' (something could not be checked; never reported as PASS). UNVERIFIED fails the job for blockers (e.g. no instruction docs) and passes it for warnings (rescue ENV_UNVERIFIED, no UI/copy files)."
+    description: "Audit status: 'PASS', 'DRIFT_DETECTED', or 'UNVERIFIED'. Missing instruction docs or unverifiable commands block."
     value: ${{ steps.run-gate.outputs.status }}
   finding-count:
     description: "Number of blocking/error findings across active gates."
@@ -49,9 +49,6 @@ outputs:
   total-finding-count:
     description: "Total number of all findings (including warnings and hygiene notices)."
     value: ${{ steps.run-gate.outputs.total_finding_count }}
-  slop-score:
-    description: "AI Slop Score (0-100, lower is cleaner) when mode includes 'anti-slop'."
-    value: ${{ steps.run-gate.outputs.slop_score }}
 
 runs:
   using: "composite"
@@ -92,5 +89,5 @@ runs:
           exit 2
         fi
 
-        # Verdict rules (blockers vs warnings), the 'format' input and the outputs live in prism_memory/action_verdict.py.
-        "$PY" -m prism_memory.action_verdict
+        # Verdict rules (blockers vs warnings), the 'format' input and the outputs live in memlet/action_verdict.py.
+        "$PY" -m memlet.action_verdict

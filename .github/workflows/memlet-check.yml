@@ -1,0 +1,47 @@
+name: Memlet Check
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Gate mode: audit only"
+        required: false
+        default: "audit"
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  memlet-gate:
+    name: "Memlet · Instruction Drift Audit"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Memlet Check
+        id: gate
+        uses: ./
+        with:
+          mode: ${{ github.event.inputs.mode || 'audit' }}
+          repo-path: "."
+          base-ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          head-ref: "HEAD"
+          fail-on-drift: "true"
+          sarif-file: "memlet-check.sarif"
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && hashFiles('memlet-check.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: memlet-check.sarif
+          category: memlet-instruction-drift

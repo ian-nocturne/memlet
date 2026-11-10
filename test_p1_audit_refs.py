@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from prism_memory.audit import audit_repository, _resolve_git_commit
-from prism_memory_mcp import PrismMemoryMCPServer
+from memlet.audit import audit_repository, _resolve_git_commit
+from memlet_mcp import MemletMCPServer
 
 
 class AuditRefSafetyTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class AuditRefSafetyTests(unittest.TestCase):
         self.victim = self.root / 'outside-audit-output'
         self.victim.write_bytes(b'DO NOT OVERWRITE\n')
         self.option = '--output=' + str(self.victim)
-        self.server = PrismMemoryMCPServer(self.root / 'store', default_task='audit/test')
+        self.server = MemletMCPServer(self.root / 'store', default_task='audit/test')
 
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo)] + list(args), text=True,
@@ -66,7 +66,7 @@ class AuditRefSafetyTests(unittest.TestCase):
 
     def test_exact_output_option_through_mcp_both_check_routes(self):
         for name, args in [('memlet_check', {'changed': False, 'base': self.option}),
-                           ('prism_memory_audit', {'baseRef': self.option})]:
+                           ('memlet_store_audit', {'baseRef': self.option})]:
             key = 'repo_path' if name == 'memlet_check' else 'repoPath'
             args[key] = str(self.repo)
             response = self.server.handle_rpc({'id': 1, 'method': 'tools/call',
@@ -111,7 +111,7 @@ class AuditRefSafetyTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 129, '', 'unknown option')
             return real_run(command, **kwargs)
 
-        with patch('prism_memory.audit.subprocess.run', side_effect=old_git):
+        with patch('memlet.audit.subprocess.run', side_effect=old_git):
             self.assertEqual(self.base, _resolve_git_commit(self.repo, 'base-tag'))
             with self.assertRaises(ValueError):
                 _resolve_git_commit(self.repo, self.option)

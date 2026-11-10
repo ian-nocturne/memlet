@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from prism_memory.standalone import (StandaloneStore as WorkStore,
+from memlet.standalone import (StandaloneStore as WorkStore,
                                      default_standalone_task_id as _standalone_task_id,
                                      legacy_standalone_notice)
 import work_memory
@@ -95,11 +95,11 @@ def read_item(store, task, item_id, offset=0, size=6000):
 
 
 def _allowed_transcript_roots():
-    custom = os.environ.get('DELTAHARNESS_TRANSCRIPT_DIRS') or os.environ.get('PRISM_TRANSCRIPT_DIRS') or ''
+    custom = os.environ.get('MEMLET_TRANSCRIPT_DIRS') or ''
     if custom.strip():
         return tuple(Path(p).expanduser() for p in custom.split(os.pathsep) if p.strip())
     home = Path.home()
-    return tuple(home / rel for rel in ('.prism-memory/sessions', '.codex/sessions', '.claude/projects', '.muse/sessions'))
+    return tuple(home / rel for rel in ('.codex/sessions', '.claude/projects', '.muse/sessions'))
 
 
 def backfill(store, task, session, end_byte=None):
@@ -113,7 +113,7 @@ def backfill(store, task, session, end_byte=None):
             source=json.loads(row['source'])
             if source.get('session')==session and source.get('reference'):
                 refs.append(source['reference'])
-        if not refs:raise ValueError('no observed transcript reference; use PRISM memory_backfill for this linked session')
+        if not refs:raise ValueError('no observed transcript reference; use Memlet memory_backfill for this linked session')
     path=Path(refs[0]).expanduser()
     allowed=_allowed_transcript_roots()
     if path.is_symlink() or path.suffix!='.jsonl' or not any(path.resolve().is_relative_to(p.resolve()) for p in allowed):
@@ -151,263 +151,15 @@ def backfill(store, task, session, end_byte=None):
 def _default_cli_root():
     pkg_dir = Path(__file__).resolve().parent
     try:
-        from prism_memory.paths import resolve_default_data_root
+        from memlet.paths import resolve_default_data_root
         return str(resolve_default_data_root(package_dir=pkg_dir))
     except Exception:
         return str(pkg_dir)
 
 
-_OPSEC_TOKEN_RE = None
-
-
-def _opsec_fingerprint(text: str) -> str:
-    import hashlib
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-OPSEC_MAX_SPAN_CHARS = 96
-OPSEC_ALLOWLIST_NAME = ".opsec-allowlist.json"
-
-
-def _opsec_is_word_char(ch: str) -> bool:
-    return ch.isalnum()
-
-
-def _opsec_candidates(line: str):
-    """Yield every span of `line` that starts and ends on a token boundary (<= OPSEC_MAX_SPAN_CHARS).
-
-    A boundary is the line start/end, any change between word and non-word characters, and both sides of
-    every punctuation character. So an exact registered string (including leading/trailing `_`, apostrophes,
-    `@`, and phrases of any word count up to the span limit) is always a candidate. Plaintext is only hashed.
-    """
-    n = len(line)
-    if not n:
-        return
-    bounds = {0, n}
-    for k in range(1, n):
-        prev, cur = line[k - 1], line[k]
-        pw, cw = _opsec_is_word_char(prev), _opsec_is_word_char(cur)
-        if pw != cw or not pw or not cw:
-            bounds.add(k)
-    ordered = sorted(bounds)
-    for idx, i in enumerate(ordered):
-        if line[i:i + 1].isspace():
-            continue
-        for j in ordered[idx + 1:]:
-            if j - i > OPSEC_MAX_SPAN_CHARS:
-                break
-            if line[j - 1].isspace():
-                continue
-            yield line[i:j]
-
-
-OPSEC_RULE_IDS = ("host_path_leak", "secret_literal_leak", "canon_forbidden_pattern")
-
-
-def _load_opsec_allowlist(target: Path):
-    """Explicit, per-finding exceptions: {file, ruleId, sha256 of the exact matched text, reason}. No blanket skips.
-
-    Every field is type-checked; a malformed file is a configuration error (exit 2), never a silent exception.
-    Fingerprint findings (`forbidden_identifier_fingerprint`) can never be allowlisted.
-    """
-    import re
-    base = target if target.is_dir() else target.parent
-    path = base / OPSEC_ALLOWLIST_NAME
-    if not path.is_file():
-        return {}, None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    allowed_top = {"schema", "policy", "entries"}
-    allowed_entry = {"file", "ruleId", "matchSha256", "reason", "synthetic"}
-    if not isinstance(data, dict) or set(data) - allowed_top or not isinstance(data.get("entries"), list):
-        raise ValueError(f"Allowlist must be an object with only {sorted(allowed_top)} and a list `entries`")
-    for key in ("schema", "policy"):
-        if key in data and not (isinstance(data[key], str) and data[key].strip()):
-            raise ValueError(f"Allowlist `{key}` must be a non-empty string")
-    entries = {}
-    for item in data["entries"]:
-        if not isinstance(item, dict) or set(item) - allowed_entry:
-            raise ValueError(f"Allowlist entry has unsupported fields (allowed: {sorted(allowed_entry)}): {sorted(item) if isinstance(item, dict) else item!r}")
-        file_v, rule_v, hash_v, reason_v = item.get("file"), item.get("ruleId"), item.get("matchSha256"), item.get("reason")
-        if not (isinstance(file_v, str) and file_v.strip()):
-            raise ValueError(f"Allowlist entry `file` must be a non-empty string: {item!r}")
-        if rule_v not in OPSEC_RULE_IDS:
-            raise ValueError(f"Allowlist entry `ruleId` must be one of {OPSEC_RULE_IDS}: {rule_v!r}")
-        if not (isinstance(hash_v, str) and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", hash_v)):
-            raise ValueError(f"Allowlist entry `matchSha256` must be a lowercase sha256 hex string: {hash_v!r}")
-        if not (isinstance(reason_v, str) and reason_v.strip()):
-            raise ValueError(f"Allowlist entry `reason` must be a non-empty string: {item!r}")
-        if "synthetic" in item and not isinstance(item["synthetic"], bool):
-            raise ValueError(f"Allowlist entry `synthetic` must be a boolean: {item['synthetic']!r}")
-        entries[(file_v, rule_v, "sha256:" + hash_v.replace("sha256:", ""))] = reason_v
-    return entries, str(path)
-
-
-def _load_opsec_canon(canon_path, target: Path):
-    """Return (patterns, fingerprints, canon_source). Patterns are compiled regexes; fingerprints are 'sha256:<hex>'."""
-    import re
-    candidates = []
-    if canon_path:
-        candidates.append(Path(canon_path))
-    else:
-        base = target if target.is_dir() else target.parent
-        candidates.extend([
-            base / "persona-canon.json",
-            Path(__file__).resolve().parent / "persona-canon.json",
-            Path(__file__).resolve().parent / "prism_memory" / "persona-canon.json",
-        ])
-        try:  # installed wheel: canon ships as prism_memory package data
-            import prism_memory as _pm
-            candidates.append(Path(_pm.__file__).resolve().parent / "persona-canon.json")
-        except Exception:
-            pass
-    for cp in candidates:
-        if not cp.is_file():
-            continue
-        canon = json.loads(cp.read_text(encoding="utf-8"))
-        patterns, fingerprints = [], set()
-        for ch in (canon.get("characters") or {}).values():
-            if not isinstance(ch, dict):
-                continue
-            for pat in ch.get("forbidden_patterns") or []:
-                if isinstance(pat, str) and pat and not (pat.startswith("<") and pat.endswith(">")):
-                    patterns.append(re.compile(pat, re.I))
-            for fp in ch.get("forbidden_identifier_sha256_fingerprints") or []:
-                raw = str(fp or "").strip().lower()
-                hexpart = raw.split(":", 1)[1] if raw.startswith("sha256:") else raw
-                if re.fullmatch(r"[0-9a-f]{64}", hexpart):
-                    fingerprints.add("sha256:" + hexpart)
-                else:
-                    raise ValueError(f"Malformed SHA-256 fingerprint in canon: {fp!r}")
-        return patterns, fingerprints, str(cp)
-    if canon_path:
-        raise FileNotFoundError(f"Canon file not found: {canon_path}")
-    return [], set(), None
-
-
-def _run_opsec_check(target_path: str, canon_path=None, include_history: bool = False, require_canon: bool = False) -> dict:
-    import re
-    import subprocess
-    from prism_memory.viberescue import SECRET_VALUE_REDACT_RE
-    p = Path(target_path or ".").resolve()
-    if not p.exists():
-        return {"ok": False, "exitCode": 2, "scannedFiles": 0, "findingCount": 0, "findings": [], "error": f"Target not found: {target_path}"}
-    files = [p] if p.is_file() else [
-        f for f in sorted(p.rglob("*"))
-        if f.is_file()
-        and not any(part in {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".deps"} for part in f.parts)
-        and f.suffix.lower() in {".md", ".json", ".html", ".ts", ".tsx", ".js", ".jsx", ".py", ".sh", ".yml", ".yaml", ".toml", ".txt", ".css", ".sql", ".cjs", ".mjs"}
-    ]
-    if not files:
-        return {"ok": False, "exitCode": 2, "scannedFiles": 0, "findingCount": 0, "findings": [], "error": "No scannable files found"}
-    try:
-        extra_patterns, fingerprints, canon_source = _load_opsec_canon(canon_path, p)
-        allowlist, allowlist_source = _load_opsec_allowlist(p)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "exitCode": 2, "scannedFiles": 0, "findingCount": 0, "findings": [], "error": f"Canon/allowlist error: {exc}"}
-    host_path_re = re.compile(r"(?:^|[\s\"'`=(]|file://)(?:/Users/(?!alice\b|bob\b|test\b)[A-Za-z0-9_.-]+|/home/(?!runner\b|ubuntu\b|user\b)[A-Za-z0-9_.-]+|[A-Za-z]:\\Users\\[A-Za-z0-9_.-]+)")
-    findings, allowlisted = [], []
-
-    def _emit(rel: str, rule: str, matched: str, finding: dict) -> None:
-        key = (rel, rule, _opsec_fingerprint(matched))
-        if key in allowlist and Path(rel).name != OPSEC_ALLOWLIST_NAME:
-            allowlisted.append({"file": rel, "line": finding.get("line"), "ruleId": rule, "matchSha256": key[2], "reason": allowlist[key]})
-        else:
-            findings.append(finding)
-
-    def _scan_line(rel: str, line_no, line: str, source: str) -> None:
-        loc = {"file": rel, "line": line_no}
-        if source != "worktree":
-            loc["source"] = source
-        for m in host_path_re.finditer(line):
-            _emit(rel, "host_path_leak", m.group(0).strip(), {"ruleId": "host_path_leak", "severity": "error", **loc, "message": "Host filesystem user path detected"})
-        # No word- or file-name-based suppression: every secret-shaped literal is reported unless an explicit
-        # allowlist entry pins that exact match (by SHA-256) in that file with a written reason.
-        for m in SECRET_VALUE_REDACT_RE.finditer(line):
-            _emit(rel, "secret_literal_leak", m.group(0), {"ruleId": "secret_literal_leak", "severity": "error", **loc, "message": "Raw credential or secret token pattern detected"})
-        for c_pat in extra_patterns:
-            for m in c_pat.finditer(line):
-                _emit(rel, "canon_forbidden_pattern", m.group(0), {"ruleId": "canon_forbidden_pattern", "severity": "error", **loc, "message": "Forbidden OPSEC pattern detected"})
-        if fingerprints:
-            hit = set()
-            for cand in _opsec_candidates(line):
-                for variant in (cand, cand.lower(), cand.strip().lower()):
-                    fp = _opsec_fingerprint(variant)
-                    if fp in fingerprints and fp not in hit:
-                        hit.add(fp)
-                        # Report the fingerprint only; never echo the matched plaintext.
-                        findings.append({"ruleId": "forbidden_identifier_fingerprint", "severity": "error", **loc, "fingerprint": fp, "message": "Text matching a forbidden identifier fingerprint detected"})
-
-    for f in files:
-        # The allowlist file itself is scanned like any other file (its reason/policy text included);
-        # its own findings cannot be allowlisted.
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        rel = str(f.relative_to(p)) if p.is_dir() else f.name
-        for line_no, line in enumerate(text.splitlines(), 1):
-            _scan_line(rel, line_no, line, "worktree")
-
-    history = None
-    if include_history:
-        repo_dir = p if p.is_dir() else p.parent
-        try:
-            proc = subprocess.run(["git", "-C", str(repo_dir), "log", "-p", "--all", "--no-color", "--format=commit %H"], capture_output=True, text=True, errors="replace", timeout=120)
-        except (OSError, subprocess.SubprocessError) as exc:
-            proc = None
-            history = {"scanned": False, "error": str(exc)}
-        if proc is not None:
-            if proc.returncode != 0:
-                history = {"scanned": False, "error": (proc.stderr or "not a git repository").strip()[:200]}
-            else:
-                commit, cur_file, commits = "", "", set()
-                for raw in proc.stdout.splitlines():
-                    if raw.startswith("commit "):
-                        commit = raw[7:].strip(); commits.add(commit); continue
-                    if raw.startswith("+++ b/"):
-                        cur_file = raw[6:]; continue
-                    if raw.startswith("+") and not raw.startswith("+++"):
-                        _scan_line(cur_file or "?", None, raw[1:], f"git:{commit[:12]}")
-                history = {"scanned": True, "commitCount": len(commits)}
-
-    unverified = []
-    if include_history and not (history or {}).get("scanned"):
-        unverified.append("git_history_not_scanned")
-    if canon_source is None:
-        unverified.append("persona_canon_not_configured")
-    canon_blocking = require_canon and canon_source is None
-    history_blocking = "git_history_not_scanned" in unverified
-    if findings:
-        exit_code = 1
-    elif history_blocking or canon_blocking:
-        exit_code = 2  # a requested check did not run: never report success
-    else:
-        exit_code = 0
-    result = {
-        "ok": exit_code == 0,
-        "exitCode": exit_code,
-        "status": "FINDINGS" if findings else ("UNVERIFIED" if exit_code == 2 else "CLEAN_FOR_CHECKED_RULES"),
-        "scannedFiles": len(files),
-        "canonSource": canon_source,
-        "canonStatus": "loaded" if canon_source else "not_configured",
-        "fingerprintCount": len(fingerprints),
-        "findingCount": len(findings),
-        "findings": findings,
-        "rawFindingCount": len(findings) + len(allowlisted),
-        "allowlistSource": allowlist_source,
-        "allowlistedCount": len(allowlisted),
-        "allowlisted": allowlisted,
-        "unverified": unverified,
-    }
-    if history is not None:
-        result["gitHistory"] = history
-    return result
-
-
-PROGRAM_NAMES=('memlet','ieum-memory','deltaharness','prism-memory')
+PROGRAM_NAMES=('memlet',)
 # Repo-scoped actions handled before the task store opens (`inspector --task` keeps the store inspector).
-_EARLY_REPO_ACTIONS=('pack','ui','inspector')
-PACK_STACK_CHOICES=['all','nextjs-supabase','fastapi-postgres','swift-ios']
+_EARLY_REPO_ACTIONS=('ui','inspector')
 
 
 def _program_name():
@@ -437,9 +189,8 @@ ADMIN_GROUPS = (
      'skill-manage skill-sync index backfill preflight capsule consolidate sync-md export'),
     ('Rules/wiki', 'init check audit wiki import slim-plan rule-context rule-recall index-build handover'),
     ('Dream', 'dream-build dream dream-recall dream-pending dream-approve dream-reject'),
-    ('Rescue/anti-slop/pack', 'rescue viberescue anti-slop pack'),
     ('Benchmarks', 'repo-benchmark compare-bench benchmark-compare benchmark'),
-    ('Maintenance', 'doctor backup restore heal-skills verify-skill inspector ui opsec-check opsec-fingerprint'),
+    ('Maintenance', 'doctor backup restore heal-skills verify-skill inspector ui'),
 )
 
 
@@ -547,10 +298,10 @@ def _deprecated(name, replacement):
 
 def _bridge_call(name, *args, **kwargs):
     try:
-        from prism_memory import memlet_bridge
+        from memlet import memlet_bridge
     except ImportError:
         return {'ok': False, 'error': 'Repository memory bridge is unavailable; install a Memlet build '
-                'containing prism_memory.memlet_bridge.', 'exitCode': 1}
+                'containing memlet.memlet_bridge.', 'exitCode': 1}
     return getattr(memlet_bridge, name)(*args, **kwargs)
 
 
@@ -559,7 +310,7 @@ def _refresh_managed_promotion(graph_path, result):
     path = Path(graph_path).expanduser().resolve()
     if (path.name == 'APPROVAL-QUEUE.json' and path.parent.name == 'dream'
             and path.parent.parent.name == '.memlet' and path.is_file()):
-        from prism_memory.memlet_bridge import promote_approved
+        from memlet.memlet_bridge import promote_approved
         promotion = promote_approved(path.parent.parent.parent)
         result['promotion'] = promotion
         if not promotion.get('ok'):
@@ -577,7 +328,7 @@ def _route_new(args):
         if args.accept:
             return _bridge_call('accept_anchor', repo, anchors=args.accept, dry_run=args.dry_run)
         if args.repin_legacy_ts:
-            from prism_memory.memlet_wiki import repin_legacy_ts_anchors
+            from memlet.memlet_wiki import repin_legacy_ts_anchors
             return repin_legacy_ts_anchors(repo, dry_run=args.dry_run)
     if args.action == 'recall' and (args.unified or args.positional_query is not None):
         kwargs = {'budget': args.budget}
@@ -608,7 +359,7 @@ def _route_new(args):
         if args.reject:
             return _bridge_call('learn_reject', args.repo, ids=args.reject, approver=args.by, reason=args.reason)
     if args.action == 'handover' and args.verify:
-        from prism_memory.memlet_wiki import verify_handover_checksum, verify_handover_markdown
+        from memlet.memlet_wiki import verify_handover_checksum, verify_handover_markdown
         try:
             path = Path(args.verify)
             content = path.read_text(encoding='utf-8')
@@ -626,10 +377,10 @@ def _route_new(args):
             result['_cli_text'] = 'memlet: ' + reason + '\n'
         return result
     if args.action == 'dream-pending':
-        from prism_memory.memlet_dream import list_pending
+        from memlet.memlet_dream import list_pending
         return list_pending(args.graph)
     if args.action == 'dream-approve':
-        from prism_memory.memlet_dream import approve_queue_items
+        from memlet.memlet_dream import approve_queue_items
         options = {}
         if args.reconsider:
             options['reconsider'] = True
@@ -639,7 +390,7 @@ def _route_new(args):
                                      snapshot_path=args.snapshot, db_path=args.db, **options)
         return _refresh_managed_promotion(args.graph, result)
     if args.action == 'dream-reject':
-        from prism_memory.memlet_dream import reject_queue_items
+        from memlet.memlet_dream import reject_queue_items
         result = reject_queue_items(args.graph, args.ids, approver=args.by, reason=args.reason, db_path=args.db)
         return _refresh_managed_promotion(args.graph, result)
     return None
@@ -730,6 +481,10 @@ def main():
     for name in ('root', 'task', 'session', 'standalone'):
         if not hasattr(args, name):
             setattr(args, name, getattr(args, '_global_' + name))
+    from memlet.compatibility import existing_store_notice
+    notice = existing_store_notice(args.root)
+    if notice:
+        print(notice, file=sys.stderr)
     _validate_modes(args, parser)
     if args.action == 'recall' and args.budget is None:
         args.budget = 1200 if args.unified or args.positional_query is not None else 6000
@@ -748,7 +503,7 @@ def _build_parser():
     # all valid global prefixes explicitly, then stop the parent from rejecting
     # a child's legacy --s as ambiguous between --session and --standalone.
     parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet: local repository memory.',allow_abbrev=False)
-    from prism_memory import VERSION
+    from memlet import VERSION
     parser.add_argument('--version',action='version',version=VERSION)
     _add_global_options(parser, defaults=True)
     _reserve_legacy_prefixes(parser)
@@ -759,10 +514,6 @@ def _build_parser():
     rb_p=sub.add_parser('repo-benchmark');rb_p.add_argument('--work-dir',default=None)
     aud_p=sub.add_parser('audit',aliases=['check']);aud_p.add_argument('repo_positional',nargs='?',default=None);aud_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     aud_p.add_argument('--base',action=_ExplicitValue,default=None);aud_p.add_argument('--head',action=_ExplicitValue,default='HEAD');aud_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
-    resc_p=sub.add_parser('rescue',aliases=['viberescue']);resc_p.add_argument('repo_positional',nargs='?',default=None);resc_p.add_argument('extra_positional',nargs='?',default=None);resc_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    resc_p.add_argument('--write',action='store_true');resc_p.add_argument('--output-dir',default=None);resc_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','prompt']);resc_p.add_argument('--exit-zero',action='store_true')
-    slop_p=sub.add_parser('anti-slop');slop_p.add_argument('repo_positional',nargs='?',default=None);slop_p.add_argument('extra_positional',nargs='?',default=None);slop_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    slop_p.add_argument('--lock',action='store_true');slop_p.add_argument('--force',action='store_true');slop_p.add_argument('--archetype',default='linear-precision');slop_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','prompt']);slop_p.add_argument('--exit-zero',action='store_true')
     init_p=sub.add_parser('init',help='Zero-daemon onboarding: create .memlet/config.json and .memlet/wiki/INDEX.md (never reads .env)')
     init_p.add_argument('repo_positional',nargs='?',default=None);init_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     init_p.add_argument('--dry-run',action='store_true');init_p.add_argument('--force',action='store_true',help='Regenerate INDEX.md and re-pin anchors')
@@ -814,8 +565,6 @@ def _build_parser():
     hand_p.add_argument('--budget',default=None,help='Token budget: a number (clamped to 500-2000) or auto (~12%% of the instruction text); default from .memlet/config.json handover.tokenBudget, else 500')
     cmp_p=sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet')
     cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    opsec_p=sub.add_parser('opsec-check');opsec_p.add_argument('repo_positional',nargs='?',default=None);opsec_p.add_argument('--file','--repo-path','--repo',dest='target_file',default=None);opsec_p.add_argument('--canon',default=None);opsec_p.add_argument('--history',action='store_true',help='Also scan added lines in the full git history (git log -p --all); exit 2 if history cannot be scanned');opsec_p.add_argument('--require-canon',action='store_true',help='Exit 2 when no persona canon (fingerprint file) is found')
-    sub.add_parser('opsec-fingerprint',help='Read one identifier per stdin line and print its sha256 fingerprint (plaintext is not stored)')
     heal_p=sub.add_parser('heal-skills');heal_p.add_argument('--dry-run',action='store_true')
     ver_p=sub.add_parser('verify-skill');ver_p.add_argument('--id',required=True);ver_p.add_argument('--command',default=None)
     ver_p.add_argument('--proof-file',default=None);ver_p.add_argument('--operation-id',default='');ver_p.add_argument('--timeout',type=float,default=15.0)
@@ -827,15 +576,10 @@ def _build_parser():
     bench_p.add_argument('repo_positional',nargs='?',default=None);bench_p.add_argument('--budget',type=int,default=6000)
     bench_p.add_argument('--format',action=_OutputFormat,default=None,choices=['json','markdown'])
     insp_p=sub.add_parser('inspector',help='Without --task: same HTML report as `ui`; with --task: task-memory inspector');insp_p.add_argument('--budget',type=int,default=6000)
-    ui_p=sub.add_parser('ui',help='Nocturne Memory & Routing Inspector: self-contained HTML report (AST health, benchmark, handover, Routlet matrix)')
+    ui_p=sub.add_parser('ui',help='Memlet Inspector: self-contained HTML report (AST health, benchmark, handover)')
     for p in (insp_p,ui_p):
         p.add_argument('repo_positional',nargs='?',default=None);p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
         p.add_argument('--output','--out',dest='output',default=None,help='HTML output file');p.add_argument('--output-dir',default=None)
-    pack_p=sub.add_parser('pack',help='Routlet x Memlet Harness Pack: per-stack CLAUDE.md, AGENTS.md, SKILL.md, PITFALLS.md, Routlet preset, design tokens, MANIFEST.json')
-    pack_p.add_argument('repo_positional',nargs='?',default=None,help='Output directory (same as --output)')
-    pack_p.add_argument('--stack',default='all',choices=PACK_STACK_CHOICES);pack_p.add_argument('--output',default=None,help='Output directory; omit to compute in memory only')
-    pack_p.add_argument('--output-dir',default=None);pack_p.add_argument('--dry-run',action='store_true');pack_p.add_argument('--list',action='store_true',help='List available stack packs')
-    pack_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     exp_p=sub.add_parser('export');exp_p.add_argument('--targets',default='claude,agents,cursor,windsurf,mcp')
     exp_p.add_argument('--target-dir',default=None);exp_p.add_argument('--write',action='store_true');exp_p.add_argument('--lang',default='ko')
     cap_p=sub.add_parser('capture');cap_p.add_argument('--file',default=None);cap_p.add_argument('--text',default=None)
@@ -912,27 +656,16 @@ def _main(args, parser):
         return routed
     if args.action=='schema':return schema()
     if args.action=='repo-benchmark':return memory.repo_benchmark(work_dir=args.work_dir)
-    if args.action=='opsec-check':
-        target_p=args.target_file or args.repo_positional or '.'
-        return _run_opsec_check(target_p,canon_path=args.canon,include_history=args.history,require_canon=args.require_canon)
     if args.action in _EARLY_REPO_ACTIONS and not (args.action=='inspector' and (args.task or args.standalone)):
-        if args.action=='pack':
-            from prism_memory.memlet_pack import build_harness_pack, list_packs
-            if args.list:return list_packs()
-            out_dir=args.output or args.output_dir or (args.repo_positional if args.repo_positional not in (None,'.') else None)
-            res=build_harness_pack(args.stack,output_dir=out_dir,dry_run=args.dry_run,output_format=args.format)
-            if args.format=='markdown' and isinstance(res.get('formatted'),str):
-                res['_cli_text']=res['formatted']+('\n' if not res['formatted'].endswith('\n') else '')
-            return res
-        from prism_memory.memlet_inspector import export_inspector_html
+        from memlet.memlet_inspector import export_inspector_html
         target_repo=args.repo_path or args.repo_positional or '.'
         out_file=args.output or args.output_dir
         return export_inspector_html(target_repo,output_path=out_file)
     if args.action in ('init','wiki'):
-        from prism_memory.memlet_wiki import init_project, wiki_status
+        from memlet.memlet_wiki import init_project, wiki_status
         target_repo=args.repo_path or args.repo_positional or '.'
         if args.action=='init' and (args.hooks or args.hooks_remove):
-            from prism_memory.memlet_hooks import init_hooks_command
+            from memlet.memlet_hooks import init_hooks_command
             res=init_hooks_command(target_repo,remove=args.hooks_remove,scope=args.hooks_scope or 'local',git_hooks=args.git_hooks,
                                    dry_run=args.dry_run,force=args.force,output_format=args.format)
         elif args.action=='init':
@@ -942,7 +675,7 @@ def _main(args, parser):
         if args.format=='markdown':res['_cli_text']=res['formatted']
         return res
     if args.action=='slim-plan':
-        from prism_memory.memlet_slim import slim_plan
+        from memlet.memlet_slim import slim_plan
         res=slim_plan(args.repo_positional or '.',args.out,keep_recent=args.keep_recent,split_rules=args.split_rules)
         # This exact plan outcome is a successful no-op, unlike invalid inputs,
         # unsafe outputs, failed proofs, or apply collisions.
@@ -950,7 +683,7 @@ def _main(args, parser):
             res['exitCode']=0
         return res
     if args.action in ('dream-build','dream'):
-        from prism_memory.memlet_dream import run_dream_build
+        from memlet.memlet_dream import run_dream_build
         return run_dream_build(
             snapshot_path=args.snapshot,
             out_json=args.out_json,
@@ -959,7 +692,7 @@ def _main(args, parser):
             vendor=args.vendor,
         )
     if args.action=='dream-recall':
-        from prism_memory.memlet_dream import run_dream_recall
+        from memlet.memlet_dream import run_dream_recall
         res=run_dream_recall(
             graph_path=args.graph,
             query_text=' '.join(args.query) if isinstance(args.query,list) else str(args.query or ''),
@@ -972,7 +705,7 @@ def _main(args, parser):
             res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
         return res
     if args.action in ('rule-context','rule-recall'):
-        from prism_memory.memlet_recall import build_context, recall
+        from memlet.memlet_recall import build_context, recall
         if args.action=='rule-context':
             return build_context(args.repo_positional or '.',core_budget=args.core_budget,index_budget=args.index_budget,auto=args.auto,threshold=args.threshold)
         usage='Use rule-recall "<query>" [--repo DIR] or rule-recall <existing-dir> "<query>".'
@@ -990,13 +723,13 @@ def _main(args, parser):
             parser.error('A rule query is required. '+usage)
         return recall(repo,query,k=args.k,safety=args.safety)
     if args.action=='index-build':
-        from prism_memory.memlet_index import build_index
+        from memlet.memlet_index import build_index
         return build_index(args.repo_positional or '.',via=args.via)
     if args.action=='brief-build':
-        from prism_memory.memlet_brief import build_brief
+        from memlet.memlet_brief import build_brief
         return build_brief(args.repo_positional or '.',via=args.via)
     if args.action in ('import','handover'):
-        from prism_memory.memlet_wiki import build_handover, import_rules
+        from memlet.memlet_wiki import build_handover, import_rules
         target_repo=args.repo_path or args.repo_positional or '.'
         if args.action=='import':
             res=import_rules(target_repo,source=args.source,dry_run=args.dry_run,output_format=args.format)
@@ -1006,38 +739,15 @@ def _main(args, parser):
         return res
     if args.action in ('compare-bench','benchmark-compare') or (args.action=='benchmark' and (
             args.repo_positional or args.format or not (args.task or args.standalone))):
-        from prism_memory.memlet_wiki import run_refactoring_comparison_benchmark
+        from memlet.memlet_wiki import run_refactoring_comparison_benchmark
         res=run_refactoring_comparison_benchmark(output_format=args.format or 'json')
         if args.format=='markdown':res['_cli_text']=res['formatted']
         return res
-    if args.action=='opsec-fingerprint':
-        fps=[_opsec_fingerprint(ln.strip().lower()) for ln in sys.stdin.read().splitlines() if ln.strip()]
-        return {'ok':True,'exitCode':0,'normalization':'strip+lowercase','fingerprints':fps}
     if args.action in ('audit','check'):
         target_repo=args.repo_path or args.repo_positional or '.'
         res=memory.audit_repo(target_repo,base_ref=args.base,head_ref=args.head,output_format=args.format)
         if args.format in ('markdown', 'sarif') and isinstance(res,dict) and isinstance(res.get('formatted'),str):
             res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
-        if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
-        return res
-    if args.action in ('rescue','viberescue'):
-        from prism_memory.viberescue import build_rescue_bundle
-        pos_repo=args.extra_positional if args.repo_positional in ('pack','scan') else args.repo_positional
-        target_repo=args.repo_path or pos_repo or '.'
-        res=build_rescue_bundle(target_repo,write_files=args.write,output_dir=args.output_dir,output_format=args.format)
-        if args.format in ('markdown','prompt') and isinstance(res.get('formatted'),str):res['_cli_text']=res['formatted']
-        if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
-        return res
-    if args.action=='anti-slop':
-        from prism_memory.anti_slop import scan_anti_slop, lock_design_system
-        is_lock=bool(args.lock or args.repo_positional=='lock')
-        pos_repo=args.extra_positional if args.repo_positional in ('scan','lock') else args.repo_positional
-        target_repo=args.repo_path or pos_repo or '.'
-        if is_lock:
-            res=lock_design_system(target_repo,archetype=args.archetype,write_files=True,force=args.force)
-        else:
-            res=scan_anti_slop(target_repo,output_format=args.format)
-        if args.format in ('markdown','prompt') and isinstance(res.get('formatted'),str):res['_cli_text']=res['formatted']
         if args.exit_zero and isinstance(res,dict):res['_cli_exit_zero']=True
         return res
     store=WorkStore(args.root)
@@ -1105,7 +815,7 @@ def _main(args, parser):
     runtime=os.environ.get('CODEX_THREAD_ID')
     if runtime and not (args.standalone and task['owner']=='standalone-owner') and not os.environ.get('ANTIGRAVITY_AGENT') and args.session!='codex:'+runtime:
         raise ValueError('CLI actor does not match the current native Codex session')
-    if os.environ.get('PRISM_PARENT_SESSION_ID'):
+    if os.environ.get('MEMLET_PARENT_SESSION_ID'):
         raise ValueError('background worker memory writes must be returned to the responsible session')
     if args.action=='heal-skills':
         return memory.heal_skills(store,args.task,session=args.session,dry_run=False)
@@ -1156,7 +866,7 @@ def _main(args, parser):
 def _hook_runtime(argv):
     """Hidden `memlet admin hook <event>`: dispatched before argparse so it can never print usage or exit 2."""
     try:
-        from prism_memory.memlet_hooks import run_hook
+        from memlet.memlet_hooks import run_hook
         return run_hook(argv)
     except BaseException:
         return 0
@@ -1165,15 +875,6 @@ def _hook_runtime(argv):
 def cli():
     if sys.argv[1:3] == ['admin', 'hook']:
         return _hook_runtime(sys.argv[3:])
-    legacy_name = Path(sys.argv[0]).name
-    legacy_script = legacy_name in PROGRAM_NAMES[1:]
-    previous_notice = os.environ.get('MEMLET_NO_DEPRECATION')
-    if legacy_script:
-        if _deprecation_enabled():
-            print("{} is now 'memlet'; this command name will be removed in a future release."
-                  .format(legacy_name), file=sys.stderr)
-        # A legacy executable and legacy subcommand still emit exactly one notice.
-        os.environ['MEMLET_NO_DEPRECATION'] = '1'
     try:
         result = main()
         exit_zero = result.pop('_cli_exit_zero', False) if isinstance(result, dict) else False
@@ -1190,12 +891,6 @@ def cli():
     except Exception as exc:
         print(json.dumps({'ok': False, 'error': str(exc), 'type': type(exc).__name__}, ensure_ascii=False), file=sys.stderr)
         return 1
-    finally:
-        if legacy_script:
-            if previous_notice is None:
-                os.environ.pop('MEMLET_NO_DEPRECATION', None)
-            else:
-                os.environ['MEMLET_NO_DEPRECATION'] = previous_notice
 
 
 if __name__=='__main__':

@@ -9,10 +9,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from prism_memory import memlet_bridge as mb
-from prism_memory import memlet_dream as md
-from prism_memory.memlet_wiki import _PAGE_STATUS_RE, build_handover, estimate_tokens, init_project, wiki_status
+from memlet import memlet_bridge as mb
+from memlet import memlet_dream as md
+from memlet.memlet_wiki import _PAGE_STATUS_RE, build_handover, estimate_tokens, init_project, wiki_status
 
 APP_PY = "def main():\n    return 1\n\n\ndef helper(x):\n    return x\n"
 
@@ -21,6 +22,18 @@ def _tmp(test, prefix):
     d = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     test.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
     return d
+
+
+def _isolate_git(test, repo):
+    # A temp directory may live inside the source checkout. Never discover
+    # that enclosing repository while testing a directory without .git.
+    home = _tmp(test, "p1-bridge-home-")
+    isolation = mock.patch.dict(os.environ, {"HOME": str(home), "TMPDIR": str(home),
+                                            "GIT_CEILING_DIRECTORIES": str(repo.parent),
+                                            "GIT_CONFIG_GLOBAL": os.devnull,
+                                            "GIT_CONFIG_SYSTEM": os.devnull})
+    isolation.start()
+    test.addCleanup(isolation.stop)
 
 
 def _records(extra=()):
@@ -51,6 +64,7 @@ def _write_jsonl(path, recs):
 class _RepoCase(unittest.TestCase):
     def setUp(self):
         self.repo = _tmp(self, "p1-bridge-repo-")
+        _isolate_git(self, self.repo)
         (self.repo / "src").mkdir()
         (self.repo / "src" / "app.py").write_text(APP_PY)
         (self.repo / "AGENTS.md").write_text("# Rules\n\n- Always run the unit tests before committing.\n"
@@ -165,7 +179,7 @@ class PromoteTests(_RepoCase):
         return ids, main_id, rel_id
 
     def test_approve_promotes_into_handover_and_rule_recall(self):
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         ids, main_id, rel_id = self.approve_two()
         page = (self.repo / mb.PROMOTED_PAGE).read_text()
         self.assertIn("`src/app.py::main`", page)               # scope names code that exists: a real anchor
@@ -188,7 +202,7 @@ class PromoteTests(_RepoCase):
         self.assertEqual("unchanged", mb.promote_approved(self.repo)["op"])
 
     def test_edited_snapshot_line_drops_lesson_from_recall_and_page(self):
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         _ids, main_id, rel_id = self.approve_two()
         snap = self.snapshot_file()
         lines = snap.read_text().splitlines()
@@ -247,7 +261,7 @@ class PromoteTests(_RepoCase):
 
     def test_forged_promoted_line_is_never_quoted_by_recall(self):
         import hashlib
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         _ids, main_id, _rel_id = self.approve_two()
         page = self.repo / mb.PROMOTED_PAGE
         text = page.read_text()
@@ -275,7 +289,7 @@ class PromoteTests(_RepoCase):
 
 class UnifiedRecallTests(_RepoCase):
     def _store(self):
-        from prism_memory.standalone import StandaloneStore
+        from memlet.standalone import StandaloneStore
         import work_memory as ledger
         root = _tmp(self, "p1-bridge-store-")
         store = StandaloneStore(root)
@@ -286,7 +300,7 @@ class UnifiedRecallTests(_RepoCase):
         return root, store
 
     def _index(self):
-        from prism_memory.memlet_index import build_index
+        from memlet.memlet_index import build_index
         rep = build_index(self.repo, runner=lambda p: "- unit tests | 1 [src: AGENTS.md:3-3]\n"
                                                       "- telegram | 2 [src: AGENTS.md:4-4]\n")
         self.assertTrue(rep["ok"], rep)
@@ -357,6 +371,7 @@ class UnifiedRecallTests(_RepoCase):
 class AnchorTests(unittest.TestCase):
     def setUp(self):
         self.repo = _tmp(self, "p1-anchor-")
+        _isolate_git(self, self.repo)
         (self.repo / "src").mkdir()
         (self.repo / "src" / "app.py").write_text(APP_PY)
         (self.repo / "src" / "other.py").write_text("def thing():\n    return 2\n")
@@ -450,10 +465,10 @@ class SlimIndexRecallTests(unittest.TestCase):
               "- Telegram notifications go through the notify script only.\n")
 
     def test_rule_moved_by_slim_plan_is_indexed_and_recalled(self):
-        from prism_memory.memlet_index import build_index, load_verified_index
-        from prism_memory.memlet_recall import recall
-        from prism_memory.memlet_slim import RULES_REL, slim_plan
-        from prism_memory.memlet_wiki import discover_instruction_files
+        from memlet.memlet_index import build_index, load_verified_index
+        from memlet.memlet_recall import recall
+        from memlet.memlet_slim import RULES_REL, slim_plan
+        from memlet.memlet_wiki import discover_instruction_files
         repo = _tmp(self, "p1-slim-repo-")
         (repo / "AGENTS.md").write_text(self.AGENTS)
         rep = build_index(repo, runner=lambda p: "- telegram notify | 2 [src: AGENTS.md:9-9]\n")
@@ -483,8 +498,8 @@ class SlimIndexRecallTests(unittest.TestCase):
         self.assertFalse(load_verified_index(repo)[2]["staleness"]["stale"])
 
     def test_old_index_without_file_hashes_still_detects_changes(self):
-        from prism_memory.memlet_index import INDEX_PAGE, build_index
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_index import INDEX_PAGE, build_index
+        from memlet.memlet_recall import recall
         repo = _tmp(self, "p1-slim-old-")
         (repo / "AGENTS.md").write_text(self.AGENTS)
         build_index(repo, runner=lambda p: "- telegram notify | 2 [src: AGENTS.md:9-9]\n")
@@ -501,7 +516,7 @@ class SlimIndexRecallTests(unittest.TestCase):
 
 class InspectorAuditKeyTests(unittest.TestCase):
     def test_real_audit_finding_shows_rule_id_and_doc_path(self):
-        from prism_memory.memlet_inspector import _audit_block, _audit_card
+        from memlet.memlet_inspector import _audit_block, _audit_card
         repo = _tmp(self, "p1-inspector-")
         (repo / "CLAUDE.md").write_text("# R\n\n- Run `scripts/missing_tool.py` before release.\n")
         block = _audit_block(repo)
@@ -515,7 +530,7 @@ class InspectorAuditKeyTests(unittest.TestCase):
         self.assertIn("CLAUDE.md:3", html)
         from unittest import mock
         legacy = {"findings": [{"rule": "old_rule", "file": "AGENTS.md", "line": 1, "reference": "x.py"}]}
-        with mock.patch("prism_memory.memlet_inspector.audit_repository", return_value=legacy):
+        with mock.patch("memlet.memlet_inspector.audit_repository", return_value=legacy):
             old = _audit_block(repo)["findings"][0]
         self.assertEqual({"rule": "old_rule", "file": "AGENTS.md", "line": 1, "reference": "x.py"}, old)
 
@@ -580,7 +595,7 @@ class ConcurrencyFixTests(_RepoCase):
     def test_queue_lock_excludes_another_process(self):
         import sys
         q = self.repo / mb.QUEUE_REL
-        code = ("import sys; sys.path.insert(0, sys.argv[1]); from prism_memory import memlet_dream as md\n"
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from memlet import memlet_dream as md\n"
                 "with md.queue_lock(sys.argv[2]):\n    print('locked', flush=True)\n    sys.stdin.readline()\n")
         child = subprocess.Popen([sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(q)],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -650,6 +665,7 @@ class ChangedCheckFixTests(unittest.TestCase):
 
     def setUp(self):
         self.repo = _tmp(self, "p1-fix-changed-")
+        _isolate_git(self, self.repo)
         (self.repo / "mod.py").write_text("def charge(x):\n    return x * 2\n")
         (self.repo / "AGENTS.md").write_text("# Rules\n- Always call `mod.py::charge` safely.\n")
         self.assertTrue(init_project(self.repo)["ok"])
@@ -742,7 +758,7 @@ class RecallFixTests(unittest.TestCase):
             "## Secrets\n\n- Never paste API_TOKEN=abcdefgh1234567890 into chat.\n")
 
     def test_zero_match_query_returns_no_rule_matches_only_labelled_safety(self):
-        from prism_memory.memlet_index import build_index
+        from memlet.memlet_index import build_index
         build_index(self.repo, runner=lambda p: "- tests before commit | 1 [src: AGENTS.md:3-4]\n"
                                                 "- sales approval | 1 [src: AGENTS.md:5-5]\n")
         u = mb.unified_recall(self.repo, "platypusquantum")
@@ -756,7 +772,7 @@ class RecallFixTests(unittest.TestCase):
         self.assertEqual(["AGENTS.md:3-4"], [i["source"] for i in hit["sections"]["safety"]])
 
     def test_plain_init_gives_parsed_rules_without_any_model_call(self):
-        from prism_memory.memlet_recall import recall
+        from memlet.memlet_recall import recall
         self.assertTrue(init_project(self.repo)["ok"])
         u = mb.unified_recall(self.repo, "unit tests integration suite")
         self.assertTrue(u["sources"]["rules"]["available"], u["sources"])
@@ -786,8 +802,8 @@ class SlimOwnershipFixTests(unittest.TestCase):
     """Lead finding B: only files `memlet slim-plan` produced count as instructions."""
 
     def test_foreign_management_files_are_not_instructions(self):
-        from prism_memory.memlet_slim import RULES_HEADER, RULES_REL
-        from prism_memory.memlet_wiki import discover_instruction_files, is_instruction_path
+        from memlet.memlet_slim import RULES_HEADER, RULES_REL
+        from memlet.memlet_wiki import discover_instruction_files, is_instruction_path
         repo = _tmp(self, "p1-fix-slim-")
         (repo / "AGENTS.md").write_text("# Rules\n\n- Keep it simple.\n")
         (repo / "management").mkdir()

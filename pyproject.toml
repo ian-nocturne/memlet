@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memlet"
-version = "8.5.0"
-description = "Memlet (formerly Ieum Memory / DeltaHarness / PRISM Memory) — code-anchored agent memory: zero-daemon init, AST-anchored Markdown wiki, instruction drift checker, bitemporal skill engine & VibeRescue kit"
+version = "9.0.0"
+description = "Code-anchored, re-checkable agent memory"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
-    {name = "DeltaHarness Architecture Team"}
+    {name = "Ian (Nocturne Lab)"}
 ]
 dependencies = []
 
@@ -24,27 +24,15 @@ semantic = [
 
 [project.scripts]
 memlet = "memory_cli:cli"
-memlet-mcp = "prism_memory_mcp:main"
-ieum-memory = "memory_cli:cli"
-ieum-memory-mcp = "prism_memory_mcp:main"
-prism-memory = "memory_cli:cli"
-prism-memory-mcp = "prism_memory_mcp:main"
-deltaharness = "memory_cli:cli"
-deltaharness-mcp = "prism_memory_mcp:main"
-viberescue = "prism_memory.viberescue:cli"
-anti-slop = "prism_memory.anti_slop:cli"
-
+memlet-mcp = "memlet_mcp:main"
 
 [tool.setuptools]
-packages = ["prism_memory"]
+packages = ["memlet"]
 py-modules = [
     "work_memory",
     "memory_vectors",
     "memory_skills",
     "memory_intelligence",
     "memory_cli",
-    "prism_memory_mcp",
+    "memlet_mcp",
 ]
-
-[tool.setuptools.package-data]
-prism_memory = ["js_env_refs.cjs"]

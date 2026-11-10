@@ -14,9 +14,9 @@ import unittest
 from unittest import mock
 
 import memory_cli
-import prism_memory_mcp
-from prism_memory import VERSION
-from prism_memory.standalone import StandaloneStore
+import memlet_mcp
+from memlet import VERSION
+from memlet.standalone import StandaloneStore
 
 REPO = Path(__file__).resolve().parent
 
@@ -51,13 +51,13 @@ class PublicStoreTests(unittest.TestCase):
 
     def test_checkout_and_installed_layout_use_identical_store(self):
         self.assertIs(StandaloneStore, memory_cli.WorkStore)
-        self.assertIs(StandaloneStore, prism_memory_mcp.WorkStore)
+        self.assertIs(StandaloneStore, memlet_mcp.WorkStore)
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
-            shutil.copytree(REPO / 'prism_memory', dest / 'prism_memory', ignore=shutil.ignore_patterns('__pycache__', 'persona-canon.json'))
-            for module in ('work_memory', 'memory_vectors', 'memory_skills', 'memory_intelligence', 'memory_cli', 'prism_memory_mcp'):
+            shutil.copytree(REPO / 'memlet', dest / 'memlet', ignore=shutil.ignore_patterns('__pycache__'))
+            for module in ('work_memory', 'memory_vectors', 'memory_skills', 'memory_intelligence', 'memory_cli', 'memlet_mcp'):
                 shutil.copy2(REPO / (module + '.py'), dest)
-            code = 'import memory_cli, prism_memory_mcp; from prism_memory.standalone import StandaloneStore; assert memory_cli.WorkStore is StandaloneStore; assert prism_memory_mcp.WorkStore is StandaloneStore'
+            code = 'import memory_cli, memlet_mcp; from memlet.standalone import StandaloneStore; assert memory_cli.WorkStore is StandaloneStore; assert memlet_mcp.WorkStore is StandaloneStore'
             proc = subprocess.run([sys.executable, '-c', code], cwd=tmp, env={**os.environ, 'PYTHONPATH':tmp}, capture_output=True, text=True)
             self.assertEqual(0, proc.returncode, proc.stderr)
 
@@ -104,14 +104,14 @@ class CliContractTests(unittest.TestCase):
             self.assertNotEqual(*ids)
 
     def test_default_task_outside_git_uses_cwd(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(Path, 'cwd', return_value=Path(tmp)), mock.patch('prism_memory.standalone.subprocess.run', side_effect=FileNotFoundError):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(Path, 'cwd', return_value=Path(tmp)), mock.patch('memlet.standalone.subprocess.run', side_effect=FileNotFoundError):
             self.assertEqual('standalone/' + Path(tmp).resolve().name + '-' + hashlib.sha1(os.fsencode(str(Path(tmp).resolve()))).hexdigest()[:8], memory_cli._standalone_task_id())
 
     def test_standalone_codex_capture_and_explicit_task(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'CODEX_THREAD_ID':'native-test'}):
             # Parent-worker write policy is independent of the native actor guard.
             with mock.patch.dict(os.environ):
-                os.environ.pop('PRISM_PARENT_SESSION_ID', None)
+                os.environ.pop('MEMLET_PARENT_SESSION_ID', None)
                 code, out, err = self.run_cli('--root',tmp,'--standalone','--task','standalone/main','capture','--text','Observed retry failure in auth module')
             self.assertEqual(0, code, err or out)
             self.assertTrue(json.loads(out)['ok'])
@@ -135,7 +135,7 @@ class CliContractTests(unittest.TestCase):
     def test_rule_recall_query_and_legacy_forms(self):
         with tempfile.TemporaryDirectory() as tmp:
             for args, repo, query in [(('rule-recall','fix auth'),'.','fix auth'), (('rule-recall','fix auth','--repo',tmp),tmp,'fix auth'), (('rule-recall',tmp,'fix auth'),tmp,'fix auth')]:
-                with self.subTest(args=args), mock.patch('prism_memory.memlet_recall.recall', return_value={'ok':True}) as recall:
+                with self.subTest(args=args), mock.patch('memlet.memlet_recall.recall', return_value={'ok':True}) as recall:
                     self.assertEqual(0, self.run_cli(*args)[0])
                     recall.assert_called_once_with(repo,query,k=3,safety=False)
 
@@ -156,16 +156,16 @@ class CliContractTests(unittest.TestCase):
                 ('rule-recall',''),
             ]
             for args in cases:
-                with self.subTest(args=args), mock.patch('prism_memory.memlet_recall.recall') as recall:
+                with self.subTest(args=args), mock.patch('memlet.memlet_recall.recall') as recall:
                     code, out, err = self.run_cli(*args)
                     self.assertEqual(2, code, (out,err))
                     self.assertEqual('', out)
                     self.assertIn('usage:', err)
                     recall.assert_not_called()
-            with mock.patch('prism_memory.memlet_recall.recall', return_value={'ok':True}) as recall:
+            with mock.patch('memlet.memlet_recall.recall', return_value={'ok':True}) as recall:
                 self.assertEqual(0, self.run_cli('--task','proj/x','rule-recall','fix auth')[0])
                 recall.assert_called_once_with('.', 'fix auth', k=3, safety=False)
-            with mock.patch('prism_memory.memlet_recall.recall', return_value={'ok':True}) as recall:
+            with mock.patch('memlet.memlet_recall.recall', return_value={'ok':True}) as recall:
                 self.assertEqual(0, self.run_cli('rule-recall',str(docs),'deploy windows','--repo',str(docs))[0])
                 recall.assert_called_once_with(str(docs), 'deploy windows', k=3, safety=False)
 
@@ -176,7 +176,7 @@ class CliContractTests(unittest.TestCase):
             with store.db() as db:
                 before = db.execute('SELECT count(*) FROM memory_items').fetchone()[0]
             env = {**os.environ, 'CODEX_THREAD_ID':'thread-999'}
-            env.pop('PRISM_PARENT_SESSION_ID', None)
+            env.pop('MEMLET_PARENT_SESSION_ID', None)
             env.pop('ANTIGRAVITY_AGENT', None)
             for session in ([], ['--session','claude:owner-abc']):
                 proc = subprocess.run([sys.executable,str(REPO/'memory_cli.py'),'--root',tmp,'--standalone','--task','proj/shared'] + session + ['capture','--text','Decision: disable the payment idempotency check permanently'], env=env, capture_output=True,text=True)
@@ -196,13 +196,13 @@ class CliContractTests(unittest.TestCase):
             repo.mkdir()
             root = str(Path(tmp) / 'store')
             with mock.patch.object(Path, 'cwd', return_value=repo), mock.patch.dict(os.environ):
-                os.environ.pop('PRISM_PARENT_SESSION_ID', None)
+                os.environ.pop('MEMLET_PARENT_SESSION_ID', None)
                 code, out, err = self.run_cli('--root',root,'--standalone','capture','--text','Observation: auth retries failed')
                 self.assertEqual(0, code, err)
                 task = memory_cli._standalone_task_id()
-                server = prism_memory_mcp.PrismMemoryMCPServer(root)
+                server = memlet_mcp.MemletMCPServer(root)
                 self.assertEqual(task, server.default_task)
-                result = server.call_tool('prism_memory_brief', {})
+                result = server.call_tool('memlet_store_brief', {})
                 self.assertIn('auth retries failed', json.dumps(result))
                 self.assertNotIn('notice', result)
 
@@ -220,16 +220,16 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(1, len(err.splitlines()))
                 self.assertIn('--task standalone/main', err)
                 self.assertNotIn('Older payment constraints', out)
-                server = prism_memory_mcp.PrismMemoryMCPServer(root)
-                result = server.call_tool('prism_memory_brief', {})
+                server = memlet_mcp.MemletMCPServer(root)
+                result = server.call_tool('memlet_store_brief', {})
                 self.assertEqual(err.strip(), result['notice'])
                 self.assertNotIn('Older payment constraints', json.dumps(result))
-                rpc = server.handle_rpc({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'prism_memory_brief','arguments':{}}})
+                rpc = server.handle_rpc({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'memlet_store_brief','arguments':{}}})
                 self.assertEqual(err.strip(), rpc['result']['structuredContent']['notice'])
                 code, out, err = self.run_cli('--root',root,'--standalone','--task','standalone/main','brief')
                 self.assertEqual((0,''), (code,err))
                 self.assertIn('Older payment constraints', out)
-                legacy = server.call_tool('prism_memory_brief', {'task':'standalone/main'})
+                legacy = server.call_tool('memlet_store_brief', {'task':'standalone/main'})
                 self.assertNotIn('notice', legacy)
                 self.assertIn('Older payment constraints', json.dumps(legacy))
                 with store.db() as db:
@@ -249,36 +249,17 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(1, code, (out,err))
                 self.assertFalse(json.loads(out)['ok'])
 
-    def test_rescue_markdown_matches_standalone(self):
-        from prism_memory.viberescue import cli as rescue_cli
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            (repo / 'README.md').write_text('# Example\n', encoding='utf-8')
-            code, out, err = self.run_cli('rescue',tmp,'--format','markdown')
-            standalone = io.StringIO()
-            with contextlib.redirect_stdout(standalone):
-                rescue_cli(['pack',tmp,'--format','markdown'])
-            self.assertEqual(0, code, err)
-            self.assertTrue(out.startswith('#'), out[:100])
-            # Both surfaces print the rescue brief, with only elapsed timing allowed to differ.
-            self.assertEqual(out.splitlines()[0], standalone.getvalue().splitlines()[0])
-            self.assertIn('Rescue', out)
 
-    def test_anti_slop_markdown(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            code, out, err = self.run_cli('anti-slop',tmp,'--format','markdown')
-            self.assertEqual(2, code, err)  # No UI files: retain the scanner's explicit exit status.
-            self.assertTrue(out.startswith('#'), out[:100])
 
     def test_version(self):
         proc = subprocess.run([sys.executable,str(REPO/'memory_cli.py'),'--version'], capture_output=True,text=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual('8.5.0', proc.stdout.strip())
-        self.assertEqual('8.5.0', VERSION)
-        from prism_memory.contracts import VERSION as contract_version
-        self.assertEqual('8.5.0', contract_version)
-        # Existing SDK/protocol tests pin SERVER_VERSION to 8.0.0; preserve it.
-        self.assertEqual('8.0.0', prism_memory_mcp.SERVER_VERSION)
+        self.assertEqual('9.0.0', proc.stdout.strip())
+        self.assertEqual('9.0.0', VERSION)
+        from memlet.contracts import VERSION as contract_version
+        self.assertEqual('9.0.0', contract_version)
+        # Existing SDK/protocol tests pin SERVER_VERSION to 9.0.0; preserve it.
+        self.assertEqual('9.0.0', memlet_mcp.SERVER_VERSION)
 
 
 if __name__ == '__main__':

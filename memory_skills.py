@@ -122,13 +122,13 @@ _FILE_HASH_AST_CACHE = {}
 _FILE_SIGNATURE_CACHE = {}
 
 
-from prism_memory import code_anchors as _code_anchors
-from prism_memory import indexing as _indexing_core
-from prism_memory import evaluation as _eval_core
+from memlet import code_anchors as _code_anchors
+from memlet import indexing as _indexing_core
+from memlet import evaluation as _eval_core
 
 
 def _cached_file_sha(file_path):
-    """Return SHA256 of file_path using prism_memory.code_anchors cache."""
+    """Return SHA256 of file_path using memlet.code_anchors cache."""
     return _code_anchors.cached_file_sha(file_path)
 
 
@@ -1039,7 +1039,7 @@ def render_skill_markdown(name, skill_id, experience_id, task, scope, version, s
         '',
         f'# {title}',
         '',
-        '> PRISM 절차 기억 스킬이에요. 자동 실행 훅이나 권한 승인이 아닌 참고 절차이며, 현재 사용자 지시·원본 근거·실행 통제가 항상 우선해요.',
+        '> Memlet 절차 기억 스킬이에요. 자동 실행 훅이나 권한 승인이 아닌 참고 절차이며, 현재 사용자 지시·원본 근거·실행 통제가 항상 우선해요.',
         '',
         f'- 스킬 ID: `{skill_id}`',
         f'- 원본 경험 ID: `{experience_id}`',
@@ -1097,7 +1097,7 @@ def _assert_no_symlink(path, stop_at=None):
 
 def _atomic_write(path, content):
     path = Path(path)
-    fd, tmp = tempfile.mkstemp(prefix='.prism-skill-', dir=str(path.parent))
+    fd, tmp = tempfile.mkstemp(prefix='.memlet-skill-', dir=str(path.parent))
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
             handle.write(content)
@@ -2317,7 +2317,7 @@ def _email_finder(text):
 
 
 def _email_alternation():
-    from prism_memory.audit import LinearAlternation
+    from memlet.audit import LinearAlternation
     return LinearAlternation(_ARCHETYPE_EMAIL_PATTERN, [_email_finder])
 
 

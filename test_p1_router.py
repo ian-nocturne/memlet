@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import memory_cli
-import prism_memory
+import memlet
 from test_cli_compat import LEGACY_COMMANDS, Sandbox, _shape
 
 
@@ -30,7 +30,7 @@ class Output(io.StringIO):
 def invoke(argv, *, tty=False, stderr_tty=False, program='memlet', suppress=False, force_notice=False):
     out, err = Output(tty), Output(stderr_tty)
     env = {key: value for key, value in os.environ.items()
-           if key not in ('CODEX_THREAD_ID', 'PRISM_PARENT_SESSION_ID', 'ANTIGRAVITY_AGENT',
+           if key not in ('CODEX_THREAD_ID', 'MEMLET_PARENT_SESSION_ID', 'ANTIGRAVITY_AGENT',
                           'MEMLET_NO_DEPRECATION', 'MEMLET_DEPRECATION')}
     if suppress:
         env['MEMLET_NO_DEPRECATION'] = '1'
@@ -53,18 +53,18 @@ def invoke(argv, *, tty=False, stderr_tty=False, program='memlet', suppress=Fals
 def installed_bridge(bridge):
     """Patch only the stub's cache entries, preserving unrelated lazy imports."""
     missing = object()
-    name = 'prism_memory.memlet_bridge'
+    name = 'memlet.memlet_bridge'
     previous_module = sys.modules.get(name, missing)
-    previous_attribute = vars(prism_memory).get('memlet_bridge', missing)
+    previous_attribute = vars(memlet).get('memlet_bridge', missing)
     sys.modules[name] = bridge
-    prism_memory.memlet_bridge = bridge
+    memlet.memlet_bridge = bridge
     try:
         yield
     finally:
         if previous_attribute is missing:
-            delattr(prism_memory, 'memlet_bridge')
+            delattr(memlet, 'memlet_bridge')
         else:
-            prism_memory.memlet_bridge = previous_attribute
+            memlet.memlet_bridge = previous_attribute
         if previous_module is missing:
             sys.modules.pop(name, None)
         else:
@@ -78,7 +78,7 @@ class RouterHelpTests(unittest.TestCase):
         entries = re.findall(r'^    ([a-z][a-z-]*)\s{2,}\S', out, re.M)
         self.assertEqual(['init', 'check', 'recall', 'handover', 'learn', 'ui', 'admin'], entries)
         self.assertIn('memlet admin --help', out)
-        for hidden in ('brief-build', 'dream-build', 'digest', 'viberescue'):
+        for hidden in ('brief-build', 'dream-build', 'digest'):
             self.assertNotIn(hidden, out)
 
     def test_every_legacy_name_parses_at_both_levels(self):
@@ -133,9 +133,6 @@ LEGACY_OPTION_DESTINATIONS = {
     'repo-benchmark': {'-h': 'help', '--help': 'help', '--work-dir': 'work_dir'},
     'audit': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--base': 'base', '--head': 'head', '--format': 'format', '--exit-zero': 'exit_zero'},
     'check': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--base': 'base', '--head': 'head', '--format': 'format', '--exit-zero': 'exit_zero'},
-    'rescue': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--write': 'write', '--output-dir': 'output_dir', '--format': 'format', '--exit-zero': 'exit_zero'},
-    'viberescue': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--write': 'write', '--output-dir': 'output_dir', '--format': 'format', '--exit-zero': 'exit_zero'},
-    'anti-slop': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--lock': 'lock', '--force': 'force', '--archetype': 'archetype', '--format': 'format', '--exit-zero': 'exit_zero'},
     'init': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--dry-run': 'dry_run', '--force': 'force', '--format': 'format'},
     'wiki': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--dry-run': 'dry_run', '--format': 'format'},
     'import': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--from': 'source', '--dry-run': 'dry_run', '--format': 'format'},
@@ -150,8 +147,6 @@ LEGACY_OPTION_DESTINATIONS = {
     'handover': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--next-step': 'next_step', '--rejected': 'rejected', '--format': 'format', '--write': 'write', '--mode': 'mode', '--budget': 'budget'},
     'compare-bench': {'-h': 'help', '--help': 'help', '--format': 'format'},
     'benchmark-compare': {'-h': 'help', '--help': 'help', '--format': 'format'},
-    'opsec-check': {'-h': 'help', '--help': 'help', '--file': 'target_file', '--repo-path': 'target_file', '--repo': 'target_file', '--canon': 'canon', '--history': 'history', '--require-canon': 'require_canon'},
-    'opsec-fingerprint': {'-h': 'help', '--help': 'help'},
     'heal-skills': {'-h': 'help', '--help': 'help', '--dry-run': 'dry_run'},
     'verify-skill': {'-h': 'help', '--help': 'help', '--id': 'id', '--command': 'command', '--proof-file': 'proof_file', '--operation-id': 'operation_id', '--timeout': 'timeout'},
     'preflight': {'-h': 'help', '--help': 'help', '--plan': 'plan', '--files': 'files', '--action-type': 'action_type'},
@@ -161,7 +156,6 @@ LEGACY_OPTION_DESTINATIONS = {
     'benchmark': {'-h': 'help', '--help': 'help', '--budget': 'budget', '--format': 'format'},
     'inspector': {'-h': 'help', '--help': 'help', '--budget': 'budget', '--repo-path': 'repo_path', '--repo': 'repo_path', '--output': 'output', '--out': 'output', '--output-dir': 'output_dir'},
     'ui': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--output': 'output', '--out': 'output', '--output-dir': 'output_dir'},
-    'pack': {'-h': 'help', '--help': 'help', '--stack': 'stack', '--output': 'output', '--output-dir': 'output_dir', '--dry-run': 'dry_run', '--list': 'list', '--format': 'format'},
     'export': {'-h': 'help', '--help': 'help', '--targets': 'targets', '--target-dir': 'target_dir', '--write': 'write', '--lang': 'lang'},
     'capture': {'-h': 'help', '--help': 'help', '--file': 'file', '--text': 'text', '--kind': 'kind', '--command': 'command', '--operation-id': 'operation_id'},
     'recall': {'-h': 'help', '--help': 'help', '--query': 'query', '--at': 'at', '--known-at': 'known_at', '--before': 'before', '--after': 'after', '--shared': 'shared', '--federated': 'federated', '--budget': 'budget'},
@@ -231,7 +225,7 @@ class LegacyPrefixTests(unittest.TestCase):
                                 value = [value]
                             self.assertEqual(value, getattr(parsed, expected))
                 count += 1
-        self.assertEqual(1197, count)
+        self.assertEqual(1004, count)
 
 
 class DeprecationTests(unittest.TestCase):
@@ -264,41 +258,8 @@ class DeprecationTests(unittest.TestCase):
         for name in list(memory_cli.PRODUCT_COMMANDS) + ['admin']:
             self.assertEqual('', invoke([name, '--help'], force_notice=True)[2])
 
-    def test_legacy_executable_names_delegate_and_warn_once(self):
-        expected = invoke(['schema'])
-        for name in ('ieum-memory', 'prism-memory', 'deltaharness'):
-            with self.subTest(program=name):
-                code, out, err = invoke(['schema'], program='/bin/' + name, force_notice=True)
-                self.assertEqual(expected[:2], (code, out))
-                self.assertEqual(name + " is now 'memlet'; this command name will be removed in a future release.\n", err)
-                self.assertEqual(expected, invoke(['schema'], program=name))
-                self.assertEqual(err, invoke(['schema'], program=name, stderr_tty=True)[2])
-                self.assertEqual(expected, invoke(['schema'], program=name, suppress=True, force_notice=True, stderr_tty=True))
-                with mock.patch.object(memory_cli, 'main', side_effect=ValueError('broken')):
-                    code, out, error = invoke(['capture'], program=name)
-                self.assertEqual((1, ''), (code, out))
-                self.assertEqual({'ok': False, 'error': 'broken', 'type': 'ValueError'}, json.loads(error))
-        self.assertEqual('', invoke(['--version'], force_notice=True)[2])
 
-    def test_legacy_executable_restores_notice_environment_on_exit(self):
-        for preset in (None, '0', '1'):
-            with mock.patch.dict(os.environ), mock.patch.object(sys, 'argv', ['ieum-memory', '--help']):
-                if preset is None:
-                    os.environ.pop('MEMLET_NO_DEPRECATION', None)
-                else:
-                    os.environ['MEMLET_NO_DEPRECATION'] = preset
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        memory_cli.cli()
-                self.assertEqual(preset, os.environ.get('MEMLET_NO_DEPRECATION'))
 
-    def test_console_script_mappings_are_unchanged_per_coordinator_decision(self):
-        project = (Path(__file__).parent / 'pyproject.toml').read_text(encoding='utf-8')
-        for name in memory_cli.PROGRAM_NAMES:
-            self.assertIn(name + ' = "memory_cli:cli"', project)
-            self.assertIn(name + '-mcp = "prism_memory_mcp:main"', project)
-        self.assertIn('viberescue = "prism_memory.viberescue:cli"', project)
-        self.assertIn('anti-slop = "prism_memory.anti_slop:cli"', project)
 
 
 class RealRouterTests(unittest.TestCase):
@@ -312,10 +273,8 @@ class RealRouterTests(unittest.TestCase):
         self.box.run(store + ['capture', '--text', 'Decision: use sqlite'])
         cases = [([], ['schema']), ([], ['wiki', '.']), ([], ['audit', '.']),
                  ([], ['import', '.', '--dry-run']), ([], ['rule-context', '.']),
-                 ([], ['rule-recall', 'deploy release']), ([], ['rescue', '.']),
-                 ([], ['anti-slop', '.']), ([], ['pack', '--list']),
-                 ([], ['compare-bench', '--format', 'markdown']),
-                 ([], ['opsec-fingerprint']), (store, ['brief']), (store, ['stats']),
+                 ([], ['rule-recall', 'deploy release']), ([], ['compare-bench', '--format', 'markdown']),
+                 (store, ['brief']), (store, ['stats']),
                  (store, ['scenes']), (store, ['skills']), (store, ['cases']),
                  (store, ['links']), (store, ['read', '--id', 'missing']),
                  (store, ['consolidate', '--dry-run']), (store, ['doctor'])]
@@ -348,7 +307,7 @@ class RealRouterTests(unittest.TestCase):
             self.assertEqual('writer', task['owner'])
 
     def test_real_json_and_markdown_capsules_verify_and_tampering_fails(self):
-        from prism_memory.memlet_wiki import build_handover, init_project
+        from memlet.memlet_wiki import build_handover, init_project
         init_project(str(self.box.repo))
         capsule = build_handover(str(self.box.repo), next_step='ship carefully', output_format='markdown')
         for suffix, content, tampered in (
@@ -429,7 +388,7 @@ class RealRouterTests(unittest.TestCase):
 
 class BridgeWiringTests(unittest.TestCase):
     def setUp(self):
-        self.bridge = types.ModuleType('prism_memory.memlet_bridge')
+        self.bridge = types.ModuleType('memlet.memlet_bridge')
         for name in ('unified_recall', 'changed_check', 'accept_anchor', 'learn_from_transcript',
                      'learn_pending', 'learn_approve', 'learn_reject'):
             setattr(self.bridge, name, mock.Mock(side_effect=lambda *a, **k: {'ok': True, 'formatted': 'bridge text\n'}))
@@ -476,7 +435,7 @@ class BridgeWiringTests(unittest.TestCase):
         self.bridge.accept_anchor.assert_called_once_with('/repo', anchors=['a.py::a', 'b.py::b'], dry_run=True)
 
     def test_check_repin_and_dry_run(self):
-        with mock.patch('prism_memory.memlet_wiki.repin_legacy_ts_anchors', return_value={'ok': True}) as repin:
+        with mock.patch('memlet.memlet_wiki.repin_legacy_ts_anchors', return_value={'ok': True}) as repin:
             invoke(['check', '/repo', '--repin-legacy-ts', '--dry-run'])
             repin.assert_called_once_with('/repo', dry_run=True)
 
@@ -522,18 +481,18 @@ class BridgeWiringTests(unittest.TestCase):
 
     def test_missing_bridge_is_clear_json_error_without_traceback(self):
         # Nested injection must restore both import locations even on failure.
-        alternate = types.ModuleType('prism_memory.memlet_bridge')
+        alternate = types.ModuleType('memlet.memlet_bridge')
         with self.assertRaisesRegex(RuntimeError, 'cleanup'):
             with installed_bridge(alternate):
-                self.assertIs(alternate, sys.modules['prism_memory.memlet_bridge'])
-                self.assertIs(alternate, prism_memory.memlet_bridge)
+                self.assertIs(alternate, sys.modules['memlet.memlet_bridge'])
+                self.assertIs(alternate, memlet.memlet_bridge)
                 raise RuntimeError('cleanup')
-        self.assertIs(self.bridge, sys.modules['prism_memory.memlet_bridge'])
-        self.assertIs(self.bridge, prism_memory.memlet_bridge)
+        self.assertIs(self.bridge, sys.modules['memlet.memlet_bridge'])
+        self.assertIs(self.bridge, memlet.memlet_bridge)
         original_import = builtins.__import__
 
         def without_bridge(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == 'prism_memory' and 'memlet_bridge' in fromlist:
+            if name == 'memlet' and 'memlet_bridge' in fromlist:
                 raise ImportError('bridge is not installed')
             return original_import(name, globals, locals, fromlist, level)
 
@@ -593,7 +552,7 @@ class ModeConflictTests(unittest.TestCase):
 
 class GlobalAndFormatTests(unittest.TestCase):
     def test_rule_recall_global_task_never_becomes_query(self):
-        with mock.patch('prism_memory.memlet_recall.recall', return_value={'ok': True}) as recall:
+        with mock.patch('memlet.memlet_recall.recall', return_value={'ok': True}) as recall:
             for flags in (['--task', 'global-task', 'rule-recall', 'actual query'],
                           ['rule-recall', 'actual query', '--task', 'global-task'],
                           ['admin', '--task', 'global-task', 'rule-recall', 'actual query']):
@@ -636,7 +595,7 @@ class GlobalAndFormatTests(unittest.TestCase):
         self.assertNotEqual('{', out[0])
 
     def test_init_receives_the_selected_tty_format(self):
-        with mock.patch('prism_memory.memlet_wiki.init_project', side_effect=lambda *a, **k: {'ok': True, 'formatted': 'init text'}) as init:
+        with mock.patch('memlet.memlet_wiki.init_project', side_effect=lambda *a, **k: {'ok': True, 'formatted': 'init text'}) as init:
             self.assertEqual('init text', invoke(['init'], tty=True)[1])
             init.assert_called_with('.', dry_run=False, force=False, output_format='markdown')
             invoke(['init'], tty=False)
@@ -645,7 +604,7 @@ class GlobalAndFormatTests(unittest.TestCase):
 
 class DreamWiringTests(unittest.TestCase):
     def test_allow_unverified_only_passed_when_requested(self):
-        with mock.patch('prism_memory.memlet_dream.run_dream_recall', return_value={'ok': True}) as recall:
+        with mock.patch('memlet.memlet_dream.run_dream_recall', return_value={'ok': True}) as recall:
             invoke(['admin', 'dream-recall', '--graph', 'queue.json', '--allow-unverified', '--query', 'fix', 'auth'])
             recall.assert_called_once_with(graph_path='queue.json', query_text='fix auth', budget_tokens=1500,
                                            snapshot_path=None, out_md=None, allow_unverified=True)
@@ -654,13 +613,13 @@ class DreamWiringTests(unittest.TestCase):
             self.assertNotIn('allow_unverified', recall.call_args.kwargs)
 
     def test_pending_approve_reject_delegate_to_dream_queue_apis(self):
-        with mock.patch('prism_memory.memlet_dream.list_pending', return_value={'ok': True}) as pending:
+        with mock.patch('memlet.memlet_dream.list_pending', return_value={'ok': True}) as pending:
             invoke(['admin', 'dream-pending', '--graph', 'q.json'])
             pending.assert_called_once_with('q.json')
-        with mock.patch('prism_memory.memlet_dream.approve_queue_items', return_value={'ok': True}) as approve:
+        with mock.patch('memlet.memlet_dream.approve_queue_items', return_value={'ok': True}) as approve:
             invoke(['admin', 'dream-approve', '--graph', 'q.json', 'n1', 'n2', '--by', 'Alice', '--snapshot', 'logs', '--db', 'q.db'])
             approve.assert_called_once_with('q.json', ['n1', 'n2'], approver='Alice', snapshot_path='logs', db_path='q.db')
-        with mock.patch('prism_memory.memlet_dream.reject_queue_items', return_value={'ok': True}) as reject:
+        with mock.patch('memlet.memlet_dream.reject_queue_items', return_value={'ok': True}) as reject:
             invoke(['admin', 'dream-reject', '--graph', 'q.json', 'n1', 'n2', '--by', 'Bob', '--reason', 'duplicate', '--db', 'q.db'])
             reject.assert_called_once_with('q.json', ['n1', 'n2'], approver='Bob', reason='duplicate', db_path='q.db')
 

@@ -4,7 +4,7 @@ import random
 import time
 import unittest
 
-from prism_memory.audit import ANCHOR_PATH_MAX_CHARS, EXPLICIT_ANCHOR_RE, iter_explicit_anchors
+from memlet.audit import ANCHOR_PATH_MAX_CHARS, EXPLICIT_ANCHOR_RE, iter_explicit_anchors
 
 
 def _view(matches):
