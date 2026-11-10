@@ -1070,11 +1070,14 @@ def build_rescue_bundle(
         complexity = "NEEDS_VERIFICATION"
         exit_code = 1
     elif critical_count == 0 and unverified_env_keys:
-        # Not a pass (`ok` stays False below), but not a failure either: there is no local .env to check
-        # against, which is the normal state of a CI runner. Exit 0 so `memlet rescue` and the Action agree.
+        # Not a pass (`ok` stays False below). When the only warnings are env keys that could not be checked
+        # because there is no local .env (the normal state of a CI runner), exit 0 so `memlet rescue` and the
+        # Action agree. Any other warning keeps its failing exit code: an unverifiable env key must never
+        # turn an otherwise failing result into exit 0.
         readiness = "ENV_UNVERIFIED"
         complexity = "NEEDS_ENV_VERIFICATION"
-        exit_code = 0
+        only_env_warnings = all(b.get("kind") == "unverified_env_key" for b in blockers)
+        exit_code = 0 if only_env_warnings else 1
     elif critical_count == 0 and warning_count == 0:
         readiness = "STATIC_CHECKS_PASSED"
         complexity = "NONE"
