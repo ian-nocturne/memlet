@@ -1185,6 +1185,106 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Option
     return symbol_hashes
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Exact-parser seam. The lexical TS/JS scanner above is an approximation, so a TS/JS anchor it fingerprints can at
+# best be `compatible-unverified`. A per-language *exact* provider (a real parser) may fingerprint the same symbols
+# under its own hash-basis name; an anchor pinned under that basis can then be `active`. A pin always records the
+# basis that made it and is re-checked under that same basis: when the provider that made a pin is missing (or is a
+# different version, i.e. a different basis name) the anchor is reported `…_basis_repin_required`, never silently
+# re-classified with another basis. Providers are optional: the default path has none and stays stdlib-only.
+#
+# Provider protocol (duck-typed):
+#     languages: tuple of language names it covers ("typescript", "javascript")
+#     basis:     hash-basis name recorded in pins, `[A-Za-z0-9_.-]+`, must change whenever its hashes could change
+#     fingerprint(path: str, text: str) -> Optional[Dict[symbol, {"ast": hex, "sig": hex}]]
+#                None when the file cannot be parsed exactly (Memlet then falls back to the lexical scanner).
+
+TS_LEXICAL_BASIS = "ts-js-lexical-v3"
+_BASIS_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}")
+_EXACT_PROVIDERS: Dict[str, Any] = {}
+_EXACT_AUTOLOAD = {"done": False}
+_EXACT_CACHE: Dict[Tuple[Any, ...], Optional[Dict[str, Dict[str, str]]]] = {}
+EXACT_PROVIDER_ENV = "MEMLET_EXACT_PARSERS"  # "0" / "off": do not auto-load optional parsers (registered ones apply)
+
+
+def register_exact_provider(provider) -> None:
+    """Register `provider` for each of its languages (replacing a previous one). Raises ValueError on a bad basis."""
+    basis = getattr(provider, "basis", None)
+    if not isinstance(basis, str) or not _BASIS_RE.fullmatch(basis) or basis in (TS_LEXICAL_BASIS, PYTHON_HASH_BASIS,
+                                                                                    "legacy", "contract-v1"):
+        raise ValueError(f"invalid exact-provider basis: {basis!r}")
+    for lang in getattr(provider, "languages", ()) or ():
+        _EXACT_PROVIDERS[str(lang)] = provider
+    _EXACT_CACHE.clear()
+
+
+def unregister_exact_provider(provider=None, language: Optional[str] = None) -> None:
+    """Remove `provider` (from every language) or whatever provider serves `language`."""
+    for lang, p in list(_EXACT_PROVIDERS.items()):
+        if (provider is not None and p is provider) or (language is not None and lang == language):
+            del _EXACT_PROVIDERS[lang]
+    _EXACT_CACHE.clear()
+
+
+def _autoload_exact_providers() -> None:
+    if _EXACT_AUTOLOAD["done"]:
+        return
+    _EXACT_AUTOLOAD["done"] = True
+    import os
+    if str(os.environ.get(EXACT_PROVIDER_ENV, "")).strip().lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        from . import ts_exact  # optional extra `memlet[treesitter]`; imports nothing third-party unless installed
+        provider = ts_exact.load_provider()
+    except Exception:  # an optional parser must never break the default path
+        return
+    if provider is not None:
+        for lang in provider.languages:
+            _EXACT_PROVIDERS.setdefault(lang, provider)
+
+
+def exact_provider(language: str):
+    """The exact provider for `language`, or None (the lexical scanner / Python AST is then the only basis)."""
+    if language not in _EXACT_PROVIDERS:
+        _autoload_exact_providers()
+    return _EXACT_PROVIDERS.get(language)
+
+
+def exact_symbol_fingerprints(file_path, language: str) -> Tuple[Optional[str], Optional[Dict[str, Dict[str, str]]]]:
+    """(basis, {symbol: {"ast", "sig"}}) from the exact provider for `language`; (None, None) without one, (basis,
+    None) when the provider could not parse the file exactly. Reads a regular, non-symlinked file of at most 2 MB."""
+    provider = exact_provider(language)
+    if provider is None:
+        return None, None
+    basis = provider.basis
+    p = Path(file_path)
+    try:
+        st = p.lstat()
+    except OSError:
+        return basis, None
+    key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino, basis, id(provider))
+    if key in _EXACT_CACHE:
+        return basis, _EXACT_CACHE[key]
+    from .memlet_wiki import read_regular_text  # contained reader: no symlink leaf, no FIFO, size cap
+    text = read_regular_text(p, 2 * 1024 * 1024)
+    result = None
+    if text is not None:
+        try:
+            raw = provider.fingerprint(str(p), text)
+        except Exception:
+            raw = None
+        if isinstance(raw, dict):
+            result = {}
+            for sym, fp in raw.items():
+                if isinstance(sym, str) and isinstance(fp, dict) and isinstance(fp.get("ast"), str) and re.fullmatch(r"[0-9a-f]{16,64}", fp["ast"]):
+                    sig = fp.get("sig")
+                    result[sym] = {"ast": fp["ast"], "sig": sig if isinstance(sig, str) and re.fullmatch(r"[0-9a-f]{16,64}", sig) else ""}
+    if len(_EXACT_CACHE) > 512:
+        _EXACT_CACHE.clear()
+    _EXACT_CACHE[key] = result
+    return basis, result
+
+
 def is_breaking_symbol_change(old_sig, curr_sig):
     """Determine if a symbol evolution breaks existing call contracts (returns (is_breaking, reason)).
     Covers positional, optional, keyword-only, posonly (/), vararg (*args/**kwargs), async, class method, and TS interface contracts.
