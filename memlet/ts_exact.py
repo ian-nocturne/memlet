@@ -52,6 +52,7 @@ def _h(value: Any) -> str:
 
 
 class TreeSitterProvider:
+    name = "tree-sitter"  # what `.memlet/config.json` `anchors.exactParsers` lists to opt in
     languages = ("typescript", "javascript")
 
     def __init__(self, ts, tst, tsj, versions: Dict[str, Optional[str]]) -> None:
@@ -73,8 +74,11 @@ class TreeSitterProvider:
         root = tree.root_node
         if root.has_error:
             return None  # never fingerprint a tree that is not a complete parse
-        out: Dict[str, Dict[str, str]] = {}
-        short: Dict[str, List[Tuple[str, Dict[str, str]]]] = {}
+        found: Dict[str, List[Dict[str, str]]] = {}  # every declaration of a name; a repeated name is never fingerprinted
+
+        def add(name: str, fp: Dict[str, str]) -> None:
+            found.setdefault(name, []).append(fp)
+
         for child in root.named_children:
             node = child
             if node.type == "export_statement":
@@ -85,14 +89,16 @@ class TreeSitterProvider:
             if t in _FUNC_DECLS:
                 name = _name(node, src)
                 if name:
-                    out.setdefault(name, self._func(node, node, src))
+                    add(name, self._func(node, node, src))
             elif t in ("lexical_declaration", "variable_declaration"):
                 for d in node.named_children:
                     if d.type != "variable_declarator":
                         continue
                     name, value = _name(d, src), d.child_by_field_name("value")
                     if name and value is not None and value.type in _FUNC_VALUES:
-                        out.setdefault(name, self._func(d, value, src))
+                        add(name, self._func(d, value, src))
+                    elif name:
+                        add(name, {"ast": "", "sig": ""})  # another binding of the name: blocks it, never anchors it
             elif t in _CLASS_DECLS:
                 name = _name(node, src)
                 if not name:
@@ -100,38 +106,50 @@ class TreeSitterProvider:
                 body = node.child_by_field_name("body")
                 methods, ctor = [], None
                 for m in (body.named_children if body is not None else []):
-                    if m.type not in ("method_definition", "abstract_method_signature"):
+                    if m.type not in ("method_definition", "abstract_method_signature", "public_field_definition",
+                                      "field_definition", "method_signature"):
                         continue
-                    mname = _name(m, src)
+                    mname = _name(m, src) or _field_name(m, src)
                     if not mname:
                         continue
-                    fp = self._func(m, m, src)
-                    if mname == "constructor":
+                    if mname == "constructor" and m.type == "method_definition":
                         ctor = m
                         continue
-                    if not mname.startswith(("_", "#")):
-                        methods.append(mname)
-                    out.setdefault(f"{name}.{mname}", fp)
-                    short.setdefault(mname, []).append((f"{name}.{mname}", fp))
+                    if m.type in ("method_definition", "abstract_method_signature", "method_signature"):
+                        fp = self._func(m, m, src)
+                        if not mname.startswith(("_", "#")):
+                            methods.append(mname)
+                    else:
+                        fp = {"ast": "", "sig": ""}  # a field of the same name
+                    add(f"{name}.{mname}", fp)  # a getter and a setter, or a repeated method, give two entries
                 params = ctor.child_by_field_name("parameters") if ctor is not None else None
-                out.setdefault(name, {"ast": _h(_dump(node, src)),
-                                      "sig": _h({"kind": "class", "methods": sorted(set(methods)),
-                                                 "ctor": _dump(params, src) if params is not None else None})})
+                add(name, {"ast": _h(_dump(node, src)),
+                           "sig": _h({"kind": "class", "methods": sorted(set(methods)),
+                                      "ctor": _dump(params, src) if params is not None else None})})
             elif t == "interface_declaration":
                 name = _name(node, src)
                 body = node.child_by_field_name("body")
                 if name:
-                    out.setdefault(name, {"ast": _h(_dump(node, src)),
-                                          "sig": _h({"kind": "interface", "body": _dump(body, src) if body is not None else None})})
+                    add(name, {"ast": _h(_dump(node, src)),
+                               "sig": _h({"kind": "interface", "body": _dump(body, src) if body is not None else None})})
             elif t == "type_alias_declaration":
                 name = _name(node, src)
                 value = node.child_by_field_name("value")
                 if name:
                     fp = _h({"kind": "type", "value": _dump(value, src) if value is not None else None})
-                    out.setdefault(name, {"ast": _h(_dump(node, src)), "sig": fp})
-        for mname, entries in short.items():  # the lexical scanner's short alias of a method that is unique
-            if mname not in out and len(entries) == 1:
-                out[mname] = entries[0][1]
+                    add(name, {"ast": _h(_dump(node, src)), "sig": fp})
+            elif t in ("enum_declaration", "module", "internal_module"):
+                name = _name(node, src)
+                if name:
+                    add(name, {"ast": "", "sig": ""})
+        out = {name: fps[0] for name, fps in found.items() if len(fps) == 1 and fps[0]["ast"]}
+        short: Dict[str, List[str]] = {}
+        for name in found:
+            if "." in name:
+                short.setdefault(name.rsplit(".", 1)[-1], []).append(name)
+        for mname, quals in short.items():  # the lexical scanner's short alias of a method that is unique
+            if mname not in found and len(quals) == 1 and quals[0] in out:
+                out[mname] = out[quals[0]]
         return out
 
     def _func(self, decl, fn, src) -> Dict[str, str]:
@@ -146,6 +164,14 @@ class TreeSitterProvider:
 
 def _name(node, src: bytes) -> Optional[str]:
     n = node.child_by_field_name("name")
+    if n is None:
+        return None
+    name = src[n.start_byte:n.end_byte].decode("utf-8", "replace")
+    return name if re.fullmatch(r"#?[A-Za-z_$][\w$]*", name) else None
+
+
+def _field_name(node, src: bytes) -> Optional[str]:
+    n = node.child_by_field_name("property") or node.child_by_field_name("name")
     if n is None:
         return None
     name = src[n.start_byte:n.end_byte].decode("utf-8", "replace")

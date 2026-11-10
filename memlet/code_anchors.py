@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _FILE_HASH_AST_CACHE = {}
 _FILE_SIGNATURE_CACHE = {}
@@ -1188,23 +1188,31 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Option
 # ---------------------------------------------------------------------------------------------------------------
 # Exact-parser seam. The lexical TS/JS scanner above is an approximation, so a TS/JS anchor it fingerprints can at
 # best be `compatible-unverified`. A per-language *exact* provider (a real parser) may fingerprint the same symbols
-# under its own hash-basis name; an anchor pinned under that basis can then be `active`. A pin always records the
-# basis that made it and is re-checked under that same basis: when the provider that made a pin is missing (or is a
-# different version, i.e. a different basis name) the anchor is reported `…_basis_repin_required`, never silently
-# re-classified with another basis. Providers are optional: the default path has none and stays stdlib-only.
+# under its own hash-basis name; an anchor pinned under that basis can then be `active`.
+#
+# * New TS/JS pins are lexical unless the repository opted in: `.memlet/config.json` `anchors.exactParsers` lists the
+#   provider's `name` (e.g. ["tree-sitter"]). Installing a package changes nothing by itself, and no environment
+#   variable can turn exact pinning on; `MEMLET_EXACT_PARSERS=0` is a kill switch for auto-loading optional parsers.
+# * A pin always records the basis that made it and is re-checked under that same basis. A pin made by an exact
+#   provider is checked by that provider when it can be imported (opt-in or not); when it is missing, cannot parse
+#   the file, or is another version (another basis name) the anchor is `…_basis_repin_required`, never silently
+#   re-classified with another basis. A stored pin without a basis is a legacy pin, which is not the same as no pin
+#   (`NEW_PIN`).
 #
 # Provider protocol (duck-typed):
+#     name:      what `anchors.exactParsers` lists to opt in ("tree-sitter")
 #     languages: tuple of language names it covers ("typescript", "javascript")
 #     basis:     hash-basis name recorded in pins, `[A-Za-z0-9_.-]+`, must change whenever its hashes could change
 #     fingerprint(path: str, text: str) -> Optional[Dict[symbol, {"ast": hex, "sig": hex}]]
-#                None when the file cannot be parsed exactly (Memlet then falls back to the lexical scanner).
+#                None when the file cannot be parsed exactly; a symbol declared more than once must be left out.
 
 TS_LEXICAL_BASIS = "ts-js-lexical-v3"
+NEW_PIN = object()  # `basis` of a fingerprint for a pin that does not exist yet (never confused with a legacy pin)
 _BASIS_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}")
 _EXACT_PROVIDERS: Dict[str, Any] = {}
 _EXACT_AUTOLOAD = {"done": False}
 _EXACT_CACHE: Dict[Tuple[Any, ...], Optional[Dict[str, Dict[str, str]]]] = {}
-EXACT_PROVIDER_ENV = "MEMLET_EXACT_PARSERS"  # "0" / "off": do not auto-load optional parsers (registered ones apply)
+EXACT_PROVIDER_ENV = "MEMLET_EXACT_PARSERS"  # "0" / "off": never auto-load optional parsers (a kill switch only)
 
 
 def register_exact_provider(provider) -> None:
@@ -1213,6 +1221,8 @@ def register_exact_provider(provider) -> None:
     if not isinstance(basis, str) or not _BASIS_RE.fullmatch(basis) or basis in (TS_LEXICAL_BASIS, PYTHON_HASH_BASIS,
                                                                                     "legacy", "contract-v1"):
         raise ValueError(f"invalid exact-provider basis: {basis!r}")
+    if not isinstance(getattr(provider, "name", None), str) or not provider.name:
+        raise ValueError("an exact provider needs a name")
     for lang in getattr(provider, "languages", ()) or ():
         _EXACT_PROVIDERS[str(lang)] = provider
     _EXACT_CACHE.clear()
@@ -1244,45 +1254,55 @@ def _autoload_exact_providers() -> None:
 
 
 def exact_provider(language: str):
-    """The exact provider for `language`, or None (the lexical scanner / Python AST is then the only basis)."""
+    """The exact provider for `language`, or None. Only called when an exact basis is actually needed (a pin made
+    with one, or a repository that opted in), so an installed but unused parser is never even imported."""
     if language not in _EXACT_PROVIDERS:
         _autoload_exact_providers()
     return _EXACT_PROVIDERS.get(language)
 
 
-def exact_symbol_fingerprints(file_path, language: str) -> Tuple[Optional[str], Optional[Dict[str, Dict[str, str]]]]:
-    """(basis, {symbol: {"ast", "sig"}}) from the exact provider for `language`; (None, None) without one, (basis,
-    None) when the provider could not parse the file exactly. Reads a regular, non-symlinked file of at most 2 MB."""
+def exact_symbol_fingerprints(file_path, language: str, *, basis: Optional[str] = None,
+                              allowed: Optional[Iterable[str]] = None
+                              ) -> Tuple[Optional[str], Optional[Dict[str, Dict[str, str]]]]:
+    """(basis, {symbol: {"ast", "sig"}}) from the exact provider for `language`. `basis`: only a provider with exactly
+    that basis may answer (else (its basis or None, None)). `allowed`: provider names the repository opted into (else
+    (None, None)). (basis, None) when the provider could not parse the file. Reads a regular, non-symlinked file of
+    at most 2 MB."""
     provider = exact_provider(language)
     if provider is None:
         return None, None
-    basis = provider.basis
+    if allowed is not None and getattr(provider, "name", None) not in set(allowed):
+        return None, None
+    if basis is not None and provider.basis != basis:
+        return provider.basis, None
     p = Path(file_path)
     try:
         st = p.lstat()
     except OSError:
-        return basis, None
-    key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino, basis, id(provider))
-    if key in _EXACT_CACHE:
-        return basis, _EXACT_CACHE[key]
+        return provider.basis, None
+    key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino, provider.basis, id(provider))
     from .memlet_wiki import read_regular_text  # contained reader: no symlink leaf, no FIFO, size cap
     text = read_regular_text(p, 2 * 1024 * 1024)
+    if text is None:
+        return provider.basis, None
+    key = key + (hashlib.sha256(text.encode("utf-8")).hexdigest(),)  # never trust stat metadata alone
+    if key in _EXACT_CACHE:
+        return provider.basis, _EXACT_CACHE[key]
+    try:
+        raw = provider.fingerprint(str(p), text)
+    except Exception:
+        raw = None
     result = None
-    if text is not None:
-        try:
-            raw = provider.fingerprint(str(p), text)
-        except Exception:
-            raw = None
-        if isinstance(raw, dict):
-            result = {}
-            for sym, fp in raw.items():
-                if isinstance(sym, str) and isinstance(fp, dict) and isinstance(fp.get("ast"), str) and re.fullmatch(r"[0-9a-f]{16,64}", fp["ast"]):
-                    sig = fp.get("sig")
-                    result[sym] = {"ast": fp["ast"], "sig": sig if isinstance(sig, str) and re.fullmatch(r"[0-9a-f]{16,64}", sig) else ""}
+    if isinstance(raw, dict):
+        result = {}
+        for sym, fp in raw.items():
+            if isinstance(sym, str) and isinstance(fp, dict) and isinstance(fp.get("ast"), str) and re.fullmatch(r"[0-9a-f]{16,64}", fp["ast"]):
+                sig = fp.get("sig")
+                result[sym] = {"ast": fp["ast"], "sig": sig if isinstance(sig, str) and re.fullmatch(r"[0-9a-f]{16,64}", sig) else ""}
     if len(_EXACT_CACHE) > 512:
         _EXACT_CACHE.clear()
     _EXACT_CACHE[key] = result
-    return basis, result
+    return provider.basis, result
 
 
 def is_breaking_symbol_change(old_sig, curr_sig):

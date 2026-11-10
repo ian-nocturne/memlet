@@ -17,10 +17,19 @@ COMMANDS = {"anchors": {"help": "Suggest code anchors for rules that mention cod
 
 
 def register(sub) -> None:
-    p = sub.add_parser("anchors", help=COMMANDS["anchors"]["help"],
+    import argparse
+    p = sub.add_parser("anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
                        description="Rules that mention code in backticks or as name() but carry no `path::symbol` "
                                    "anchor can be anchored without editing your files: suggestions are resolved "
-                                   "against the repository's symbols, and accepted anchors live in .memlet/config.json.")
+                                   "against the repository's symbols, and accepted anchors live in .memlet/config.json.",
+                       epilog="A path in a rule is read from the repository root and from the instruction file's "
+                              "folder; when both exist the mention is ambiguous. Write a leading `/` (`/src/auth.py`) "
+                              "to mean the repository root only.\n\n"
+                              "Integrity, not authentication: the ledger check shows an accepted entry is exactly what "
+                              "`anchors accept` recorded in this repository's ledger and was not dropped since. It does "
+                              "not show who accepted it: a process that can rewrite both .memlet/config.json and the "
+                              "ledger can forge an acceptance, and copying both files to another clone carries the "
+                              "acceptances along.")
     nested = p.add_subparsers(dest="anchors_command", metavar="{suggest,accept,list,drop}")
     nested.required = True
     s = nested.add_parser("suggest", help="List rules that could be anchored (read-only).")

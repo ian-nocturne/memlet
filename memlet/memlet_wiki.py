@@ -48,7 +48,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .audit import (BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, LazyBlockPattern, SpanMatch,
                     audit_repository, iter_explicit_anchors)
-from .code_anchors import (PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_symbol_fingerprints, extract_file_symbol_hashes,
+from .code_anchors import (NEW_PIN, PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_symbol_fingerprints, extract_file_symbol_hashes,
                            extract_file_symbol_signatures, previous_python_symbol_hashes)
 
 MEMLET_VERSION = "9.0.0"
@@ -264,6 +264,15 @@ class UnsafePathError(ValueError):
     """A Memlet-managed location is a symlink, not a regular file / real directory, or outside the repository."""
 
 
+class ConcurrentChangeError(ValueError):
+    """`write_managed_bytes(..., if_match=...)`: the file is no longer what the caller read; nothing was written."""
+
+
+def content_tag(data: Optional[bytes]) -> str:
+    """The `if_match` value for bytes a caller read (`"absent"` when the file did not exist)."""
+    return "absent" if data is None else "sha256:" + hashlib.sha256(data).hexdigest()
+
+
 def _rel_parts(rel: Any) -> Optional[Tuple[str, ...]]:
     rel = str(rel).replace("\\", "/")
     while rel.startswith("./"):
@@ -397,10 +406,14 @@ def _ensure_managed_dir(root: Path, parts: Tuple[str, ...]) -> Path:
 
 
 def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool = False,
-                        new_mode: int = 0o644) -> int:
+                        new_mode: int = 0o644, if_match: Optional[str] = None) -> int:
     """Write `data` to `root/rel` (below `.memlet/`), refusing (UnsafePathError, nothing written) when the location
     fails `managed_path_problem`. Replaces atomically through a temp file in the same directory and keeps an existing
-    file's mode; `create_only` creates a new file exclusively (O_EXCL | O_NOFOLLOW) instead."""
+    file's mode; `create_only` creates a new file exclusively (O_EXCL | O_NOFOLLOW) instead.
+
+    `if_match` (optional; default None keeps the unconditional behaviour): the `content_tag` of the bytes the caller
+    read. Re-checked immediately before the replace; when the file changed meanwhile (or appeared / disappeared),
+    ConcurrentChangeError is raised and nothing is written, instead of silently overwriting another writer's edit."""
     problem = managed_path_problem(root, rel)
     if problem:
         raise UnsafePathError(problem)
@@ -426,6 +439,10 @@ def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool 
         problem = managed_path_problem(root, rel)  # re-checked just before the replace
         if problem:
             raise UnsafePathError(problem)
+        if if_match is not None:
+            current = read_regular_bytes(target, 64 * 1024 * 1024) if os.path.lexists(str(target)) else None
+            if (os.path.lexists(str(target)) and current is None) or content_tag(current) != if_match:
+                raise ConcurrentChangeError(f"{rel} was changed by another program while Memlet was writing it")
         os.replace(tmp, str(target))  # renames over the leaf: a symlink there would be replaced, never followed
     except BaseException:
         with contextlib.suppress(OSError):
@@ -562,13 +579,23 @@ def _req_sig_hash(sig: Dict[str, Any]) -> Optional[str]:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:_HASH_LEN]
 
 
-def _current_fingerprint(root: Path, rel_path: str, symbol: str, basis: Optional[str] = None) -> Dict[str, Any]:
+def exact_parser_opt_in(root: Path) -> List[str]:
+    """Exact parsers this repository opted into for NEW TS/JS pins: `.memlet/config.json` `anchors.exactParsers`
+    (e.g. ["tree-sitter"]). Empty by default; installing a parser package alone never changes how anything is pinned."""
+    cfg, _err = read_config(root)
+    anchors = cfg.get("anchors") if isinstance(cfg, dict) else None
+    names = anchors.get("exactParsers") if isinstance(anchors, dict) else None
+    return [n for n in names if isinstance(n, str) and n][:8] if isinstance(names, list) else []
+
+
+def _current_fingerprint(root: Path, rel_path: str, symbol: str, basis: Any = NEW_PIN) -> Dict[str, Any]:
     """Resolve an anchor against the working tree; returns resolution plus current hashes.
 
-    TS/JS: `basis` is the hash basis of the pin being checked (None for a new pin). A new pin uses the exact
-    provider when one is available (`code_anchors.exact_provider`), else the lexical scanner. A lexical or legacy
-    pin is always re-checked lexically. A pin made by an exact provider is re-checked only by that same provider
-    (same basis name); when it is unavailable the result carries `basisUnavailable` and is never compared."""
+    TS/JS: `basis` is the hash basis of the pin being checked, `NEW_PIN` for a pin that does not exist yet. A new pin
+    is lexical unless the repository opted into an exact parser (`exact_parser_opt_in`). A lexical pin, and a legacy
+    pin stored without a basis (`None` / "legacy", never confused with `NEW_PIN`), is always re-checked lexically. A
+    pin made by an exact provider is re-checked only by that same provider (same basis name); when it is unavailable
+    the result carries `basisUnavailable` and is never compared."""
     if rel_path.startswith("/") or ".." in Path(rel_path).parts or _is_secret_path(rel_path):
         return {"resolution": "rejected", "reason": "path_outside_repo_or_secret"}
     target = root / rel_path
@@ -592,15 +619,15 @@ def _current_fingerprint(root: Path, rel_path: str, symbol: str, basis: Optional
     lexical_ts = language in ("typescript", "javascript")
     fp_basis = TS_LEXICAL_BASIS if lexical_ts else PYTHON_HASH_BASIS if language == "python" else "contract-v1"
     hash_exact, hash_reason, sig_hash, basis_unavailable = not lexical_ts, "ts_js_lexical_scan_unverified", sig.get("sigHash") or "", None
-    if lexical_ts and basis not in (None, "legacy", TS_LEXICAL_BASIS):
-        exact_basis, exact = exact_symbol_fingerprints(target, language)
+    if lexical_ts and basis is not NEW_PIN and basis not in (None, "legacy", TS_LEXICAL_BASIS):
+        exact_basis, exact = exact_symbol_fingerprints(target, language, basis=basis)
         if exact_basis != basis or exact is None or symbol not in exact:
             basis_unavailable = basis  # the parser that made this pin cannot re-check it now
         else:
             fp_basis, hash_exact, hash_reason = exact_basis, True, "exact_parser"
             ast_hash, sig_hash = exact[symbol]["ast"], exact[symbol]["sig"] or sig_hash
-    elif lexical_ts and basis is None:
-        exact_basis, exact = exact_symbol_fingerprints(target, language)
+    elif lexical_ts and basis is NEW_PIN and exact_parser_opt_in(root):
+        exact_basis, exact = exact_symbol_fingerprints(target, language, allowed=exact_parser_opt_in(root))
         if exact and symbol in exact:
             fp_basis, hash_exact, hash_reason = exact_basis, True, "exact_parser"
             ast_hash, sig_hash = exact[symbol]["ast"], exact[symbol]["sig"] or sig_hash
@@ -627,7 +654,8 @@ def _same_hash(a: Optional[str], b: Optional[str]) -> bool:
 
 def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
     pin = anchor.get("pin")
-    cur = _current_fingerprint(root, anchor["path"], anchor["symbol"], basis=(pin or {}).get("basis") if pin else None)
+    # a stored pin is checked under its own basis (None = a legacy pin); no pin at all is NEW_PIN
+    cur = _current_fingerprint(root, anchor["path"], anchor["symbol"], basis=pin.get("basis") if pin else NEW_PIN)
     # Optional diagnostic metadata is used only when it belongs to exactly this baseline.
     if pin and not pin.get("types"):
         cp = _load_config_pins(root).get(f"{anchor['path']}::{anchor['symbol']}") or {}
@@ -1674,7 +1702,12 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
         r["id"] = "rule-" + hashlib.sha256(f"{r['source']}\n{r['text']}".encode("utf-8")).hexdigest()[:12]
     suggested = {k for r in rules for k in r.get("suggestedAnchors") or []}
     if suggested:
+        # per-anchor provenance: `sidecarIds` = every acceptance supplying it; `suggested` only when no rule wrote it
         written = {k for r in rules for k in r["anchors"] if k not in (r.get("suggestedAnchors") or [])}
+        for r in rules:
+            for k, sid in (r.get("sidecarIds") or {}).items():
+                if k in cache:
+                    cache[k]["sidecarIds"] = sorted(set(cache[k].get("sidecarIds") or []) | {sid})
         for k in suggested - written:
             if k in cache:
                 cache[k]["suggested"] = True
@@ -1716,7 +1749,8 @@ def classify_rule_quotes(root: Path, entries: List[Dict[str, Any]]) -> None:
     for e, r in zip(entries, rules):
         e["anchorStatus"] = r["status"]
         e["anchors"] = [dict({"anchor": k, "status": by_key[k]["status"], "reason": by_key[k]["reason"]},
-                             **({"suggested": True} if k in (r.get("suggestedAnchors") or []) else {}))
+                             **({"suggested": True, "sidecarId": (r.get("sidecarIds") or {}).get(k)}
+                                if k in (r.get("suggestedAnchors") or []) else {}))
                         for k in r["anchors"]]
         e["anchorReason"] = "; ".join(dict.fromkeys(a["reason"] for a in e["anchors"])) or "no_code_anchor"
 
@@ -1737,14 +1771,17 @@ def pinned_anchor_report(root: Path) -> Dict[str, Any]:
     from .memlet_anchors import sidecar_index
     side = sidecar_index(root)
     side_sources: Dict[str, List[str]] = {}
+    side_ids: Dict[str, List[str]] = {}
     for e in side["attached"]:  # an accepted sidecar anchor is reported at its rule, like a written anchor
         side_sources.setdefault(e["anchor"], []).append(f"{e['source']}:{e['currentLine']}")
+        side_ids.setdefault(e["anchor"], []).append(e["id"])
     anchors = []
     for k in sorted(merged):
         a = classify_anchor(root, merged[k])
         if k in side_sources:
             written = bool(a["sources"])
             a["sources"] = a["sources"] + [s for s in side_sources[k] if s not in a["sources"]]
+            a["sidecarIds"] = sorted(side_ids[k])
             if not written:
                 a["suggested"] = True
         anchors.append(a)
@@ -2418,10 +2455,14 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
     for items in lists.values():
         for item in items:
             r = by_src.get(item.get("source"))
-            if r is not None and "anchors" in item:
+            if r is not None and "anchors" in item:  # per rule: exactly the anchors this rule got from sidecars
                 item["suggestedAnchors"] = [_bounded_anchor(k) for k in r["suggestedAnchors"]]
-            elif "reason" in item and "anchor" in item and (by_key.get(item["anchor"]) or {}).get("suggested"):
-                item["suggested"] = True
+                item["sidecarIds"] = [r["sidecarIds"][k] for k in r["suggestedAnchors"] if k in (r.get("sidecarIds") or {})]
+            elif "reason" in item and "anchor" in item and (by_key.get(item["anchor"]) or {}).get("sidecarIds"):
+                a = by_key[item["anchor"]]
+                if a.get("suggested"):
+                    item["suggested"] = True
+                item["sidecarIds"] = list(a["sidecarIds"])
 
 
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
