@@ -85,30 +85,69 @@ _ANCHOR_SYMBOL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 ANCHOR_PATH_MAX_CHARS = 1024
 
 
+_SYMBOL_START_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_MAKEFILE_NAMES = ("Makefile", "makefile", "GNUmakefile")
+
+
+def _leftmost_anchor_start(text: str, left: int, end: int) -> Optional[int]:
+    """Leftmost start in [left, end) from which the path part of EXPLICIT_ANCHOR_RE matches and ends exactly at
+    `end` (the separator), computed directly instead of retrying the path regex from every start (that was quadratic
+    in the 1 KB window per separator). `text[left:end]` holds path characters only. The path is `/`-separated
+    non-empty segments whose last one is `<1+ chars>.<ext>` or a Makefile name; so any start after the last empty
+    segment (`//`) that is not itself a `/` works, as long as the last segment qualifies."""
+    win = text[left:end]
+    if not win or win.endswith("/"):
+        return None
+    dbl = win.rfind("//")
+    s0 = dbl + 2 if dbl >= 0 else 0
+    if s0 < len(win) and win[s0] == "/":
+        s0 += 1
+    if s0 >= len(win):
+        return None
+    last_slash = win.rfind("/")
+    seg_start = max(last_slash + 1, s0)  # the last segment as seen from the leftmost start
+    last_seg = win[seg_start:]
+    whole_last = win[last_slash + 1:]
+    candidates = []
+    if any(whole_last.endswith("." + e) and len(last_seg) >= len(e) + 2 for e in KNOWN_CODE_EXTENSIONS):
+        candidates.append(s0)
+    if s0 <= last_slash and whole_last in _MAKEFILE_NAMES:
+        candidates.append(s0)  # `(?:seg/)*Makefile` from the leftmost start
+    # the name alone (zero `seg/` repetitions) may also start inside the last segment
+    candidates += [len(win) - len(name) for name in _MAKEFILE_NAMES
+                   if win.endswith(name) and len(win) - len(name) >= s0]
+    return left + min(candidates) if candidates else None
+
+
 def iter_explicit_anchors(text: str):
     """`EXPLICIT_ANCHOR_RE.finditer(text)` in linear time.
 
     Run on a whole line, the pattern retries its path part from every position of a long run of path
     characters, which is quadratic (a 100 KB line took over a minute). Every match contains a `::` or `#`
-    separator, so only the window around each separator is searched: the path characters to its left (at most
-    `ANCHOR_PATH_MAX_CHARS`, far beyond any real path) and the symbol characters to its right. Matches are the
-    same objects, with the same absolute spans, as `finditer` would yield for paths within that length.
+    separator, so each separator is handled once: the symbol must start right after it (else no match uses it),
+    the path must end right before it, so the path-plus-separator part is searched only in the window of path
+    characters to its left (at most `ANCHOR_PATH_MAX_CHARS`, far beyond any real path) with the search ending at the
+    separator -- never from starts inside the long symbol run after it, which the earlier window search retried
+    one by one (`a.py::` + 50,000 `-` took 21 s). The full match is then taken once at the found start. Matches are
+    the same objects, with the same absolute spans, as `finditer` would yield for paths within that length.
     """
     last_end = 0
     n = len(text)
     for sep in _ANCHOR_SEP_RE.finditer(text):
         if sep.start() < last_end:
             continue
+        if sep.end() >= n or text[sep.end()] not in _SYMBOL_START_CHARS:
+            continue  # `[A-Za-z_]` must follow the separator: no match can use this one
         left = sep.start()
         floor = max(last_end, left - ANCHOR_PATH_MAX_CHARS)
         while left > floor and text[left - 1] in _ANCHOR_PATH_CHARS:
             left -= 1
         if left == sep.start():
             continue
-        right = sep.end()
-        while right < n and text[right] in _ANCHOR_SYMBOL_CHARS:
-            right += 1
-        m = EXPLICIT_ANCHOR_RE.search(text, left, right)
+        start = _leftmost_anchor_start(text, left, sep.start())
+        if start is None:
+            continue
+        m = EXPLICIT_ANCHOR_RE.match(text, start)
         if m is not None and m.start() >= last_end:
             last_end = m.end()
             yield m
@@ -118,10 +157,345 @@ BACKTICK_FILE_RE = re.compile(
     rf"`(?P<path>(?:\./)?(?:(?:[A-Za-z0-9_.-]+/)*(?:Makefile|makefile|GNUmakefile)|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:{EXT_PATTERN})(?![A-Za-z0-9_])))(?:::|#(?P<symbol>[A-Za-z_][A-Za-z0-9_.-]*))?`"
 )
 
+# ---------------------------------------------------------------------------------------------------------------
+# Linear-time text scanning. A regex that retries a long unmatched run from every start position (a lazy `.*?`
+# block per unclosed opener, `\[[^\]]+\]` per `[`, an unanchored `[a-z][a-z.+-]*://`) is quadratic on hostile input.
+# The objects below give the same matches as the regex they replace (same leftmost-first semantics, same spans) but
+# visit each character a bounded number of times. They expose the `re.Pattern` methods their callers use.
+
+
+class SpanMatch:
+    """A `re.Match` stand-in (group 0 / group 1, start, end, span) for matches found without `re`."""
+
+    __slots__ = ("string", "_start", "_end")
+
+    def __init__(self, string: str, start: int, end: int) -> None:
+        self.string, self._start, self._end = string, start, end
+
+    def group(self, *groups: Any) -> Any:
+        if not groups:
+            return self.string[self._start:self._end]
+        if len(groups) == 1:
+            if groups[0] not in (0, 1):
+                raise IndexError("no such group")
+            return self.string[self._start:self._end]
+        return tuple(self.group(g) for g in groups)
+
+    def __getitem__(self, g: Any) -> str:
+        return self.group(g)
+
+    def start(self, g: int = 0) -> int:
+        return self._start
+
+    def end(self, g: int = 0) -> int:
+        return self._end
+
+    def span(self, g: int = 0) -> Tuple[int, int]:
+        return self._start, self._end
+
+
+def _expand(repl: Any, m: Any) -> str:
+    return repl(m) if callable(repl) else repl
+
+
+class _LinearPattern:
+    """Common `search` / `finditer` / `findall` / `sub` / `subn` over `_spans(text, pos)` (non-overlapping, in order).
+    A string replacement is inserted literally (no backreferences)."""
+
+    pattern = ""
+
+    def _spans(self, text: str, pos: int = 0):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def finditer(self, text: str, pos: int = 0):
+        for s, e in self._spans(text, pos):
+            yield SpanMatch(text, s, e)
+
+    def search(self, text: str, pos: int = 0):
+        return next(self.finditer(text, pos), None)
+
+    def findall(self, text: str) -> List[str]:
+        return [text[s:e] for s, e in self._spans(text)]
+
+    def subn(self, repl: Any, text: str, count: int = 0) -> Tuple[str, int]:
+        out: List[str] = []
+        last = n = 0
+        for s, e in self._spans(text):
+            out.append(text[last:s])
+            out.append(_expand(repl, SpanMatch(text, s, e)))
+            last = e
+            n += 1
+            if count and n >= count:
+                break
+        if not n:
+            return text, 0
+        out.append(text[last:])
+        return "".join(out), n
+
+    def sub(self, repl: Any, text: str, count: int = 0) -> str:
+        return self.subn(repl, text, count)[0]
+
+
+class LazyBlockPattern(_LinearPattern):
+    """`BEGIN[\\s\\S]*?END<suffix>` in linear time.
+
+    Every END match is located once (overlapping occurrences included, as the lazy scan would see them); each BEGIN
+    found by a left-to-right search takes the first END that starts at or after the BEGIN's end, exactly as the lazy
+    regex does. A BEGIN with no END after it means no later BEGIN has one either (BEGIN ends grow with their starts),
+    so the scan stops instead of retrying every remaining opener against the rest of the text."""
+
+    def __init__(self, pattern: str, begin: "re.Pattern[str]", end: "re.Pattern[str]", end_prefix: str,
+                 suffix: Optional[str] = None, *, dotall: bool = True,
+                 full: Optional["re.Pattern[str]"] = None) -> None:
+        """`dotall=False`: the body cannot cross a newline (`.` without re.S); a BEGIN whose first END lies beyond
+        the end of its line fails, and so does every later BEGIN on that line, so the scan resumes on the next line.
+        `full`: the equivalent single regex, matched once at each found start to return real match objects (with
+        named groups); it is anchored there and stops at the same first END, so it costs the span length."""
+        self.pattern, self._begin, self._end, self._end_prefix, self._suffix = pattern, begin, end, end_prefix, suffix
+        self._dotall, self._full = dotall, full
+
+    def _end_spans(self, text: str) -> Tuple[List[int], List[int]]:
+        starts, ends = [], []
+        i = text.find(self._end_prefix)
+        while i >= 0:
+            m = self._end.match(text, i)
+            if m:
+                starts.append(i)
+                ends.append(m.end())
+            i = text.find(self._end_prefix, i + 1)
+        return starts, ends
+
+    def _spans(self, text: str, pos: int = 0):
+        import bisect
+
+        if self._end_prefix not in text:
+            return
+        starts, ends = self._end_spans(text)
+        while True:
+            m = self._begin.search(text, pos)
+            if m is None:
+                return
+            i = bisect.bisect_left(starts, m.end())
+            if not self._dotall:
+                nl = text.find("\n", m.end())
+                if i == len(starts) or (nl >= 0 and starts[i] >= nl):
+                    if nl < 0:
+                        return
+                    pos = nl + 1  # no END on this line: no later BEGIN on it has one either
+                    continue
+            elif i == len(starts):
+                return
+            e = ends[i]
+            if self._suffix and text.startswith(self._suffix, e):
+                e += len(self._suffix)
+            yield m.start(), e
+            pos = e if e > m.start() else m.start() + 1
+
+    def finditer(self, text: str, pos: int = 0):
+        for s, e in self._spans(text, pos):
+            if self._full is not None:
+                m = self._full.match(text, s)
+                if m is not None:
+                    yield m
+                    continue
+            yield SpanMatch(text, s, e)
+
+
+class _RunEnd:
+    """End of the maximal run of `cls` characters that contains / starts at a position, memoised so that every
+    start inside one run is answered in O(1) after the run was scanned once."""
+
+    def __init__(self, text: str, cls_star: "re.Pattern[str]") -> None:
+        self.text, self.rx, self.lo, self.hi = text, cls_star, -1, -1
+
+    def __call__(self, q: int) -> int:
+        if self.lo <= q <= self.hi:
+            return self.hi
+        self.lo, self.hi = q, self.rx.match(self.text, q).end()
+        return self.hi
+
+
+class _MemoSearch:
+    """`rx.search(text, pos)` for non-decreasing `pos`, re-using the last answer while it is still the leftmost."""
+
+    def __init__(self, text: str, rx: "re.Pattern[str]") -> None:
+        self.text, self.rx, self.frm, self.m = text, rx, -1, None
+
+    def __call__(self, pos: int):
+        if 0 <= self.frm <= pos and (self.m is None or self.m.start() >= pos):
+            return self.m
+        self.frm, self.m = pos, self.rx.search(self.text, pos)
+        return self.m
+
+
+def regex_finder(rx: "re.Pattern[str]"):
+    """Finder for alternatives whose single attempt is bounded (a literal prefix and no long run before a test that
+    can fail): `rx.search` from each position."""
+    def factory(text: str):
+        search = _MemoSearch(text, rx)
+
+        def find(pos: int):
+            m = search(pos)
+            return m.span() if m else None
+        return find
+    return factory
+
+
+def prefix_run_finder(prefix: "re.Pattern[str]", cls_star: "re.Pattern[str]", min_len: int):
+    """`PREFIX[cls]{min_len,}` (nothing after the run): the match ends at the end of the class run."""
+    def factory(text: str):
+        search, run = _MemoSearch(text, prefix), _RunEnd(text, cls_star)
+
+        def find(pos: int):
+            while True:
+                m = search(pos)
+                if m is None:
+                    return None
+                q = m.end()
+                end = run(q)
+                if end - q >= min_len:
+                    return m.start(), end
+                pos = m.start() + 1
+        return find
+    return factory
+
+
+def run_tail_finder(prefix: "re.Pattern[str]", cls_star: "re.Pattern[str]", min_len: int, tail: "re.Pattern[str]"):
+    """`PREFIX[cls]{min_len,}TAIL` where TAIL starts with a character outside `cls`: the greedy run can only end at
+    the end of the class run, so every start inside one run shares one TAIL test; the leftmost start has the longest
+    run. One TAIL test per run instead of one per start."""
+    def factory(text: str):
+        search, run = _MemoSearch(text, prefix), _RunEnd(text, cls_star)
+        memo: Dict[int, Optional[int]] = {}
+
+        def tail_end(b: int) -> Optional[int]:
+            if b not in memo:
+                memo.clear()
+                m = tail.match(text, b)
+                memo[b] = m.end() if m else None
+            return memo[b]
+
+        def find(pos: int):
+            while True:
+                m = search(pos)
+                if m is None:
+                    return None
+                q = m.end()
+                b = run(q)
+                if b - q >= min_len:
+                    t = tail_end(b)
+                    if t is not None:
+                        return m.start(), t
+                pos = max(b, m.start() + 1)  # every later start in this run fails the same way
+        return find
+    return factory
+
+
+class LinearAlternation(_LinearPattern):
+    """Matches of `alt_1|alt_2|...` with `re` semantics (leftmost start wins; at one start the earlier alternative
+    wins), one finder per alternative (or per group of alternatives that are safe together). Finders return their own
+    leftmost `(start, end)` at or after `pos` and are called with non-decreasing `pos`."""
+
+    def __init__(self, pattern: str, finders: List[Any], flags: int = 0) -> None:
+        self.pattern, self.flags, self._factories = pattern, flags, list(finders)
+
+    def _spans(self, text: str, pos: int = 0):
+        finders = [f(text) for f in self._factories]
+        cache: List[Any] = [None] * len(finders)
+        n = len(text)
+        while pos <= n:
+            best = None
+            for i, find in enumerate(finders):
+                c = cache[i]
+                if c is None or (c is not False and c[0] < pos):
+                    c = cache[i] = find(pos) or False
+                if c is not False and (best is None or c[0] < best[0]):
+                    best = c
+            if best is None:
+                return
+            yield best
+            pos = best[1] if best[1] > best[0] else best[1] + 1
+
+
+# Strip HTML comments `<!-- ... -->` (lazy, across lines) in linear time.
+HTML_COMMENT_RE = LazyBlockPattern(r"<!--[\s\S]*?-->", re.compile(r"<!--"), re.compile(r"-->"), "-->")
+
 # Matches markdown links `[label](path/to/file.ext)`
-MD_LINK_FILE_RE = re.compile(
+_MD_LINK_FILE_RX = re.compile(
     rf"\[[^\]]+\]\((?P<path>(?!https?://|mailto:|file://|#)(?:\./)?(?:(?:[A-Za-z0-9_.-]+/)*(?:Makefile|makefile|GNUmakefile)|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:{EXT_PATTERN})(?![A-Za-z0-9_])))(?:#(?P<anchor>[A-Za-z0-9_.-]+))?\)"
 )
+
+
+def _bracket_candidates(text: str, pos: int = 0):
+    """Start positions where `\\[[^\\]]+\\]` can begin a match, one per `]`: the leftmost `[` after the previous `]`
+    with at least one character before the `]`. Every other `[` before that `]` has the same continuation, so it
+    matches iff this one does (the regex would retry each of them against the same text)."""
+    seg = pos
+    n = len(text)
+    while seg < n:
+        r = text.find("]", seg)
+        if r < 0:
+            return
+        i = text.find("[", seg, r - 1) if r - 1 > seg else -1
+        if i >= 0:
+            nxt = yield i, r
+            if nxt is not None:  # caller consumed a match ending at nxt
+                seg = nxt
+                continue
+        seg = r + 1
+
+
+class _MdLinkPattern(_LinearPattern):
+    pattern = _MD_LINK_FILE_RX.pattern
+    groupindex = _MD_LINK_FILE_RX.groupindex
+
+    def finditer(self, text: str, pos: int = 0):
+        gen = _bracket_candidates(text, pos)
+        try:
+            i, _r = next(gen)
+            while True:
+                m = _MD_LINK_FILE_RX.match(text, i)
+                if m:
+                    yield m
+                    i, _r = gen.send(m.end())
+                else:
+                    i, _r = next(gen)
+        except StopIteration:
+            return
+
+    def _spans(self, text: str, pos: int = 0):
+        for m in self.finditer(text, pos):
+            yield m.span()
+
+    def match(self, text: str, pos: int = 0):
+        return _MD_LINK_FILE_RX.match(text, pos)
+
+
+MD_LINK_FILE_RE = _MdLinkPattern()
+
+_REF_LINK_KEY_RX = re.compile(r"(\[[^\]]+\])\[[^\]]+\]")
+
+
+def strip_ref_link_keys(line: str) -> str:
+    """`re.sub(r"(\\[[^\\]]+\\])\\[[^\\]]+\\]", r"\\1", line)` in linear time: drop the `[ref]` of `[label][ref]`."""
+    if "][" not in line:
+        return line
+    out, last = [], 0
+    gen = _bracket_candidates(line)
+    try:
+        i, r = next(gen)
+        while True:
+            m = _REF_LINK_KEY_RX.match(line, i) if line.startswith("[", r + 1) else None
+            if m:
+                out += [line[last:i], m.group(1)]
+                last = m.end()
+                i, r = gen.send(m.end())
+            else:
+                i, r = next(gen)
+    except StopIteration:
+        pass
+    out.append(line[last:])
+    return "".join(out)
 
 # Matches unbackticked repo paths that contain at least one directory separator `dir/file.ext`
 SLASH_PATH_RE = re.compile(
@@ -254,20 +628,32 @@ PYTHON_BUILTINS_AND_COMMON = {
 }
 
 
+MAX_AUDIT_DOC_BYTES = 2 * 1024 * 1024     # one instruction document; a larger one is skipped
+MAX_AUDIT_TOTAL_BYTES = 32 * 1024 * 1024  # all documents of one audit together
+
+
+def _read_doc_text(path: Path) -> Optional[str]:
+    """A regular, non-symlinked document of at most MAX_AUDIT_DOC_BYTES, else None (never blocks on a FIFO)."""
+    from .memlet_wiki import read_regular_text
+    return read_regular_text(path, MAX_AUDIT_DOC_BYTES, errors="replace")
+
+
 def _discover_instruction_docs(repo_root: Path) -> List[Path]:
     """Find instruction, rule, runbook, and skill markdown files in repo_root."""
     found: List[Path] = []
     seen: Set[str] = set()
+    from .memlet_wiki import contained_path_problem  # the one in-repository containment rule (no symlink component)
 
     def _add(p: Path) -> None:
         try:
-            if p.is_symlink() or not p.is_file():
+            rel = p.relative_to(repo_root).as_posix()
+            if contained_path_problem(repo_root, rel) is not None or not p.is_file():
                 return
             resolved = str(p.resolve())
             if resolved not in seen:
                 seen.add(resolved)
                 found.append(p)
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     top_Names = (
@@ -819,13 +1205,18 @@ def audit_repository(
         re.IGNORECASE,
     )
 
+    doc_bytes_left = MAX_AUDIT_TOTAL_BYTES
     for doc_path in docs:
         try:
             doc_rel = str(doc_path.relative_to(root))
-            raw_doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
-            # Strip HTML comments <!-- ... --> while preserving exact line numbers
-            clean_doc_text = re.sub(
-                r"<!--[\s\S]*?-->",
+            raw_doc_text = _read_doc_text(doc_path)
+            if raw_doc_text is None:  # not a regular file, unreadable or over the per-document bound
+                continue
+            doc_bytes_left -= len(raw_doc_text)
+            if doc_bytes_left < 0:  # cumulative bound: one audit reads at most MAX_AUDIT_TOTAL_BYTES of documents
+                break
+            # Strip HTML comments <!-- ... --> while preserving exact line numbers (linear in the text)
+            clean_doc_text = HTML_COMMENT_RE.sub(
                 lambda m: "\n" * m.group(0).count("\n"),
                 raw_doc_text,
             )
@@ -965,7 +1356,7 @@ def audit_repository(
                 recent_tutorial_lines = 4
 
             # Strip Markdown reference-style link keys `[label][ref_id]` so `ref_id` is not misparsed as a local path
-            line_for_paths = re.sub(r"(\[[^\]]+\])\[[^\]]+\]", r"\1", line)
+            line_for_paths = strip_ref_link_keys(line)
 
             # 3. Extract file & explicit symbol references on this line
             line_refs: List[Tuple[str, Optional[str]]] = []

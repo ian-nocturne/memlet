@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from prism_memory.audit import LazyBlockPattern, LinearAlternation, regex_finder, run_tail_finder
+
 BRIEF_PAGE = ".memlet/wiki/BRIEF.md"
 BRIEF_SCHEMA = "memlet-brief/v1"
 # Only runners that can be made tool-free and subscription-only are allowed; everything else fails closed.
@@ -90,14 +92,104 @@ def check_runner(via: str) -> Tuple[bool, str]:
 
 _LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(?P<rule>.+?)\s*\[src:\s*(?P<src>[^\]]+)\]\s*$")
 _CITE_RE = re.compile(r"^\s*(?P<file>[^:\s][^:]*?):(?P<a>\d+)(?:\s*-\s*(?P<b>\d+))?\s*$")
-_PIN_RE = re.compile(r"<!-- memlet:brief (?P<body>.*?) -->")
+def line_lazy_marker(prefix: str, body: str, suffix: str) -> LazyBlockPattern:
+    """`<prefix>(?P<body>BODY.*?)<suffix>` on one line (`.` stops at a newline), evaluated in linear time: a line
+    full of unclosed openers is scanned once instead of once per opener."""
+    rx = re.compile(re.escape(prefix) + "(?P<body>" + body + ".*?)" + re.escape(suffix))
+    return LazyBlockPattern(rx.pattern, re.compile(re.escape(prefix) + body), re.compile(re.escape(suffix)), suffix,
+                            dotall=False, full=rx)
+
+
+_PIN_RE = line_lazy_marker("<!-- memlet:brief ", "", " -->")
+_BRIEF_META_RE = line_lazy_marker("<!-- memlet:brief-meta ", r"\{", "} -->")
 _PIN_BODY_RE = re.compile(r"rank=\d+ pins=(?P<pins>\S+:\d+-\d+=[0-9a-f]{64}(?: \S+:\d+-\d+=[0-9a-f]{64})*)")
-_PEM_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S)
-_EXTRA_SECRET_RE = re.compile(
+# Secret masking: one linear-time implementation (`_mask`) used by every brief / index / recall / handover display.
+# The patterns are unchanged; they are evaluated by `audit.LazyBlockPattern` / `audit.LinearAlternation`, which give
+# the same matches as the plain regexes without retrying long runs from every start (`'z' * 100000` took seconds).
+_PEM_PATTERN = r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----"
+_PEM_RE = LazyBlockPattern(_PEM_PATTERN, re.compile(r"-----BEGIN [A-Z0-9 ]+-----"),
+                           re.compile(r"-----END [A-Z0-9 ]+-----"), "-----END ")
+_EXTRA_SECRET_PATTERN = (
     r"(?:sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}"
     r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@"
     r"|\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)[A-Z0-9_]*\s*[:=]\s*['\"]?[^\s'\"]{8,}"
-    r"|(?:api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+]{12,})", re.I)
+    r"|(?:api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+]{12,})")
+
+
+def _url_credentials_finder(text: str):
+    """`[A-Za-z][A-Za-z0-9+.\\-]*://[^\\s/:@]+:[^\\s/@]+@` (re.I). The scheme run before a `://` is one class run, so
+    the only start that matters for one `://` is the first letter of that run (every start in it shares the same
+    continuation); one test per `://` instead of one per letter of a long word."""
+    scheme_ch = re.compile(r"[A-Za-z0-9+.\-]", re.I)
+    letter = re.compile(r"[A-Za-z]", re.I)
+    tail = re.compile(r"://[^\s/:@]+:[^\s/@]+@", re.I)
+    state = {"c": -1, "frm": -1, "r": 0, "end": None}
+
+    def next_sep(frm: int) -> int:
+        # memoised `text.find("://", frm)`: the last answer stays valid while it is still at or after `frm`
+        if 0 <= state["frm"] <= frm and (state["c"] < 0 or state["c"] >= frm) and state.get("found", False):
+            return state["c"]
+        c = text.find("://", frm)
+        state["frm"], state["found"] = frm, True
+        if c != state["c"]:
+            state.update(c=c, end=None, scanned=False)
+        return c
+
+    def find(pos: int):
+        c = next_sep(pos + 1)
+        while c >= 0:
+            if not state.get("scanned"):
+                r = c
+                while r > 0 and scheme_ch.match(text, r - 1):
+                    r -= 1
+                m = tail.match(text, c)
+                state.update(r=r, end=m.end() if m else None, scanned=True)
+            if state["end"] is not None:
+                s = max(pos, state["r"])
+                while s < c and not letter.match(text, s):
+                    s += 1
+                if s < c:
+                    return s, state["end"]
+            c = next_sep(c + 1)
+        return None
+    return find
+
+
+def _keyword_word_finder(text: str):
+    """`\\b[A-Z0-9_]*(?:KEY|TOKEN|...|AUTH)[A-Z0-9_]*\\s*[:=]\\s*['\\"]?[^\\s'\\"]{8,}` (re.I). Both runs are one word
+    of class characters: a start is only possible at a word boundary, i.e. at the start of a word run, and the match
+    exists iff that word contains a keyword and the separator/value follow the word. One test per word."""
+    word = re.compile(r"[A-Z0-9_]+", re.I)
+    keyword = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH", re.I)
+    rest = re.compile(r"\s*[:=]\s*['\"]?[^\s'\"]{8,}")
+    wordch = re.compile(r"\w")
+
+    def find(pos: int):
+        while True:
+            m = word.search(text, pos)
+            if m is None:
+                return None
+            p, e = m.span()
+            if not (p > 0 and wordch.match(text, p - 1)) and keyword.search(text, p, e):
+                t = rest.match(text, e)
+                if t:
+                    return p, t.end()
+            pos = e
+    return find
+
+
+def _extra_secret_alternation():
+    cls = r"[A-Za-z0-9_\-]"
+    head = re.compile(r"sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}",
+                      re.I)
+    jwt = run_tail_finder(re.compile(r"eyJ", re.I), re.compile(cls + "*", re.I), 10,
+                          re.compile(r"\." + cls + r"{10,}\." + cls + r"{10,}", re.I))
+    named = re.compile(r"(?:api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+]{12,}", re.I)
+    return LinearAlternation(_EXTRA_SECRET_PATTERN, [regex_finder(head), jwt, _url_credentials_finder,
+                                                     _keyword_word_finder, regex_finder(named)], re.I)
+
+
+_EXTRA_SECRET_RE = _extra_secret_alternation()
 MAX_BRIEF_LINES = 120
 
 
@@ -117,8 +209,10 @@ def _sha(text: str) -> str:
 
 
 def _source_lines(root: Path) -> Dict[str, List[str]]:
-    from prism_memory.memlet_wiki import discover_instruction_files, _read_text
-    return {rel: _read_text(root / rel).splitlines() for rel in discover_instruction_files(root, exclude_snapshots=True)}
+    """Discovered instruction files (snapshot copies excluded), each through the shared contained, size-capped
+    reader (`memlet_wiki._source_texts`: per-file and cumulative bounds)."""
+    from prism_memory.memlet_wiki import _source_texts, discover_instruction_files
+    return {rel: text.splitlines() for rel, text in _source_texts(root, discover_instruction_files(root, exclude_snapshots=True))}
 
 
 def _cited_text(files: Dict[str, List[str]], file: str, a: int, b: int) -> Optional[str]:
@@ -252,15 +346,15 @@ def build_brief(repo_path=".", *, via: str = "claude", runner=None, write: bool 
 
 def load_verified_brief(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """(fresh, stale, meta) — deterministic re-check of every pin against the current instruction files."""
-    page = root / BRIEF_PAGE
-    if not page.is_file() or page.is_symlink():
+    from prism_memory.memlet_wiki import MAX_WIKI_PAGE_BYTES, read_managed_text
+    text = read_managed_text(root, BRIEF_PAGE, MAX_WIKI_PAGE_BYTES)  # contained, regular, size-capped
+    if text is None:
         return [], [], None
-    text = page.read_text(encoding="utf-8", errors="replace")
     meta = None
-    m = re.search(r"<!-- memlet:brief-meta (\{.*?\}) -->", text)
+    m = _BRIEF_META_RE.search(text)
     if m:
         try:
-            meta = json.loads(m.group(1))
+            meta = json.loads(m.group("body") + "}")
         except ValueError:
             meta = None
     files = _source_lines(root)
@@ -268,6 +362,8 @@ def load_verified_brief(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str
     for line in text.splitlines():
         if not line.startswith("- "):
             continue
+        if len(fresh) + len(stale) >= MAX_BRIEF_LINES:  # bounded work: a brief never has more lines than this
+            break
         marks = list(_PIN_RE.finditer(line))
         if not marks:
             continue
@@ -283,7 +379,8 @@ def load_verified_brief(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str
             if cur is not None and _sha(cur) == sha:
                 continue
             width, lines = int(b) - int(a) + 1, files.get(f) or []
-            moved = any(_sha("\n".join(lines[i:i + width])) == sha for i in range(0, max(0, len(lines) - width + 1)))
+            moved = 1 <= width <= 13 and any(_sha("\n".join(lines[i:i + width])) == sha
+                                              for i in range(0, max(0, len(lines) - width + 1)))
             if not moved:  # unchanged text that merely moved (lines inserted above) still verifies
                 ok = False
         item = {"rule": rule, "source": src.group(1) if src else ""}

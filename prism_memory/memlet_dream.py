@@ -1433,6 +1433,8 @@ def recall_subgraph(
     view = graph
     if require_approval:
         view, excluded = approved_view(graph)
+    else:
+        view = _quote_integrity_view(graph)  # raw mode: an edited stored quote is still never shown
     header = "# Memlet Dream Subgraph Capsule\n"
     if not require_approval:
         header += UNAPPROVED_LABEL
@@ -1905,6 +1907,9 @@ def build_cortex_lineage_payload(
     graph: Dict[str, Any],
     subgraph_info: Optional[Dict[str, Any]] = None,
     snapshot_files: Optional[Dict[str, List[str]]] = None,
+    *,
+    citation_snapshot: Optional[Dict[str, List[str]]] = None,
+    require_citations: bool = False,
 ) -> Dict[str, Any]:
     """Build the `memlet.cortex_lineage.v1` JSON payload for `memlet_cortex.py`.
     Applies recall's surviving-node and bound-edge filtering (NICE 3) and 48-char node ID normalization (NICE 4).
@@ -1913,10 +1918,23 @@ def build_cortex_lineage_payload(
     (`reviewState: "approved"`). Everything else that is not rejected is still shown so a human can review
     it, but as `verdict: "PENDING"`, `reviewState: "pending"`, `verifiedBy: "awaiting review"` and never
     `inRecallCapsule: true` — whatever verdict the file claims.
+
+    Citation labelling: an approval is only shown as approved while its stored quotes hash to their pins
+    (`item_quotes_consistent`), and, with `require_citations=True`, while every pin of the item also verifies
+    against `citation_snapshot` (the caller's fixed snapshot; None means no snapshot was available, so nothing can
+    be verified). Anything else is shown as pending with `citationVerified: false`, no reviewer attribution, no
+    SUPPORTED verdict and never in the recall capsule.
     """
     import copy
 
     _check_graph_safe_structure(graph)
+
+    def _citation_ok(item: Dict[str, Any], kind: str) -> bool:
+        if not item_quotes_consistent(item, kind):
+            return False
+        if not require_citations:
+            return True
+        return citation_snapshot is not None and _verify_item_pins(item, kind, citation_snapshot) is None
     if snapshot_files is not None:
         ver = verify_ontology_contract(graph, snapshot_files)
         if not ver["ok"]:
@@ -1925,8 +1943,14 @@ def build_cortex_lineage_payload(
     display = copy.deepcopy(graph)
     raw_nodes = [n for n in (display.get("nodes") or []) if isinstance(n, dict)]
     node_review: List[str] = []
+    node_cited: List[bool] = []
     for n in raw_nodes:
         st = approval_state(n, "node")
+        cited = _citation_ok(n, "node") and all(_citation_ok(e, "edge") for e in (n.get("edges") or [])
+                                                if isinstance(e, dict))
+        node_cited.append(cited)
+        if st == "approved" and not cited:
+            st = "unverified"  # approved by a human, but its cited text cannot be verified now
         if st == "approved":
             n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
             n["edgeVerdict"] = "VALID"
@@ -1942,6 +1966,8 @@ def build_cortex_lineage_payload(
     edge_review: Dict[str, str] = {}
     for eid, refs in _edge_refs(display).items():
         st = _edge_state(refs)
+        if st == "approved" and not all(_citation_ok(r, "edge") for r in refs):
+            st = "unverified"
         edge_review[eid] = st
         for ref in refs:
             if st == "approved":
@@ -2027,6 +2053,7 @@ def build_cortex_lineage_payload(
         raw_vendors = n.get("vendorOrigins") if isinstance(n.get("vendorOrigins"), list) else []
         is_approved = node_review[idx] == "approved"
         approver = str((n.get("approval") or {}).get("by") or "") if is_approved else ""
+        unverified = node_review[idx] == "unverified"
         nodes_out.append({
             "id": lid,
             "kind": cat,
@@ -2042,8 +2069,10 @@ def build_cortex_lineage_payload(
             "sha256Pin": str(pp.get("sha256") or ""),
             "supersededBySpan": safe_truncate_masked(str(sp.get("span") or ""), 64) if sp else None,
             "supersededBySha256": str(sp.get("sha256") or "") if sp else None,
-            "verifiedBy": safe_truncate_masked(approver, 64) if is_approved else "awaiting review",
+            "verifiedBy": (safe_truncate_masked(approver, 64) if is_approved
+                           else "citation not verified" if unverified else "awaiting review"),
             "verdict": verdict if is_approved else PENDING,
+            "citationVerified": bool(node_cited[idx]),
         })
         surviving_edges_out.extend(node_surv_map[idx])
         if len(nodes_out) >= 24:
@@ -2095,6 +2124,7 @@ def build_cortex_lineage_payload(
             "pinVerification": str(sub_d.get("pinVerification") or "not_reported"),
         },
         "pendingReviewCount": sum(1 for n in nodes_out if n.get("reviewState") == "pending"),
+        "unverifiedCitationCount": sum(1 for n in nodes_out if not n.get("citationVerified")),
     }
 
 
@@ -2291,6 +2321,23 @@ def read_jsonl_transcript(path: Any, *, max_line_chars: Optional[int] = None,
     return lines, stats
 
 
+# Read bounds for snapshots and queues, so one recall / approval / Cortex load does bounded work on any input. A file
+# over its bound, or anything past the cumulative bounds, makes the load fail (nothing is verified from a partial
+# snapshot); callers report the snapshot or queue as unavailable.
+SNAPSHOT_MAX_FILE_BYTES = 32 * 1024 * 1024
+SNAPSHOT_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+SNAPSHOT_MAX_FILES = 2000
+QUEUE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _read_bounded_text(f: Path, limit: int, label: str) -> str:
+    from prism_memory.memlet_wiki import read_regular_text
+    text = read_regular_text(f, limit, errors="replace")
+    if text is None:
+        raise ValueError(f"{label} {f} is not a regular file of at most {limit} bytes")
+    return text
+
+
 def load_snapshot(snapshot_path: Any) -> Dict[str, List[str]]:
     """Load a session snapshot from a directory of `.log`/`.jsonl` files, one `.jsonl` transcript, or a JSON snapshot map."""
     return load_snapshot_with_report(snapshot_path)[0]
@@ -2326,9 +2373,21 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
     if p.is_dir():
         out: Dict[str, List[str]] = {}
         found = sorted(set(p.rglob("*.log")) | set(p.rglob("*.jsonl")))
+        if len(found) > SNAPSHOT_MAX_FILES:
+            raise ValueError(f"snapshot directory {p} holds more than {SNAPSHOT_MAX_FILES} transcript files")
+        total = 0
         for f in found:
             if not f.is_file() or f.is_symlink():
                 continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if size > SNAPSHOT_MAX_FILE_BYTES:
+                raise ValueError(f"snapshot file {f} is larger than {SNAPSHOT_MAX_FILE_BYTES} bytes")
+            total += size
+            if total > SNAPSHOT_MAX_TOTAL_BYTES:
+                raise ValueError(f"snapshot directory {p} is larger than {SNAPSHOT_MAX_TOTAL_BYTES} bytes")
             try:
                 f.resolve().relative_to(p)
             except ValueError:
@@ -2341,7 +2400,7 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
             if f.suffix == ".jsonl":
                 _add_jsonl(out, rel, f)
             else:
-                out[rel] = redact_secret_blocks(f.read_text(encoding="utf-8", errors="replace")).splitlines()
+                out[rel] = redact_secret_blocks(_read_bounded_text(f, SNAPSHOT_MAX_FILE_BYTES, "snapshot file")).splitlines()
                 report["logFiles"] += 1
         if not out:
             raise ValueError(
@@ -2350,11 +2409,13 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
             )
         return out, report
     if p.is_file() and not p.is_symlink() and p.suffix == ".jsonl":
+        if p.stat().st_size > SNAPSHOT_MAX_FILE_BYTES:
+            raise ValueError(f"snapshot file {p} is larger than {SNAPSHOT_MAX_FILE_BYTES} bytes")
         single: Dict[str, List[str]] = {}
         _add_jsonl(single, p.name, p)
         return single, report
     if p.is_file() and not p.is_symlink():
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(_read_bounded_text(p, SNAPSHOT_MAX_FILE_BYTES, "snapshot file"))
         if isinstance(raw, dict):
             res: Dict[str, List[str]] = {}
             for k, v in raw.items():
@@ -2463,7 +2524,7 @@ def extract_candidates_with_report(
             if not clean_body:
                 continue
             cue_body = clean_body.replace("\u2019", "'").replace("\u2018", "'")
-            scope_m = re.search(r"([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))", clean_body)
+            scope_m = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))", clean_body)  # run starts only: linear, same first match
             scope_tag = scope_m.group(1) if scope_m else "project_rules"
 
             if has_ts and _SUPERSEDE_CUE_RE.search(cue_body):
@@ -2813,7 +2874,7 @@ def _load_queue(queue_path: Any) -> Tuple[Path, Dict[str, Any]]:
     q = q.resolve()
     if not q.is_file():
         raise FileNotFoundError(f"Dream queue file not found: {q}")
-    graph = json.loads(q.read_text(encoding="utf-8"))
+    graph = json.loads(_read_bounded_text(q, QUEUE_MAX_BYTES, "Dream queue"))
     if not isinstance(graph, dict) or graph.get("schema") != DREAM_ONTOLOGY_SCHEMA:
         raise ValueError(f"Not a {DREAM_ONTOLOGY_SCHEMA} queue: {q}")
     return q, graph
@@ -2979,6 +3040,41 @@ def _locate_snapshot(
     if isinstance(rec, str) and rec and Path(rec).exists():
         return load_snapshot(rec), "recorded"
     return None, "missing"
+
+
+def pin_quote_consistent(pin: Any) -> bool:
+    """The quote stored in a pin is the text it is pinned to: `quoteLines` joins to `quoteText` and `quoteText`
+    hashes to the pinned `sha256`. Needs no snapshot, so even an explicitly unverified view can tell that a stored
+    quote was edited after pinning (the approval digest covers the pin identity and hash, not the quote bytes)."""
+    if not isinstance(pin, dict):
+        return False
+    text, lines = pin.get("quoteText"), pin.get("quoteLines")
+    if not isinstance(text, str) or not isinstance(lines, list) or not all(isinstance(x, str) for x in lines):
+        return False
+    return "\n".join(lines) == text and sha256_hex(text) == pin.get("sha256")
+
+
+def _item_pins(item: Dict[str, Any], kind: str) -> List[Any]:
+    if kind == "node":
+        pins = [item.get("primaryPin")] + list(item.get("allPins") or [])
+        if item.get("supersededByPin") is not None:
+            pins.append(item.get("supersededByPin"))
+        return pins
+    return [item.get("srcPin")] + ([item.get("targetPin")] if item.get("targetPin") is not None else [])
+
+
+def item_quotes_consistent(item: Any, kind: str, *, lenient: bool = False) -> bool:
+    """`pin_quote_consistent` for every pin a node (primary, all, superseded-by) or an edge (source, target) carries.
+    `lenient=True` (raw, unapproved views) only rejects a quote that is present and contradicts its hash: a pin
+    that carries no quote at all displays nothing, so it is not rejected there."""
+    if not isinstance(item, dict):
+        return False
+    for p in _item_pins(item, kind):
+        if lenient and (not isinstance(p, dict) or ("quoteText" not in p and "quoteLines" not in p)):
+            continue
+        if not pin_quote_consistent(p):
+            return False
+    return True
 
 
 def _verify_item_pins(item: Dict[str, Any], kind: str, snap: Dict[str, List[str]]) -> Optional[str]:
@@ -3397,6 +3493,22 @@ def reject_queue_items(
     )
 
 
+def _quote_integrity_view(graph: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy of `graph` in which every node / edge whose stored quote does not hash to its pin is PENDING."""
+    import copy
+
+    g = copy.deepcopy(graph)
+    for n in g.get("nodes") or []:
+        if isinstance(n, dict) and not item_quotes_consistent(n, "node", lenient=True):
+            n["verdict"] = PENDING
+            n["edgeVerdict"] = PENDING
+    for _eid, refs in _edge_refs(g).items():
+        if not all(item_quotes_consistent(r, "edge", lenient=True) for r in refs):
+            for ref in refs:
+                ref["edgeVerdict"] = PENDING
+    return g
+
+
 def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Copy of `graph` in which only items with a valid, digest-matching human approval keep a recallable
     verdict (recomputed, never read from the file); everything else is forced to PENDING or REJECTED."""
@@ -3408,6 +3520,8 @@ def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
         if not isinstance(n, dict):
             continue
         st = approval_state(n, "node")
+        if st == "approved" and not item_quotes_consistent(n, "node"):
+            st = "pending"  # a stored quote no longer matches its pinned hash: never shown as approved
         if st == "approved":
             n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
             n["edgeVerdict"] = "VALID"
@@ -3422,6 +3536,8 @@ def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
             n["edgeVerdict"] = PENDING
     for _eid, refs in _edge_refs(g).items():
         st = _edge_state(refs)
+        if st == "approved" and not all(item_quotes_consistent(r, "edge") for r in refs):
+            st = "pending"
         if st == "approved":
             mark = "VALID"
         elif st == "rejected" or str(refs[0].get("edgeVerdict") or "").upper() == REJECTED:
@@ -3459,7 +3575,7 @@ def run_dream_recall(
     g_path = Path(graph_path).expanduser().resolve()
     if not g_path.is_file():
         raise FileNotFoundError(f"Dream ontology graph file not found: {g_path}")
-    graph = json.loads(g_path.read_text(encoding="utf-8"))
+    graph = json.loads(_read_bounded_text(g_path, QUEUE_MAX_BYTES, "Dream ontology graph"))
     if not isinstance(graph, dict):
         raise ValueError("Dream ontology graph must be a JSON object.")
     snap, snap_source = _locate_snapshot(graph, snapshot_path)

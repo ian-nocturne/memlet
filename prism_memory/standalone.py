@@ -84,9 +84,39 @@ class StandaloneStore:
         self.path = self.db_path
         self.default_owner = default_owner
         self._lock = threading.RLock()
+        # Set when this open applied a one-time schema migration: {"migration", "backup"} (the backup path, if any).
+        self.migration = None
         self._init_schema()
 
+    def _backup_before_migration(self):
+        """Before the one-time 8 -> 9 column `tasks.created` migration, copy the database next to itself as
+        `<name>.bak-pre-migration-<UTC>` (SQLite backup API, so pages still in the WAL are included). Done once: an
+        existing pre-migration backup is reused. Returns the backup path, or None when no migration is pending."""
+        if not self.db_path.is_file() or self.db_path.is_symlink():
+            return None
+        conn = sqlite3.connect(str(self.db_path), timeout=15.0)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            if not columns or "created" in columns:
+                return None
+            existing = sorted(self.db_path.parent.glob(self.db_path.name + ".bak-pre-migration-*"))
+            if existing:
+                return str(existing[0])
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            dest = self.db_path.with_name(f"{self.db_path.name}.bak-pre-migration-{stamp}")
+            if os.path.lexists(str(dest)):
+                raise sqlite3.OperationalError(f"refusing to overwrite an existing path: {dest}")
+            out = sqlite3.connect(str(dest))
+            try:
+                conn.backup(out)
+            finally:
+                out.close()
+            return str(dest)
+        finally:
+            conn.close()
+
     def _init_schema(self):
+        backup = self._backup_before_migration()
         with self.db(True) as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS tasks (
@@ -107,6 +137,10 @@ class StandaloneStore:
             if "created" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN created REAL NOT NULL DEFAULT 0")
                 conn.execute("UPDATE tasks SET created = updated")
+                self.migration = {"migration": "tasks.created (8 -> 9 columns)", "backup": backup}
+                import logging
+                logging.getLogger("prism_memory.standalone").info(
+                    "migrated %s: added tasks.created; pre-migration copy: %s", self.db_path, backup or "none")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS input_leases (
                     task TEXT PRIMARY KEY,

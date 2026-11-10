@@ -84,15 +84,23 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_DIR_RELS = (mw.MEMLET_DIR, mw.WIKI_DIR, DREAM_DIR, SNAPSHOT_REL)
+_DB_FILES = (DB_REL, DB_REL + "-journal", DB_REL + "-wal", DB_REL + "-shm")
+
+
 def _symlinked(root: Path, rels: Iterable[str]) -> Optional[str]:
-    """First repo-relative path component (of any of `rels`) that is a symlink, else None."""
+    """Why the first of `rels` is not a safe Memlet location (a symlinked component, a non-regular file or a
+    non-directory where a directory is expected, or a location outside the repository), else None. The same check
+    (`memlet_wiki.managed_path_problem`) that every Memlet-managed write applies."""
     for rel in rels:
-        cur = root
-        for part in Path(rel).parts:
-            cur = cur / part
-            if cur.is_symlink():
-                return mw._rel(root, cur)
+        problem = mw.managed_path_problem(root, rel, leaf="dir" if rel in _DIR_RELS else "file")
+        if problem:
+            return problem
     return None
+
+
+def _refusing(problem: str) -> str:
+    return problem if problem.startswith("refusing") else f"refusing {problem}"
 
 
 def _ids(ids: Any) -> List[str]:
@@ -138,8 +146,9 @@ def _load_queue(root: Path) -> Tuple[Optional[Dict[str, Any]], str]:
 
 
 def _load_snapshot(root: Path) -> Tuple[Optional[Dict[str, List[str]]], str]:
+    """The bridge's fixed in-repo snapshot (`.memlet/dream/snapshot/`), never a path read from the queue."""
     snap = root / SNAPSHOT_REL
-    if snap.is_symlink():
+    if _symlinked(root, (SNAPSHOT_REL,)):
         return None, "refusing symlinked snapshot directory"
     if not snap.is_dir():
         return None, "no transcript snapshot (.memlet/dream/snapshot/)"
@@ -236,9 +245,10 @@ def _bounded_files(files: List[Path], skipped: Dict[str, Any]) -> List[Path]:
 
 
 def _write_text_atomic(target: Path, text: str) -> None:
-    if target.is_symlink():
-        raise ValueError(f"refusing to write through a symlink: {target}")
-    md._atomic_write_file(target, text)
+    """Every bridge write below `.memlet/` (snapshot files, promoted page, accepted config and pages): the shared
+    checked helper (`memlet_wiki.write_managed_path`): refused when any component is a symlink or not a regular
+    file / real directory, temp file in the same directory, atomic replace, a new file is private (0600)."""
+    mw.write_managed_path(target, text, new_mode=0o600)
 
 
 def _store_snapshot(snap_dir: Path, f: Path, lines: List[str]) -> Tuple[str, str]:
@@ -252,14 +262,18 @@ def _store_snapshot(snap_dir: Path, f: Path, lines: List[str]) -> Tuple[str, str
     if not primary.exists() and not primary.is_symlink():
         _write_text_atomic(primary, data)
         return primary.name, "create"
-    old = primary.read_text(encoding="utf-8", errors="replace").splitlines()
+    old_text = mw.read_regular_text(primary, md.SNAPSHOT_MAX_FILE_BYTES, errors="replace")
+    if old_text is None:
+        raise ValueError(f"refusing snapshot file {primary.name}: not a regular file within the snapshot bound")
+    old = old_text.splitlines()
     if old == lines:
         return primary.name, "unchanged"
     if lines[:len(old)] == old:
         _write_text_atomic(primary, data)
         return primary.name, "extend"
     variant = snap_dir / f"{base}-{_sha(data)[:10]}.log"
-    if variant.is_file() and not variant.is_symlink() and variant.read_text(encoding="utf-8", errors="replace").splitlines() == lines:
+    if (variant.is_file() and not variant.is_symlink()
+            and (mw.read_regular_text(variant, md.SNAPSHOT_MAX_FILE_BYTES, errors="replace") or "").splitlines() == lines):
         return variant.name, "unchanged"
     _write_text_atomic(variant, data)
     return variant.name, "create-variant"
@@ -348,9 +362,9 @@ def learn_from_transcript(repo_path=".", transcript_path=None, *, vendor="autono
         return _fail(str(exc), 2)
     if not transcript_path:
         return _fail("a transcript path (.jsonl / .log file or a directory) is required", 2)
-    bad = _symlinked(root, (QUEUE_REL, DB_REL, SNAPSHOT_REL))
+    bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL) + _DB_FILES + (PROMOTED_PAGE,) + mw._LEDGER_FILES)
     if bad:
-        return _fail(f"refusing symlinked path {bad}", 2)
+        return _fail(_refusing(bad), 2)
     src = Path(str(transcript_path)).expanduser()
     if not src.exists() and not src.is_symlink():
         return _fail(f"transcript not found: {src}", 2)
@@ -474,7 +488,7 @@ def learn_pending(repo_path=".") -> Dict[str, Any]:
         return _fail(str(exc), 2)
     bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL))
     if bad:
-        return _fail(f"refusing symlinked path {bad}", 2)
+        return _fail(_refusing(bad), 2)
     empty_counts = {"approvedNodes": 0, "rejectedNodes": 0, "approvedEdges": 0, "rejectedEdges": 0,
                     "pendingNodes": 0, "pendingEdges": 0}
     try:
@@ -512,9 +526,9 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "") -> Dict[s
     wanted = _ids(ids)
     if not wanted:
         return _fail("at least one Dream item id is required", 2)
-    bad = _symlinked(root, (QUEUE_REL, DB_REL, SNAPSHOT_REL))
+    bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL) + _DB_FILES + (PROMOTED_PAGE,) + mw._LEDGER_FILES)
     if bad:
-        return _fail(f"refusing symlinked path {bad}", 2)
+        return _fail(_refusing(bad), 2)
     q = root / QUEUE_REL
     if not q.is_file():
         return _fail("no Dream queue (.memlet/dream/APPROVAL-QUEUE.json); run `learn` first", 1)
@@ -663,23 +677,29 @@ def _parse_promoted(text: str) -> List[Dict[str, Any]]:
     return rules
 
 
-def _page_edit_problem(root: Path, text: str) -> Optional[str]:
-    """None when the page is exactly what Memlet last wrote (per the ledger), else why it must not be overwritten."""
+def _page_edit_problem(root: Path, text: str, *, for_reader: bool = False) -> Optional[str]:
+    """None when the page is exactly what Memlet last wrote (per the ledger), else why it must not be overwritten.
+
+    `for_reader=True` is the rule readers (handover, recall, session start, changed-file check) apply before they
+    present anything on the page as verified: the latest ledger event for the page must be a Memlet write
+    (promotion, anchor accept, pin migration) of exactly this body. An earlier hand edit that a later explicit
+    `accept` re-pinned no longer blocks readers; promotion keeps its stricter rule (any recorded hand edit after the
+    last promotion blocks an overwrite, so hand notes are never destroyed)."""
     if _PAGE_META not in text:
         return f"{PROMOTED_PAGE} exists but was not written by Memlet; move it aside to let Memlet regenerate it"
     ledger = root / mw.LEDGER_PATH
-    if ledger.is_symlink() or not ledger.is_file():
+    if _symlinked(root, mw._LEDGER_FILES) or not ledger.is_file():
         return f"{PROMOTED_PAGE} exists but the ledger has no record of Memlet writing it; move the page aside"
     try:
-        with contextlib.closing(sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True)) as conn:
+        with contextlib.closing(mw.connect_managed_sqlite(root, mw.LEDGER_PATH, readonly=True)) as conn:
             rows = conn.execute("SELECT id, content_sha256, event_type FROM wiki_events WHERE page=? ORDER BY id",
                                 (PROMOTED_PAGE,)).fetchall()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         return f"cannot read the ledger: {exc}"
     promotes = [r[0] for r in rows if r[2] == "dream_promote"]
     if not promotes:
         return f"{PROMOTED_PAGE} exists but the ledger has no record of Memlet writing it; move the page aside"
-    if any(r[2] == "user_edit" and r[0] > promotes[-1] for r in rows):
+    if not for_reader and any(r[2] == "user_edit" and r[0] > promotes[-1] for r in rows):
         return f"{PROMOTED_PAGE} was edited by hand (ledger user_edit); move your notes to another page first"
     last = rows[-1]
     if last[2] not in _MEMLET_PAGE_EVENTS or last[1] != mw._page_body_sha256(text):
@@ -688,12 +708,8 @@ def _page_edit_problem(root: Path, text: str) -> Optional[str]:
 
 
 def _record_pages(root: Path, events: Sequence[Tuple[str, str, str]], snapshots: Optional[List[Dict[str, Any]]] = None) -> None:
-    ledger = root / mw.LEDGER_PATH
-    if ledger.is_symlink():
-        raise ValueError("refusing a symlinked ledger")
-    ledger.parent.mkdir(parents=True, exist_ok=True)
     now = mw._utc_now()
-    with contextlib.closing(sqlite3.connect(str(ledger))) as conn:
+    with contextlib.closing(mw.connect_managed_sqlite(root, mw.LEDGER_PATH)) as conn:
         with conn:
             mw._ledger_ready(conn)
             for page, sha, event in events:
@@ -770,9 +786,14 @@ def promote_approved(repo_path=".") -> Dict[str, Any]:
 def _promote_locked(root: Path) -> Dict[str, Any]:
     bad = _symlinked(root, (PROMOTED_PAGE, mw.LEDGER_PATH, QUEUE_REL, SNAPSHOT_REL))
     if bad:
-        return _fail(f"refusing symlinked path {bad}", 2, page=PROMOTED_PAGE, promoted=[], removed=[])
+        return _fail(_refusing(bad), 2, page=PROMOTED_PAGE, promoted=[], removed=[])
     page = root / PROMOTED_PAGE
-    old_text = page.read_text(encoding="utf-8", errors="replace") if page.is_file() else None
+    old_text = None
+    if page.is_file():
+        old_text = mw.read_regular_text(page, mw.MAX_WIKI_PAGE_BYTES, errors="replace")
+        if old_text is None:
+            return _fail(f"{PROMOTED_PAGE} is larger than {mw.MAX_WIKI_PAGE_BYTES} bytes or unreadable; move it aside",
+                         1, page=PROMOTED_PAGE, promoted=[], removed=[])
     prev: Dict[str, Dict[str, Any]] = {}
     if old_text is not None:
         problem = _page_edit_problem(root, old_text)
@@ -823,7 +844,6 @@ def _promote_locked(root: Path) -> Dict[str, Any]:
         op = "unchanged"
     else:
         try:
-            page.parent.mkdir(parents=True, exist_ok=True)
             _write_text_atomic(page, text)
             _record_pages(root, [(PROMOTED_PAGE, mw._page_body_sha256(text), "dream_promote")])
         except (OSError, ValueError, sqlite3.Error) as exc:
@@ -843,12 +863,18 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
     page = root / PROMOTED_PAGE
     if _symlinked(root, (PROMOTED_PAGE,)) or not page.is_file():
         return [], []
-    text = page.read_text(encoding="utf-8", errors="replace")
-    if _PAGE_META not in text:
+    text = mw.read_regular_text(page, mw.MAX_WIKI_PAGE_BYTES, errors="replace")
+    if text is None or _PAGE_META not in text:
         return [], []
     rules = _parse_promoted(text)
     if not rules:
         return [], []
+    # The same ownership rule promotion applies before overwriting the page: unless the page is exactly what Memlet
+    # last wrote (ledger hash), nothing on it is fresh -- a hand edit (e.g. a re-written anchor comment) is not
+    # trusted until an explicit `accept` or promotion records it.
+    if _page_edit_problem(root, text, for_reader=True):
+        return [], [{"topic": "approved lesson · dream", "importance": 2, "source": f"{PROMOTED_PAGE}:{r['line']}",
+                     "dreamId": r["id"]} for r in rules]
     try:
         graph, _why = _load_queue(root) if not _symlinked(root, (QUEUE_REL,)) else (None, "")
     except (OSError, ValueError):
@@ -923,7 +949,7 @@ def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]
 def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
     bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL))
     if bad:
-        return [], {"available": False, "reason": f"refusing symlinked path {bad}"}, []
+        return [], {"available": False, "reason": _refusing(bad)}, []
     q = root / QUEUE_REL
     if not q.is_file():
         return [], {"available": False, "reason": "no Dream queue (.memlet/dream/APPROVAL-QUEUE.json)"}, []
@@ -1121,28 +1147,12 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
 
 
 def _wiki_pages(root: Path) -> Dict[str, str]:
-    wiki = root / mw.WIKI_DIR
-    out: Dict[str, str] = {}
-    if wiki.is_symlink() or not wiki.is_dir() or (root / mw.MEMLET_DIR).is_symlink():
-        return out
-    for p in sorted(wiki.rglob("*.md")):
-        if p.is_symlink() or not p.is_file():
-            continue
-        out[mw._rel(root, p)] = mw._read_text(p)
-    return out
+    """Wiki pages through the shared bounded, contained iterator (`memlet_wiki.iter_wiki_pages`)."""
+    return dict(mw.iter_wiki_pages(root))
 
 
 def _load_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    p = root / mw.CONFIG_PATH
-    if p.is_symlink():
-        return None, "refusing a symlinked .memlet/config.json"
-    if not p.is_file():
-        return None, None
-    try:
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return None, f".memlet/config.json is unreadable: {exc}"
-    return (cfg, None) if isinstance(cfg, dict) else (None, ".memlet/config.json is not an object")
+    return mw.read_config(root)
 
 
 def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]:
@@ -1155,16 +1165,29 @@ def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]
     names = _ids(anchors)
     if not names:
         return _fail("at least one `path::symbol` anchor is required", 2, accepted=[], unknown=[], dryRun=bool(dry_run))
-    bad = _symlinked(root, (mw.CONFIG_PATH, mw.WIKI_DIR, mw.LEDGER_PATH))
+    bad = _symlinked(root, (mw.MEMLET_DIR, mw.CONFIG_PATH, mw.WIKI_DIR, PROMOTED_PAGE) + mw._LEDGER_FILES)
     if bad:
-        return _fail(f"refusing symlinked path {bad}", 2, accepted=[], unknown=[], dryRun=bool(dry_run))
+        return _fail(_refusing(bad), 2, accepted=[], unknown=[], dryRun=bool(dry_run))
+    if dry_run:
+        return _accept_locked(root, names, dry_run)
+    try:
+        # The whole read (config, pages) -> re-pin -> write (config, pages, promoted page) -> ledger runs under the
+        # Memlet write lock that Dream promotion, approval and every wiki writer also hold: a page rendered from an
+        # older generation can never replace a newer one (an approved lesson can no longer be lost to an accept).
+        with mw.memlet_write_lock(root):
+            return _accept_locked(root, names, dry_run)
+    except (OSError, ValueError) as exc:
+        return _fail(f"accept failed: {exc}", 1, accepted=[], unknown=[], dryRun=bool(dry_run))
+
+
+def _accept_locked(root: Path, names: List[str], dry_run: bool) -> Dict[str, Any]:
     cfg, err = _load_config(root)
     if err:
         return _fail(err, 1, accepted=[], unknown=[], dryRun=bool(dry_run))
     pages = _wiki_pages(root)
     known = set((mw._validated_config_pins(cfg)[0] if cfg else {}).keys())
-    for rel in mw.discover_instruction_files(root):
-        known.update(f"{a['path']}::{a['symbol']}" for a in mw._extract_anchors(mw._read_text(root / rel), rel))
+    for rel, src_text in mw._source_texts(root, mw.discover_instruction_files(root)):
+        known.update(f"{a['path']}::{a['symbol']}" for a in mw._extract_anchors(src_text, rel))
     for rel, text in pages.items():
         known.update(f"{a['path']}::{a['symbol']}" for a in mw._extract_anchors(text, rel))
     unknown = [a for a in names if a not in known]
@@ -1187,7 +1210,10 @@ def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]
                 return m.group(0)
             return _pin_comment(key, new_pins[key]).strip()
         new = mw.PIN_RE.sub(_sub, text)
-        if new != text:
+        page_keys = {f"{m.group('path')}::{m.group('symbol')}" for m in mw.PIN_RE.finditer(text)}
+        if new != text or (rel == PROMOTED_PAGE and page_keys and page_keys <= set(new_pins)):
+            # the promoted page is also re-recorded when every pin on it was just accepted, even if a hand edit had
+            # already written those exact pins: the explicit accept is what makes its pins trusted again (A7)
             changed_pages[rel] = (text, new)
     res = {"ok": not unknown and not refused, "exitCode": 0 if not unknown and not refused else 1, "command": "accept",
            "accepted": accepted, "unknown": unknown, "refused": refused, "dryRun": bool(dry_run),
@@ -1202,16 +1228,21 @@ def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]
                 pins[a] = {"astHash": p["ast"], "sigHash": p["sig"], "reqSigHash": p["req"], "hashBasis": p["basis"]}
             cfg["pinnedAnchors"] = dict(sorted(pins.items()))
             cfg_path = root / mw.CONFIG_PATH
-            cfg_path.parent.mkdir(parents=True, exist_ok=True)
             _write_text_atomic(cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             last = mw._read_ledger_hashes(root / mw.LEDGER_PATH)
             events: List[Tuple[str, str, str]] = []
             for rel, (before, after) in sorted(changed_pages.items()):
                 b_sha = mw._page_body_sha256(before)
-                if rel in last and last[rel] != b_sha:  # an unrecorded hand edit stays visible in the ledger
+                hand_edited = rel in last and last[rel] != b_sha
+                if hand_edited:  # an unrecorded hand edit stays visible in the ledger
                     events.append((rel, b_sha, "user_edit"))
-                _write_text_atomic(root / rel, after)
-                events.append((rel, mw._page_body_sha256(after), "anchor_accept"))
+                if after != before:
+                    _write_text_atomic(root / rel, after)
+                keys = {f"{m.group('path')}::{m.group('symbol')}" for m in mw.PIN_RE.finditer(after)}
+                # A hand-edited promoted page becomes Memlet's again only when every pin on it was explicitly
+                # accepted now; otherwise another hand-edited pin would be trusted by readers (it stays a user edit).
+                owned = not (rel == PROMOTED_PAGE and hand_edited and not keys <= set(accepted))
+                events.append((rel, mw._page_body_sha256(after), "anchor_accept" if owned else "user_edit"))
             snaps = [mw.classify_anchor(root, {"path": a.rsplit("::", 1)[0], "symbol": a.rsplit("::", 1)[1],
                                                "pin": new_pins[a]}) for a in accepted]
             _record_pages(root, events, snaps)
@@ -1351,7 +1382,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
     changed_set = set(changed)
     rules = mw._rules_from_files(root, _cheap_rule_sources(root, cfg, changed))
     page_pins: Dict[str, Dict[str, Any]] = {}
-    for rel, text in _wiki_pages(root).items():
+    for rel, text in mw.trusted_wiki_pages(root):  # same promoted-page ownership rule as handover
         for a in mw._extract_anchors(text, rel):
             if a["pin"]:
                 page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])

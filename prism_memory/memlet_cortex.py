@@ -12,6 +12,7 @@ Safety contract (same as the rest of the inspector):
 
 from __future__ import annotations
 
+import copy
 import html
 import json
 import math
@@ -45,24 +46,46 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
         return None
     try:
         root_p = Path(str(p))
-        q_file = root_p / ".memlet" / "dream" / "APPROVAL-QUEUE.json"
-        for chk_p in (root_p, root_p / ".memlet", root_p / ".memlet" / "dream", q_file):
-            if chk_p.is_symlink():
-                return None
-        if q_file.is_file() and q_file.stat().st_size <= 2_000_000:
-            from prism_memory.memlet_dream import build_cortex_lineage_payload, recall_subgraph
-            g = json.loads(q_file.read_text(encoding="utf-8"))
-            if not isinstance(g, dict):
-                return None
-            # The capsule only ever contains human-approved items (approval digest re-checked). The UI does
-            # not follow the queue's recorded snapshot path (untrusted input; could point anywhere), so the
-            # capsule is reported as UNVERIFIED_OPT_OUT. Pending items are shown for review only, labelled
-            # PENDING / awaiting review and never "in capsule".
-            sub = recall_subgraph(g, query_text="", budget_tokens=1500, require_approval=True, allow_unverified=True)
-            return build_cortex_lineage_payload(g, sub)
+        if root_p.is_symlink():
+            return None
+        from prism_memory import memlet_bridge as mb
+        from prism_memory import memlet_dream as md
+        from prism_memory import memlet_wiki as mw
+        if mb._symlinked(root_p, (mb.QUEUE_REL,)):
+            return None
+        q_file = root_p / mb.QUEUE_REL
+        g_text = mw.read_regular_text(q_file, 2_000_000)
+        if g_text is None:
+            return None
+        g = json.loads(g_text)
+        if not isinstance(g, dict):
+            return None
+        # Citations are verified against the bridge's fixed in-repo snapshot (`.memlet/dream/snapshot/`), never a
+        # path read from the queue. An approved item is shown as approved (and in the capsule) only while its
+        # stored quotes hash to their pins and every pin verifies against that snapshot; anything that cannot be
+        # verified (no snapshot, changed snapshot, edited quote) is shown as pending with `citationVerified: false`.
+        snap, _why = mb._load_snapshot(root_p)
+        verified = copy.deepcopy(g)
+        keep = []
+        for n in verified.get("nodes") or []:
+            if not isinstance(n, dict):
+                continue
+            if snap is not None and mb._node_edges_verify(n, snap) is None:
+                keep.append(n)
+        verified["nodes"] = keep
+        kept_edges = {str(e.get("edgeId")) for n in keep for e in (n.get("edges") or []) if isinstance(e, dict)}
+        verified["edges"] = [e for e in (verified.get("edges") or [])
+                             if isinstance(e, dict) and str(e.get("edgeId")) in kept_edges]
+        sub: Dict[str, Any] = {"includedNodeIds": [], "pinVerification": "unavailable_no_snapshot"}
+        if snap is not None:
+            try:
+                sub = md.recall_subgraph(verified, query_text="", budget_tokens=1500, snapshot_files=snap,
+                                         require_approval=True)
+            except ValueError:
+                sub = {"includedNodeIds": [], "pinVerification": "unavailable_snapshot_mismatch"}
+        return md.build_cortex_lineage_payload(g, sub, citation_snapshot=snap, require_citations=True)
     except Exception:
         return None
-    return None
 
 
 def _cortex_data(ws: Dict[str, Any]) -> Dict[str, Any]:

@@ -195,6 +195,34 @@ def compute_actr_activation(
     return round(norm_score, 4)
 
 
+_REFERENCED_PATH_RE = re.compile(
+    r'(/(?:Users|var|private|tmp|opt|etc)/[^\s`\'"<>():;,]+|(?:[A-Za-z0-9_.-]+/)*(?:Makefile|makefile|GNUmakefile)'
+    r'|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:py|json|md|sh|js|jsx|ts|tsx|mjs|cjs|go|rs|sql|tf|ya?ml))'
+    r'(?:::([A-Za-z_][A-Za-z0-9_.-]*))?')
+_FILE_NAME_RE = re.compile(r'\b([A-Za-z0-9_.-]+\.(?:py|json|md|sh|js|ts))\b')
+_SCAN_TOKEN_MAX = 512
+_NONSPACE_RUN_RE = re.compile(r'\S+')
+
+
+def _short_tokens(text):
+    """`text` with every whitespace-free token longer than _SCAN_TOKEN_MAX characters blanked to spaces (same length,
+    so spans are unchanged). The path / file-name extractors cannot match across whitespace, so matches inside short
+    tokens are exactly as before; a token over the bound (no real path is that long) is not scanned, which bounds the
+    work those regexes do (they retried long runs from every start: 20 KB of `-` took seconds)."""
+    if len(text) <= _SCAN_TOKEN_MAX:
+        return text
+    out, last = [], 0
+    for m in _NONSPACE_RUN_RE.finditer(text):
+        if m.end() - m.start() > _SCAN_TOKEN_MAX:
+            out.append(text[last:m.start()])
+            out.append(' ' * (m.end() - m.start()))
+            last = m.end()
+    if not out:
+        return text
+    out.append(text[last:])
+    return ''.join(out)
+
+
 def _extract_referenced_files(card, root=None, explicit_files=None):
     """Extract existing regular file paths and referenced AST symbol hashes (file.py::Symbol)."""
     candidates = []
@@ -232,7 +260,7 @@ def _extract_referenced_files(card, root=None, explicit_files=None):
         str(card.get('conditions', '')),
         str(card.get('outcome', '')),
     ] + [str(s) for s in card.get('steps', [])])
-    for match in re.finditer(r'(/(?:Users|var|private|tmp|opt|etc)/[^\s`\'"<>():;,]+|(?:[A-Za-z0-9_.-]+/)*(?:Makefile|makefile|GNUmakefile)|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:py|json|md|sh|js|jsx|ts|tsx|mjs|cjs|go|rs|sql|tf|ya?ml))(?:::([A-Za-z_][A-Za-z0-9_.-]*))?', text_blob):
+    for match in _REFERENCED_PATH_RE.finditer(_short_tokens(text_blob)):
         token = match.group(1).strip('.,:;!?)')
         candidates.append(token)
         if match.group(2):
@@ -344,8 +372,11 @@ def evaluate_staleness(skill_row, now=None):
                         if curr_syms.get(sym) != old_sym_sha
                     ]
                     if sym_diffs and p.suffix.lower() == '.py':
-                        legacy_syms = _code_anchors.extract_file_symbol_hashes(p, legacy=True)
-                        sym_diffs = [sym for sym in sym_diffs if legacy_syms.get(sym) != tracked_syms[sym]]
+                        # hashes tracked with a previous Python basis (python-ast-v2 / legacy) still match when that
+                        # basis, recomputed on this interpreter, gives the tracked hash
+                        previous = _code_anchors.previous_python_symbol_hashes(p)
+                        sym_diffs = [sym for sym in sym_diffs
+                                     if not any(h.get(sym) == tracked_syms[sym] for h in previous)]
                     if not sym_diffs:
                         # File changed outside the tracked symbols! Symbol anchor protects skill from false staleness.
                         symbol_anchored_saved.append(entry['path'])
@@ -1216,8 +1247,8 @@ def _write_skill_event_and_row(db, row):
             continue
         old = entry.get('symbols') if isinstance(entry.get('symbols'), dict) else {}
         current = extract_file_symbol_hashes(entry['path'])
-        legacy = _code_anchors.extract_file_symbol_hashes(entry['path'], legacy=True)
-        symbols = {sym: current[sym] if sym in current and legacy.get(sym) == value else value
+        previous = _code_anchors.previous_python_symbol_hashes(entry['path'])
+        symbols = {sym: current[sym] if sym in current and any(h.get(sym) == value for h in previous) else value
                    for sym, value in old.items()}
         refreshed.append(dict(entry, symbols=symbols) if symbols != old else entry)
     if refreshed != refs:
@@ -1881,7 +1912,7 @@ def sync_task_links(db, task, force=False):
         for raw_f in (src.get('files') or []):
             if isinstance(raw_f, str) and raw_f.strip():
                 files.add(Path(raw_f.strip()).name.lower())
-        for m in re.finditer(r'\b([A-Za-z0-9_.-]+\.(?:py|json|md|sh|js|ts))\b', item.get('content', '')):
+        for m in _FILE_NAME_RE.finditer(_short_tokens(item.get('content', ''))):
             fn = m.group(1).lower()
             if fn not in ('skill.md', 'provenance.json'):
                 files.add(fn)
@@ -1969,7 +2000,7 @@ def sync_task_links(db, task, force=False):
             if isinstance(f, dict) and f.get('path')
         }
         text_blob = '\n'.join([sk['title'], sk['conditions'], sk['counterexamples']] + list(sk['steps']))
-        for m in re.finditer(r'\b([A-Za-z0-9_.-]+\.(?:py|json|md|sh|js|ts))\b', text_blob):
+        for m in _FILE_NAME_RE.finditer(_short_tokens(text_blob)):
             fn = m.group(1).lower()
             if fn not in ('skill.md', 'provenance.json'):
                 files.add(fn)
@@ -2252,7 +2283,45 @@ def get_links(db, task, node_id=None, limit=100):
 
 
 _ARCHETYPE_PATH_RE = re.compile(r'/(?:Users|home|var|private|tmp|opt|etc)/[^\s`\'"<>():;,]+')
-_ARCHETYPE_EMAIL_RE = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+_ARCHETYPE_EMAIL_PATTERN = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+
+
+def _email_finder(text):
+    """Leftmost matches of _ARCHETYPE_EMAIL_PATTERN in linear time: every start inside one local-part run shares the
+    same `@domain` continuation and the leftmost word-boundary start has the longest local part, so each `@` is
+    tried once (from that start) instead of once per boundary (`sk-sk-sk-...` was quadratic)."""
+    full = re.compile(_ARCHETYPE_EMAIL_PATTERN)
+    local = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-')
+    word = re.compile(r'\w')
+
+    def is_b(i):
+        before = i > 0 and bool(word.match(text, i - 1))
+        after = i < len(text) and bool(word.match(text, i))
+        return before != after
+
+    def find(pos):
+        at = text.find('@', pos + 1)
+        while at >= 0:
+            r = at
+            while r > pos and text[r - 1] in local:
+                r -= 1
+            for s in range(r, at):
+                if is_b(s):
+                    m = full.match(text, s)
+                    if m:
+                        return m.span()
+                    break  # later starts share the same continuation with a shorter local part
+            at = text.find('@', at + 1)
+        return None
+    return find
+
+
+def _email_alternation():
+    from prism_memory.audit import LinearAlternation
+    return LinearAlternation(_ARCHETYPE_EMAIL_PATTERN, [_email_finder])
+
+
+_ARCHETYPE_EMAIL_RE = _email_alternation()
 _ARCHETYPE_UUID_RE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.IGNORECASE)
 _ARCHETYPE_HEX_RE = re.compile(r'\b[0-9a-f]{24,64}\b', re.IGNORECASE)
 _ARCHETYPE_SECRET_RE = re.compile(r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._-]+)\b')
