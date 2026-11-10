@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .audit import BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, audit_repository
+from .audit import BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, audit_repository, iter_explicit_anchors
 from .code_anchors import extract_file_symbol_hashes, extract_file_symbol_signatures
 
 MEMLET_VERSION = "8.4.0"
@@ -244,7 +244,7 @@ def _extract_anchors(text: str, source: str) -> List[Dict[str, Any]]:
             out.append({"path": m.group("path"), "symbol": m.group("symbol"), "source": source,
                         "line": line_no, "pin": {"ast": m.group("ast"), "sig": m.group("sig"), "req": m.group("req"), "basis": m.group("basis")}})
         scrubbed = PIN_RE.sub("", line)
-        for m in EXPLICIT_ANCHOR_RE.finditer(scrubbed):
+        for m in iter_explicit_anchors(scrubbed):
             if "::" not in m.group(0):
                 continue
             path = m.group("path")
@@ -1097,7 +1097,7 @@ def _line_refs(text: str) -> List[Tuple[str, Optional[str]]]:
     """`path::Symbol` anchors and backticked file paths in one rule, in order of appearance."""
     refs: List[Tuple[str, Optional[str]]] = []
     scrubbed = PIN_RE.sub("", text)
-    for m in EXPLICIT_ANCHOR_RE.finditer(scrubbed):
+    for m in iter_explicit_anchors(scrubbed):
         if "::" in m.group(0):
             refs.append((_clean_ref_path(m.group("path")), m.group("symbol").rstrip(".-")))
     for m in BACKTICK_FILE_RE.finditer(scrubbed):

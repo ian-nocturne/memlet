@@ -79,6 +79,40 @@ EXPLICIT_ANCHOR_RE = re.compile(
     r"(?:(?:::|#)(?P<symbol>[A-Za-z_][A-Za-z0-9_.-]*))"
 )
 
+_ANCHOR_SEP_RE = re.compile(r"::|#")
+_ANCHOR_PATH_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/")
+_ANCHOR_SYMBOL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+ANCHOR_PATH_MAX_CHARS = 1024
+
+
+def iter_explicit_anchors(text: str):
+    """`EXPLICIT_ANCHOR_RE.finditer(text)` in linear time.
+
+    Run on a whole line, the pattern retries its path part from every position of a long run of path
+    characters, which is quadratic (a 100 KB line took over a minute). Every match contains a `::` or `#`
+    separator, so only the window around each separator is searched: the path characters to its left (at most
+    `ANCHOR_PATH_MAX_CHARS`, far beyond any real path) and the symbol characters to its right. Matches are the
+    same objects, with the same absolute spans, as `finditer` would yield for paths within that length.
+    """
+    last_end = 0
+    n = len(text)
+    for sep in _ANCHOR_SEP_RE.finditer(text):
+        if sep.start() < last_end:
+            continue
+        left = sep.start()
+        floor = max(last_end, left - ANCHOR_PATH_MAX_CHARS)
+        while left > floor and text[left - 1] in _ANCHOR_PATH_CHARS:
+            left -= 1
+        if left == sep.start():
+            continue
+        right = sep.end()
+        while right < n and text[right] in _ANCHOR_SYMBOL_CHARS:
+            right += 1
+        m = EXPLICIT_ANCHOR_RE.search(text, left, right)
+        if m is not None and m.start() >= last_end:
+            last_end = m.end()
+            yield m
+
 # Matches backticked file paths like `src/auth.ts`, `payment_gateway.py`, `Makefile`
 BACKTICK_FILE_RE = re.compile(
     rf"`(?P<path>(?:\./)?(?:(?:[A-Za-z0-9_.-]+/)*(?:Makefile|makefile|GNUmakefile)|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:{EXT_PATTERN})(?![A-Za-z0-9_])))(?:::|#(?P<symbol>[A-Za-z_][A-Za-z0-9_.-]*))?`"
@@ -935,7 +969,7 @@ def audit_repository(
 
             # 3. Extract file & explicit symbol references on this line
             line_refs: List[Tuple[str, Optional[str]]] = []
-            for m_exp in EXPLICIT_ANCHOR_RE.finditer(line_for_paths):
+            for m_exp in iter_explicit_anchors(line_for_paths):
                 sym = m_exp.group("symbol")
                 if sym and re.match(r"^L\d+", sym):
                     sym = None

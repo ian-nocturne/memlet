@@ -942,8 +942,12 @@ class ReviewRound1Tests(_Case):
         start = time.monotonic()
         r = self.cli("admin", "hook", "git-pre-commit")
         elapsed = time.monotonic() - start
-        self.assertEqual((0, "", ""), (r.returncode, r.stdout, r.stderr))
+        # The anchor scan is linear now, so the hook finishes instead of being cut off by its deadline:
+        # it still never fails the commit, stays fast, and reports the stale rule on stderr.
+        self.assertEqual((0, ""), (r.returncode, r.stdout))
         self.assertLess(elapsed, 2.0)
+        self.assertIn("mod.py::charge", r.stderr)
+        self.assertNotIn("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" * 50, r.stderr)
 
     # -- R3 ------------------------------------------------------------------------------------------------------
     @unittest.skipUnless(NOT_ROOT, "permission checks do not apply to root")
