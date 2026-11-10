@@ -68,15 +68,21 @@ CANARY_SECRETS: Tuple[str, ...] = (
 # Expanded secret patterns covering PEM private keys, OpenAI/Anthropic/GitHub/Slack/AWS/Google keys, JWTs, and key=value secrets
 # Private-key armour, qualified or not: `PRIVATE KEY` (PKCS#8), `RSA/EC/DSA/OPENSSH/ENCRYPTED PRIVATE KEY`,
 # `PGP PRIVATE KEY BLOCK`; also a PuTTY `.ppk` key (header line through its `Private-MAC:` line).
-_KEY_BEGIN = r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----"
-_KEY_END = r"-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----"
-_PEM_BLOCK_RE = re.compile(_KEY_BEGIN + r"[\s\S]*?" + _KEY_END)
-_PPK_BLOCK_RE = re.compile(r"PuTTY-User-Key-File-\d+:[\s\S]*?Private-MAC:[^\n]*")
+# The armour label is bounded ({0,64}): real labels are a few words, and an unbounded class lets a long run of
+# label characters make every marker attempt rescan the run (quadratic on one long line).
+_KEY_BEGIN = r"-----BEGIN [A-Z0-9 _-]{0,64}PRIVATE KEY(?: BLOCK)?-----"
+_KEY_END = r"-----END [A-Z0-9 _-]{0,64}PRIVATE KEY(?: BLOCK)?-----"
+_KEY_BEGIN_RE = re.compile(_KEY_BEGIN)
+_KEY_END_RE = re.compile(_KEY_END)
+_PPK_HEAD_RE = re.compile(r"PuTTY-User-Key-File-\d+:")
+_PPK_MAC_RE = re.compile(r"Private-MAC:[^\n]*")
 # A begin marker whose end marker is missing: everything up to the next blank line (text) is the key body.
-_PEM_OPEN_RE = re.compile(_KEY_BEGIN + r"[\s\S]*?(?=\n[ \t]*\n|\Z)")
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
 _SECRET_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(_KEY_BEGIN + r"[^\n]*"),  # per line: a begin marker and anything after it on that line
-    re.compile(r"[^\n]*" + _KEY_END),     # per line: a key body ending in an end marker
+    # per line: a key body ending in an end marker. Anchored at the line start, so one long line without the
+    # marker is scanned once (the unanchored form retried from every position: quadratic).
+    re.compile(r"(?m)^[^\n]*" + _KEY_END),
     re.compile(r"PuTTY-User-Key-File-\d+:[^\n]*"),
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,}"),
@@ -84,7 +90,9 @@ _SECRET_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{12,}"),
     re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
     re.compile(r"AIza[0-9A-Za-z_-]{35}"),
-    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    # a JWT starts at a token boundary; without the look-behind a long `eyJeyJ...` run is retried from every
+    # `eyJ` inside it (quadratic)
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|authorization)[ \t]*[:=][ \t]*['\"]?[^\s'\"]{8,}"),
     re.compile(r"CANARY[-_]SPEC012", re.IGNORECASE),
 )
@@ -94,7 +102,7 @@ REDACTION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("ANTHROPIC_API_KEY", re.compile(r"sk-ant-[A-Za-z0-9_-]{12,}")),
     ("GITHUB_PAT", re.compile(r"(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("AWS_SECRET_KEY", re.compile(r"(?:(?:AKIA|ASIA)[0-9A-Z]{16}|(?i:aws[_-]?secret[_-]?[a-z0-9_]*[ \t]*[:=][ \t]*['\"]?[^\s'\"]{8,}))")),
-    ("BEARER_JWT", re.compile(r"(?:eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|xox[baprs]-[A-Za-z0-9-]{12,})")),
+    ("BEARER_JWT", re.compile(r"(?:(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|xox[baprs]-[A-Za-z0-9-]{12,})")),
 )
 
 # file_id may be a nested relative path (`dir/sub/file.log`); absolute paths, `..`, `.`/empty
@@ -139,20 +147,63 @@ def sanitize_node_id(raw_id: Any, fallback: str = "L-000") -> str:
 SECRET_BLOCK_MARK = "[REDACTED_SECRET_BLOCK]"
 
 
+def _closed_spans(text: str, start_re: "re.Pattern[str]", end_re: "re.Pattern[str]") -> List[Tuple[int, int]]:
+    """Non-overlapping (start, end) spans from each start marker to the first end marker after it (what the lazy
+    `start[\\s\\S]*?end` regex matched), in one pass: every end marker is found once, not once per start marker."""
+    import bisect
+
+    ends = [(m.start(), m.end()) for m in end_re.finditer(text)]
+    end_starts = [e[0] for e in ends]
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    for m in start_re.finditer(text):
+        if m.start() < pos:
+            continue
+        i = bisect.bisect_left(end_starts, m.end())
+        if i == len(ends):
+            break  # no end marker after this start, hence none after any later start either
+        spans.append((m.start(), ends[i][1]))
+        pos = ends[i][1]
+    return spans
+
+
+def _open_spans(text: str) -> List[Tuple[int, int]]:
+    """A begin marker without an end marker: through the end of its paragraph (the next blank line) or the text."""
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    for m in _KEY_BEGIN_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        blank = _BLANK_LINE_RE.search(text, m.end())
+        end = blank.start() if blank else len(text)
+        spans.append((m.start(), end))
+        pos = end
+    return spans
+
+
+def _replace_blocks(text: str, spans: List[Tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    out, last = [], 0
+    for a, b in spans:
+        out.append(text[last:a])
+        out.append("\n".join([SECRET_BLOCK_MARK] * (text.count("\n", a, b) + 1)))
+        last = b
+    out.append(text[last:])
+    return "".join(out)
+
+
 def redact_secret_blocks(text: str) -> str:
     """Replace every multi-line private-key block (PEM/PKCS#8/OpenSSH/PGP armour, PuTTY .ppk) with one
     `[REDACTED_SECRET_BLOCK]` per line it spanned, so the line count, and every pin that addresses a later line, is
     unchanged. A begin marker without an end marker is redacted up to the next blank line (or the end of the text).
-    Run on the whole text BEFORE splitting into lines: line-by-line masking cannot see a key body between markers."""
+    Run on the whole text BEFORE splitting into lines: line-by-line masking cannot see a key body between markers.
+    Linear in the text length (each marker kind is located once)."""
     if not text:
         return text or ""
-
-    def _block(m: "re.Match[str]") -> str:
-        return "\n".join([SECRET_BLOCK_MARK] * (m.group(0).count("\n") + 1))
-
-    for rx in (_PEM_BLOCK_RE, _PPK_BLOCK_RE, _PEM_OPEN_RE):
-        text = rx.sub(_block, text)
-    return text
+    text = _replace_blocks(text, _closed_spans(text, _KEY_BEGIN_RE, _KEY_END_RE))
+    text = _replace_blocks(text, _closed_spans(text, _PPK_HEAD_RE, _PPK_MAC_RE))
+    return _replace_blocks(text, _open_spans(text))
 
 
 def mask_secrets(text: str) -> str:
@@ -2163,12 +2214,15 @@ def _jsonl_record_to_line(obj: Any, prefer_response_items: bool = False) -> Opti
     return f"{ts} [{role}] {body}" if ts else f"[{role}] {body}"
 
 
-def read_jsonl_transcript(path: Any) -> Tuple[List[str], Dict[str, int]]:
+def read_jsonl_transcript(path: Any, *, max_line_chars: Optional[int] = None,
+                          max_text_chars: Optional[int] = None) -> Tuple[List[str], Dict[str, int]]:
     """Read a Claude Code / Codex CLI `.jsonl` session transcript into pin-addressable lines.
 
     Line N of the result always corresponds to physical line N of the file, so appended records never
     shift existing pins. Non-message, hidden (tool/system/developer/reasoning/analysis) and malformed lines
-    become empty strings, which `resolve_pin` refuses to pin. A record whose text is not valid UTF-8 scalar
+    become empty strings, which `resolve_pin` refuses to pin. Optional bounds: a physical line longer than
+    `max_line_chars` is never held in memory or parsed, and a visible message longer than `max_text_chars` is never
+    kept (not even partially); both become empty lines, counted in `overlongLines` / `overlongMessages`. A record whose text is not valid UTF-8 scalar
     data (e.g. a lone surrogate from a `\\ud800` escape) counts as malformed. Nothing is written to disk.
 
     Timestamp policy: the record's own ISO timestamp (outer record, else the message/payload/item) is used
@@ -2177,11 +2231,23 @@ def read_jsonl_transcript(path: Any) -> Tuple[List[str], Dict[str, int]]:
     """
     p = Path(str(path))
     parsed: List[Any] = []
-    stats = {"records": 0, "messages": 0, "malformedLines": 0, "nonMessageLines": 0, "skippedDuplicateEvents": 0}
+    stats = {"records": 0, "messages": 0, "malformedLines": 0, "nonMessageLines": 0, "skippedDuplicateEvents": 0,
+             "overlongLines": 0, "overlongMessages": 0}
     _blank = object()
     _bad = object()
     with p.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
+        while True:
+            raw = fh.readline() if max_line_chars is None else fh.readline(max_line_chars + 1)
+            if not raw:
+                break
+            if max_line_chars is not None and len(raw) > max_line_chars and not raw.endswith("\n"):
+                while True:  # drain the rest of this physical line without keeping it
+                    rest = fh.readline(1 << 16)
+                    if not rest or rest.endswith("\n"):
+                        break
+                stats["overlongLines"] += 1
+                parsed.append(_blank)
+                continue
             raw = raw.rstrip("\r\n")
             if not raw.strip():
                 parsed.append(_blank)
@@ -2204,6 +2270,10 @@ def read_jsonl_transcript(path: Any) -> Tuple[List[str], Dict[str, int]]:
             lines.append("")
             continue
         line = _jsonl_record_to_line(obj, prefer_response_items=prefer)
+        if line is not None and max_text_chars is not None and len(line) > max_text_chars:
+            stats["overlongMessages"] += 1
+            lines.append("")
+            continue
         if line is not None:
             try:
                 line.encode("utf-8")
@@ -2765,7 +2835,10 @@ def queue_lock_path(queue_path: Any) -> Path:
     q = Path(str(queue_path)).expanduser()
     real = q.parent.resolve() / q.name
     uid = os.getuid() if hasattr(os, "getuid") else "user"
-    base = Path(tempfile.gettempdir()) / f"memlet-locks-{uid}"
+    # MEMLET_LOCK_DIR overrides the directory (tests use a private one they remove afterwards); lock files are never
+    # unlinked by this library: another process may be waiting on the same file.
+    override = os.environ.get("MEMLET_LOCK_DIR")
+    base = Path(override).expanduser() if override else Path(tempfile.gettempdir()) / f"memlet-locks-{uid}"
     if base.is_symlink():
         raise ValueError(f"Refusing a symlinked lock directory: {base}")
     base.mkdir(mode=0o700, exist_ok=True)

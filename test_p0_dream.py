@@ -1070,5 +1070,93 @@ class QueueLockTests(unittest.TestCase):
         self.assertEqual([], [p.name for p in q.parent.iterdir()])  # nothing is written next to the queue
 
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# Wave 3 review R2: linear secret masking and bounded transcript reading (unit C1 fix round 1)
+
+import time as _time  # noqa: E402
+
+_LOCKS = {}
+
+
+def setUpModule():
+    _LOCKS["prior"] = os.environ.get("MEMLET_LOCK_DIR")
+    _LOCKS["dir"] = tempfile.mkdtemp(prefix="p0-dream-locks-")
+    os.environ["MEMLET_LOCK_DIR"] = _LOCKS["dir"]
+
+
+def tearDownModule():
+    if _LOCKS.get("prior") is None:
+        os.environ.pop("MEMLET_LOCK_DIR", None)
+    else:
+        os.environ["MEMLET_LOCK_DIR"] = _LOCKS["prior"]
+    shutil.rmtree(_LOCKS["dir"], ignore_errors=True)
+
+
+class LinearMaskingTests(unittest.TestCase):
+    ADVERSARIAL = {
+        "long-plain-line": "Never call main() " + "z" * 300000,
+        "dashes": "-" * 300000,
+        "end-marker-prefixes": "-----END " * 40000,
+        "begin-marker-prefixes": "-----BEGIN " * 40000,
+        "label-run": "-----BEGIN " + "A" * 300000,
+        "unclosed-begins": "-----BEGIN RSA PRIVATE KEY-----\nabc\n" * 20000,
+        "jwt-like-run": "eyJ" * 100000,
+        "putty-headers": "PuTTY-User-Key-File-2: x\n" * 30000,
+        "aws-secret-run": "aws_secret_" * 30000,
+    }
+
+    def test_masking_is_linear_on_adversarial_lines(self):
+        for label, text in self.ADVERSARIAL.items():
+            with self.subTest(case=label):
+                start = _time.monotonic()
+                md.mask_secrets(text)
+                self.assertLess(_time.monotonic() - start, 1.0, label)
+
+    def test_block_redaction_still_covers_every_key_shape(self):
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"
+        cases = {
+            "pkcs8": f"a\n-----BEGIN PRIVATE KEY-----\n{body}\n{body}\n-----END PRIVATE KEY-----\nb",
+            "rsa-one-line": f"x -----BEGIN RSA PRIVATE KEY----- {body} -----END RSA PRIVATE KEY----- y",
+            "openssh": f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----",
+            "pgp": f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n{body}\n-----END PGP PRIVATE KEY BLOCK-----",
+            "truncated": f"start\n-----BEGIN EC PRIVATE KEY-----\n{body}\n{body}",
+            "truncated-then-paragraph": f"-----BEGIN PRIVATE KEY-----\n{body}\n\nlater text",
+            "ppk": f"PuTTY-User-Key-File-3: ssh-ed25519\nPrivate-Lines: 1\n{body}\nPrivate-MAC: abcdef\nafter",
+            "end-only": f"{body}{body}-----END PRIVATE KEY-----",
+            "two-blocks": (f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nmid\n"
+                           f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                out = md.mask_secrets(text)
+                self.assertNotIn(body, out)
+                self.assertEqual(text.count("\n"), out.count("\n"))  # line numbers (pins) unchanged
+        self.assertIn("later text", md.mask_secrets(cases["truncated-then-paragraph"]))
+        self.assertIn("mid", md.mask_secrets(cases["two-blocks"]))
+        self.assertTrue(md.mask_secrets(cases["ppk"]).endswith("after"))
+
+    def test_bounded_jsonl_reader_skips_overlong_lines_and_messages_whole(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        f = tmp / "t.jsonl"
+        recs = [{"type": "user", "message": {"role": "user", "content": "short rule"}},
+                {"type": "user", "message": {"role": "user", "content": "Q" * 5000}},
+                {"type": "user", "message": {"role": "user", "content": "tail " + "R" * 50}}]
+        raw_long = json.dumps({"type": "user", "message": {"role": "user", "content": "P" * 20000}})
+        f.write_text("\n".join([json.dumps(recs[0]), json.dumps(recs[1]), raw_long, json.dumps(recs[2])]) + "\n")
+        lines, stats = md.read_jsonl_transcript(f, max_line_chars=10000, max_text_chars=1000)
+        self.assertEqual(4, len(lines))
+        self.assertIn("short rule", lines[0])
+        self.assertEqual(["", ""], lines[1:3])
+        self.assertIn("tail", lines[3])
+        self.assertEqual((1, 1), (stats["overlongLines"], stats["overlongMessages"]))
+        unbounded, _st = md.read_jsonl_transcript(f)
+        self.assertIn("P" * 100, unbounded[2])  # default (other callers): unchanged behaviour
+
+    def test_queue_lock_directory_can_be_overridden(self):
+        p = md.queue_lock_path(Path(tempfile.gettempdir()) / "x" / "Q.json")
+        self.assertEqual(Path(_LOCKS["dir"]).resolve(), p.parent.resolve())
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

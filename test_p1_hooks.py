@@ -77,6 +77,22 @@ def _working_python():
 
 
 PYTHON = _working_python()
+_LOCK_ENV = {}
+
+
+def setUpModule():
+    # A private queue-lock directory for this module (CLI subprocesses inherit it), removed afterwards.
+    _LOCK_ENV["prior"] = os.environ.get("MEMLET_LOCK_DIR")
+    _LOCK_ENV["dir"] = tempfile.mkdtemp(prefix="p1-hooks-locks-")
+    os.environ["MEMLET_LOCK_DIR"] = _LOCK_ENV["dir"]
+
+
+def tearDownModule():
+    if _LOCK_ENV.get("prior") is None:
+        os.environ.pop("MEMLET_LOCK_DIR", None)
+    else:
+        os.environ["MEMLET_LOCK_DIR"] = _LOCK_ENV["prior"]
+    shutil.rmtree(_LOCK_ENV["dir"], ignore_errors=True)
 
 
 def _tree(root):
@@ -828,7 +844,7 @@ class GitHookTests(_Case):
         rep = self.install("--git-hooks")
         items = {i["hook"]: i for i in rep["hooks"]["gitHooks"]["items"]}
         self.assertEqual("skipped", items["pre-commit"]["op"])
-        self.assertIn("not written by Memlet", items["pre-commit"]["reason"])
+        self.assertIn("Memlet did not write", items["pre-commit"]["reason"])
         self.assertEqual(original, foreign.read_bytes())
         self.assertTrue((self.hooks_dir() / "post-merge").is_file())
         r = self.cli("init", ".", "--hooks-remove")
@@ -890,6 +906,337 @@ class GitHookTests(_Case):
         r = self.cli("init", ".", "--hooks", "--git-hooks", cwd=plain)
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertEqual("not inside a git work tree", json.loads(r.stdout)["hooks"]["gitHooks"]["skipped"])
+
+
+NOT_ROOT = not hasattr(os, "geteuid") or os.geteuid() != 0
+
+
+@unittest.skipUnless(PYTHON and HAS_GIT, "needs git and a launcher-independent interpreter")
+class ReviewRound1Tests(_Case):
+    """Regression tests for the Wave 3 review findings (R2-R6, R8, S1-S3, transcript symlinks, lock directory)."""
+
+    def init_git_repo(self, memlet=True):
+        self.git_init()
+        if memlet:
+            self.assertEqual(0, self.cli("init", ".").returncode)
+
+    # -- R2 ------------------------------------------------------------------------------------------------------
+    def test_r2_long_transcript_line_is_skipped_fast(self):
+        self.init_git_repo()
+        t = self.write_transcript("slow.jsonl", [{"type": "user", "message": {"role": "user", "content":
+                                                   "Never call main() in app.py " + "z" * 100000}}])
+        for event in ("stop", "pre-compact"):
+            start = time.monotonic()
+            self.assertIsNone(self.hook(event, {"cwd": str(self.repo), "transcript_path": str(t)}))
+            self.assertLess(time.monotonic() - start, 3.0)
+        snap = self.repo / mb.SNAPSHOT_REL
+        self.assertFalse(any("zzzz" in f.read_text() for f in snap.iterdir()) if snap.is_dir() else False)
+
+    def test_r2_pre_commit_stays_under_two_seconds_on_a_pathological_rule(self):
+        self.init_git_repo()
+        self.install("--git-hooks")
+        (self.repo / "mod.py").write_text(MOD_STALE)
+        (self.repo / "AGENTS.md").write_text("# Rules\n\n- Always call `mod.py::charge` through the retry wrapper. "
+                                             + "z" * 100000 + "\n")
+        self.git("add", "mod.py")
+        start = time.monotonic()
+        r = self.cli("admin", "hook", "git-pre-commit")
+        elapsed = time.monotonic() - start
+        self.assertEqual((0, "", ""), (r.returncode, r.stdout, r.stderr))
+        self.assertLess(elapsed, 2.0)
+
+    # -- R3 ------------------------------------------------------------------------------------------------------
+    @unittest.skipUnless(NOT_ROOT, "permission checks do not apply to root")
+    def test_r3_unwritable_git_hooks_dir_refuses_before_any_write(self):
+        self.git_init()
+        hooks = self.repo / ".git" / "hooks"
+        hooks.chmod(0o500)
+        self.addCleanup(hooks.chmod, 0o755)
+        before = _tree(self.repo)
+        r = self.cli("init", ".", "--hooks", "--git-hooks")
+        self.assertEqual(2, r.returncode, r.stdout)
+        self.assertIn("nothing was changed", json.loads(r.stdout)["error"])
+        self.assertEqual(before, _tree(self.repo))  # no .memlet, no .claude, no record
+
+    @unittest.skipUnless(NOT_ROOT, "permission checks do not apply to root")
+    def test_r3_unwritable_claude_dir_or_memlet_dir_refuses_before_any_write(self):
+        (self.repo / ".claude").mkdir()
+        self.settings().write_text('{"model": "original"}')
+        (self.repo / ".claude").chmod(0o500)
+        self.addCleanup((self.repo / ".claude").chmod, 0o755)
+        before = _tree(self.repo)
+        r = self.cli("init", ".", "--hooks")
+        self.assertEqual(2, r.returncode)
+        self.assertEqual(before, _tree(self.repo))
+        self.assertFalse((self.repo / ".memlet").exists())
+        (self.repo / ".claude").chmod(0o755)
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        (self.repo / ".memlet").chmod(0o500)
+        self.addCleanup((self.repo / ".memlet").chmod, 0o755)
+        before = _tree(self.repo)
+        rep = mh.hooks_command(self.repo, which=lambda name: None, interpreter=PYTHON)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(before, _tree(self.repo))
+
+    def _fail_git_write(self):
+        real = mh._cas_write
+
+        def failing(path, data, mode, expected, txn, what):
+            if what.startswith("git hook"):
+                raise OSError(13, "Permission denied (injected)")
+            return real(path, data, mode, expected, txn, what)
+        return mock.patch.object(mh, "_cas_write", failing)
+
+    def test_r3_failure_after_settings_rolls_back_everything_including_init(self):
+        self.git_init()
+        before = _tree(self.repo)
+        with self._fail_git_write():
+            rep = mh.init_hooks_command(self.repo, git_hooks=True, which=lambda name: None, interpreter=PYTHON)
+        self.assertFalse(rep["ok"])
+        self.assertIn("rolled back", rep["error"])
+        self.assertEqual([], rep["leftBehind"])
+        self.assertEqual(before, _tree(self.repo))  # settings, .claude/ and the .memlet/ init created are all gone
+        # an already initialised repository: config and settings come back byte for byte
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        (self.repo / ".claude").mkdir()
+        self.settings().write_text(FOREIGN)
+        before = _tree(self.repo)
+        with self._fail_git_write():
+            rep = mh.init_hooks_command(self.repo, git_hooks=True, which=lambda name: None, interpreter=PYTHON)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(before, _tree(self.repo))
+
+    def test_r3_an_exception_inside_init_removes_what_init_created(self):
+        from prism_memory import memlet_wiki as mw
+        real = mw.init_project
+        before = _tree(self.repo)
+
+        def explode(*a, **k):
+            real(*a, **k)
+            raise RuntimeError("init failed after writing")
+
+        with mock.patch.object(mw, "init_project", explode):
+            rep = mh.init_hooks_command(self.repo, which=lambda name: None, interpreter=PYTHON)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(before, _tree(self.repo))
+
+    def test_r3_rollback_never_overwrites_an_intervening_edit(self):
+        self.git_init()
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        real = mh._cas_write
+
+        def edit_then_fail(path, data, mode, expected, txn, what):
+            if what.startswith("git hook"):
+                self.settings().write_text('{"edited": "by the user"}')
+                raise OSError(28, "No space left on device (injected)")
+            return real(path, data, mode, expected, txn, what)
+
+        with mock.patch.object(mh, "_cas_write", edit_then_fail):
+            rep = mh.hooks_command(self.repo, git_hooks=True, which=lambda name: None, interpreter=PYTHON)
+        self.assertFalse(rep["ok"])
+        self.assertEqual('{"edited": "by the user"}', self.settings().read_text())
+        self.assertTrue(any("settings.local.json" in x for x in rep["leftBehind"]), rep["leftBehind"])
+        self.assertIn("leftBehind", rep["error"])
+
+    # -- R4 ------------------------------------------------------------------------------------------------------
+    def test_r4_concurrent_writer_thread_is_never_lost(self):
+        import threading
+        (self.repo / ".claude").mkdir()
+        s = self.settings()
+        s.write_text(json.dumps({"padding": "x" * (16 * 1024 * 1024), "model": "original"}))
+        plan = mh.plan_claude(self.repo, "local", remove=False, prefix="memlet", cfg={})
+        done = []
+
+        def writer():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if any(s.parent.glob(".settings.local.json.memlet-*")):
+                    s.write_text('{"permissions":{"allow":["Bash(concurrent)"]}}')
+                    done.append(True)
+                    return
+                time.sleep(0.0005)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        with self.assertRaises(mh.Refused):
+            mh.apply_claude(self.repo, "local", plan, {})
+        t.join()
+        self.assertTrue(done)
+        self.assertEqual({"permissions": {"allow": ["Bash(concurrent)"]}}, json.loads(s.read_text()))
+        self.assertEqual(["settings.local.json"], sorted(x.name for x in s.parent.iterdir()))
+
+    def test_r4_in_place_edit_inside_the_final_gap_is_put_back(self):
+        (self.repo / ".claude").mkdir()
+        s = self.settings()
+        s.write_text("{}")
+        plan = mh.plan_claude(self.repo, "local", remove=False, prefix="memlet", cfg={})
+        real_replace = os.replace
+
+        def racing_replace(src, dst):
+            if str(dst) == str(s):
+                with open(str(s), "r+") as fh:  # in place, same inode, after the last check
+                    fh.write('{"x": 1}')
+                    fh.truncate()
+            return real_replace(src, dst)
+
+        with mock.patch.object(mh.os, "replace", racing_replace):
+            with self.assertRaises(mh.Refused) as ctx:
+                mh.apply_claude(self.repo, "local", plan, {})
+        self.assertIn("put back", str(ctx.exception))
+        self.assertEqual('{"x": 1}', s.read_text())
+        self.assertEqual(["settings.local.json"], sorted(x.name for x in s.parent.iterdir()))
+
+    # -- R5 / R6 -------------------------------------------------------------------------------------------------
+    def test_r5_marker_prefix_or_unrecorded_copy_is_foreign(self):
+        self.init_git_repo()
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        spoof = b"#!/bin/sh\n# memlet-managed-hook v2 example copied from docs\nprintf foreign-hook\n"
+        hook.write_bytes(spoof)
+        hook.chmod(0o755)
+        rep = self.install("--git-hooks")
+        self.assertEqual("skipped", {i["hook"]: i["op"] for i in rep["hooks"]["gitHooks"]["items"]}["pre-commit"])
+        self.assertEqual(spoof, hook.read_bytes())
+        self.assertEqual(0, self.cli("init", ".", "--hooks-remove", "--git-hooks").returncode)
+        self.assertEqual(spoof, hook.read_bytes())
+        # an exact generated script that this repository's record does not list is foreign too
+        exact = mh.git_hook_script("memlet", "pre-commit", "git-pre-commit").encode()
+        hook.write_bytes(exact)
+        rep = self.install("--git-hooks")
+        self.assertEqual("skipped", {i["hook"]: i["op"] for i in rep["hooks"]["gitHooks"]["items"]}["pre-commit"])
+        self.assertEqual(exact, hook.read_bytes())
+        # a recorded Memlet hook that the user edited becomes theirs: kept on removal
+        post = self.repo / ".git" / "hooks" / "post-merge"
+        self.assertTrue(post.is_file())
+        post.write_text(post.read_text() + "echo mine\n")
+        r = self.cli("init", ".", "--hooks-remove", "--git-hooks")
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("echo mine", post.read_text())
+        self.assertEqual(exact, hook.read_bytes())
+
+    def test_r6_non_executable_owned_hook_gets_its_bit_back(self):
+        self.init_git_repo()
+        self.install("--git-hooks")
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        content = hook.read_bytes()
+        hook.chmod(0o644)
+        rep = self.install("--git-hooks")
+        items = {i["hook"]: i["op"] for i in rep["hooks"]["gitHooks"]["items"]}
+        self.assertEqual({"pre-commit": "chmod", "post-merge": "unchanged"}, items)
+        self.assertTrue(os.stat(str(hook)).st_mode & stat.S_IXUSR)
+        self.assertEqual(content, hook.read_bytes())
+        again = self.install("--git-hooks")
+        self.assertEqual("unchanged", {i["hook"]: i["op"] for i in again["hooks"]["gitHooks"]["items"]}["pre-commit"])
+
+    # -- R8 ------------------------------------------------------------------------------------------------------
+    def test_r8_unreadable_queue_is_never_reported_as_zero_pending(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        self.assertTrue(mb.learn_from_transcript(self.repo, self.write_transcript())["ok"])
+        (self.repo / mb.QUEUE_REL).write_text("{broken")
+        out = self.hook("session-start", {"cwd": str(self.repo)})
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("pending", ctx)
+        self.assertIn("mod.py::charge", ctx)
+        self.assertIn("pending lessons unavailable", (self.repo / mh.LOG_REL).read_text())
+
+    # -- S1 ------------------------------------------------------------------------------------------------------
+    def test_s1_formatting_is_kept_and_an_unchanged_file_is_not_touched(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        (self.repo / ".claude").mkdir()
+        cases = {
+            "tabs-crlf-nofinal": '  {\r\n\t"model": "x",\r\n\t"hooks": {}\r\n}',
+            "four-spaces": '{\n    "model": "x"\n}\n',
+            "compact": '{"model":"x","permissions":{"allow":["Bash(ls)"]}}',
+            "ascii-escapes": '{"model": "\\ud55c"}\n',
+        }
+        for label, original in cases.items():
+            with self.subTest(case=label):
+                for f in self.settings().parent.iterdir():
+                    f.unlink()
+                cfg = json.loads((self.repo / ".memlet" / "config.json").read_text())
+                cfg.pop("hooks", None)
+                (self.repo / ".memlet" / "config.json").write_text(json.dumps(cfg))
+                self.settings().write_bytes(original.encode())
+                rep = mh.hooks_command(self.repo, which=lambda name: None, interpreter=PYTHON)
+                self.assertTrue(rep["ok"], rep)
+                self.assertIn(mh.FORMAT_NOTICE, rep["notices"])
+                text = self.settings().read_bytes().decode()
+                if label == "tabs-crlf-nofinal":
+                    self.assertTrue(text.startswith("  {\r\n\t\"model\""))
+                    self.assertFalse(text.endswith("\n"))
+                    self.assertNotIn("\r\r", text)
+                    self.assertEqual(text.count("\n"), text.count("\r\n"))
+                elif label == "four-spaces":
+                    self.assertIn('\n    "model": "x"', text)
+                    self.assertTrue(text.endswith("}\n"))
+                elif label == "compact":
+                    self.assertNotIn("\n", text)
+                    self.assertTrue(text.startswith('{"model":"x","permissions":{"allow":["Bash(ls)"]},"hooks":'))
+                else:
+                    self.assertIn("\\ud55c", text)
+                st = os.stat(str(self.settings()))
+                rep = mh.hooks_command(self.repo, which=lambda name: None, interpreter=PYTHON)
+                self.assertEqual("unchanged", rep["claude"]["op"])
+                st2 = os.stat(str(self.settings()))
+                self.assertEqual((st.st_ino, st.st_mtime_ns), (st2.st_ino, st2.st_mtime_ns))
+
+    # -- S2 ------------------------------------------------------------------------------------------------------
+    def test_s2_memlet_command_under_another_matcher_is_left_alone(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        (self.repo / ".claude").mkdir()
+        bash = {"matcher": "Bash", "hooks": [{"type": "command", "command": "memlet admin hook post-tool-use || true",
+                                              "timeout": 10}]}
+        self.settings().write_text(json.dumps({"hooks": {"PostToolUse": [bash]}}))
+        rep = mh.hooks_command(self.repo, which=lambda name: None, interpreter=PYTHON)
+        self.assertTrue(rep["ok"], rep)
+        groups = json.loads(self.settings().read_text())["hooks"]["PostToolUse"]
+        self.assertEqual(bash, groups[0])
+        self.assertEqual("Write|Edit", groups[1]["matcher"])
+        self.assertEqual("post-tool-use", mh.memlet_hook_event(groups[1]["hooks"][0]))
+        self.assertEqual(1, len(rep["claude"]["leftAlone"]))
+        self.assertIn("'Bash'", rep["claude"]["leftAlone"][0])
+        rep = mh.hooks_command(self.repo, remove=True)
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual([bash], json.loads(self.settings().read_text())["hooks"]["PostToolUse"])
+
+    # -- S3 ------------------------------------------------------------------------------------------------------
+    def test_s3_log_rotation_reads_only_the_tail_and_refuses_a_fifo(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        log = self.repo / mh.LOG_REL
+        with log.open("wb") as fh:
+            for _ in range(48):
+                fh.write(b"x\n" * (512 * 1024))
+        code = ("import resource, sys\nsys.path.insert(0, %r)\nfrom pathlib import Path\n"
+                "from prism_memory import memlet_hooks as h\n"
+                "before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+                "h._log(Path(%r), 'stop', 'synthetic')\n"
+                "after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+                "print(after - before)\n" % (str(HERE), str(self.repo)))
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(0, r.returncode, r.stderr)
+        growth = int(r.stdout.strip())
+        self.assertLess(growth, 16 * 1024 * 1024)  # ru_maxrss is bytes on macOS, KiB on Linux: both far below 48 MiB
+        self.assertLessEqual(log.stat().st_size, mh.LOG_CAP_BYTES)
+        log.unlink()
+        os.mkfifo(str(log))
+        start = time.monotonic()
+        mh._log(self.repo, "stop", "synthetic")  # must neither block nor write
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(str(log)).st_mode))
+
+    # -- transcript path symlinks, lock directory ----------------------------------------------------------------
+    def test_transcript_reached_through_a_symlinked_directory_is_rejected(self):
+        self.assertEqual(0, self.cli("init", ".").returncode)
+        t = self.write_transcript()
+        link = self.tmp / "linked"
+        link.symlink_to(t.parent, target_is_directory=True)
+        self.assertIsNone(self.hook("stop", {"cwd": str(self.repo), "transcript_path": str(link / t.name)}))
+        self.assertFalse((self.repo / mb.QUEUE_REL).exists())
+        self.assertIn("symlink in the transcript path", (self.repo / mh.LOG_REL).read_text())
+
+    def test_lock_directory_override_is_used(self):
+        from prism_memory import memlet_dream as md
+        p = md.queue_lock_path(self.repo / "q.json")
+        self.assertEqual(Path(os.environ["MEMLET_LOCK_DIR"]).resolve(), p.parent.resolve())
 
 
 if __name__ == "__main__":
