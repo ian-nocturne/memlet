@@ -265,7 +265,7 @@ class UnsafePathError(ValueError):
 
 
 class ConcurrentChangeError(ValueError):
-    """`write_managed_bytes(..., if_match=...)`: the file is no longer what the caller read; nothing was written."""
+    """`write_managed_bytes(..., if_match=...)`: the file changed since the caller read it; nothing was written."""
 
 
 def content_tag(data: Optional[bytes]) -> str:
@@ -412,8 +412,9 @@ def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool 
     file's mode; `create_only` creates a new file exclusively (O_EXCL | O_NOFOLLOW) instead.
 
     `if_match` (optional; default None keeps the unconditional behaviour): the `content_tag` of the bytes the caller
-    read. Re-checked immediately before the replace; when the file changed meanwhile (or appeared / disappeared),
-    ConcurrentChangeError is raised and nothing is written, instead of silently overwriting another writer's edit."""
+    read. The write is refused (ConcurrentChangeError, nothing written) when the file changed since it was read; that
+    is checked again immediately before the replace, but this is not an atomic compare-and-swap: a writer that does
+    not take Memlet's lock can still race the final step."""
     problem = managed_path_problem(root, rel)
     if problem:
         raise UnsafePathError(problem)
@@ -442,7 +443,7 @@ def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool 
         if if_match is not None:
             current = read_regular_bytes(target, 64 * 1024 * 1024) if os.path.lexists(str(target)) else None
             if (os.path.lexists(str(target)) and current is None) or content_tag(current) != if_match:
-                raise ConcurrentChangeError(f"{rel} was changed by another program while Memlet was writing it")
+                raise ConcurrentChangeError(f"{rel} changed since Memlet read it")
         os.replace(tmp, str(target))  # renames over the leaf: a symlink there would be replaced, never followed
     except BaseException:
         with contextlib.suppress(OSError):

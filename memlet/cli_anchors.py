@@ -1,7 +1,7 @@
 """`memlet admin anchors`: suggest, accept, list and drop sidecar code anchors (see `memlet.memlet_anchors`).
 
     memlet admin anchors suggest [--repo PATH] [--limit N] [--format markdown]
-    memlet admin anchors accept ID... | --all-unique [--dry-run] [--repo PATH]
+    memlet admin anchors accept ID... | --all-unique [--dry-run] [--repo PATH]   (--all-unique: file+symbol only)
     memlet admin anchors list [--repo PATH]
     memlet admin anchors drop ID... [--dry-run] [--repo PATH]
 
@@ -20,8 +20,10 @@ def register(sub) -> None:
     import argparse
     p = sub.add_parser("anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
                        description="Rules that mention code in backticks or as name() but carry no `path::symbol` "
-                                   "anchor can be anchored without editing your files: suggestions are resolved "
-                                   "against the repository's symbols, and accepted anchors live in .memlet/config.json.",
+                                   "anchor can be anchored without editing your files. Suggestions are proposals for "
+                                   "you to check: file+symbol (the rule names the file, which has one definition) or "
+                                   "single-definition-found (the scan found one definition; what was not scanned is "
+                                   "listed). Accepted anchors live in .memlet/config.json.",
                        epilog="A path in a rule is read from the repository root and from the instruction file's "
                               "folder; when both exist the mention is ambiguous. Write a leading `/` (`/src/auth.py`) "
                               "to mean the repository root only.\n\n"
@@ -36,9 +38,12 @@ def register(sub) -> None:
     s.add_argument("--repo", default=".", help="Repository path (default: current directory)")
     s.add_argument("--limit", type=int, default=200, help="At most this many suggestions and ambiguous entries")
     cli_plugins.add_format_option(s)
-    a = nested.add_parser("accept", help="Accept suggestions by id, or every current suggestion with --all-unique.")
+    a = nested.add_parser("accept", help="Accept suggestions by id (any level), or every file+symbol suggestion with "
+                                         "--all-unique.")
     a.add_argument("ids", nargs="*", metavar="ID")
-    a.add_argument("--all-unique", action="store_true", help="Accept every current (unambiguous) suggestion")
+    a.add_argument("--all-unique", action="store_true",
+                   help="Accept every current file+symbol suggestion (the rule names the file). single-definition-found "
+                        "suggestions are never accepted in bulk: check each and accept it by id")
     a.add_argument("--dry-run", action="store_true", help="Show what would be accepted; write nothing")
     a.add_argument("--repo", default=".")
     cli_plugins.add_format_option(a)

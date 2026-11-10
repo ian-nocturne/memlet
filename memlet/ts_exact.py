@@ -142,12 +142,19 @@ class TreeSitterProvider:
                 name = _name(node, src)
                 if name:
                     add(name, {"ast": "", "sig": ""})
-        out = {name: fps[0] for name, fps in found.items() if len(fps) == 1 and fps[0]["ast"]}
+        bindings = _binding_counts(root, src)
+        if bindings is None:
+            return None  # an identifier escape that cannot be decoded: fail closed for the whole file
+        # a name bound anywhere else in the file (assignment at any depth, a nested or conditional declaration, a
+        # parameter, an import, an escaped spelling of it) gets no exact fingerprint: the status then falls back to
+        # the non-exact path and can never be `active` for a rebinding the parser did not attribute
+        out = {name: fps[0] for name, fps in found.items()
+               if len(fps) == 1 and fps[0]["ast"] and bindings.get(name.rsplit(".", 1)[-1], 0) <= 1}
         short: Dict[str, List[str]] = {}
         for name in found:
             if "." in name:
                 short.setdefault(name.rsplit(".", 1)[-1], []).append(name)
-        for mname, quals in short.items():  # the lexical scanner's short alias of a method that is unique
+        for mname, quals in short.items():  # the lexical scanner's short alias of a method declared once in this file
             if mname not in found and len(quals) == 1 and quals[0] in out:
                 out[mname] = out[quals[0]]
         return out
@@ -168,6 +175,70 @@ def _name(node, src: bytes) -> Optional[str]:
         return None
     name = src[n.start_byte:n.end_byte].decode("utf-8", "replace")
     return name if re.fullmatch(r"#?[A-Za-z_$][\w$]*", name) else None
+
+
+_ESCAPE_RE = re.compile(r"\\u(?:\{([0-9a-fA-F]{1,6})\}|([0-9a-fA-F]{4}))")
+_ID_TYPES = {"identifier", "property_identifier", "shorthand_property_identifier", "private_property_identifier",
+             "type_identifier", "shorthand_property_identifier_pattern", "statement_identifier"}
+# (parent type, field) pairs and parent types whose identifier child is a binding of that name
+_BINDING_FIELDS = {("function_declaration", "name"), ("generator_function_declaration", "name"),
+                   ("function_expression", "name"), ("function", "name"), ("class_declaration", "name"),
+                   ("abstract_class_declaration", "name"), ("class", "name"), ("variable_declarator", "name"),
+                   ("assignment_expression", "left"), ("augmented_assignment_expression", "left"),
+                   ("method_definition", "name"), ("method_signature", "name"), ("abstract_method_signature", "name"),
+                   ("public_field_definition", "name"), ("field_definition", "property"), ("pair", "key"),
+                   ("for_in_statement", "left"), ("catch_clause", "parameter"), ("required_parameter", "pattern"),
+                   ("optional_parameter", "pattern"), ("interface_declaration", "name"),
+                   ("type_alias_declaration", "name"), ("enum_declaration", "name"), ("import_specifier", "name"),
+                   ("import_specifier", "alias"), ("namespace_import", None), ("import_clause", None),
+                   ("export_specifier", "alias"), ("rest_pattern", None), ("assignment_pattern", "left"),
+                   ("formal_parameters", None), ("array_pattern", None), ("object_pattern", None),
+                   ("pair_pattern", "value"), ("object_assignment_pattern", "left")}
+_BINDING_PARENTS = {pt for pt, f in _BINDING_FIELDS if f is None}
+
+
+def _decode(name: str) -> Optional[str]:
+    if "\\" not in name:
+        return name
+    def rep(m):
+        cp = int(m.group(1) or m.group(2), 16)
+        if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+            raise ValueError("bad escape")
+        return chr(cp)
+    try:
+        out = _ESCAPE_RE.sub(rep, name)
+    except ValueError:
+        return None
+    return None if "\\" in out else out
+
+
+def _binding_counts(root, src: bytes) -> Optional[Dict[str, int]]:
+    """How often each (escape-decoded) name is bound anywhere in the file; None when an escape cannot be decoded."""
+    counts: Dict[str, int] = {}
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        for i in range(node.child_count - 1, -1, -1):
+            stack.append(node.children[i])
+        if node.type not in _ID_TYPES:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        field = None
+        for i in range(parent.child_count):
+            if parent.children[i].id == node.id:
+                field = parent.field_name_for_child(i)
+                break
+        member_assign = (parent.type == "member_expression" and field == "property" and parent.parent is not None
+                         and parent.parent.type in ("assignment_expression", "augmented_assignment_expression"))
+        if not ((parent.type, field) in _BINDING_FIELDS or parent.type in _BINDING_PARENTS or member_assign):
+            continue
+        name = _decode(src[node.start_byte:node.end_byte].decode("utf-8", "replace"))
+        if name is None:
+            return None
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def _field_name(node, src: bytes) -> Optional[str]:

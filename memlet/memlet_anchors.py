@@ -2,42 +2,52 @@
 
 Memlet can only re-check a rule that names code as `path::symbol`, and almost no instruction file is written that way.
 The rules do mention code, in backticks and in prose (`validate_token()`, `` `src/auth.py` ``). This module finds those
-mentions and offers the anchor itself.
+mentions and PROPOSES an anchor. A suggestion is a proposal for a human, like a Dream candidate: Memlet cannot prove
+that a name means one piece of code, and accepting a suggestion is a human decision.
 
 Suggestions (`suggest_anchors`, read-only, no model call). The rules of the discovered instruction files and the
 hand-written wiki pages that carry no `::` anchor are scanned for backticked identifiers / paths and `name()` forms
-(URLs are ignored; a mention inside a quotation or after "e.g." / "for example" is never suggested). They are resolved
-against the repository, and only an unambiguous resolution is suggested:
+(URLs are ignored; a mention inside a quotation or after "e.g." / "for example" is never suggested). Two levels:
 
-* `file+symbol`: the rule names a code file and that file holds exactly one binding of the name, which is an
-  anchorable definition. A named file that does not define the name never falls back to another file, and a path
-  with two readings (from the repository root and from the instruction file's folder) is ambiguous. A leading `/`
-  (`` `/src/auth.py` ``) means "from the repository root" only.
-* `unique-symbol`: a distinctive name (not a generic word, not a plain capitalised English word) with exactly one
-  binding in the whole repository. Bindings are definitions at any depth, assignments, lambdas, imports from outside
-  the defining module, `__all__` exports, `match` case bodies, repeated declarations, and textual `def NAME` /
-  `function NAME` / `class NAME` / `NAME =` hits in code that is not indexed (vendored, generated, hidden, oversize,
-  unparsable or another language). When the scan is incomplete (a bound was hit, a file could not be read) no
-  `unique-symbol` is issued at all.
+* `file+symbol`: the rule names a code file and that file has exactly one definition of the symbol (and no other
+  binding of the name). A named file that does not define the name never falls back to another file, and a path with
+  two readings (from the repository root and from the instruction file's folder) is ambiguous. A leading `/`
+  (`` `/src/auth.py` ``) means "from the repository root" only. `accept --all-unique` accepts these.
+* `single-definition-found`: a distinctive name for which the scan found one definition and no other binding-like
+  occurrence. The reason states the evidence (how many files were indexed, how many were scanned as text, what was
+  not scanned: dependency / build folders and nested repositories, listed in `notScanned`). Accepted by id only.
+
+What counts against a single definition: in parsed Python and TS/JS every binding (definitions at any depth,
+assignments, loop / `with` / `except` / walrus targets, imports that do not resolve to the defining file itself,
+wildcard imports and exports, `__all__`, object-literal members, class fields, repeated declarations); in every
+file that is not parsed by an indexer (vendored, generated, hidden, oversize, unparsable, other languages) ANY
+whole-token occurrence of the name after NFKC normalisation. Anything that could not be read or enumerated, and every
+bound that was hit, makes the scan incomplete: then no `single-definition-found` is offered at all.
 
 Everything else is listed under `ambiguous` with a reason and candidates, never guessed. Every bound that was hit is
 reported (`truncated`, `truncation`, `scanned.skippedSources`, `scanned.indexIncomplete`).
 
-Sidecar anchors. `accept_suggestions` stores `{id, source, sectionPath, line, ruleSha256, anchor, pin}` in
-`.memlet/config.json` (`sidecarAnchors`) under the Memlet write lock, bound to the exact config bytes it read, and
-records the acceptance in the ledger (`sidecar_anchor_events`). The user's files are never edited. A rule's identity
-is its text hash plus the chain of Markdown headings it sits under, in the same file: a line shift under the same
-headings stays attached (`lineShifted`; the recorded line is informational), a different heading chain, file or text
-detaches it. On every read (no cache) an entry is honoured only while its shape is valid, the ledger's latest event for
-it is an `accept` of exactly these bytes, the rule text occurs exactly once in its file, it is read as a rule, has no
-written `::` anchor and still mentions the symbol. Attached entries are then checked like a written `path::symbol` in
-`check`, `recall`, `handover`, the hooks and MCP, marked `suggested` with their acceptance id.
+Sidecar anchors. `accept_suggestions` stores `{id, source, sectionPath, sectionSha256, line, ruleSha256, anchor, pin}`
+in `.memlet/config.json` (`sidecarAnchors`) under the Memlet write lock and records the acceptance in the ledger
+(`sidecar_anchor_events`). The user's files are never edited. The config write is refused when the file changed since
+it was read; that is checked again immediately before the replace, but a writer that does not take Memlet's lock can
+still race the final step. A rule's identity is its text hash plus the complete chain of Markdown headings (ATX and
+Setext) it sits under, in the same file: a line shift under the same headings stays attached (`lineShifted`; the
+recorded line is informational), a different heading chain, file or text detaches it. On every read (no cache) an
+entry is honoured only while its shape is valid, the ledger's latest event for it is an `accept` of exactly these
+bytes, the rule text occurs exactly once in its file, it is read as a rule, has no written `::` anchor and still
+mentions the symbol. Attached entries are then checked like a written `path::symbol` in `check`, `recall`,
+`handover`, the hooks and MCP, marked `suggested` with their acceptance id.
 
 Integrity, not authentication. Like Dream approvals, the ledger check proves only that an entry is byte-for-byte what
 `memlet admin anchors accept` recorded in this ledger, and that it was not dropped since. It does not prove who
 accepted it: a process that can rewrite both `.memlet/config.json` and the ledger can forge an acceptance, and copying
 both files into another clone carries the acceptances with them. The mention check limits what any entry (forged or
 not) can claim: a rule can only ever be anchored to a symbol it names.
+
+Threat model. Memlet defends against hostile repository CONTENT (static symlinks, crafted files) and serialises its own
+writers. It does not defend against another process of the same user racing a write: such a process could modify the
+same files directly anyway.
 """
 
 from __future__ import annotations
@@ -50,6 +60,7 @@ import os
 import posixpath
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -59,7 +70,7 @@ from .code_anchors import (_TS_JS_EXTS, _balanced_end, _blank_js_comments_preser
                            _extract_ts_js_signatures)
 
 SIDECAR_KEY = "sidecarAnchors"
-CONFIDENCES = ("file+symbol", "unique-symbol")  # strongest first
+CONFIDENCES = ("file+symbol", "single-definition-found")  # strongest first; only the first is accepted in bulk
 LEDGER_TABLE = "sidecar_anchor_events"
 _LEDGER_SCHEMA = ("CREATE TABLE IF NOT EXISTS sidecar_anchor_events (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id TEXT,"
                   " entry_sha256 TEXT, event_type TEXT, recorded_at TEXT)")
@@ -73,14 +84,15 @@ MAX_INDEX_FILES = 5000              # code files parsed for anchorable definitio
 MAX_INDEX_FILE_BYTES = 2 * 1024 * 1024  # same cap as the extractors: a larger file is scanned textually only
 MAX_INDEX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_SCAN_FILE_BYTES = 8 * 1024 * 1024   # textual binding scan of code that is not indexed; larger: incomplete
-MAX_SCAN_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_SCAN_TOTAL_BYTES = 48 * 1024 * 1024
+MAX_NOT_SCANNED_LISTED = 20         # pruned folders named in `notScanned` (the count is always complete)
 MAX_WALK_ENTRIES = 100_000          # directory entries visited while walking the repository
 MAX_RULES = 5000                    # candidate rules considered
 MAX_RULE_SCAN_CHARS = 16_384        # a longer rule is not scanned completely, so nothing in it is suggested
 MAX_MENTIONS_PER_RULE = 24
 MAX_CANDIDATES_SHOWN = 8
 MAX_SIDECAR_ENTRIES = 1000          # more accepted entries than this: readers reject all, accept refuses to write
-MAX_SECTION_DEPTH = 8
+MAX_SECTION_DEPTH = 8                 # display only; the identity hash covers the complete chain
 MAX_SECTION_TITLE = 200
 _RULE_DISPLAY = 160
 
@@ -90,9 +102,20 @@ _OTHER_CODE_EXTS = frozenset({".go", ".rs", ".rb", ".java", ".kt", ".kts", ".swi
                               ".r", ".jl", ".ex", ".exs", ".erl", ".dart", ".vue", ".svelte", ".m", ".mm", ".groovy",
                               ".clj", ".hs", ".ml", ".fs", ".nim", ".zig", ".pyi", ".pyx", ".astro"})
 _CODE_EXTS = _INDEX_EXTS | _OTHER_CODE_EXTS
+# Files that are never code (documentation, data, styles, media): not scanned for name occurrences. Every other
+# regular file that no indexer parses is scanned as text, so an unknown language still counts against a definition.
+_NOT_CODE_EXTS = frozenset({".md", ".mdx", ".markdown", ".mdc", ".txt", ".rst", ".adoc", ".org", ".json", ".jsonl",
+                            ".ndjson", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".csv", ".tsv", ".lock",
+                            ".log", ".css", ".scss", ".sass", ".less", ".svg", ".xml", ".map", ".png", ".jpg", ".jpeg",
+                            ".gif", ".ico", ".webp", ".bmp", ".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".zst",
+                            ".tar", ".jar", ".whl", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov",
+                            ".wav", ".sqlite", ".sqlite3", ".db", ".pyc", ".so", ".dylib", ".dll", ".exe", ".o", ".a",
+                            ".class", ".parquet", ".pkl", ".npy", ".bin"})
+_NOT_CODE_NAMES = frozenset({"readme", "license", "licence", "changelog", "changes", "notice", "authors",
+                             "contributing", "copying", "codeowners", "history", "news"})
 # Not repository source (dependencies, build output, VCS / Memlet state): never walked.
 _PRUNE_DIRS = frozenset(set(EXCLUDED_DIRS) | {mw.MEMLET_DIR, ".hg", ".svn", "bower_components", "jspm_packages"})
-# Repository code that is never anchored to, but whose bindings still block a "unique" claim.
+# Repository code that is never anchored to, but whose name occurrences still count against a single definition.
 _SKIPPED_SOURCE_DIRS = frozenset({"vendor", "vendors", "third_party", "third-party", "generated", "__generated__"})
 _GENERATED_NAME_RE = re.compile(r"(?:\.min\.(?:js|mjs|cjs)|\.bundle\.(?:js|mjs)|\.d\.(?:ts|mts|cts)|_pb2(?:_grpc)?\.py"
                                 r"|\.(?:generated|gen)\.[A-Za-z]+)$", re.I)
@@ -131,9 +154,10 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def suggestion_id(source: str, rule_sha: str, anchor: str, section_path: Iterable[str] = ()) -> str:
-    """Stable id of a suggestion / sidecar entry: same file, heading chain, rule text and anchor give the same id."""
-    return "anc-" + _sha256(json.dumps([source, list(section_path), rule_sha, anchor], ensure_ascii=True))[:12]
+def suggestion_id(source: str, rule_sha: str, anchor: str, section_sha: str = "") -> str:
+    """Stable id of a suggestion / sidecar entry: same file, heading chain (its `sectionSha256`), rule text and
+    anchor give the same id."""
+    return "anc-" + _sha256(json.dumps([source, section_sha or _section_sha(()), rule_sha, anchor], ensure_ascii=True))[:12]
 
 
 def _mask(text: str) -> str:
@@ -168,8 +192,8 @@ def _url_spans(text: str) -> List[Tuple[int, int]]:
 
 
 def _example_mask(text: str, code_spans: List[Tuple[int, int]]) -> bytearray:
-    """1 for every character inside a quotation ("…", “…”, outside code spans) or after "e.g." / "for example" /
-    "example". Linear: built once, then looked up per mention."""
+    """1 for every character inside a quotation ("…", '…', “…”, ‘…’, outside code spans) or after "e.g." / "for
+    example" / "example". Linear: built once, then looked up per mention."""
     code = bytearray(len(text))
     for a, b in code_spans:
         code[a:b] = b"\x01" * (b - a)
@@ -178,6 +202,20 @@ def _example_mask(text: str, code_spans: List[Tuple[int, int]]) -> bytearray:
     for k in range(0, len(quotes) - 1, 2):
         a, b = quotes[k], quotes[k + 1] + 1
         mask[a:b] = b"\x01" * (b - a)
+    # paired single quotes: an opener follows a non-alphanumeric character and precedes a non-space, a closer
+    # follows a non-space and precedes a non-alphanumeric character; apostrophes inside words (don't, it's) are neither
+    n, open_at = len(text), None
+    for i, ch in enumerate(text):
+        if ch not in "'‘’" or code[i]:
+            continue
+        before = text[i - 1] if i else " "
+        after = text[i + 1] if i + 1 < n else " "
+        if open_at is None:
+            if ch in "'‘" and not before.isalnum() and not after.isspace():
+                open_at = i
+        elif ch in "'’" and not before.isspace() and not after.isalnum():
+            mask[open_at:i + 1] = b"\x01" * (i + 1 - open_at)
+            open_at = None
     i = text.find("“")
     while i != -1:
         j = text.find("”", i + 1)
@@ -256,7 +294,8 @@ def rule_mentions(text: str) -> Dict[str, Any]:
 
 def _distinctive(name: str, call_form: bool) -> bool:
     """Could this name only mean code? Dotted, snake_case, camelCase / compound PascalCase, or written as a call, and
-    not a generic word. A plain capitalised word (`Convention`) is English, not code. Only for `unique-symbol`."""
+    not a generic word. A plain capitalised word (`Convention`) is English, not code. Only for
+    `single-definition-found`."""
     last = name.rsplit(".", 1)[-1]
     if last.lower() in COMMON_NAMES or len(last) < 3:
         return False
@@ -357,6 +396,31 @@ class _PyBindings(ast.NodeVisitor):
         self._target(node.target, getattr(node, "lineno", 0))
         self.visit(node.value)
 
+    def visit_For(self, node: Any) -> None:
+        self._target(node.target, node.lineno)
+        self.generic_visit(node)
+
+    visit_AsyncFor = visit_For
+
+    def visit_With(self, node: Any) -> None:
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._target(item.optional_vars, node.lineno)
+        self.generic_visit(node)
+
+    visit_AsyncWith = visit_With
+
+    def visit_ExceptHandler(self, node: Any) -> None:
+        if node.name:
+            self._add(node.name, getattr(node, "lineno", 0), "assign", None)
+        self.generic_visit(node)
+
+    def visit_Global(self, node: Any) -> None:
+        for name in node.names:
+            self._add(name, node.lineno, "assign", None)
+
+    visit_Nonlocal = visit_Global
+
     def visit_Import(self, node: Any) -> None:
         for a in node.names:
             bound = a.asname or a.name.split(".")[0]
@@ -364,6 +428,10 @@ class _PyBindings(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: Any) -> None:
         for a in node.names:
+            if a.name == "*":  # could bind any name: blocks every wanted name
+                for name in self.wanted:
+                    self._add(name, node.lineno, "wildcard", None, module=node.module or "", level=int(node.level or 0))
+                continue
             self._add(a.asname or a.name, node.lineno, "import", None, module=node.module or "",
                       level=int(node.level or 0), orig=a.name)
 
@@ -401,13 +469,31 @@ def _py_analysis(text: str, wanted: Set[str]) -> Optional[Tuple[List[Dict[str, A
 
 _TS_CLASS_RE = re.compile(r"\bclass[ \t]+([A-Za-z_$][\w$]*)[^{;\n]*\{")
 _TS_IMPORT_RE = re.compile(r"\bimport\s+(?:type\s+)?([\w$\s{},*]{1,2000}?)\s+from\s*(['\"])([^'\"\n]{1,300})\2")
-_TS_REEXPORT_RE = re.compile(r"\bexport\s+(?:type\s+)?\{([^}]{0,2000})\}\s*from\s*(['\"])([^'\"\n]{1,300})\2")
-_TS_REQUIRE_RE = re.compile(r"\b(?:const|let|var)\s*\{([^}]{0,2000})\}\s*=\s*require\(\s*(['\"])([^'\"\n]{1,300})\2")
+_TS_REEXPORT_RE = re.compile(r"\bexport\s+(?:type\s+)?(\{[^}]{0,2000}\})\s*from\s*(['\"])([^'\"\n]{1,300})\2")
+_TS_EXPORT_LOCAL_RE = re.compile(r"\bexport\s+(?:type\s+)?(\{[^}]{0,2000}\})(?!\s*from\b)")
+_TS_STAR_RE = re.compile(r"\bexport\s+\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s*)?from\b")
+_JS_ESCAPE_RE = re.compile(r"\\u(?:\{([0-9a-fA-F]{1,6})\}|([0-9a-fA-F]{4}))")
+_TS_REQUIRE_RE = re.compile(r"\b(?:const|let|var)\s*(\{[^}]{0,2000}\})\s*=\s*require\(\s*(['\"])([^'\"\n]{1,300})\2")
 _TS_REQUIRE1_RE = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*(['\"])([^'\"\n]{1,300})\2")
 _TS_MEMBER_BEFORE = re.compile(r"^[ \t]*(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set|"
                                r"declare|export|default|accessor)[ \t]+)*\*?[ \t]*$")
 _TS_METHOD_AFTER = re.compile(r"[ \t]*(?:<[^>\n]{0,120}>)?[ \t]*\([^)]{0,600}\)[ \t]*(?::[^{;\n]{0,160})?\{")
-_TS_PROP_AFTER = re.compile(r"[ \t]*:[ \t]*(?:async[ \t]+)?(?:function\b|\([^)\n]{0,200}\)[ \t]*=>|[A-Za-z_$][\w$]*[ \t]*=>)")
+_TS_PROP_AFTER = re.compile(r"[ \t]*[?!]?[ \t]*[:;=]")      # `name:` / `name;` / `name =` (members, fields, keys)
+_TS_MEMBER_PREFIX = re.compile(r"(?:^|[{,;}])[ \t]*(?:(?:public|private|protected|static|readonly|override|abstract|"
+                               r"async|get|set|declare|accessor)[ \t]+)*\*?[ \t]*$")
+
+
+def _decode_js_escapes(text: str) -> Optional[str]:
+    """JS identifier escapes (`\\u0076`, `\\u{76}`) decoded, None when one cannot be decoded."""
+    def rep(m: Any) -> str:
+        cp = int(m.group(1) or m.group(2), 16)
+        if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+            raise ValueError("bad escape")
+        return chr(cp)
+    try:
+        return _JS_ESCAPE_RE.sub(rep, text)
+    except ValueError:
+        return None
 
 
 def _ts_import_names(clause: str) -> List[Tuple[str, str]]:
@@ -443,6 +529,11 @@ def _ts_analysis(text: str, wanted: Set[str]) -> Optional[Tuple[List[Dict[str, A
         code = _blank_js_comments_preserve_lines(text, blank_strings=False)[0]
     except (RecursionError, MemoryError, ValueError):
         return None
+    if "\\u" in masked:  # `\u0076alidate_token` is the identifier validate_token
+        decoded = _decode_js_escapes(masked)
+        if decoded is None:
+            return None
+        masked = decoded
     if not ok:
         return None
     targets = []
@@ -478,10 +569,10 @@ def _ts_analysis(text: str, wanted: Set[str]) -> Optional[Tuple[List[Dict[str, A
             kind = "def"
         elif _ASSIGN_AFTER.match(masked, e, e + 120):
             kind = "assign"
-        elif _TS_MEMBER_BEFORE.match(before) and _TS_METHOD_AFTER.match(masked, e, e + 700):
-            kind = "method"
-        elif _TS_PROP_AFTER.match(masked, e, e + 300):
-            kind = "property"
+        elif _TS_MEMBER_PREFIX.search(before) and _TS_METHOD_AFTER.match(masked, e, e + 700):
+            kind = "method"  # class or object-literal method, on its own line or inline
+        elif _TS_MEMBER_PREFIX.search(before) and _TS_PROP_AFTER.match(masked, e, e + 40):
+            kind = "property"  # object-literal key, class field, interface member
         if kind is None:
             continue
         owner = None
@@ -502,6 +593,17 @@ def _ts_analysis(text: str, wanted: Set[str]) -> Optional[Tuple[List[Dict[str, A
                 if bound in wanted:
                     out.append({"name": bound, "line": _line_at(code, m.start(), [0, 1]), "kind": "import", "qual": None,
                                 "module": m.group(3), "level": 0, "orig": orig})
+    for m in _TS_EXPORT_LOCAL_RE.finditer(code):  # `export { foreign as name }`: a new name for another binding
+        for bound, orig in _ts_import_names(m.group(1)):
+            if bound in wanted and bound != orig:
+                out.append({"name": bound, "line": _line_at(code, m.start(), [0, 1]), "kind": "export-alias", "qual": None})
+    for m in _TS_STAR_RE.finditer(code):  # `export * from`: could bind any name
+        if m.group(1):
+            if m.group(1) in wanted:
+                out.append({"name": m.group(1), "line": _line_at(code, m.start(), [0, 1]), "kind": "import-module", "qual": None})
+            continue
+        for name in wanted:
+            out.append({"name": name, "line": _line_at(code, m.start(), [0, 1]), "kind": "wildcard", "qual": None})
     for m in _TS_REQUIRE1_RE.finditer(code):
         if m.group(1) in wanted:
             out.append({"name": m.group(1), "line": _line_at(code, m.start(), [0, 1]), "kind": "import-module",
@@ -509,17 +611,18 @@ def _ts_analysis(text: str, wanted: Set[str]) -> Optional[Tuple[List[Dict[str, A
     return targets, out
 
 
+_TOKEN_RE = re.compile(r"[\w$]+")
+
+
 def _text_bindings(text: str, wanted: Set[str]) -> List[Dict[str, Any]]:
-    """Cheap textual bindings in code that is not indexed: `def NAME`, `function NAME`, `class NAME`, `NAME =` ..."""
+    """Files no indexer parses: ANY whole-token occurrence of a wanted name, compared after NFKC normalisation (so
+    `𝚟alidate_token` counts as `validate_token`), is a possible binding. No per-language patterns."""
     out: List[Dict[str, Any]] = []
+    norm = unicodedata.normalize("NFKC", text)
     lc = [0, 1]
-    for m in _NAME_SCAN_RE.finditer(text):
-        name = m.group(0)
-        if name not in wanted:
-            continue
-        s, e = m.span()
-        if _TEXT_DEF_BEFORE.search(text[max(0, s - 40):s]) or _ASSIGN_AFTER.match(text, e, e + 120):
-            out.append({"name": name, "line": _line_at(text, s, lc), "kind": "text", "qual": None})
+    for m in _TOKEN_RE.finditer(norm):
+        if m.group(0) in wanted:
+            out.append({"name": m.group(0), "line": _line_at(norm, m.start(), lc), "kind": "text", "qual": None})
     return out
 
 
@@ -554,12 +657,18 @@ class SymbolIndex:
         self.incomplete: List[str] = []  # something relevant could not be read or scanned
         self.stats = {"codeFiles": 0, "symbols": 0, "bytes": 0, "skippedCodeFiles": 0, "scannedBytes": 0,
                       "generatedSkipped": 0, "oversizedSkipped": 0, "parseErrors": 0, "walkEntries": 0}
+        self.not_scanned: List[str] = []  # pruned folders (dependencies, build output, nested repositories)
         if self.wanted:
             self._build()
 
     @property
     def complete(self) -> bool:
         return not (self.truncated or self.incomplete)
+
+    def not_scanned_summary(self) -> Dict[str, Any]:
+        """{count, paths (at most MAX_NOT_SCANNED_LISTED), reason}: folders left out for cost; they do not demote."""
+        return {"count": len(self.not_scanned), "paths": self.not_scanned[:MAX_NOT_SCANNED_LISTED],
+                "reason": "dependency / build folders and nested repositories are not scanned"}
 
     def _record(self, rel: str, targets: Optional[List[Dict[str, Any]]], occ: List[Dict[str, Any]]) -> None:
         self.analysis[rel] = (targets, occ)
@@ -570,7 +679,8 @@ class SymbolIndex:
         for o in occ:
             self.bindings.setdefault(o["name"], []).append(dict(o, path=rel, test=test))
 
-    def _scan_text_only(self, rel: str, full: str, size: int, text: Optional[str] = None) -> None:
+    def _scan_text_only(self, rel: str, full: str, size: int, text: Optional[str] = None,
+                        binary_skip: bool = False) -> None:
         if size > MAX_SCAN_FILE_BYTES:
             self.incomplete.append(f"not_scanned_oversize:{rel}")
             return
@@ -582,6 +692,8 @@ class SymbolIndex:
         if text is None:
             self.incomplete.append(f"unreadable:{rel}")
             return
+        if binary_skip and "\x00" in text[:8192]:
+            return  # a binary file of an unknown type: not code
         self.stats["scannedBytes"] += size
         self.stats["skippedCodeFiles"] += 1
         self._record(rel, None, _text_bindings(text, self.wanted))
@@ -589,39 +701,63 @@ class SymbolIndex:
     def _analyse(self, rel: str, text: str) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
         return _py_analysis(text, self.wanted) if rel.lower().endswith(".py") else _ts_analysis(text, self.wanted)
 
+    def _walk_error(self, exc: OSError) -> None:
+        where = getattr(exc, "filename", None) or "?"
+        try:
+            where = Path(where).relative_to(self.root).as_posix()
+        except ValueError:
+            pass
+        self.incomplete.append(f"walk_error:{where}:{exc.strerror or type(exc).__name__}")
+
     def _build(self) -> None:
         root = self.root
         seen = 0
-        for cur, dirs, files in os.walk(root):
+        for cur, dirs, files in os.walk(root, onerror=self._walk_error):
             rel_dir = Path(cur).relative_to(root).as_posix()
             rel_dir = "" if rel_dir == "." else rel_dir
             if rel_dir and (Path(cur) / ".git").exists():
                 dirs[:] = []
+                self.not_scanned.append(rel_dir + "/ (nested repository)")
                 continue  # a nested repository / worktree: its code belongs to that repository
             parts = rel_dir.split("/") if rel_dir else []
             skipped_dir = any(p in _SKIPPED_SOURCE_DIRS or p.startswith(".") for p in parts)
-            dirs[:] = sorted(d for d in dirs if d not in _PRUNE_DIRS and not os.path.islink(os.path.join(cur, d)))
+            kept = []
+            for d in sorted(dirs):
+                if os.path.islink(os.path.join(cur, d)):
+                    continue  # never followed: not repository content
+                if d in _PRUNE_DIRS:
+                    if d != mw.MEMLET_DIR and not (d == ".git" and not rel_dir):
+                        self.not_scanned.append(f"{rel_dir}/{d}/" if rel_dir else f"{d}/")
+                    continue
+                kept.append(d)
+            dirs[:] = kept
             seen += len(dirs) + len(files)
             self.stats["walkEntries"] = seen
             if seen > MAX_WALK_ENTRIES:
                 self.truncated.append(f"walk_entries>{MAX_WALK_ENTRIES}")
                 return
             for fn in sorted(files):
-                ext = Path(fn).suffix.lower()
-                if ext not in _CODE_EXTS:
-                    continue
                 full = os.path.join(cur, fn)
+                rel = f"{rel_dir}/{fn}" if rel_dir else fn
+                ext = Path(fn).suffix.lower()
+                code = ext in _CODE_EXTS
+                if not code and (ext in _NOT_CODE_EXTS or fn.split(".")[0].lower() in _NOT_CODE_NAMES
+                                 or (fn.startswith(".") and not ext)):
+                    continue  # documentation, data, styles, media, config dotfiles: never code
+                if mw._is_secret_path(rel) or mw.instruction_path_shape(rel):
+                    continue  # secrets are never read; instruction files are the rules themselves
                 try:
                     st = os.lstat(full)
-                except OSError:
+                except OSError as exc:
+                    self.incomplete.append(f"stat_error:{rel}:{exc.strerror or type(exc).__name__}")
                     continue
                 if os.path.islink(full) or not os.path.isfile(full):
                     continue
-                rel = f"{rel_dir}/{fn}" if rel_dir else fn
-                self.code_files.add(rel)
-                self.basenames.setdefault(fn, []).append(rel)
-                if skipped_dir or ext not in _INDEX_EXTS:
-                    self._scan_text_only(rel, full, st.st_size)
+                if code:
+                    self.code_files.add(rel)
+                    self.basenames.setdefault(fn, []).append(rel)
+                if not code or skipped_dir or ext not in _INDEX_EXTS:
+                    self._scan_text_only(rel, full, st.st_size, binary_skip=not code)
                     continue
                 if _GENERATED_NAME_RE.search(fn):
                     self.stats["generatedSkipped"] += 1
@@ -648,9 +784,9 @@ class SymbolIndex:
                     self._scan_text_only(rel, full, st.st_size, text)
                     continue
                 res = self._analyse(rel, text)
-                if res is None:  # does not parse: no anchor into it could be active, but its bindings still count
+                if res is None:  # does not parse: no anchor into it could be active, but its names still count
                     self.stats["parseErrors"] += 1
-                    self._record(rel, None, _text_bindings(text, self.wanted))
+                    self._scan_text_only(rel, full, st.st_size, text)
                 else:
                     self._record(rel, res[0], res[1])
 
@@ -704,45 +840,49 @@ class SymbolIndex:
         return [t for t in self.targets.get(last, []) if t["symbol"] == name or t["symbol"].endswith("." + name)
                 or "." not in name]
 
-    # -- same binding through an import ------------------------------------------------------------------------
+    # -- an import of the definition itself ----------------------------------------------------------------------
 
-    def _module_files(self, occ: Dict[str, Any]) -> List[str]:
+    @staticmethod
+    def _import_is_target(occ: Dict[str, Any], target: Dict[str, Any]) -> bool:
+        """Does this import provably name the target's OWN file? Only (a) a relative import / path that normalises to
+        that file, or (b) an absolute Python dotted path equal to the target's path from the repository root or to a
+        sibling module of the importing file. No suffix matching and no re-export hops: a module that re-exports is
+        exempt only for its own direct import. Wildcards, TS path aliases and package specifiers never qualify."""
+        if occ.get("kind") != "import" or occ.get("orig") != target["name"]:
+            return False
         importer, module, level = occ["path"], occ.get("module") or "", int(occ.get("level") or 0)
+        want = target["path"]
         if importer.lower().endswith(".py"):
-            mod_parts = [p for p in module.split(".") if p]
+            if not want.endswith(".py"):
+                return False
+            parts = [x for x in module.split(".") if x]
+            if any(not re.fullmatch(r"[A-Za-z_]\w*", x) for x in parts):
+                return False
             if level:
                 base = posixpath.dirname(importer)
                 for _ in range(level - 1):
+                    if not base:
+                        return False  # above the repository root
                     base = posixpath.dirname(base)
-                stem = posixpath.join(base, *mod_parts) if mod_parts else base
-                cands = [stem + ".py", posixpath.join(stem, "__init__.py")] if mod_parts else [posixpath.join(stem, "__init__.py")]
-                return [c.lstrip("/") for c in cands if c.lstrip("/") in self.code_files]
-            tail = "/".join(mod_parts)
-            if not tail:
-                return []
-            return sorted(f for f in self.code_files if f.endswith(".py") and any(
-                f == t or f.endswith("/" + t) for t in (tail + ".py", tail + "/__init__.py")))
-        if not module.startswith("."):
-            return []  # a package specifier: code outside the repository
+                stem = posixpath.join(base, *parts) if parts else base
+                cands = {stem + ".py", posixpath.join(stem, "__init__.py")} if parts else {posixpath.join(stem, "__init__.py")}
+            else:
+                if not parts:
+                    return False
+                tail = "/".join(parts)
+                sib = posixpath.join(posixpath.dirname(importer), tail)
+                cands = {tail + ".py", tail + "/__init__.py", sib + ".py", sib + "/__init__.py"}
+            return want in {c.lstrip("/") for c in cands}
+        if not module.startswith((".", "/")) or module.startswith("/"):
+            return False  # package specifiers and path aliases: code outside what the files show
         base = posixpath.normpath(posixpath.join(posixpath.dirname(importer), module))
-        cands = [base] + [base + e for e in sorted(_TS_JS_EXTS)] + [posixpath.join(base, "index" + e) for e in sorted(_TS_JS_EXTS)]
+        if base.startswith(".."):
+            return False
+        cands = {base} | {base + e for e in _TS_JS_EXTS} | {posixpath.join(base, "index" + e) for e in _TS_JS_EXTS}
         stem, ext = posixpath.splitext(base)
         if ext in (".js", ".mjs", ".cjs", ".jsx"):
-            cands += [stem + e for e in (".ts", ".tsx", ".mts", ".cts")]
-        return [c for c in cands if c in self.code_files]
-
-    def _same_binding(self, occ: Dict[str, Any], target: Dict[str, Any], depth: int = 0) -> bool:
-        """Is this an import of exactly `target` from the module that defines it (directly or via <= 3 re-exports)?"""
-        if occ.get("kind") != "import" or occ.get("orig") != target["name"] or depth > 3:
-            return False
-        files = self._module_files(occ)
-        if len(files) != 1:
-            return False
-        if files[0] == target["path"]:
-            return True
-        _t, occs = self.file_analysis(files[0])
-        return any(self._same_binding(dict(o, path=files[0]), target, depth + 1)
-                   for o in occs if o["name"] == target["name"] and o.get("kind") == "import")
+            cands |= {stem + e for e in (".ts", ".tsx", ".mts", ".cts")}
+        return want in cands
 
     def other_bindings(self, mention: str, target: Dict[str, Any], occs: Optional[List[Dict[str, Any]]] = None
                        ) -> List[Dict[str, Any]]:
@@ -751,7 +891,7 @@ class SymbolIndex:
         out = []
         own = None
         for o in (self.bindings.get(last, []) if occs is None else occs):
-            if o.get("kind") == "import" and self._same_binding(o, target):
+            if o.get("kind") == "import" and self._import_is_target(o, target):
                 continue
             if "." in mention and o.get("qual") and not (o["qual"] == mention or o["qual"].endswith("." + mention)):
                 continue  # a dotted mention rules out bindings known to sit in another scope
@@ -837,8 +977,38 @@ def _source_text(root: Path, rel: str) -> Optional[str]:
     return mw.read_regular_text(root / rel, mw._MAX_SOURCE_BYTES)
 
 
+def _atx_heading(line: str) -> Optional[Tuple[int, str]]:
+    """(level, canonical title) of a CommonMark ATX heading, else None. A closing `#` run counts only after a space or
+    tab (`# C#` is the title `C#`, `# Scope ###` is `Scope`). Direct scan, no backtracking regex."""
+    s = line.rstrip("\r\n")
+    i = 0
+    while i < len(s) and i < 4 and s[i] == " ":
+        i += 1
+    if i > 3:
+        return None
+    j = i
+    while j < len(s) and s[j] == "#":
+        j += 1
+    if not 1 <= j - i <= 6 or (j < len(s) and s[j] not in " \t"):
+        return None
+    content = s[j:].strip(" \t")
+    k = len(content)
+    while k > 0 and content[k - 1] == "#":
+        k -= 1
+    if k == 0:
+        content = ""
+    elif k < len(content) and content[k - 1] in " \t":
+        content = content[:k].rstrip(" \t")
+    return j - i, re.sub(r"[ \t]+", " ", content)
+
+
+_SETEXT_RE = re.compile(r" {0,3}(=+|-+)[ \t]*")
+_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+
+
 def _heading_chains(lines: List[str]) -> List[Tuple[str, ...]]:
-    """For every line, the chain of ATX headings it sits under (outside code fences and front matter)."""
+    """For every line, the complete chain of headings it sits under: ATX and Setext headings, outside code fences
+    (a fence closes only with the same character, at least as long, as CommonMark requires) and front matter."""
     out: List[Tuple[str, ...]] = []
     stack: List[Tuple[int, str]] = []
     front_end = -1
@@ -847,24 +1017,50 @@ def _heading_chains(lines: List[str]) -> List[Tuple[str, ...]]:
             if lines[i].strip() == "---":
                 front_end = i
                 break
-    in_fence = False
+    fence: Optional[Tuple[str, int]] = None
+    prev_para: Optional[str] = None  # the previous line, when it can be the text of a Setext heading
+
+    def push(level: int, title: str) -> None:
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+
     for idx, line in enumerate(lines):
+        bare = line.rstrip("\r\n")
         if idx <= front_end:
             out.append(())
             continue
-        if mw._FENCE_RE.match(line):
-            in_fence = not in_fence
-        elif not in_fence:
-            h = mw._HEADING_RE.match(line)
-            if h:
-                stripped = line.lstrip()
-                level = len(stripped) - len(stripped.lstrip("#"))
-                while stack and stack[-1][0] >= level:
-                    stack.pop()
-                stack.append((level, h.group("title").strip()[:MAX_SECTION_TITLE]))
-                stack = stack[-MAX_SECTION_DEPTH:]
-        out.append(tuple(t for _lvl, t in stack))
+        if fence is not None:
+            m = _FENCE_OPEN_RE.fullmatch(bare)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2).strip():
+                fence = None
+            out.append(tuple(t for _l, t in stack))
+            prev_para = None
+            continue
+        m = _FENCE_OPEN_RE.fullmatch(bare)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence = (m.group(1)[0], len(m.group(1)))
+            out.append(tuple(t for _l, t in stack))
+            prev_para = None
+            continue
+        atx = _atx_heading(bare)
+        if atx:
+            push(*atx)
+            prev_para = None
+        elif prev_para is not None and _SETEXT_RE.fullmatch(bare):
+            push(1 if bare.strip()[0] == "=" else 2, prev_para)
+            prev_para = None
+        else:
+            stripped = bare.strip()
+            plain = (stripped and not mw._BULLET_RE.match(bare) and not stripped.startswith((">", "<!--", "|"))
+                     and len(bare) - len(bare.lstrip(" ")) < 4)
+            prev_para = re.sub(r"[ \t]+", " ", stripped) if plain else None
+        out.append(tuple(t for _l, t in stack))
     return out
+
+
+def _section_sha(chain: Iterable[str]) -> str:
+    return _sha256(json.dumps(list(chain), ensure_ascii=True))
 
 
 def _source_rules(rel: str, text: str) -> Dict[str, Any]:
@@ -876,7 +1072,9 @@ def _source_rules(rel: str, text: str) -> Dict[str, Any]:
     for r in rules:
         i = r["line"] - 1
         r["fullText"] = _rule_body(lines[i]) if 0 <= i < len(lines) else r["text"]
-        r["sectionPath"] = list(chains[i]) if 0 <= i < len(chains) else []
+        chain = list(chains[i]) if 0 <= i < len(chains) else []
+        r["sectionSha256"] = _section_sha(chain)  # identity: the complete canonical titles
+        r["sectionPath"] = [t[:MAX_SECTION_TITLE] for t in chain][-MAX_SECTION_DEPTH:]  # display only
     counts: Dict[str, int] = {}
     for line in lines:
         body = _rule_body(line)
@@ -960,23 +1158,31 @@ def _resolve(index: SymbolIndex, rule: Dict[str, Any]) -> Tuple[List[Dict[str, A
             amb.append(_ambiguous(rule, name, "name_too_generic_to_anchor_without_a_file", cands))
             continue
         if not index.complete:
-            amb.append(_ambiguous(rule, name, "symbol_index_incomplete_uniqueness_unproven", cands))
+            amb.append(_ambiguous(rule, name, "scan_incomplete_single_definition_not_established", cands))
             continue
         t = cands[0]
         others = index.other_bindings(name, t)
         if others:
             amb.append(_ambiguous(rule, name, "other_bindings_of_the_name", [t] + others))
             continue
-        sugg.append(_suggestion(rule, t, "unique-symbol", name,
-                                f"`{name}` has exactly one binding in the repository: {t['path']}:{t['line']} ({t['kind']})"
-                                + ("; that definition is in a test file" if t["test"] else "")))
+        ns = index.not_scanned_summary()
+        reason = (f"one definition of `{name}` found ({t['path']}:{t['line']}, {t['kind']}) in "
+                  f"{index.stats['codeFiles']} indexed file(s); no other binding-like occurrence in "
+                  f"{index.stats['skippedCodeFiles']} text-scanned file(s); not scanned: "
+                  + (", ".join(ns["paths"]) + (f" (+{ns['count'] - len(ns['paths'])} more)" if ns["count"] > len(ns["paths"]) else "")
+                     if ns["count"] else "nothing")
+                  + ("; that definition is in a test file" if t["test"] else "") + ". A proposal: check it before accepting.")
+        sg = _suggestion(rule, t, "single-definition-found", name, reason)
+        sg["notScanned"] = ns
+        sugg.append(sg)
     return sugg, amb, unresolved
 
 
 def _suggestion(rule, target, confidence, mention, reason) -> Dict[str, Any]:
     anchor = f"{target['path']}::{target['symbol']}"
-    return {"id": suggestion_id(rule["source"], rule["ruleSha256"], anchor, rule["sectionPath"]),
+    return {"id": suggestion_id(rule["source"], rule["ruleSha256"], anchor, rule["sectionSha256"]),
             "source": rule["source"], "line": rule["line"], "sectionPath": list(rule["sectionPath"]),
+            "sectionSha256": rule["sectionSha256"],
             "ruleSha256": rule["ruleSha256"], "rule": _clip(_mask(rule["fullText"])), "anchor": anchor,
             "confidence": confidence, "reason": reason, "mention": mention,
             "target": {"path": target["path"], "symbol": target["symbol"], "line": target["line"],
@@ -1018,6 +1224,7 @@ def _suggest(root: Path, limit: Optional[int]) -> Dict[str, Any]:
             written += 1
             continue
         if not r["mentions"]["complete"]:
+            truncation.append(f"rule_not_scanned_completely:{r['source']}:{r['line']}")  # too long / too many mentions
             if r["mentions"]["idents"]:
                 amb.append(_ambiguous(r, r["mentions"]["idents"][0]["name"], "rule_too_long_to_scan_completely", []))
             continue
@@ -1047,7 +1254,9 @@ def _suggest(root: Path, limit: Optional[int]) -> Dict[str, Any]:
     scanned = dict(index.stats, rules=len(rules), rulesWithWrittenAnchors=written, sources=len(sources),
                    unresolvedMentions=unresolved, skippedSources=skipped,
                    indexIncomplete=index.truncated + index.incomplete)
+    by_level = {c: sum(1 for x in sugg if x["confidence"] == c) for c in CONFIDENCES}
     return {"ok": True, "exitCode": 0, "command": "anchors suggest", "repoPath": str(root),
+            "countsByConfidence": by_level, "notScanned": index.not_scanned_summary(),
             "suggestions": sugg if limit is None else sugg[:limit], "ambiguous": amb if limit is None else amb[:limit],
             "suggestionCount": len(sugg), "ambiguousCount": len(amb), "alreadyAccepted": already, "scanned": scanned,
             "truncated": bool(truncation), "truncation": truncation}
@@ -1071,17 +1280,19 @@ def count_suggestions(root: Path) -> int:
 
 def format_suggestions(res: Dict[str, Any]) -> str:
     sc = res.get("scanned") or {}
+    levels = res.get("countsByConfidence") or {}
+    ns = res.get("notScanned") or {}
     lines = ["## Memlet anchor suggestions", "",
+             "These are proposals for a human to check, not verified facts.",
              f"- Scanned {sc.get('rules', 0)} rule(s) in {sc.get('sources', 0)} file(s); {sc.get('codeFiles', 0)} code "
-             f"file(s) indexed, {sc.get('skippedCodeFiles', 0)} scanned for bindings only",
+             f"file(s) indexed, {sc.get('skippedCodeFiles', 0)} scanned as text",
+             f"- Not scanned: {ns.get('count', 0)} folder(s)" + (": " + ", ".join(ns.get("paths") or []) if ns.get("count") else ""),
              f"- {res.get('suggestionCount', 0)} suggestion(s) · {res.get('ambiguousCount', 0)} ambiguous (not suggested)"
              f" · {res.get('alreadyAccepted', 0)} already accepted"]
     if res.get("truncated"):
         lines.append("- INCOMPLETE: " + ", ".join((res.get("truncation") or [])[:8])
                      + ("…" if len(res.get("truncation") or []) > 8 else "")
                      + " — `accept --all-unique` is refused until this is resolved")
-    lines.append("- Nothing is changed by this command. `memlet admin anchors accept ID…` (or `--all-unique`) stores the "
-                 "anchor in `.memlet/config.json`; your files are never edited. Check that the rule really means that code.")
     if res.get("suggestions"):
         lines += ["", "### Suggestions", ""]
         for s in res["suggestions"]:
@@ -1096,6 +1307,12 @@ def format_suggestions(res: Dict[str, Any]) -> str:
             more = a.get("candidateCount", 0) - len(a["candidates"])
             lines.append(f"- `{a['source']}:{a['line']}` `{a['mention']}`: {a['reason']}"
                          + (f" — candidates: {cands}" if cands else "") + (f" (+{more} more)" if more > 0 else ""))
+    lines += ["", "### Accepting", "",
+              f"- {levels.get('file+symbol', 0)} file+symbol: `memlet admin anchors accept --all-unique` (accepts only these)",
+              f"- {levels.get('single-definition-found', 0)} single-definition-found: by id only, after checking each: "
+              "`memlet admin anchors accept ID…`",
+              "- Nothing is changed by this command. Accepting stores the anchor in `.memlet/config.json`; your files are "
+              "never edited."]
     return "\n".join(lines) + "\n"
 
 
@@ -1117,8 +1334,10 @@ def _validate_entry(e: Any) -> Optional[str]:
     """None when `e` is a well-formed sidecar entry, else why not."""
     if not isinstance(e, dict):
         return "entry_not_an_object"
-    if "sectionPath" not in e:
+    if "sectionPath" not in e or "sectionSha256" not in e:
         return "older_entry_format_accept_again"
+    if not (isinstance(e.get("sectionSha256"), str) and re.fullmatch(r"[0-9a-f]{64}", e["sectionSha256"])):
+        return "invalid_sectionSha256"
     sp = e.get("sectionPath")
     if not (isinstance(sp, list) and len(sp) <= MAX_SECTION_DEPTH
             and all(isinstance(t, str) and len(t) <= MAX_SECTION_TITLE for t in sp)):
@@ -1140,7 +1359,7 @@ def _validate_entry(e: Any) -> Optional[str]:
     basis = pin.get("basis")
     if basis is not None and not (isinstance(basis, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", basis)):
         return "invalid_pin"
-    if e.get("id") != suggestion_id(e["source"], e["ruleSha256"], anchor, sp):
+    if e.get("id") != suggestion_id(e["source"], e["ruleSha256"], anchor, e["sectionSha256"]):
         return "id_does_not_match_entry"
     line = e.get("line")
     if not (isinstance(line, int) and not isinstance(line, bool) and line > 0):
@@ -1153,6 +1372,7 @@ def entry_digest(e: Dict[str, Any]) -> str:
     of it is detected rather than reported as if accepted)."""
     pin = {k: e["pin"].get(k) for k in ("ast", "sig", "req", "basis", "types", "shape")}
     return _sha256(json.dumps({"id": e["id"], "source": e["source"], "sectionPath": list(e["sectionPath"]),
+                               "sectionSha256": e["sectionSha256"],
                                "line": e["line"], "ruleSha256": e["ruleSha256"], "anchor": e["anchor"], "pin": pin},
                               sort_keys=True))
 
@@ -1208,7 +1428,8 @@ def _checked_entries(root: Path, config: Optional[Dict[str, Any]]) -> Tuple[List
                              "source": e.get("source") if isinstance(e, dict) else None, "reason": why})
             continue
         seen.add(e["id"])
-        good.append({"id": e["id"], "source": e["source"], "sectionPath": list(e["sectionPath"]), "line": e["line"],
+        good.append({"id": e["id"], "source": e["source"], "sectionPath": list(e["sectionPath"]),
+                     "sectionSha256": e["sectionSha256"], "line": e["line"],
                      "ruleSha256": e["ruleSha256"], "anchor": e["anchor"],
                      "pin": {k: e["pin"].get(k) for k in ("ast", "sig", "req", "basis", "types", "shape")}})
     return good, rejected
@@ -1262,7 +1483,7 @@ def sidecar_index(root: Path, config: Optional[Dict[str, Any]] = None) -> Dict[s
                 reason = "rule_not_read_as_a_rule"  # e.g. beyond the reader's per-file limit, or no longer a list item
             else:
                 hit = hits[0]
-                if hit["sectionPath"] != e["sectionPath"]:
+                if hit["sectionSha256"] != e["sectionSha256"]:
                     reason = "rule_moved_to_another_section"
                 elif _written_anchor(hit):
                     reason = "rule_has_written_anchor"
@@ -1360,7 +1581,7 @@ def _guard(command: str, root: Path, dry_run: bool, fn, **extra: Any) -> Dict[st
             return fn()
     except mw.ConcurrentChangeError as exc:
         return _refusal(command, root, f"{exc}; nothing was written. Run the command again (it re-reads the "
-                        "current .memlet/config.json)", dry_run, concurrentChange=True, **extra)
+                        "current .memlet/config.json)", dry_run, concurrentChange=True, **extra)  # see the threat model
     except mw.UnsafePathError as exc:
         return _refusal(command, root, f"{exc}; nothing was written", dry_run, **extra)
     except (OSError, ValueError, sqlite3.Error, TimeoutError) as exc:
@@ -1377,7 +1598,15 @@ def _read_config_bound(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[s
         return None, None, mw.content_tag(None)
     data = mw.read_regular_bytes(p, mw.MAX_CONFIG_BYTES)
     if data is None:
-        return None, f".memlet/config.json is unreadable or larger than {mw.MAX_CONFIG_BYTES} bytes", ""
+        try:
+            size = os.lstat(str(p)).st_size
+        except OSError:
+            size = -1
+        if size > mw.MAX_CONFIG_BYTES:
+            return None, (f".memlet/config.json is {size} bytes, over the {mw.MAX_CONFIG_BYTES}-byte limit Memlet reads, "
+                          "so Memlet cannot change it safely; nothing was written. Recover by editing it by hand: "
+                          "shrink or remove the unrelated key that grew"), ""
+        return None, ".memlet/config.json is unreadable", ""
     try:
         cfg = json.loads(data.decode("utf-8"))
     except ValueError as exc:
@@ -1389,6 +1618,16 @@ def _read_config_bound(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[s
 
 def _config_text(config: Dict[str, Any]) -> str:
     return json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _too_big(text: str) -> Optional[str]:
+    """An error when the serialised config would exceed what every reader accepts (checked before any write)."""
+    size = len(text.encode("utf-8"))
+    if size > mw.MAX_CONFIG_BYTES:
+        return (f"the new .memlet/config.json would be {size} bytes, over the {mw.MAX_CONFIG_BYTES}-byte limit every "
+                "Memlet reader accepts; nothing was written and the old file is intact. Shrink the largest unrelated key "
+                "by hand, or drop entries, then run the command again")
+    return None
 
 
 def _ledger_events(root: Path, events: List[Tuple[str, str, str]], snaps: List[Dict[str, Any]]) -> None:
@@ -1419,8 +1658,8 @@ def _pins_elsewhere(root: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def accept_suggestions(repo_path=".", ids=(), *, all_unique=False, dry_run=False) -> Dict[str, Any]:
-    """Accept suggestions (by id, or every current suggestion with `all_unique`) as sidecar anchors: a pinning event,
-    like `init`. Suggestions are recomputed under the write lock, so an id always refers to the current rule text.
+    """Accept suggestions as sidecar anchors: by id (any level), or with `all_unique` every current `file+symbol`
+    suggestion (never a `single-definition-found` one). A pinning event, like `init`. Suggestions are recomputed under the write lock, so an id always refers to the current rule text.
     Accepting the id of an already attached entry re-pins it to the current code (after the human reviewed it).
     Refused without writing: an existing or resulting state over MAX_SIDECAR_ENTRIES, `all_unique` on an incomplete
     scan, a config.json changed by another program meanwhile. Never edits a file outside `.memlet/`."""
@@ -1447,7 +1686,9 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
                         dry_run, accepted=[], truncation=found["truncation"])
     current = {s["id"]: s for s in found["suggestions"]}
     attached = {e["id"]: e for e in sidecar_index(root, config)["attached"]}
-    selected_new = list(current) if all_unique else []
+    # bulk acceptance takes only file+symbol; a single-definition-found proposal needs its id (a human look)
+    selected_new = [i for i, s in current.items() if s["confidence"] == "file+symbol"] if all_unique else []
+    not_bulk = sorted(i for i, s in current.items() if s["confidence"] != "file+symbol") if all_unique else []
     repins, unknown = [], []
     for i in ids:
         if i in current:
@@ -1477,6 +1718,7 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
             pin = {"ast": fp["ast"], "sig": fp.get("sig") or None, "req": fp.get("req"), "basis": fp.get("basis"),
                    "types": fp.get("types"), "shape": fp.get("shape")}
         new_entries[i] = {"id": i, "source": s["source"], "sectionPath": list(s["sectionPath"]),
+                          "sectionSha256": s["sectionSha256"],
                           "line": s.get("currentLine") or s["line"], "ruleSha256": s["ruleSha256"],
                           "anchor": s["anchor"], "pin": pin}
         (repinned if i in repins else accepted).append(i)
@@ -1489,6 +1731,7 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
                     key=lambda e: str(e.get("id")) if isinstance(e, dict) else "")
     actions: List[Dict[str, str]] = []
     res = {"command": "anchors accept", "repoPath": str(root), "dryRun": dry_run, "accepted": accepted,
+           "notAcceptedInBulk": not_bulk,
            "repinned": repinned, "reusedExistingPin": sorted(reused), "unknown": unknown, "refused": refused,
            "entries": [new_entries[i] for i in sorted(new_entries)], "actions": actions,
            "baselineNotice": "Accepting records the current code as the baseline of each rule; it does not verify "
@@ -1498,6 +1741,9 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
             config = mw._base_config(mw._git_head(root), mw.discover_instruction_files(root))
         config = dict(config)
         config[SIDECAR_KEY] = merged
+        big = _too_big(_config_text(config))
+        if big:
+            return _refusal("anchors accept", root, big, dry_run, accepted=[])
         if dry_run:
             actions += [{"op": "would-update", "path": mw.CONFIG_PATH}, {"op": "would-update", "path": mw.LEDGER_PATH}]
         else:
@@ -1507,16 +1753,24 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
             actions.append({"op": "update", "path": mw.CONFIG_PATH})
             snaps = [mw.classify_anchor(root, {"path": e["anchor"].rsplit("::", 1)[0], "symbol": e["anchor"].rsplit("::", 1)[1],
                                                "pin": e["pin"]}) for e in new_entries.values()]
+            records_before = _ledger_records(root)
             try:
                 _ledger_events(root, [(i, entry_digest(e), "accept") for i, e in sorted(new_entries.items())], snaps)
             except (sqlite3.Error, OSError, ValueError) as exc:
-                done = sorted(new_entries)
+                states = {}
+                for i, e in sorted(new_entries.items()):
+                    rec = records_before.get(i)
+                    states[i] = ("unchanged from a recorded acceptance: still in effect"
+                                 if rec is not None and rec[1] == "accept" and rec[0] == entry_digest(e)
+                                 else "new or changed: not in effect until accepted again")
+                pending = [i for i, st in states.items() if st.startswith("new")]
                 res.update(ok=False, exitCode=1, partialWrite=True, written=[mw.CONFIG_PATH], notWritten=[mw.LEDGER_PATH],
-                           error=(f"the ledger could not be written ({exc}) after .memlet/config.json was updated with "
-                                  f"{len(done)} entr{'y' if len(done) == 1 else 'ies'} ({', '.join(done)}). Those entries "
-                                  "are NOT in effect (every reader rejects them as not_recorded_by_accept). To recover, "
-                                  "fix the ledger and run `memlet admin anchors accept " + " ".join(done) + "` again, or "
-                                  "remove them with `memlet admin anchors drop " + " ".join(done) + "`."))
+                           entryStates=states,
+                           error=(f"the ledger could not be written ({exc}) after .memlet/config.json was updated. Per "
+                                  "entry: " + "; ".join(f"{i}: {st}" for i, st in states.items()) + "."
+                                  + (" To recover, fix the ledger and run `memlet admin anchors accept " + " ".join(pending)
+                                     + "` again, or remove them with `memlet admin anchors drop " + " ".join(pending) + "`."
+                                     if pending else "")))
                 res["formatted"] = f"## Memlet anchors accept\n\n- ERROR: {res['error']}\n- written: `{mw.CONFIG_PATH}`\n"
                 return res
             actions.append({"op": "update", "path": mw.LEDGER_PATH})
@@ -1532,6 +1786,9 @@ def _accept_locked(root: Path, ids: List[str], all_unique: bool, dry_run: bool) 
     lines += [f"- {'would re-pin' if dry_run else 're-pinned'} `{i}` → `{new_entries[i]['anchor']}`" for i in repinned]
     lines += [f"- UNKNOWN `{i}` (not a current suggestion or attached entry; run `memlet admin anchors suggest`)" for i in unknown]
     lines += [f"- REFUSED `{r['id']}` `{r['anchor']}`: {r['reason']}" for r in refused]
+    if not_bulk:
+        lines.append(f"- {len(not_bulk)} single-definition-found suggestion(s) were not accepted: --all-unique takes "
+                     "only file+symbol; check each and accept it by id (`memlet admin anchors accept ID…`)")
     if not (accepted or repinned or unknown or refused):
         lines.append("- Nothing to accept.")
     lines.append("- Your files were not edited" + (" and nothing was written." if dry_run else "; the anchors live in `.memlet/config.json`."))
@@ -1563,6 +1820,9 @@ def _drop_locked(root: Path, ids: List[str], dry_run: bool) -> Dict[str, Any]:
     if dropped:
         config = dict(config)
         config[SIDECAR_KEY] = [e for e in raw if not (isinstance(e, dict) and e.get("id") in dropped)]
+        big = _too_big(_config_text(config))
+        if big:
+            return _refusal("anchors drop", root, big, dry_run, dropped=[])
         if dry_run:
             actions += [{"op": "would-update", "path": mw.LEDGER_PATH}, {"op": "would-update", "path": mw.CONFIG_PATH}]
         else:
