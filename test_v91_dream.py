@@ -58,7 +58,7 @@ class DreamFixture(unittest.TestCase):
     def proposer(self, vendor, prompt, **kwargs):
         if prompt == dc.VERIFY_PROMPT:
             return '{"verdict":"SUPPORTED"}'
-        fid = kwargs["stdin_text"].split(":", 1)[0]
+        fid = json.loads(kwargs["stdin_text"].splitlines()[0])["id"].rsplit(":", 1)[0]
         cand = {"category": "repeated_pitfall", "title": "Broken cache path", "scope_tag": "cache.py",
                 "src_spans": [fid + ":1"], "edges": [{"edge_type": "BLOCKS", "target": "cache.py"}]}
         return json.dumps([cand])
@@ -143,7 +143,7 @@ class SubmitRunTests(DreamFixture):
                        {"category": "fiction"}, {"edges": [{"edge_type": "BLOCKS", "target": "cache.py", "src_span": "outside.log:1"}]}):
             invalid.append(dict(c, **change))
         r = dc.dream_submit(self.repo, b["runId"], b["batchId"], invalid, proposer="host")
-        self.assertTrue(r["ok"], r)
+        self.assertFalse(r["ok"], r)
         self.assertEqual(4, len(r["rejected"]))
         self.assertEqual([], r["added"])
         self.assertFalse((self.repo / mb.QUEUE_REL).exists())
@@ -714,7 +714,7 @@ class ReviewRegressionTests(DreamFixture):
         b = dc.dream_next(self.repo, batch_tokens=128)
         last = b["rows"][-1][1]+1
         result = dc.dream_submit(self.repo, b["runId"], b["batchId"], [self.candidate(b, line=last)], proposer="host")
-        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["ok"], result)
         self.assertEqual("citation outside supplied batch", result["rejected"][0]["reason"])
 
     def test_stale_trusted_proposer_citation_is_rehashed(self):
