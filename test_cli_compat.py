@@ -152,6 +152,11 @@ class Sandbox:
             ("consolidate-dry-run", store + ["consolidate", "--dry-run"]),
             ("heal-skills-dry-run", store + ["heal-skills", "--dry-run"]),
             ("read-missing", store + ["read", "--id", "nope"]),
+            ("recall-shared-prefix", store + ["recall", "--s"]),
+            ("learn-file-prefix-stdin", store + ["learn", "--f", "-"], "{}"),
+            ("rule-recall-safety-prefix", ["rule-recall", "deploy release", "--s"]),
+            ("read-size-prefix", store + ["read", "--id", "nope", "--s", "5"]),
+            ("check-format-prefix", ["check", ".", "--f", "markdown"]),
         ]
 
 
