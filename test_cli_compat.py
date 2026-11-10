@@ -21,7 +21,7 @@ GOLDEN = HERE / "testdata" / "cli_golden.json"
 
 LEGACY_COMMANDS = [
     "schema", "brief", "stats", "scenes", "doctor", "backup", "restore", "repo-benchmark", "audit", "check",
-    "init", "wiki", "import", "slim-plan", "dream-build", "dream", "dream-recall",
+    "init", "wiki", "import", "slim-plan", "dream-build", "dream-recall",
     "rule-context", "rule-recall", "index-build", "brief-build", "handover", "compare-bench", "benchmark-compare",
     "heal-skills", "verify-skill", "preflight", "capsule", "consolidate", "sync-md",
     "benchmark", "inspector", "ui", "export", "capture", "recall", "read", "skills", "skill", "cases", "links",
@@ -124,7 +124,6 @@ class Sandbox:
             ("benchmark", ["benchmark", "."]),
             ("compare-bench-markdown", ["compare-bench", "--format", "markdown"]),
             ("dream-build", ["dream-build", "--snapshot", str(self.logs), "--out-json", q]),
-            ("dream-alias", ["dream", "--snapshot", str(self.logs), "--out-json", q]),
             ("dream-recall", ["dream-recall", "--graph", q, "--snapshot", str(self.logs), "--query", "git-hooks"]),
             ("dream-recall-markdown", ["dream-recall", "--graph", q, "--snapshot", str(self.logs), "--format", "markdown", "--query", "git-hooks"]),
             ("dream-recall-no-snapshot-arg", ["dream-recall", "--graph", q, "--query", "git-hooks"]),

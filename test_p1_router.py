@@ -138,7 +138,6 @@ LEGACY_OPTION_DESTINATIONS = {
     'import': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--from': 'source', '--dry-run': 'dry_run', '--format': 'format'},
     'slim-plan': {'-h': 'help', '--help': 'help', '--out': 'out', '--keep-recent': 'keep_recent', '--split-rules': 'split_rules'},
     'dream-build': {'-h': 'help', '--help': 'help', '--candidates': 'candidates', '--snapshot': 'snapshot', '--out-json': 'out_json', '--out-db': 'out_db', '--vendor': 'vendor'},
-    'dream': {'-h': 'help', '--help': 'help', '--candidates': 'candidates', '--snapshot': 'snapshot', '--out-json': 'out_json', '--out-db': 'out_db', '--vendor': 'vendor'},
     'dream-recall': {'-h': 'help', '--help': 'help', '--graph': 'graph', '--query': 'query', '--budget': 'budget', '--max-tokens': 'budget', '--snapshot': 'snapshot', '--out-md': 'out_md', '--format': 'format'},
     'rule-context': {'-h': 'help', '--help': 'help', '--core-budget': 'core_budget', '--index-budget': 'index_budget', '--auto': 'auto', '--threshold': 'threshold'},
     'rule-recall': {'-h': 'help', '--help': 'help', '--repo': 'repo', '--k': 'k', '--safety': 'safety'},
@@ -225,7 +224,7 @@ class LegacyPrefixTests(unittest.TestCase):
                                 value = [value]
                             self.assertEqual(value, getattr(parsed, expected))
                 count += 1
-        self.assertEqual(1004, count)
+        self.assertEqual(969, count)
 
 
 class DeprecationTests(unittest.TestCase):
