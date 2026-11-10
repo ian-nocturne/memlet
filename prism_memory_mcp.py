@@ -289,7 +289,13 @@ def mcp_tools():
 
 
 def memlet_tools():
-    """Bounded repository tools. Protocol 2024-11-05 predates tool annotations."""
+    """Bounded repository tools.
+
+    Each tool carries MCP tool annotations. Hosts that gate tool calls on them (Codex blocks or prompts for every
+    tool without `readOnlyHint` in its default approval mode) can then run the three read-only tools without
+    asking, while `memlet_learn`, which writes the pending queue, still goes through the host's approval.
+    Hosts that predate annotations ignore the extra key.
+    """
     def string(limit=4096):
         return {'type': 'string', 'minLength': 1, 'maxLength': limit}
 
@@ -326,6 +332,10 @@ def memlet_tools():
              'inputSchema': {'type': 'object', 'properties': dict(repo_path=string(), **props),
                              'required': required, 'additionalProperties': False}}
             for name, description, props, required in specs]
+    read_only = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}
+    for tool in tools[:-1]:
+        tool['annotations'] = dict(read_only)
+    tools[-1]['annotations'] = {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}
     tools[-1]['inputSchema']['allOf'] = [
         {'if': {'properties': {'action': {'const': 'transcript'}}, 'required': ['action']},
          'then': {'required': ['transcript_path']}}]

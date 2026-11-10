@@ -547,7 +547,7 @@ import memory_intelligence
 from prism_memory import memlet_bridge as bridge
 from prism_memory import memlet_dream as dream
 from prism_memory.memlet_wiki import init_project
-from prism_memory_mcp import PrismMemoryMCPServer, SERVER_VERSION
+from prism_memory_mcp import PrismMemoryMCPServer, SERVER_VERSION, mcp_tools
 
 
 class MemletMCPTests(unittest.TestCase):
@@ -839,6 +839,20 @@ class MemletMCPTests(unittest.TestCase):
             learn.assert_not_called()
         self.assertTrue(result['isError'])
         self.assertIn('symlink', result['structuredContent']['error'])
+
+    def test_tool_annotations_mark_the_three_read_only_tools_and_not_learn(self):
+        # A live Codex session blocked every memlet tool in non-interactive mode because none carried
+        # `readOnlyHint`; hosts gate tool calls on these annotations.
+        tools = {tool['name']: tool for tool in mcp_tools() if tool['name'].startswith('memlet_')}
+        self.assertEqual({'memlet_check', 'memlet_recall', 'memlet_handover', 'memlet_learn'}, set(tools))
+        for name in ('memlet_check', 'memlet_recall', 'memlet_handover'):
+            self.assertIs(True, tools[name]['annotations']['readOnlyHint'], name)
+            self.assertIs(False, tools[name]['annotations']['destructiveHint'], name)
+        self.assertIs(False, tools['memlet_learn']['annotations']['readOnlyHint'])
+        self.assertIs(False, tools['memlet_learn']['annotations']['destructiveHint'])
+        for tool in mcp_tools():
+            if not tool['name'].startswith('memlet_'):
+                self.assertNotIn('annotations', tool, tool['name'])
 
     def test_known_agent_roots_and_trusted_environment_override(self):
         home = self.root / 'home'
