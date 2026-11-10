@@ -64,9 +64,10 @@ def _strip_docstring_from_body(body_nodes):
 def normalized_symbol_ast_hash(node) -> str:
     """Compute a docstring/comment/lineno-invariant AST hash for a function or class."""
     try:
-        cloned = copy.copy(node)
-        if hasattr(cloned, "body") and isinstance(cloned.body, list):
-            cloned.body = _strip_docstring_from_body(cloned.body)
+        cloned = copy.deepcopy(node)
+        for child in ast.walk(cloned):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                child.body = _strip_docstring_from_body(child.body)
         return _sha256_text(ast.dump(cloned, annotate_fields=True, include_attributes=False))
     except Exception:
         return _sha256_text(ast.dump(node, annotate_fields=True, include_attributes=False))
@@ -197,10 +198,11 @@ def _split_top_level_commas(text: str):
     depth_paren = 0
     depth_brace = 0
     depth_brack = 0
-    for ch in text or "":
+    masked, _ = _blank_js_comments_preserve_lines(text or "", blank_strings=True)
+    for idx, ch in enumerate(masked):
         if ch == "<":
             depth_angle += 1
-        elif ch == ">" and depth_angle > 0:
+        elif ch == ">" and depth_angle > 0 and (idx == 0 or masked[idx - 1] != "="):
             depth_angle -= 1
         elif ch == "(":
             depth_paren += 1
@@ -220,7 +222,7 @@ def _split_top_level_commas(text: str):
                 parts.append(token)
             buf = []
             continue
-        buf.append(ch)
+        buf.append(text[idx])
     tail = "".join(buf).strip()
     if tail:
         parts.append(tail)
@@ -234,7 +236,7 @@ def _parse_ts_js_params(raw_params: str):
     all_args = []
     has_vararg = False
     for idx, tok in enumerate(_split_top_level_commas(raw_params)):
-        cleaned = re.sub(r"/\*.*?\*/", "", tok).strip()
+        cleaned = _blank_js_comments_preserve_lines(tok)[0].strip()
         if not cleaned:
             continue
         # Remove access modifiers in TS constructors (public, private, protected, readonly)
@@ -244,10 +246,11 @@ def _parse_ts_js_params(raw_params: str):
             continue
         has_default = False
         depth = 0
-        for i, c in enumerate(cleaned):
+        masked = _blank_js_comments_preserve_lines(cleaned, blank_strings=True)[0]
+        for i, c in enumerate(masked):
             if c in "<({[":
                 depth += 1
-            elif c in ">)}]" and depth > 0:
+            elif c in ">)}]" and depth > 0 and not (c == ">" and i and masked[i - 1] == "="):
                 depth -= 1
             elif c == "=" and depth == 0 and (i == 0 or cleaned[i - 1] != "=") and (i + 1 >= len(cleaned) or cleaned[i + 1] not in ("=", ">")):
                 has_default = True
@@ -500,134 +503,210 @@ def _strip_js_comments(text: str) -> str:
     return "\n".join(ln.strip() for ln in blanked.splitlines() if ln.strip())
 
 
-def _build_ts_func_sig(is_async: bool, raw_params: str, body_text: str) -> dict:
+def _js_hash_tokens(text: str) -> List[str]:
+    """Comment/indentation-invariant tokens, retaining literals and line breaks.
+
+    This is a lexical approximation, not a JS parser: automatic semicolon
+    insertion, regex/division ambiguity and JSX prevent claiming AST exactness.
+    """
+    clean, _ = _blank_js_comments_preserve_lines(text)
+    pattern = re.compile(
+        r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"
+        r"|[A-Za-z_$][\w$]*|(?:\d+(?:\.\d+)?)|===|!==|=>|==|!=|<=|>=|\+\+|--|&&|\|\||\?\?|\*\*|\.\.\.|[^\s]",
+        re.S,
+    )
+    tokens = []
+    end = 0
+    for match in pattern.finditer(clean):
+        if tokens and "\n" in clean[end:match.start()]:
+            tokens.append("\n")  # ASI makes line breaks semantically significant.
+        tokens.append(match.group())
+        end = match.end()
+    return tokens
+
+
+def _balanced_end(mask: str, start: int) -> int:
+    """Return the end (exclusive) of a balanced group in lexically masked JS."""
+    pairs = {"(": ")", "[": "]", "{": "}", "<": ">"}
+    if start >= len(mask) or mask[start] not in pairs:
+        return -1
+    # Angle brackets are only structural when explicitly scanning generics;
+    # comparisons inside a parameter default must not hide the closing ')'.
+    opening = mask[start]
+    depth = 0
+    for i in range(start, len(mask)):
+        ch = mask[i]
+        if ch == opening:
+            depth += 1
+        elif ch == pairs[opening] and not (ch == ">" and i and mask[i - 1] == "="):
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _skip_js_space(mask: str, pos: int) -> int:
+    while pos < len(mask) and mask[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _ts_parameters(mask: str, pos: int):
+    """Locate a complete parameter list, including nested callback/generic types."""
+    pos = _skip_js_space(mask, pos)
+    if pos < len(mask) and mask[pos] == "<":
+        pos = _balanced_end(mask, pos)
+        if pos < 0:
+            return None
+        pos = _skip_js_space(mask, pos)
+    if pos < len(mask) and mask[pos] == "(":
+        end = _balanced_end(mask, pos)
+        return (pos + 1, end - 1, end) if end >= 0 else None
+    m = re.match(r"[A-Za-z_$][\w$]*", mask[pos:])
+    return (pos, pos + m.end(), pos + m.end()) if m else None
+
+
+def _ts_body_start(mask: str, pos: int, arrow: bool):
+    """Skip a return annotation, including object, callback and generic types."""
+    pos = _skip_js_space(mask, pos)
+    annotation = pos < len(mask) and mask[pos] == ":"
+    type_start = pos + 1 if annotation else pos
+    if annotation:
+        pos += 1
+    while pos < len(mask):
+        pos = _skip_js_space(mask, pos)
+        if mask.startswith("=>", pos):
+            if arrow:
+                return _skip_js_space(mask, pos + 2), pos
+            pos += 2
+            continue
+        if pos >= len(mask) or mask[pos] == ";":
+            return None
+        ch = mask[pos]
+        if ch == "{":
+            prefix = mask[type_start:pos].rstrip()
+            # An object type starts an annotation or follows a type operator.
+            is_type = annotation and (not prefix or prefix[-1:] in ("|", "&", ":", "?") or prefix.endswith("=>"))
+            if not is_type and not arrow:
+                return pos, pos
+            if not annotation and arrow:
+                return None
+        if ch in "([{<":
+            end = _balanced_end(mask, pos)
+            if end < 0:
+                return None
+            pos = end
+        elif not annotation:
+            return None
+        else:
+            pos += 1
+    return None
+
+
+def _build_ts_func_sig(is_async: bool, raw_params: str, body_text: str, return_type: str = "", type_parameters: str = "") -> dict:
     req_args, opt_args, all_args, has_vararg = _parse_ts_js_params(raw_params)
-    norm_body = _sha256_text(_strip_js_comments(body_text))
+    contract = {"kind": "function", "isAsync": bool(is_async),
+                "parameters": _js_hash_tokens(raw_params), "returnType": _js_hash_tokens(return_type),
+                "typeParameters": _js_hash_tokens(type_parameters)}
     sig = {
-        "kind": "function",
-        "isAsync": bool(is_async),
-        "posonlyArgs": [],
-        "regularArgs": all_args,
-        "reqArgs": req_args,
-        "optArgs": opt_args,
-        "allArgs": all_args,
-        "kwonlyReq": [],
-        "kwonlyAll": [],
-        "hasVararg": has_vararg,
-        "hasKwarg": False,
-        "normAstHash": norm_body,
+        "kind": "function", "isAsync": bool(is_async), "posonlyArgs": [],
+        "regularArgs": all_args, "reqArgs": req_args, "optArgs": opt_args, "allArgs": all_args,
+        "kwonlyReq": [], "kwonlyAll": [], "hasVararg": has_vararg, "hasKwarg": False,
+        "normAstHash": _digest({"contract": contract, "body": _js_hash_tokens(body_text)}),
+        "sigHash": _digest(contract),
+        "hashExact": False, "hashReason": "ts_js_lexical_scan_unverified",
     }
-    sig["sigHash"] = _digest({
-        "kind": "function",
-        "isAsync": bool(is_async),
-        "reqArgs": req_args,
-        "allArgs": all_args,
-        "hasVararg": has_vararg,
-    })
     return sig
 
 
 def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
-    """Extract function, arrow function, HOC wrapper, class, method, interface, and type contracts from TS/JS."""
+    """Extract contracts with balanced parameter scans and literal-preserving hashes."""
     src_text, syntax_ok = _blank_js_comments_preserve_lines(raw_src_text, blank_strings=True)
     sigs = {}
 
     def _line_of(idx: int) -> int:
-        # Skip leading whitespace/newlines consumed by `^[ \t]*` so the line points at the declaration itself.
         while idx < len(src_text) and src_text[idx] in " \t\r\n":
             idx += 1
         return src_text.count("\n", 0, idx) + 1
 
-    # 1. Standard function declarations: [export] [default] [async] function Name[<T>](params)
+    def _callable(pos, is_async=False, arrow=False):
+        params = _ts_parameters(src_text, pos)
+        if params is None:
+            return None
+        pstart, pend, end = params
+        body = _ts_body_start(src_text, end, arrow)
+        if body is None:
+            return None
+        bstart, rend = body
+        if bstart < len(src_text) and src_text[bstart] == "{":
+            bend = _balanced_end(src_text, bstart)
+            if bend < 0:
+                return None
+        else:
+            # Expression arrows: scan balanced groups until a statement/wrapper boundary.
+            bend = bstart
+            while bend < len(src_text) and src_text[bend] not in ";,)}":
+                if src_text[bend] in "([{":
+                    next_pos = _balanced_end(src_text, bend)
+                    if next_pos < 0:
+                        return None
+                    bend = next_pos
+                else:
+                    bend += 1
+        sig = _build_ts_func_sig(is_async, raw_src_text[pstart:pend], raw_src_text[bstart:bend],
+                                 raw_src_text[end:rend], raw_src_text[pos:pstart - 1] if src_text[_skip_js_space(src_text, pos):].startswith("<") else "")
+        return sig
+
     func_pat = re.compile(
-        r"(?m)^[ \t]*(?:export[ \t]+)?(default[ \t]+)?(?:declare[ \t]+)?(async[ \t]+)?function[ \t]*\*?[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?:<[^>({\n]*>)?[ \t]*\(([^)]*)\)"
-    )
+        r"(?m)^[ \t]*(?:export[ \t]+)?(default[ \t]+)?(?:declare[ \t]+)?(async[ \t]+)?"
+        r"function[ \t]*\*?[ \t]+([A-Za-z_$][\w$]*)")
     for m in func_pat.finditer(src_text):
-        is_default = bool(m.group(1))
-        is_async = bool(m.group(2))
-        name = m.group(3)
-        raw_params = m.group(4) or ""
-        brace_pos = src_text.find("{", m.end())
-        body_block = _extract_brace_block(src_text, brace_pos) if brace_pos != -1 else m.group(0)
-        sig = _build_ts_func_sig(is_async, raw_params, body_block)
-        sig["line"] = _line_of(m.start())
-        sigs[name] = sig
-        if is_default and re.match(r"[ \t]*export\b", src_text[m.start():].lstrip("\n")):
-            sigs["default"] = sig
+        sig = _callable(m.end(), bool(m.group(2)))
+        if sig:
+            sig["line"] = _line_of(m.start())
+            sigs[m.group(3)] = sig
+            if m.group(1):
+                sigs["default"] = sig
 
-    # 1b. Anonymous default exports: `export default function(...)`, `export default async (...) =>`, `export default x =>`
-    anon_default_pat = re.compile(
-        r"(?m)^[ \t]*export[ \t]+default[ \t]+(?:(async[ \t]+)?function[ \t]*\*?[ \t]*(?:<[^>({\n]*>)?[ \t]*\(([^)]*)\)"
-        r"|(async[ \t]+)?(?:<[^>({\n]*>\s*)?(?:\(([^)]*)\)|([A-Za-z_$][A-Za-z0-9_$]*))\s*(?::[^=\n>]+)?=>)"
-    )
-    for m in anon_default_pat.finditer(src_text):
-        if "default" in sigs:
-            break
-        is_async = bool(m.group(1) or m.group(3))
-        if m.group(2) is not None:
-            raw_params = m.group(2)
-        elif m.group(4) is not None:
-            raw_params = m.group(4)
-        else:
-            raw_params = m.group(5) or ""
-        rest = src_text[m.end():].lstrip()
-        if rest.startswith("{"):
-            brace_pos = src_text.find("{", m.end())
-            body_block = _extract_brace_block(src_text, brace_pos)
-        else:
-            body_block = rest.splitlines()[0] if rest else m.group(0)
-        sig = _build_ts_func_sig(is_async, raw_params, body_block)
-        sig["line"] = _line_of(m.start())
-        sigs["default"] = sig
-
-    # 2. Arrow function / function expression assignments (supports both `(a, b) =>` and single-identifier `x =>`)
-    arrow_pat = re.compile(
-        r"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?::[^=\n]+)?=\s*(async[ \t]+)?(?:<[^>({\n]*>\s*)?(?:\(([^)]*)\)|([A-Za-z_$][A-Za-z0-9_$]*))\s*(?::[^=\n>]+)?=>"
-    )
-    for m in arrow_pat.finditer(src_text):
-        name = m.group(1)
-        is_async = bool(m.group(2))
-        raw_params = m.group(3) if m.group(3) is not None else (m.group(4) or "")
-        rest = src_text[m.end():].lstrip()
-        if rest.startswith("{"):
-            brace_pos = src_text.find("{", m.end())
-            body_block = _extract_brace_block(src_text, brace_pos)
-        else:
-            body_block = rest.splitlines()[0] if rest else m.group(0)
-        sig = _build_ts_func_sig(is_async, raw_params, body_block)
-        sig["line"] = _line_of(m.start())
-        sigs[name] = sig
-
-    # 2b. React / generic HOC wrappers (supports single or nested `memo(forwardRef(...))`, `withAuth(...)`, multiline)
-    hoc_pat = re.compile(
-        r"(?m)^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?::[^=\n]+)?=\s*)?"
-        r"(?:[A-Za-z_$][A-Za-z0-9_$.]*\s*(?:<[^>(\n]*>)?\s*\(\s*)+"
-        r"(?:(async[ \t]+)?function(?:[ \t]+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\(([^)]*)\)|(async[ \t]+)?(?:\(([^)]*)\)|([A-Za-z_$][A-Za-z0-9_$]*))\s*=>)"
-    )
-    for m in hoc_pat.finditer(src_text):
-        var_name = m.group(1)
-        fn_async = bool(m.group(2) or m.group(5))
-        fn_name = m.group(3)
-        raw_params = (
-            m.group(4)
-            if m.group(4) is not None
-            else (m.group(6) if m.group(6) is not None else (m.group(7) or ""))
-        )
-        brace_pos = src_text.find("{", m.end())
-        body_block = _extract_brace_block(src_text, brace_pos) if brace_pos != -1 else m.group(0)
-        sig = _build_ts_func_sig(fn_async, raw_params, body_block)
-        sig["line"] = _line_of(m.start())
-        if var_name:
-            sigs[var_name] = sig
-        if fn_name:
-            sigs[fn_name] = sig
+    # Assignments, anonymous defaults and nested HOC wrappers share the same scanner.
+    assign_pat = re.compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*"
+        r"(?::[^=\n]+)?=|^[ \t]*export[ \t]+default[ \t]+")
+    for m in assign_pat.finditer(src_text):
+        name = m.group(1) or "default"
+        if name in sigs:
+            continue
+        pos = _skip_js_space(src_text, m.end())
+        for _ in range(32):  # bounded nesting of wrappers such as memo(forwardRef(...))
+            am = re.match(r"async\b\s*", src_text[pos:])
+            fnpos = pos + am.end() if am else pos
+            fm = re.match(r"function\b\s*\*?\s*([A-Za-z_$][\w$]*)?", src_text[fnpos:])
+            sig = _callable(fnpos + fm.end() if fm else fnpos, bool(am), arrow=not bool(fm))
+            if sig:
+                sig["line"] = _line_of(m.start())
+                sigs[name] = sig
+                if fm and fm.group(1):
+                    sigs[fm.group(1)] = sig
+                break
+            wrapper = re.match(r"[A-Za-z_$][\w$.]*\s*", src_text[pos:])
+            if not wrapper:
+                break
+            pos += wrapper.end()
+            if pos < len(src_text) and src_text[pos] == "<":
+                pos = _balanced_end(src_text, pos)
+                if pos < 0:
+                    break
+            pos = _skip_js_space(src_text, pos)
+            if pos >= len(src_text) or src_text[pos] != "(":
+                break
+            pos = _skip_js_space(src_text, pos + 1)
 
     # 3. Classes and their methods: [export] [default] [abstract] class Name
     class_pat = re.compile(
         r"(?m)^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[^{;\n]*\{"
     )
     method_pat = re.compile(
-        r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|override|abstract)[ \t]+)*(async[ \t]+)?([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?:<[^>({\n]*>)?[ \t]*\(([^)]*)\)[ \t]*(?::[^{\n;]+)?\{"
+        r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|override|abstract)[ \t]+)*(async[ \t]+)?([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?=[<(])"
     )
     reserved_keywords = {"if", "for", "while", "switch", "catch", "function", "return", "sizeof", "typeof"}
     by_short_method = {}
@@ -642,10 +721,9 @@ def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
             m_name = mm.group(2)
             if m_name in reserved_keywords:
                 continue
-            m_params = mm.group(3) or ""
-            m_brace = cls_block.find("{", mm.end() - 1)
-            m_body = _extract_brace_block(cls_block, m_brace) if m_brace != -1 else mm.group(0)
-            msig = _build_ts_func_sig(m_async, m_params, m_body)
+            msig = _callable(brace_pos + mm.end(), m_async)
+            if msig is None:
+                continue
             msig["line"] = _line_of(brace_pos + mm.start())
             if m_name == "constructor":
                 ctor_sig = msig
@@ -669,7 +747,7 @@ def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
             "kwonlyAll": [],
             "hasVararg": ctor_sig["hasVararg"] if ctor_sig else False,
             "hasKwarg": False,
-            "normAstHash": _sha256_text(_strip_js_comments(cls_block)),
+            "normAstHash": _digest(_js_hash_tokens(raw_src_text[cm.start():brace_pos + len(cls_block)])),
         }
         cls_sig["sigHash"] = _digest({
             "kind": "class",
@@ -726,7 +804,7 @@ def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
             "kwonlyAll": [],
             "hasVararg": False,
             "hasKwarg": False,
-            "normAstHash": _sha256_text(_strip_js_comments(iface_block)),
+            "normAstHash": _digest(_js_hash_tokens(raw_src_text[im.start():brace_pos + len(iface_block)])),
         }
         isig["sigHash"] = _digest({
             "kind": "interface",
@@ -744,7 +822,7 @@ def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
         tname = tm.group(1)
         if tname in sigs:
             continue
-        rhs = tm.group(2).strip()
+        rhs = _js_hash_tokens(raw_src_text[tm.start(2):tm.end(2)])
         tsig = {
             "kind": "type",
             "isAsync": False,
@@ -757,8 +835,8 @@ def _extract_ts_js_signatures(raw_src_text: str) -> Tuple[bool, dict]:
             "kwonlyAll": [],
             "hasVararg": False,
             "hasKwarg": False,
-            "normAstHash": _sha256_text(rhs),
-            "sigHash": _sha256_text(rhs),
+            "normAstHash": _digest(rhs),
+            "sigHash": _digest(rhs),
         }
         tsig["line"] = _line_of(tm.start())
         sigs[tname] = tsig
@@ -945,7 +1023,7 @@ def extract_file_symbol_signatures(file_path):
     return res
 
 
-def extract_file_symbol_hashes(file_path):
+def extract_file_symbol_hashes(file_path, *, legacy: bool = False):
     """Extract per-symbol SHA256 hashes from a source file via AST (Python) or polyglot contract extractor."""
     p = Path(file_path)
     try:
@@ -956,7 +1034,7 @@ def extract_file_symbol_hashes(file_path):
             return {}
         key = (str(p), st.st_mtime_ns, st.st_size)
         cached = _FILE_HASH_AST_CACHE.get(key)
-        if cached is not None and cached[1] is not None:
+        if not legacy and cached is not None and cached[1] is not None:
             return cached[1]
         raw_bytes = p.read_bytes()
         sha = cached[0] if cached is not None else hashlib.sha256(raw_bytes).hexdigest()
@@ -975,7 +1053,7 @@ def extract_file_symbol_hashes(file_path):
             for qname, name, is_nested, node in scoped_nodes:
                 try:
                     norm_dump = ast.dump(node, annotate_fields=True, include_attributes=False)
-                    hval = _sha256_text(norm_dump)
+                    hval = _sha256_text(norm_dump) if legacy else normalized_symbol_ast_hash(node)
                 except Exception:
                     start_ln = max(0, getattr(node, "lineno", 1) - 1)
                     end_ln = getattr(node, "end_lineno", start_ln + 1)
@@ -989,7 +1067,8 @@ def extract_file_symbol_hashes(file_path):
                     symbol_hashes[short_name] = entries[0][1]
                 else:
                     symbol_hashes[short_name] = _digest({qn: hv for qn, hv in sorted(entries)})
-            _FILE_HASH_AST_CACHE[key] = (sha, symbol_hashes)
+            if not legacy:
+                _FILE_HASH_AST_CACHE[key] = (sha, symbol_hashes)
             return symbol_hashes
         except SyntaxError:
             pass

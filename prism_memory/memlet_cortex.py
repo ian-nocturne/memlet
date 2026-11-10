@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Optional
 
 MAX_CARDS = 24
 MAX_DEAD_ENDS = 6
-_ORBIT_CAPS = {"active": 18, "compatible-unverified": 12, "stale": 10}
-_STATES = ("active", "compatible-unverified", "stale")
+_ORBIT_CAPS = {"active": 18, "compatible-unverified": 12, "stale": 10, "path-exists": 0, "unpinned": 0}
+_STATES = ("active", "compatible-unverified", "stale", "path-exists", "unpinned")
 
 
 def _e(value: Any) -> str:
@@ -63,7 +63,7 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
 def _cortex_data(ws: Dict[str, Any]) -> Dict[str, Any]:
     """Select and order what the client needs; never invents values."""
     anchors = [dict(a, status=_status(a.get("status"))) for a in ws.get("anchors") or []]
-    rank = {"stale": 0, "compatible-unverified": 1, "active": 2}
+    rank = {"stale": 0, "compatible-unverified": 1, "active": 4, "path-exists": 3, "unpinned": 2}
     ordered = sorted(enumerate(anchors), key=lambda p: (rank[p[1]["status"]], p[0]))
     shown = [a for _i, a in ordered[:MAX_CARDS]]
     h = ws.get("handover") or None
@@ -72,7 +72,8 @@ def _cortex_data(ws: Dict[str, Any]) -> Dict[str, Any]:
     if h:
         rejected = list(h.get("rejectedApproaches") or [])
         handover = {k: h.get(k) for k in ("schema", "repoHead", "activeConstraints", "reverifyBeforeUse",
-                                          "quarantinedStaleAnchors", "omitted", "capsuleSignature",
+                                          "quarantinedStaleAnchors", "omitted", "capsuleSignature", "checksum",
+                                          "pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints",
                                           "tokenEstimate", "tokenBudget", "authorityBoundary")}
         handover["rejectedApproaches"] = rejected[:MAX_DEAD_ENDS]
     led = ws.get("ledger") or {}
@@ -153,6 +154,8 @@ def _hero(ws: Dict[str, Any], wid: str) -> str:
     if n:
         headline, sub = (f"{n} rule{'s' if n != 1 else ''} stopped steering your agent",
                          "quarantined · never injected into the next model")
+    elif counts["path-exists"] or counts["unpinned"]:
+        headline, sub = "Some anchors have no verified baseline", "path existence and unpinned symbols are not verified"
     elif total:
         headline, sub = "Every anchored rule still matches the code", "nothing quarantined in this workspace"
     else:
@@ -371,8 +374,8 @@ JS = r"""
   'use strict';
   var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var NS='http://www.w3.org/2000/svg';
-  var CLS={'active':'ok','compatible-unverified':'warn','stale':'bad','dead':'dead'};
-  var COLOR={'active':'#10B981','compatible-unverified':'#F59E0B','stale':'#F43F5E','dead':'#A78BFA'};
+  var CLS={'active':'ok','compatible-unverified':'warn','stale':'bad','path-exists':'warn','unpinned':'warn','dead':'dead'};
+  var COLOR={'active':'#10B981','compatible-unverified':'#F59E0B','stale':'#F43F5E','path-exists':'#F59E0B','unpinned':'#F59E0B','dead':'#A78BFA'};
   var REVERIFY={
     'unpinned':'Re-verify first — anchor is unpinned, so no baseline hash exists to compare',
     'optional_args_added_signature_compatible':'Re-verify first — an optional argument was added; required signature unchanged',
@@ -476,7 +479,7 @@ JS = r"""
     }
     var TRIM_KEY={'active':'s-active','compatible-unverified':'s-warn','stale':'s-bad','dead':'s-dead'};
     function slotsFor(it){ return slotsBy[it.id]||(trimSlots[TRIM_KEY[it.status]]?[trimSlots[TRIM_KEY[it.status]]]:[]); }
-    function outFor(it){ return outEls[it.status]||outEls.dead; }
+    function outFor(it){ return outEls[it.status]||outEls['compatible-unverified']; }
     function dispText(it){
       if(!H) return 'no capsule';
       var d=disp[it.anchor];
