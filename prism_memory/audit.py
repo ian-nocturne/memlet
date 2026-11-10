@@ -21,6 +21,7 @@ from pathlib import Path
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -517,6 +518,92 @@ def _compute_git_diff_changes(
     return diff_info
 
 
+_COMPOUND_SUFFIXES = (".gz", ".bz2", ".xz", ".zst", ".zip", ".tar", ".tgz", ".br")
+_RUNTIME_ROOTS = {"state", "data", "outputs", "output", "out", "cache", ".cache", "tmp", "logs", "log", "runs",
+                  "artifacts", "work", "receipts", "telemetry", "var", "test-results", "ci-shards", "coverage", "playwright-report",
+                  "results", "rehearsal_logs"}
+_INSTRUCTION_NAMES = {"agents.md", "claude.md", "gemini.md", "skill.md", ".cursorrules", "copilot-instructions.md"}
+# A reference is only treated as intentional when the marker is attached to *that* occurrence.
+_ATTACHED_BEFORE_RE = re.compile(
+    r"(?:--out(?:put)?(?:-dir|-file)?[=\s]+|(?:^|\s)-o\s+|>\s*|→\s*|->\s*|\b(?:writes?|saves?|stores?|emits?|dumps?)\b[^`\x22\x27\n]{0,30}?\bto\s+|\bwrites?\s+|\bsaved?\s+(?:to|as)\s+|"
+    r"\b(?:output|outputs|produces|generates)\s*:?\s*|\be\.g\.,?\s*|\bfor\s+example,?\s*|예\s*:\s*|예시\s*:?\s*|출력\s*:\s*|생성\s*:\s*)"
+    r"[`\"'(\[]*$",
+    re.IGNORECASE,
+)
+_ATTACHED_AFTER_RE = re.compile(r"^[`\"')\]]*\s*(?:에|로|으로)\s*(?:저장|기록|작성|생성|출력)", re.IGNORECASE)
+_REQUIRED_NEAR_RE = re.compile(r"\b(?:required|must|read|load|requires?|before)\b|필수|반드시|읽(?:어|고|은|기)|먼저", re.IGNORECASE)
+_HISTORICAL_SEGMENTS = {"archive", "archives", "snapshot", "snapshots", "context", "history", "postmortems"}
+_HISTORICAL_NAME_RE = re.compile(r"(?:REPORT|AUDIT|RETRO|POSTMORTEM|REVIEW|ACCEPTANCE|EVIDENCE|PREREG)[^/]*\.md$", re.IGNORECASE)
+_DATED_NAME_RE = re.compile(r"(?:19|20)\d{2}-?[01]\d-?[0-3]\d")  # dated review/report snapshots, e.g. *_20261016.md
+_FOREIGN_SEGMENTS = {"bug-reproductions", "reproductions", "upstream", "vendor", "third_party", "third-party"}
+_RUNTIME_DATA_EXTS = (".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".log", ".sqlite", ".sqlite3", ".db", ".parquet")
+
+
+def _occurrences(line: str, clean_p: str):
+    """Yield (before, after) context for every standalone-looking occurrence of `clean_p` in `line`."""
+    for m in re.finditer(re.escape(clean_p), line):
+        yield line[max(0, m.start() - 60):m.start()], line[m.end():m.end() + 30]
+
+
+def _occurrence_is_not_a_repo_path(before: str, after: str) -> Optional[str]:
+    if re.search(r"(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|~)/?$", before) or re.search(r"\$\{?$", before):
+        return "shell_variable_or_home_expansion"
+    if re.search(r"file://[^\s)`'\"]*$", before):
+        return "file_uri_external"
+    if any(after.startswith(sfx) for sfx in _COMPOUND_SUFFIXES):
+        return "compound_suffix_phantom"
+    return None
+
+
+def _classify_unresolved_reference(line: str, clean_p: str, doc_rel: str, root: Path, doc_dir: Path) -> Optional[Tuple[str, str]]:
+    """Explain why an unresolved reference is not a confirmed broken path (conservative, per occurrence).
+
+    None keeps the `missing_path` error. ("skip", why) only when *every* occurrence of the path on the line is part
+    of a shell variable, a file:// URI or a longer compressed file name. ("warning", why) only for an occurrence with
+    an attached example/output marker, a template placeholder, or a non-instruction historical document — and never
+    when the same line says the file is required / must be read."""
+    occ = list(_occurrences(line, clean_p))
+    if occ:
+        reasons = [_occurrence_is_not_a_repo_path(b, a) for b, a in occ]
+        if all(reasons):
+            return ("skip", reasons[0])
+    if re.search(r"YYYY|MM-DD|<[^>]+>|\*|\{[^}]*\}", clean_p):
+        return ("skip", "template_placeholder")
+    required = bool(_REQUIRED_NEAR_RE.search(line))
+    if required:
+        return None
+    if any(_ATTACHED_BEFORE_RE.search(b) or _ATTACHED_AFTER_RE.search(a) for b, a in occ):
+        if clean_p.split("/", 1)[0].lower() in _RUNTIME_ROOTS:
+            return ("warning", "generated_output_path")
+        return ("warning", "example_or_planned_output")
+    if re.search(r"(?:\bDrive\b|드라이브|Google\s*Drive|iCloud)\s*`?" + re.escape(clean_p), line, re.IGNORECASE):
+        return ("warning", "external_drive_reference")
+    doc_name = doc_rel.rsplit("/", 1)[-1].lower()
+    if doc_name not in _INSTRUCTION_NAMES:
+        # data files under a runtime root (state/…/status.json) are written by the program at run time
+        if clean_p.split("/", 1)[0].lower() in _RUNTIME_ROOTS and clean_p.lower().endswith(_RUNTIME_DATA_EXTS):
+            return ("warning", "runtime_data_file")
+        segs = {s.lower() for s in doc_rel.split("/")[:-1]}
+        if segs & _FOREIGN_SEGMENTS:
+            return ("warning", "foreign_codebase_reference")
+        if segs & _HISTORICAL_SEGMENTS or _HISTORICAL_NAME_RE.search(doc_rel) or _DATED_NAME_RE.search(doc_name):
+            return ("warning", "historical_document_reference")
+    return None
+
+
+def _node_accepts_syntax(path: Path) -> Optional[bool]:
+    """`node --check` verdict for JS files when Node is installed; None when it cannot be asked."""
+    if path.suffix.lower() not in (".js", ".mjs", ".cjs"):
+        return None
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        return subprocess.run([node, "--check", str(path)], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def audit_repository(
     repo_path: str | Path,
     *,
@@ -931,6 +1018,21 @@ def audit_repository(
                     if exp_sym is None and "/" not in clean_p:
                         if raw_p.strip().startswith("./") or not clean_p.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")) or not run_bare_re.search(line):
                             continue
+                    verdict = _classify_unresolved_reference(line, clean_p, doc_rel, root, doc_path.parent)
+                    if verdict and verdict[0] == "skip":
+                        continue
+                    if verdict:
+                        _add_finding(
+                            rule_id="unverified_path",
+                            severity="warning",
+                            doc_rel=doc_rel,
+                            line_no=idx,
+                            target_path=clean_p,
+                            symbol=exp_sym,
+                            message=f"`{doc_rel}:{idx}`의 `{clean_p}`는 저장소에 없지만 의도된 참조일 수 있어요 ({verdict[1]}).",
+                            remediation="예시·계획·생성물·과거 기록이면 그대로 두고, 현재 지침이라면 경로를 고치세요.",
+                        )
+                        continue
                     _add_finding(
                         rule_id="missing_path",
                         severity="error",
@@ -958,6 +1060,18 @@ def audit_repository(
                 resolved_line_files.append((rel_target, candidate, sig_info))
 
                 if resolution == "parse_error" or (not syntax_ok and resolution in ("exact", "contract")):
+                    if exp_sym is None and _node_accepts_syntax(candidate):
+                        _add_finding(
+                            rule_id="parser_disagreement",
+                            severity="warning",
+                            doc_rel=doc_rel,
+                            line_no=idx,
+                            target_path=rel_target,
+                            symbol=exp_sym,
+                            message=f"`{rel_target}`는 Node가 문법을 통과시켰지만 Memlet 경량 파서는 해석하지 못했어요.",
+                            remediation="심볼 앵커는 수동 검토 대상으로 두세요.",
+                        )
+                        continue
                     _add_finding(
                         rule_id="syntax_error",
                         severity="error",

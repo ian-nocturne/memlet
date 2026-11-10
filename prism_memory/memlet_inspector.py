@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import memlet_wiki
+from . import memlet_cortex, memlet_wiki
 from .audit import audit_repository
 
 INSPECTOR_SCHEMA = "nocturne-memlet-inspector/v1"
@@ -163,6 +163,11 @@ def _live_workspace(root: Path, errors: List[str]) -> Dict[str, Any]:
     except Exception as exc:
         errors.append(f"handover: {type(exc).__name__}")
         ws["handover"] = None
+    try:
+        ws["ontologyLineage"] = memlet_cortex._load_dream_lineage({"path": str(root)})
+    except Exception as exc:
+        errors.append(f"ontologyLineage: {type(exc).__name__}")
+        ws["ontologyLineage"] = None
     return ws
 
 
@@ -281,7 +286,7 @@ def _demo_workspace() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Benchmark, simulator, Routlet matrix, Pro packs
+# Benchmark, simulator, Routlet matrix, Harness packs
 
 
 def _benchmark_block(errors: List[str]) -> Optional[Dict[str, Any]]:
@@ -348,7 +353,7 @@ ROUTLET_MATRIX: Dict[str, Any] = {
     ],
 }
 
-PRO_PACKS = [
+HARNESS_PACKS = [
     {"id": "nextjs-supabase", "name": "Next.js + Supabase", "stack": "App Router · Route Handlers · Supabase Auth/RLS",
      "rules": 38, "anchors": 24,
      "guards": ["Route handler signature pins", "Service-role key never in client bundles", "RLS policy drift check"]},
@@ -386,8 +391,8 @@ def build_inspector_payload(repo_path: str = ".") -> Dict[str, Any]:
         "benchmark": _benchmark_block(errors),
         "simulator": dict(SIMULATOR_DEFAULTS),
         "routletMatrix": ROUTLET_MATRIX,
-        "proPacks": PRO_PACKS,
-        "pricing": {"inspector": "$19/mo Pro", "harnessPack": "$29 Pro Pack"},
+        "harnessPacks": HARNESS_PACKS,
+        "license": "Apache-2.0",
         "externalNetworkCalls": 0,
         "errors": errors,
     }
@@ -464,7 +469,7 @@ background:var(--acc);color:#fff;font-weight:500}.btn.ghost{background:transpare
 textarea.md{width:100%;min-height:200px;margin-top:12px;background:#0C0D13;color:var(--mut);border:1px solid var(--line);
 border-radius:10px;padding:12px;font:12px/1.5 var(--mono);resize:vertical}
 .sig{font-family:var(--mono);font-size:12px;word-break:break-all;color:#C7C9FF}
-.price{font-size:13px;color:var(--mut)}.price b{color:var(--fg);font-size:20px}
+.packmeta{font-size:12.5px;color:var(--mut)}.packmeta code{color:var(--fg)}
 footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);color:var(--dim);font-size:12px;display:flex;
 flex-wrap:wrap;gap:12px;justify-content:space-between}
 [hidden]{display:none!important}
@@ -782,22 +787,22 @@ def _tab_routing(payload: Dict[str, Any]) -> str:
         + "".join(f'<tr><td>{_e(role)}</td><td class="mono">{_e(model)}</td><td class="mono hash">{_e(effort)}</td></tr>'
                   for role, model, effort in t.get("lanes") or []) + '</tbody></table></div></div>'
         for t in topo)
-    pricing = payload.get("pricing") or {}
+    license_label = payload.get("license") or "Apache-2.0"
     packs = "".join(
         f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:baseline"><h3>{_e(p.get("name"))}</h3>'
         f'<span class="pill acc">{_e(p.get("id"))}</span></div><p class="sub">{_e(p.get("stack"))}</p>'
         f'<div class="grid g2"><div><div class="lbl">Rules</div><div class="kpi">{_e(p.get("rules"))}</div></div>'
         f'<div><div class="lbl">Anchors</div><div class="kpi">{_e(p.get("anchors"))}</div></div></div>'
         f'<ul class="items" style="margin-top:12px">' + "".join(f'<li>{_e(g)}</li>' for g in p.get("guards") or []) +
-        f'</ul><p class="price" style="margin:12px 0 0"><b>{_e(pricing.get("harnessPack"))}</b> · preview</p></div>'
-        for p in payload.get("proPacks") or [])
+        f'</ul><p class="packmeta" style="margin:12px 0 0"><code>memlet pack --stack {_e(p.get("id"))}</code> · {_e(license_label)}</p></div>'
+        for p in payload.get("harnessPacks") or [])
     return (f'<div class="grid"><div class="grid g3">{fams}</div>'
             f'<p class="sub" style="margin:0">Evidence as of {_e(m.get("evidenceAsOf"))} · {_e(m.get("evidenceSource"))}</p>'
             f'<div class="card"><div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center">'
             f'<div><h3>Orchestration topology</h3><p class="sub" style="margin:0">Routlet proposes; you select. Memlet gates every hop.</p></div>'
             f'<div class="seg" data-topology-switch role="group" aria-label="topology">{buttons}</div></div><div style="margin-top:14px">{panels}</div></div>'
-            f'<div><h3 style="margin:8px 0 4px;font-size:14px">Pro Harness Packs · preview</h3>'
-            f'<p class="sub">Pre-anchored rule sets for common stacks. Contents are a preview and may change.</p>'
+            f'<div><h3 style="margin:8px 0 4px;font-size:14px">Stack Harness Packs · {_e(license_label)}</h3>'
+            f'<p class="sub">Pre-anchored rule sets for common stacks, included under {_e(license_label)}.</p>'
             f'<div class="grid g3">{packs}</div></div></div>')
 
 
@@ -818,17 +823,18 @@ def render_inspector_html(payload: Dict[str, Any]) -> str:
     notice = f'<p class="notice">{_e(payload.get("showcaseReason"))}</p>' if payload.get("showcaseReason") else ""
     errs = payload.get("errors") or []
     err_html = f'<p class="notice" style="border-color:rgba(244,63,94,.35);color:#FDA4AF">Some probes failed: {_e("; ".join(errs))}</p>' if errs else ""
-    tabs = (("t-health", "AST Anchor Health & Wiki Ledger", _tab_health),
+    tabs = (("t-cortex", "Memory Cortex", memlet_cortex.tab_cortex),
+            ("t-health", "AST Anchor Health & Wiki Ledger", _tab_health),
             ("t-bench", "Refactoring Benchmark & Delta Simulator", _tab_benchmark),
             ("t-handover", "Handover Capsule", _tab_handover),
-            ("t-routing", "Routing Matrix & Pro Packs", _tab_routing))
+            ("t-routing", "Routing Matrix & Harness Packs", _tab_routing))
     tab_buttons = "".join(
         f'<button type="button" role="tab" id="{tid}-tab" aria-controls="{tid}" aria-selected="{"true" if i == 0 else "false"}" '
         f'tabindex="{0 if i == 0 else -1}">{i + 1} · {_e(label)}</button>' for i, (tid, label, _f) in enumerate(tabs))
     panels = "".join(
         f'<section role="tabpanel" id="{tid}" aria-labelledby="{tid}-tab"{"" if i == 0 else " hidden"}>{fn(payload)}</section>'
         for i, (tid, _l, fn) in enumerate(tabs))
-    pricing = payload.get("pricing") or {}
+    license_label = payload.get("license") or "Apache-2.0"
     doc = (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -836,19 +842,19 @@ def render_inspector_html(payload: Dict[str, Any]) -> str:
         'script-src \'unsafe-inline\'; img-src data:; base-uri \'none\'; form-action \'none\'">'
         '<meta name="referrer" content="no-referrer">'
         f'<title>Nocturne Memory &amp; Routing Inspector · {_e(payload.get("repoName"))}</title>'
-        f'<style>{_CSS}</style></head>'
+        f'<style>{_CSS}{memlet_cortex.CSS}</style></head>'
         f'<body data-ws="{default_ws}" data-filter="all"><div class="wrap">'
         f'<header class="top"><div class="brand"><div class="logo" aria-hidden="true"></div><div>'
         f'<h1>Nocturne Memory &amp; Routing Inspector</h1><p>Nocturne Lab · Memlet {_e(payload.get("memletVersion"))} · '
         f'<span class="mono">{_e(payload.get("repoName"))}</span></p></div></div>'
-        f'<div style="display:flex;gap:8px;flex-wrap:wrap"><span class="pill acc">memlet ui · {_e(pricing.get("inspector"))}</span>'
+        f'<div style="display:flex;gap:8px;flex-wrap:wrap"><span class="pill acc">memlet ui · {_e(license_label)}</span>'
         f'<span class="pill">read-only</span><span class="pill">0 network calls</span></div></header>'
         f'<div class="controls"><div class="seg" data-ws-switch role="group" aria-label="workspace">{ws_buttons}</div>'
         f'<div class="seg" data-filter-switch role="group" aria-label="anchor status filter">{filters}</div></div>'
         f'{notice}{err_html}<nav class="tabs" role="tablist" aria-label="inspector sections">{tab_buttons}</nav>{panels}'
         f'<footer><span>Generated offline by <span class="mono">memlet ui</span> · schema <span class="mono">{_e(payload.get("schema"))}</span>'
         f'</span><span>Self-contained file · no CDN · host paths scrubbed to <span class="mono">&lt;repo&gt;</span></span></footer>'
-        f'</div><script>{_JS}</script></body></html>')
+        f'</div><script>{_JS}</script><script>{memlet_cortex.JS}</script></body></html>')
     # Final belt-and-braces pass: no home-directory path may survive in the document.
     return _HOME_PATH_RE.sub(html.escape(REPO_PLACEHOLDER), doc)
 

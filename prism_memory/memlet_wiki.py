@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -83,6 +84,7 @@ TOP_INSTRUCTION_FILES = (
 )
 INSTRUCTION_GLOBS = (".cursor/rules/*.md", ".cursor/rules/*.mdc", ".github/instructions/*.md")
 NESTED_INSTRUCTION_NAMES = ("CLAUDE.md", "AGENTS.md", "SKILL.md")
+_SCRATCH_DIRS = {"_workspace", "worktrees", ".worktrees"}
 
 
 def _is_secret_path(rel: str) -> bool:
@@ -106,8 +108,13 @@ def _git_head(root: Path) -> Optional[str]:
     return sha if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha) else None
 
 
-def discover_instruction_files(root: Path) -> List[str]:
-    """Return sorted repo-relative paths of agent instruction files (never `.env*`)."""
+def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> List[str]:
+    """Return sorted repo-relative paths of agent instruction files (never `.env*`).
+
+    exclude_snapshots=True also drops copies kept under snapshot folders, matched by whole folder name only
+    (runs, outputs, artifacts, archive(s), snapshot(s), tmp, cache, backup(s), bak, old, or names ending
+    _backup/-bak/.old): they are old snapshots, not current instructions. Dated names such as backup_20261101 are
+    NOT matched, and current folders like backup-service/ are kept. Default unchanged."""
     found = set()
 
     def _add(p: Path) -> None:
@@ -125,14 +132,22 @@ def discover_instruction_files(root: Path) -> List[str]:
     for pat in INSTRUCTION_GLOBS:
         for p in root.glob(pat):
             _add(p)
-    for name in NESTED_INSTRUCTION_NAMES:
-        for p in root.rglob(name):
-            try:
-                parts = p.relative_to(root).parts
-            except ValueError:
-                continue
-            if len(parts) <= 4 and not any(part in EXCLUDED_DIRS or part == MEMLET_DIR for part in parts):
-                _add(p)
+    # Walk with pruning instead of rglob: skip excluded dirs, scratch worktree folders, and any nested git
+    # repository/worktree (a sub-directory holding its own `.git`), whose instructions belong to that repo.
+    names = set(NESTED_INSTRUCTION_NAMES)
+    for cur, dirs, files in os.walk(root):
+        rel_parts = Path(cur).relative_to(root).parts
+        if rel_parts and (root / Path(*rel_parts) / ".git").exists():
+            dirs[:] = []
+            continue
+        if len(rel_parts) >= 3:  # same depth as before: files at most 3 directories below the root
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and d != MEMLET_DIR and d not in _SCRATCH_DIRS]
+        for f in files:
+            if f in names:
+                _add(Path(cur) / f)
+    if exclude_snapshots:
+        found = {f for f in found if not any(_SNAPSHOT_SEGMENT_RE.search(seg) for seg in f.split("/")[:-1])}
     return sorted(found)
 
 
@@ -661,7 +676,16 @@ IMPORT_PAGE = ".memlet/wiki/imported-rules.md"
 HANDOVER_PAGE = ".memlet/wiki/HANDOVER.md"
 IMPORT_SOURCES = ("auto", "claude-md", "cursorrules", "ai-memory", "claude-mem")
 _MEMORY_DIRS = {"ai-memory": ".ai-memory", "claude-mem": ".claude-mem"}
+BRIEF_PAGE = ".memlet/wiki/BRIEF.md"  # written by `memlet brief-build`; never read back as wiki rule text
+RULE_INDEX_PAGE = ".memlet/wiki/INDEX-RULES.md"  # written by `memlet index-build`; never read back as wiki rule text
 _GENERATED_PAGES = (INDEX_PATH, IMPORT_PAGE, HANDOVER_PAGE)
+# BRIEF.md / INDEX-RULES.md count as generated only when they carry their generator's marker: a page a person wrote
+# under the same name keeps being read as ordinary wiki rules.
+_MARKED_GENERATED_PAGES = {BRIEF_PAGE: "<!-- memlet:brief-meta ", RULE_INDEX_PAGE: "<!-- memlet:index-meta "}
+
+
+def _is_generated_page(rel: str, text: str) -> bool:
+    return rel in _GENERATED_PAGES or (rel in _MARKED_GENERATED_PAGES and _MARKED_GENERATED_PAGES[rel] in text)
 RULE_STATES = ANCHOR_STATES + ("unanchored",)
 _MAX_SOURCE_FILES = 400
 _MAX_SOURCE_BYTES = 1_000_000
@@ -1038,11 +1062,47 @@ def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, 
 # `memlet handover`: a signed capsule that only carries context Memlet could verify.
 
 HANDOVER_SCHEMA = "routlet-memlet-handover/v1"
-HANDOVER_TOKEN_BUDGET = 500
+HANDOVER_TOKEN_BUDGET = 500  # default; per call (`--budget`) or per repo (`config.json` handover.tokenBudget)
+HANDOVER_BUDGET_MIN, HANDOVER_BUDGET_MAX = 500, 2000
+HANDOVER_AUTO_RATIO = 0.12  # `auto`: about 12% of the instruction text the capsule stands in for, clamped to [min, max]
+_HANDOVER_QUARANTINE_FLOOR = 3  # stale anchors kept in the capsule under budget pressure, as long as the budget allows
+_HANDOVER_ANCHOR_LIMIT = 96
+
+
+def _bounded_anchor(anchor: str) -> str:
+    """Keep anchors identifiable but bounded: long paths become `head…#sha8::symbol`."""
+    if len(anchor) <= _HANDOVER_ANCHOR_LIMIT:
+        return anchor
+    digest = hashlib.sha256(anchor.encode("utf-8")).hexdigest()[:8]
+    path, _, symbol = anchor.rpartition("::")
+    keep = max(16, _HANDOVER_ANCHOR_LIMIT - len(symbol) - 14)
+    return f"{path[:keep]}…#{digest}::{symbol}" if symbol else f"{anchor[:_HANDOVER_ANCHOR_LIMIT - 10]}…#{digest}"
 AUTHORITY_BOUNDARY = "read-only-context-only: execution and external side-effect approvals are NOT inherited"
 HANDOVER_SIGNED_FIELDS = ("schema", "repoHead", "activeConstraints", "reverifyBeforeUse", "quarantinedStaleAnchors",
                           "rejectedApproaches", "executionProof", "nextAction", "authorityBoundary", "omitted")
 _HANDOVER_LIST_CAP = 40
+DIGEST_SIGNED_FIELDS = ("mode", "projectRules")
+HANDOVER_MODES = ("verified", "digest", "brief", "index")
+INDEX_SIGNED_FIELDS = ("mode", "quotedRules", "ruleIndex", "staleIndex", "indexSource")
+BRIEF_SIGNED_FIELDS = ("mode", "briefRules", "staleBrief", "briefSource")
+_DIGEST_TEXT_LIMIT = 200
+_DIGEST_STALE_SHOWN = 3
+# instruction copies inside run outputs / backups are snapshots of old rules, not the project's current instructions
+# Snapshot folders for opt-in discovery exclusion: whole-segment names only, so current folders such as
+# `backup-service/` or `output-format/` keep their instructions; `pre_v10_backup/`, `runs/`, `outputs/` do not.
+_SNAPSHOT_SEGMENT_RE = re.compile(
+    r"^(?:runs?|outputs?|artifacts?|archives?|snapshots?|tmp|\.?cache|backups?|bak|old)$"
+    r"|[_.-](?:backup|bak|old)$|^(?:pre|old)[_-].*[_-](?:backup|bak)$", re.I)
+_DIGEST_SKIP_SEGMENT_RE = re.compile(r"^(?:runs?|outputs?|artifacts?|archives?|snapshots?|tmp|\.?cache)$|backup|\bbak\b|_old$|^old$", re.I)
+_DIGEST_STRONG_RE = re.compile(
+    r"\b(?:must(?:\s+not)?|never|always|do\s+not|don't|only|required?|forbidden|prohibited|mandatory|shall|no\s+\w+\s+without)\b"
+    r"|금지|반드시|필수|절대|하지\s*(?:마|않)|만\s|승인|허용(?:하지|되지)|안\s*돼|않아요|말아요", re.I)
+_DIGEST_RISK_RE = re.compile(
+    r"\b(?:secrets?|credentials?|tokens?|api\s*keys?|\.env|paid|billing|live|deploy|push|commit|delete|rm\s+-rf|force|"
+    r"approv\w*|budget|quota|production|real\s+money|trading|publish|upload)\b|비밀|키|결제|유료|과금|실거래|배포|푸시|커밋|삭제|승인|게시|업로드|한도",
+    re.I)
+_DIGEST_SECTION_RE = re.compile(r"rule|constraint|safety|guard|policy|principle|must|never|don't|do not|forbid|금지|원칙|규칙|주의|필수|안전", re.I)
+_DIGEST_SOURCE_TAIL_RE = re.compile(r"\s+—\s+source\s+`[^`]*`.*$")
 _HANDOVER_TEXT_LIMIT = 160
 _NEXT_ACTION_LIMIT = 300
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
@@ -1063,9 +1123,15 @@ def estimate_tokens(text: str) -> int:
     return total
 
 
+def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
+    # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
+    extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
+    return HANDOVER_SIGNED_FIELDS + extra
+
+
 def handover_signature(capsule: Dict[str, Any]) -> str:
     """SHA-256 over the canonical JSON of the signed capsule fields."""
-    payload = {k: capsule.get(k) for k in HANDOVER_SIGNED_FIELDS}
+    payload = {k: capsule.get(k) for k in _signed_fields(capsule)}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -1084,7 +1150,8 @@ def _git_modified_count(root: Path) -> Optional[int]:
     """Working-tree entries from `git status --porcelain`, ignoring Memlet's own `.memlet/` files."""
     try:
         out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
-                             cwd=str(root), capture_output=True, text=True, timeout=10)
+                             cwd=str(root), capture_output=True, text=True, timeout=10,
+                             env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))  # read-only: never take .git/index.lock
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -1110,12 +1177,58 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
         "",
         "### Active constraints (AST-verified)",
     ]
-    lines += [f"- {a['rule']} (`{a['source']}`)" for a in c["activeConstraints"]] or ["- (none)"]
+    lines += [f"- {a['rule']} (`{a['source']}`" + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "")
+              + ")" for a in c["activeConstraints"]] or ["- (none)"]
+    if c.get("mode") == "index":
+        src = c.get("indexSource") or {}
+        lines += ["", "### Key rules (quoted verbatim from the instruction files; source unchanged since the index was built)"]
+        for a in c.get("quotedRules") or []:
+            lines.append(f"- [{a['topic']}] `{a['source']}`:")
+            lines += [f"  > {q}" for q in a["quote"].splitlines()]
+        if not c.get("quotedRules"):
+            lines.append("- (none — run `memlet index-build` to create the index)" if not src else "- (none fit the budget)")
+        lines += ["", "### Rule index — BEFORE acting on any of these topics, read the cited lines "
+                  f"(topics chosen by {src.get('via') or 'n/a'} at {src.get('builtAt') or 'n/a'}; not listing a rule here does "
+                  "not mean it does not exist)"]
+        lines += [f"- {a['topic']} → `{a['source']}`" for a in c.get("ruleIndex") or []] or ["- (none)"]
+        if c["omitted"].get("ruleIndex"):
+            lines.append(f"- {c['omitted']['ruleIndex']} more index entr(y/ies) omitted for the token budget; read the "
+                         "project instructions for anything not listed here")
+        held = len(c.get("staleIndex") or []) + c["omitted"].get("staleIndex", 0)
+        if held:
+            lines.append(f"- WARNING: {held} indexed rule(s) changed since the index was built (re-read before relying on "
+                         "them): " + "; ".join(f"{a['topic']} `{a['source']}`" for a in (c.get("staleIndex") or [])))
+    if c.get("mode") == "brief":
+        src = c.get("briefSource") or {}
+        lines += ["", f"### Project brief (LLM-written by {src.get('via') or 'n/a'} at {src.get('builtAt') or 'n/a'}; cited "
+                  "instruction text unchanged since then — meaning and code behaviour are NOT verified; follow unless current "
+                  "instructions say otherwise)"]
+        lines += [f"- {a['rule']} (`{a['source']}`)" for a in c.get("briefRules") or []] or [
+            "- (none — run `memlet brief-build` to create one)"]
+        if c["omitted"].get("briefRules"):
+            lines.append(f"- {c['omitted']['briefRules']} lower-priority brief line(s) omitted for the token budget; read the "
+                         "project instructions for anything not listed here")
+        held = len(c.get("staleBrief") or []) + c["omitted"].get("staleBrief", 0)
+        if held:
+            lines.append(f"- WARNING: {held} brief line(s) held back because their cited instructions changed: "
+                         + "; ".join(f"`{a['source']}`" for a in (c.get("staleBrief") or [])) + " — re-read those lines")
+    if c.get("mode") == "digest":
+        lines += ["", "### Project rules (from instructions; not code-anchored — follow unless current instructions say otherwise)"]
+        lines += [f"- {a['rule']} (`{a['source']}`" + (f"; path not found: {', '.join(a['pathNotFound'])}" if a.get("pathNotFound")
+                  else "") + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")"
+                  for a in c.get("projectRules") or []] or ["- (none)"]
+        if c["omitted"].get("projectRules"):
+            lines.append(f"- {c['omitted']['projectRules']} lower-priority rule(s) omitted for the token budget; read the "
+                         "project instructions for anything not listed here")
     if c["reverifyBeforeUse"]:
         lines += ["", "### Re-verify before use (compatible-unverified)"]
         lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["reverifyBeforeUse"]]
     lines += ["", "### Quarantined stale anchors (not handed over)"]
     lines += [f"- `{a['anchor']}`: {a['reason']}" for a in c["quarantinedStaleAnchors"]] or ["- (none)"]
+    hidden_stale = c["omitted"].get("quarantinedStaleAnchors", 0)
+    if hidden_stale:
+        lines.append(f"- WARNING: {hidden_stale} more stale anchor(s) are quarantined but not listed here; do not follow any "
+                     "rule whose anchor is not in the active list (run `memlet wiki` for the full list)")
     lines += ["", "### Rejected approaches (do not retry)"]
     lines += [f"- {a['approach']}" for a in c["rejectedApproaches"]] or ["- (none)"]
     lines += [
@@ -1132,16 +1245,176 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
+    """(token budget, where it came from). Order: explicit argument > config.json `handover.tokenBudget` > default.
+
+    A number is clamped to [HANDOVER_BUDGET_MIN, HANDOVER_BUDGET_MAX]; `auto` scales with the instruction text."""
+    source = "argument"
+    if budget is None:
+        cfg_path = root / CONFIG_PATH
+        try:
+            cfg = None if cfg_path.is_symlink() else json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cfg = None
+        hand = cfg.get("handover") if isinstance(cfg, dict) else None
+        budget = hand.get("tokenBudget") if isinstance(hand, dict) else None
+        source = "config"
+    if budget is None:
+        return HANDOVER_TOKEN_BUDGET, "default"
+    if str(budget).strip().lower() == "auto":
+        text = "".join(_read_text(root / f) for f in discover_instruction_files(root))
+        want = int(round(estimate_tokens(text) * HANDOVER_AUTO_RATIO))
+        return max(HANDOVER_BUDGET_MIN, min(HANDOVER_BUDGET_MAX, want)), f"{source}:auto"
+    try:
+        if isinstance(budget, bool) or (isinstance(budget, float) and not budget.is_integer()):
+            raise ValueError(budget)
+        n = int(budget)
+    except (TypeError, ValueError, OverflowError):  # 1e999 parses to infinity; non-integral or junk -> default
+        return HANDOVER_TOKEN_BUDGET, f"{source}:invalid->default"
+    return max(HANDOVER_BUDGET_MIN, min(HANDOVER_BUDGET_MAX, n)), source
+
+
+def resolve_handover_mode(root: Path, mode=None) -> str:
+    """Explicit argument > config.json `handover.mode` > `verified`. Unknown values fall back to `verified`."""
+    if mode is None:
+        try:
+            cfg_path = root / CONFIG_PATH
+            cfg = None if cfg_path.is_symlink() else json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cfg = None
+        hand = cfg.get("handover") if isinstance(cfg, dict) else None
+        mode = hand.get("mode") if isinstance(hand, dict) else None
+    mode = str(mode or "verified").strip().lower()
+    return mode if mode in HANDOVER_MODES else "verified"
+
+
+def _digest_norm(text: str) -> str:
+    text = _DIGEST_SOURCE_TAIL_RE.sub("", text or "")
+    return re.sub(r"[\W_]+", " ", text).strip().lower()
+
+
+def _digest_compact(text: str, limit: int = _DIGEST_TEXT_LIMIT) -> Tuple[str, bool]:
+    """(text, complete). Strip markdown decoration; shorten only at a sentence end and only when the dropped tail
+    carries no rule wording (approval, prohibition, risk). Otherwise keep the whole rule: a condition is never cut."""
+    complete = len(text or "") < _RULE_TEXT_LIMIT  # judged on the reader's raw slice, before any decoration is removed
+    text = _DIGEST_SOURCE_TAIL_RE.sub("", text or "")
+    text = re.sub(r"\*\*|__|(?<!\w)[*_](?!\s)|(?<!\s)[*_](?!\w)", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text, complete
+    ends = [m.end() for m in re.finditer(r"(?:[.!?]|요\.|다\.)\s", text) if limit // 2 <= m.end() <= limit]
+    for cut in reversed(ends):
+        tail = text[cut:]
+        if not (_DIGEST_STRONG_RE.search(tail) or _DIGEST_RISK_RE.search(tail)):
+            return text[:cut].rstrip(), complete
+    return text, complete
+
+
+def _digest_score(rule: Dict[str, Any], primary: set) -> float:
+    text, section, src = rule["text"], rule.get("section") or "", rule["source"]
+    score = 0.0
+    score += 3.0 * min(2, len(_DIGEST_STRONG_RE.findall(text)))
+    score += 2.0 * min(2, len(_DIGEST_RISK_RE.findall(text)))
+    score += 2.0 if _DIGEST_SECTION_RE.search(section) else 0.0
+    score += 2.0 if src in primary else 0.0
+    score += 1.0 if "`" in text else 0.0  # names an exact path / command / flag
+    score += max(0.0, 1.5 - rule["line"] / 200.0)  # earlier in the file reads as more central
+    return round(score, 3)
+
+
+def _digest_prose(root: Path, files: Iterable[str], known: set) -> List[Dict[str, Any]]:
+    """Prose lines that state a rule (strong wording) in files whose rules are otherwise bullets — `_extract_rules`
+    skips such lines, yet instruction files often put their most important rule in a paragraph."""
+    out: List[Dict[str, Any]] = []
+    for rel in files:
+        lines = _read_text(root / rel).splitlines()
+        if not any(_BULLET_RE.match(l) for l in lines):
+            continue  # plain-line files are already fully extracted
+        section, in_fence, front = "", False, bool(lines and lines[0].strip() == "---")
+        for no, line in enumerate(lines, start=1):
+            if front:
+                front = not (no > 1 and line.strip() == "---")
+                continue
+            if _FENCE_RE.match(line):
+                in_fence = not in_fence
+                continue
+            h = _HEADING_RE.match(line)
+            if in_fence or h:
+                section = h.group("title").strip() if h and not in_fence else section
+                continue
+            s = line.strip()
+            if (len(s) < 40 or _BULLET_RE.match(line) or s.startswith(("<!--", "|", ">", "`"))
+                    or not _DIGEST_STRONG_RE.search(s) or (rel, no) in known):
+                continue
+            if _line_refs(PIN_RE.sub("", s)) or _DEAD_END_HEADING_RE.search(section):
+                continue  # a referenced path/symbol must go through anchor verification; dead-ends travel elsewhere
+            out.append({"source": rel, "line": no, "section": section, "text": s[:_RULE_TEXT_LIMIT], "refs": [],
+                        "status": "unanchored", "anchors": []})
+    return out
+
+
+def _digest_rules(constraints: List[Dict[str, Any]], skip_sources: set, anchor_by_key=None,
+                  extra: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Instruction rules an agent needs that the verified list does not carry, ranked and de-duplicated.
+
+    Unanchored rules qualify. So do rules held back only because a referenced *file* is missing (no code symbol
+    drifted): the instruction may still hold, so it travels flagged instead of silently vanishing. Rules whose
+    code anchors drifted stay blocked, as in verified mode."""
+    anchor_by_key = anchor_by_key or {}
+    pool = list(constraints) + list(extra or [])
+    primary = {r["source"] for r in pool if r["source"].rsplit("/", 1)[-1] in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+               and "/" not in r["source"]}
+    seen, out = set(), []
+    for r in pool:
+        if r["source"] in skip_sources or r["source"].startswith(WIKI_DIR):
+            continue
+        missing = []
+        if r["status"] == "stale":
+            anchors = [anchor_by_key.get(a) for a in r.get("anchors") or []]
+            if not anchors or any(a is None for a in anchors):
+                continue
+            stale = [a for a in anchors if a.get("status") == "stale"]
+            # only a missing *file* reference qualifies; any drifted code symbol keeps the rule blocked
+            if not stale or any(a.get("symbol") or a.get("reason") != "missing_path" for a in stale):
+                continue
+            missing = [a["path"] for a in stale]
+        elif r["status"] != "unanchored":
+            continue
+        norm = _digest_norm(r["text"])
+        if len(norm) < 12 or norm in seen:
+            continue
+        seen.add(norm)
+        rule_text, complete = _digest_compact(r["text"])
+        item = {"rule": rule_text, "source": f"{r['source']}:{r['line']}",
+                "lineSha256": hashlib.sha256(r["text"].encode("utf-8")).hexdigest()[:12],
+                "score": _digest_score(r, primary)}
+        if missing:
+            item["pathNotFound"] = sorted(set(missing))[:3]
+        if not complete:
+            item["truncated"] = True
+        out.append(item)
+    out.sort(key=lambda x: (-x["score"], x["source"]))
+    return out
+
+
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
-                   output_format: str = "json", write: bool = False) -> Dict[str, Any]:
+                   output_format: str = "json", write: bool = False, budget=None, mode=None) -> Dict[str, Any]:
     """`memlet handover`: deterministic, signed (<500 token) Routlet × Memlet handover capsule.
 
     Only rules whose anchors are all `active` are carried as constraints; `stale` anchors are quarantined
     and `compatible-unverified` ones are listed for re-verification. Recorded dead-ends (bullets under a
     `Rejected Approaches` / `Dead-Ends` heading) and `--rejected` items travel as rejected approaches."""
     root = _resolve_root(repo_path)
+    token_budget, budget_source = resolve_handover_budget(root, budget)
+    mode = resolve_handover_mode(root, mode)
+    digest = mode == "digest"
+    brief = mode == "brief"
+    index = mode == "index"
     head = _git_head(root)
-    rules = _rules_from_files(root, import_source_files(root, "auto"))
+    # digest reads only discovered instruction files: memory-note folders may hold credentials in prose
+    sources = discover_instruction_files(root) if (digest or brief or index) else import_source_files(root, "auto")
+    skip_sources = {s for s in sources if any(_DIGEST_SKIP_SEGMENT_RE.search(seg) for seg in s.split("/")[:-1])} if digest else set()
+    rules = _rules_from_files(root, [s for s in sources if s not in skip_sources])
     page_pins: Dict[str, Dict[str, Any]] = {}
     wiki_dir = root / WIKI_DIR
     if wiki_dir.is_dir() and not wiki_dir.is_symlink():
@@ -1153,14 +1426,14 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
             for a in _extract_anchors(text, rel):
                 if a["pin"]:
                     page_pins.setdefault(f"{a['path']}::{a['symbol']}", a["pin"])
-            if rel not in _GENERATED_PAGES:
+            if not _is_generated_page(rel, text) and not (digest or brief or index):  # alt modes: wiki gives pins only
                 body = _STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text))
                 rules.extend(_extract_rules(body, rel))
     dead_ends = [r for r in rules if _DEAD_END_HEADING_RE.search(r["section"])]
     dead_ids = {id(r) for r in dead_ends}
     constraints, seen = [], set()
     for r in rules:
-        norm = re.sub(r"\s+", " ", r["text"]).strip().lower()
+        norm = _digest_norm(r["text"]) if digest else re.sub(r"\s+", " ", r["text"]).strip().lower()
         if id(r) in dead_ids or norm in seen:
             continue
         seen.add(norm)
@@ -1169,13 +1442,20 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     pins.update(_config_pins(root))
     anchors = _verify_rules(root, constraints, pins, pin_source="pinned")
     by_key = {a["anchor"]: a for a in anchors}
+    def _active(r):
+        if not digest:
+            return {"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
+        text, complete = _digest_compact(r["text"])
+        item = {"rule": text, "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
+        if not complete:
+            item["truncated"] = True
+        return item
     lists: Dict[str, List[Dict[str, Any]]] = {
-        "activeConstraints": [
-            {"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "anchors": r["anchors"], "source": f"{r['source']}:{r['line']}"}
-            for r in constraints if r["status"] == "active"
-        ],
-        "reverifyBeforeUse": [{"anchor": a["anchor"], "reason": a["reason"]} for a in anchors if a["status"] == "compatible-unverified"],
-        "quarantinedStaleAnchors": [{"anchor": a["anchor"], "reason": a["reason"]} for a in anchors if a["status"] == "stale"],
+        "activeConstraints": [_active(r) for r in constraints if r["status"] == "active"],
+        "reverifyBeforeUse": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
+                              for a in anchors if a["status"] == "compatible-unverified"],
+        "quarantinedStaleAnchors": [{"anchor": _bounded_anchor(a["anchor"]), "reason": a["reason"]}
+                                    for a in anchors if a["status"] == "stale"],
         "rejectedApproaches": [],
     }
     seen_rejected = set()
@@ -1184,8 +1464,67 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         if text and text.lower() not in seen_rejected:
             seen_rejected.add(text.lower())
             lists["rejectedApproaches"].append({"approach": text, "source": src})
-    omitted = {k: max(0, len(v) - _HANDOVER_LIST_CAP) for k, v in lists.items()}
-    lists = {k: v[:_HANDOVER_LIST_CAP] for k, v in lists.items()}
+    if digest:
+        known = {(r["source"], r["line"]) for r in rules}
+        lists["projectRules"] = _digest_rules(constraints, skip_sources, by_key,
+                                              _digest_prose(root, [s for s in sources if s not in skip_sources], known))
+        primary = {r["source"] for r in constraints if "/" not in r["source"]}
+        by_src = {f"{r['source']}:{r['line']}": r for r in constraints}
+        for a in lists["activeConstraints"]:  # code-verified rules earn a bonus but compete on the same scale
+            a["score"] = round(_digest_score(by_src[a["source"]], primary) + 2.0, 3) if a["source"] in by_src else 2.0
+        lists["activeConstraints"].sort(key=lambda a: -a["score"])
+        # one entry per rule across both lists: the same rule also appears as a (clipped) copy in code-anchors.md
+        key = lambda s: _digest_norm(s.rstrip("…"))[:80]
+        seen_keys = set()
+        for name in ("activeConstraints", "projectRules"):
+            kept = []
+            for a in lists[name]:
+                k = key(a["rule"])
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    kept.append(a)
+            lists[name] = kept
+    if digest or brief or index:  # every instruction-derived text field leaves masked, not only the special lists
+        from prism_memory.memlet_brief import _mask
+        for items in lists.values():
+            for a in items:
+                for f in ("rule", "approach"):
+                    if isinstance(a.get(f), str):
+                        a[f] = _mask(a[f])
+    caps = {k: _HANDOVER_LIST_CAP for k in lists}
+    index_meta = None
+    if index:
+        from prism_memory.memlet_index import QUOTE_MAX_LINES, load_verified_index
+        fresh_idx, stale_idx, index_meta = load_verified_index(root)
+        lists["quotedRules"] = [{"topic": e["topic"], "quote": e["quote"], "source": e["source"]}
+                                for e in fresh_idx if e["importance"] == 1 and e["lines"] <= QUOTE_MAX_LINES]
+        quoted = {e["source"] for e in lists["quotedRules"]}
+        lists["ruleIndex"] = [{"topic": e["topic"], "source": e["source"]} for e in fresh_idx if e["source"] not in quoted]
+        lists["staleIndex"] = [{"topic": e["topic"], "source": e["source"]} for e in stale_idx]
+        caps.update({"quotedRules": 200, "ruleIndex": 400, "staleIndex": _DIGEST_STALE_SHOWN,
+                     "quarantinedStaleAnchors": _DIGEST_STALE_SHOWN})
+    brief_meta = None
+    if brief:
+        from prism_memory.memlet_brief import load_verified_brief
+        fresh, stale_brief, brief_meta = load_verified_brief(root)
+        lists["briefRules"], lists["staleBrief"] = fresh, stale_brief
+        caps["briefRules"], caps["staleBrief"] = 200, _DIGEST_STALE_SHOWN
+        caps["quarantinedStaleAnchors"] = _DIGEST_STALE_SHOWN
+    if digest:
+        caps["quarantinedStaleAnchors"] = _DIGEST_STALE_SHOWN  # the WARNING line still carries the full count
+        caps["projectRules"] = 200
+    if digest or brief or index:  # displayed strings only; membership above already used the real citations
+        from prism_memory.memlet_brief import _mask
+        for items in lists.values():
+            for a in items:
+                for f in ("rule", "topic", "source", "anchor", "approach"):
+                    if isinstance(a.get(f), str):
+                        a[f] = _mask(a[f])
+                for f in ("anchors", "pathNotFound"):
+                    if isinstance(a.get(f), list):
+                        a[f] = [_mask(x) if isinstance(x, str) else x for x in a[f]]
+    omitted = {k: max(0, len(v) - caps[k]) for k, v in lists.items()}
+    lists = {k: v[:caps[k]] for k, v in lists.items()}
     counts = _rule_counts(constraints)
     proof = {
         "modifiedFilesCount": _git_modified_count(root),
@@ -1194,17 +1533,50 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         "unanchoredRulesOmitted": counts["unanchored"],
     }
     next_action = _clip(next_step, _NEXT_ACTION_LIMIT) if next_step else None
-    # Trim the least safety-critical items first until the rendered capsule fits the token budget.
-    drop_order = ("reverifyBeforeUse", "quarantinedStaleAnchors", "activeConstraints", "rejectedApproaches")
+    # Trim the least safety-critical items first until the rendered capsule fits the token budget. Quarantined stale
+    # anchors go last and keep a floor: the next model must still learn which rules it must not follow.
+    if index:  # a quote that does not fit is demoted to an index entry first; index tail goes last
+        drop_order = ("reverifyBeforeUse", "activeConstraints", "quotedRules", "ruleIndex", "rejectedApproaches", "staleIndex",
+                      "quarantinedStaleAnchors")
+    elif brief:  # the brief is ranked by importance: its tail goes after anchored extras; safety lists are kept longest
+        drop_order = ("reverifyBeforeUse", "activeConstraints", "briefRules", "rejectedApproaches", "staleBrief",
+                      "quarantinedStaleAnchors")
+    elif digest:  # lowest-ranked project rules go first; verified anchored rules and safety lists are kept longest
+        drop_order = ("reverifyBeforeUse", "projectRules", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
+    else:
+        drop_order = ("reverifyBeforeUse", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
+    floors = {"quarantinedStaleAnchors": min(_HANDOVER_QUARANTINE_FLOOR, caps["quarantinedStaleAnchors"])}
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
                    "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
+        if digest:
+            capsule["mode"] = "digest"
+        if index:
+            capsule["mode"] = "index"
+            capsule["indexSource"] = ({k: index_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if index_meta
+                                      else None)
+        if brief:
+            capsule["mode"] = "brief"
+            capsule["briefSource"] = ({k: brief_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if brief_meta
+                                      else None)
         signature = handover_signature(capsule)
         markdown = _render_handover(capsule, signature)
         tokens = estimate_tokens(markdown)
-        victim = next((k for k in drop_order if lists[k]), None)
-        if tokens < HANDOVER_TOKEN_BUDGET or victim is None:
+        victim = next((k for k in drop_order if len(lists[k]) > floors.get(k, 0)), None)
+        if digest and victim in ("projectRules", "activeConstraints"):
+            ranked = [k for k in ("projectRules", "activeConstraints") if lists[k]]
+            victim = min(ranked, key=lambda k: lists[k][-1]["score"])  # drop the globally least important rule
+        if tokens < token_budget:
             break
+        if victim is None:
+            # The floor is a preference, the budget is a contract: shrink the floor; the WARNING line keeps the count.
+            if floors["quarantinedStaleAnchors"] > 0:
+                floors["quarantinedStaleAnchors"] -= 1
+                continue
+            break
+        if index and victim == "quotedRules":  # never lose a top rule: keep it reachable as an index entry
+            demoted = lists[victim][-1]
+            lists["ruleIndex"] = [{"topic": demoted["topic"], "source": demoted["source"]}] + lists["ruleIndex"]
         lists[victim] = lists[victim][:-1]
         omitted[victim] += 1
 
@@ -1226,19 +1598,23 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
                     _record_page(conn, HANDOVER_PAGE, _page_body_sha256(page), "handover", now)
             actions.append({"op": "update" if existed else "create", "path": LEDGER_PATH})
 
+    over = tokens >= token_budget
     report: Dict[str, Any] = {
-        "ok": True,
-        "exitCode": 0,
+        "ok": not over,
+        "exitCode": 2 if over else 0,
         "command": "handover",
         "repoPath": str(root),
         **capsule,
         "capsuleSignature": signature,
-        "signedFields": list(HANDOVER_SIGNED_FIELDS),
+        "signedFields": list(_signed_fields(capsule)),
         "tokenEstimate": tokens,
-        "tokenBudget": HANDOVER_TOKEN_BUDGET,
+        "tokenBudget": token_budget,
+        "budgetExceeded": over,
         "written": bool(write),
         "actions": actions,
     }
+    if budget_source != "default":  # additive only when a budget was chosen: the default report stays byte-identical
+        report["tokenBudgetSource"] = budget_source
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = markdown
     return report

@@ -147,18 +147,50 @@ memlet anti-slop . --format markdown
 anti-slop lock . --archetype linear-precision
 ```
 
-### 7. Inspect Memory & Routing in One Page (`memlet ui`)
+### 7. Inspect Memory, Dream Ontology & Routing in One Page (`memlet ui`)
 
-The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out.
+The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out.
 
 ```bash
 memlet ui .                                   # writes .memlet/inspector.html after `memlet init` (alias: memlet inspector .)
-memlet ui . --output memlet-inspector.html    # or any other path
+memlet ui . --out memlet-inspector.html       # --out and --output are both supported
 ```
 
-### 8. Start a New Project With a Stack Harness (`memlet pack`)
+### 8. Session Log Ontology & Subgraph Recall (`memlet dream-build` / `dream-recall`)
 
-The **Routlet × Memlet Pro Harness Pack** writes one bundle per stack (`nextjs-supabase`, `fastapi-postgres`, `swift-ios`) with 7 files: a `CLAUDE.md` constitution (anchor conventions, session delta rules, human gates), a cross-vendor `AGENTS.md`, a `SKILL.md` with pre-flight checks, receipt and rollback, a `PITFALLS.md` of 5 recorded dead-ends that `memlet handover` carries as rejected approaches, a Routlet routing preset, Linear / Stripe / Toss design tokens (every text pair >= 4.5:1), and a `MANIFEST.json` with SHA-256 checksums.
+`memlet dream-build` (or `python3 -m prism_memory.memlet_dream dream-build`) binds candidate lessons and 4 typed edges (`GOVERNS`, `SUPERSEDES`, `RESOLVES`, `BLOCKS`) to verbatim `file.log:start-end` spans and SHA-256 hashes, rejects unpinned or time-inverted `SUPERSEDES` edges, masks 5 secret families (`[REDACTED_SECRET]`), and writes `.memlet/dream/APPROVAL-QUEUE.json` (plus optional SQLite tables: `ontology_nodes`, `ontology_edges`, `dream_runs`).
+
+```bash
+# Build from cross-vendor candidate JSON + persist to SQLite
+memlet dream-build \
+  --candidates ./dream_candidates.json \
+  --snapshot ./session_logs \
+  --out-json .memlet/dream/APPROVAL-QUEUE.json \
+  --out-db .memlet/dream/ontology.sqlite
+
+# Autonomous deterministic draft (omit --candidates; 0 LLM calls)
+memlet dream-build \
+  --snapshot ./session_logs \
+  --out-json .memlet/dream/APPROVAL-QUEUE.json
+
+# 1-hop subgraph recall (verifies SHA-256 pins when --snapshot is passed)
+memlet dream-recall \
+  --graph .memlet/dream/APPROVAL-QUEUE.json \
+  --snapshot ./session_logs \
+  --query memlet_wiki.py digest anchor truncation \
+  --max-tokens 1500 \
+  --out-md .memlet/dream/APPROVAL-QUEUE.md \
+  --format markdown
+```
+
+**Contract & Scope Notes:**
+- **Quarantine Labels:** `## 4. Superseded Quarantine (SUPERSEDES)` emits `old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT]` and `replacement_pin [ACTIVE — APPLY THIS]`. If the superseding source node is itself superseded, dropped during pass-2 validation, or omitted by `--max-tokens`, the label switches to `replacement_pin [SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY]` and the capsule is re-trimmed so `tokenEstimate <= tokenBudget`. (`ALREADY_SUPERSEDED` is the JSON node `verdict` field.)
+- **`--candidates` vs. Autonomous Draft:** Omitting `--candidates` runs `extract_candidates_from_snapshot()` (`extractionMode: "autonomous_deterministic"`, 0 LLM calls) to produce an initial draft for review. The C8 benchmark result (`M1 3.7% -> M2-G 63.0%`, 126 runs / 756 judgments at `<= 1,500` tokens) uses cross-vendor candidates supplied via `--candidates`.
+- **Single-Bucket Dedup:** Each recalled node renders once under its highest-priority bucket (`SUPERSEDES` > `RESOLVES` / `BLOCKS` > `GOVERNS`); full edge lists remain in JSON, SQLite, and Cortex UI.
+
+### 9. Start a New Project With a Stack Harness (`memlet pack`)
+
+The **Routlet × Memlet Harness Pack** writes one bundle per stack (`nextjs-supabase`, `fastapi-postgres`, `swift-ios`) with 7 files: a `CLAUDE.md` constitution (anchor conventions, session delta rules, human gates), a cross-vendor `AGENTS.md`, a `SKILL.md` with pre-flight checks, receipt and rollback, a `PITFALLS.md` of 5 recorded dead-ends that `memlet handover` carries as rejected approaches, a Routlet routing preset, Linear / Stripe / Toss design tokens (every text pair >= 4.5:1), and a `MANIFEST.json` with SHA-256 checksums.
 
 ```bash
 memlet pack --list                                   # stack metadata
@@ -178,7 +210,9 @@ memlet pack --stack nextjs-supabase --output ./harness-packs
 | `memlet benchmark [--format markdown]` (alias `compare-bench`) | Reproducible refactoring & handover comparison (see below). |
 | `memlet rescue .` (or `viberescue pack .`) | Secret-scrubbed static triage bundle for stuck projects. |
 | `memlet anti-slop .` (or `anti-slop scan .`) | UI & copy slop score with `file:line` findings. |
-| `memlet ui . [--output FILE]` (alias `inspector`) | Self-contained, escaped HTML inspector: AST health, benchmark, handover, Routlet matrix. |
+| `memlet ui . [--out\|--output FILE]` (alias `inspector`) | Self-contained, escaped HTML inspector: AST health, benchmark, handover, Dream ontology lineage, Routlet matrix. |
+| `memlet dream-build --snapshot DIR_OR_JSON --out-json FILE [--candidates FILE] [--out-db SQLITE]` (alias `dream`) | Quote-pinned 4-edge ontology builder (`GOVERNS`/`SUPERSEDES`/`RESOLVES`/`BLOCKS`) with SHA-256 verification and optional SQLite persistence. |
+| `memlet dream-recall --graph FILE [--snapshot DIR_OR_JSON] [--query ...] [--max-tokens N] [--out-md FILE]` | 1-hop ontology subgraph recall capsule with dual-pin `SUPERSEDES` quarantine and hard token budget enforcement. |
 | `memlet pack [--stack all\|nextjs-supabase\|fastapi-postgres\|swift-ios] [--output DIR] [--dry-run] [--list]` | Stack harness bundles with a SHA-256 `MANIFEST.json`; no `--output` means nothing is written. |
 | `memlet --standalone capsule --plan "..." --files prism_memory/audit.py` | Budgeted cross-vendor handover capsule. |
 | `memlet --standalone doctor` | Environment & SQLite WAL health check. |

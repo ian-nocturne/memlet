@@ -944,7 +944,7 @@ class StandaloneService:
 
 
 class MemoryEngine:
-    """High-level commercial SDK for PRISM Memory v8.0.
+    """High-level open-source Python SDK for Memlet (Apache-2.0).
     Can operate standalone on any workspace path (`MemoryEngine('/path/to/dir')`) or wrap an existing `WorkStore`.
     """
 

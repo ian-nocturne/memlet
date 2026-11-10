@@ -444,10 +444,41 @@ def main():
     imp_rules_p.add_argument('repo_positional',nargs='?',default=None);imp_rules_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     imp_rules_p.add_argument('--from',dest='source',default='auto',choices=['auto','claude-md','cursorrules','ai-memory','claude-mem'])
     imp_rules_p.add_argument('--dry-run',action='store_true');imp_rules_p.add_argument('--format',default='json',choices=['json','markdown'])
-    hand_p=sub.add_parser('handover',help='Signed <500-token handover capsule: verified constraints only, stale anchors quarantined')
+    slim_p=sub.add_parser('slim-plan',help='Propose a slimmer AGENTS.md by moving (never rewriting) older directives into an indexed log; writes only to --out, with a preservation proof')
+    slim_p.add_argument('repo_positional',nargs='?',default=None);slim_p.add_argument('--out',required=True)
+    slim_p.add_argument('--keep-recent',type=int,default=2);slim_p.add_argument('--split-rules',action='store_true')
+    dream_b=sub.add_parser('dream-build',aliases=['dream'],help='Build verified Dream ontology graph + SQLite tables from session logs and optional candidates (no model call)')
+    dream_b.add_argument('--candidates',default=None,help='Optional path to raw candidate JSON; if omitted, deterministically extracts candidates from --snapshot')
+    dream_b.add_argument('--snapshot',required=True,help='Path to session log directory (*.log) or JSON snapshot map')
+    dream_b.add_argument('--out-json',required=True,help='Output path for verified ontology JSON')
+    dream_b.add_argument('--out-db',default=None,help='Optional SQLite DB path to write ontology_nodes, ontology_edges, and dream_runs')
+    dream_b.add_argument('--vendor',default='autonomous-deterministic',help='Extractor vendor tag')
+    dream_p=sub.add_parser('dream-recall',help='1-hop ontology subgraph recall (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS) from a verified Dream queue JSON (no model call)')
+    dream_p.add_argument('--graph',required=True,help='Path to Dream ontology JSON')
+    dream_p.add_argument('--query',nargs='*',default='',help='Task or question query (supports unquoted multi-word queries)')
+    dream_p.add_argument('--budget','--max-tokens',dest='budget',type=int,default=1500,help='Maximum token budget (default 1500)')
+    dream_p.add_argument('--snapshot',default=None,help='Optional log directory or JSON snapshot map to verify pins before recall')
+    dream_p.add_argument('--out-md',default=None,help='Optional path to write the Markdown approval queue capsule')
+    dream_p.add_argument('--format',default='json',choices=['json','markdown'],help='Stdout format (json or markdown)')
+    rctx_p=sub.add_parser('rule-context',help='T0 safety core (verbatim quotes) + T1 rule index from the verified INDEX-RULES.md (no model call)')
+    rctx_p.add_argument('repo_positional',nargs='?',default=None)
+    rctx_p.add_argument('--core-budget',type=int,default=600);rctx_p.add_argument('--index-budget',type=int,default=600)
+    rctx_p.add_argument('--auto',action='store_true',help='Return the whole instructions when they fit --threshold tokens, else the tiered context');rctx_p.add_argument('--threshold',type=int,default=8000)
+    rrec_p=sub.add_parser('rule-recall',help='T2: rules most relevant to a task, quoted verbatim from the instructions (deterministic BM25, no model call)')
+    rrec_p.add_argument('repo_positional',nargs='?',default=None);rrec_p.add_argument('task',nargs='?',default='')
+    rrec_p.add_argument('--k',type=int,default=3);rrec_p.add_argument('--safety',action='store_true',help='Add up to 4 importance-1 rules not already shown (not a guarantee of full coverage)')
+    index_p=sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)')
+    index_p.add_argument('repo_positional',nargs='?',default=None)
+    index_p.add_argument('--via',default='claude',choices=['claude'])
+    brief_p=sub.add_parser('brief-build',help='EXPERIMENTAL (failed its faithfulness evaluation): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified')
+    brief_p.add_argument('repo_positional',nargs='?',default=None)
+    brief_p.add_argument('--via',default='claude',choices=['claude'],help='Runner: claude only (tool-free, claude.ai subscription verified before the call; refuses API-key auth)')
+    hand_p=sub.add_parser('handover',help='Signed, budgeted handover capsule (default <500 tokens): verified constraints only, stale anchors quarantined')
     hand_p.add_argument('repo_positional',nargs='?',default=None);hand_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     hand_p.add_argument('--next-step',default=None);hand_p.add_argument('--rejected',action='append',default=[],help='Rejected approach / dead-end (repeatable)')
     hand_p.add_argument('--format',default='json',choices=['json','markdown']);hand_p.add_argument('--write',action='store_true',help='Write .memlet/wiki/HANDOVER.md and record a handover ledger event')
+    hand_p.add_argument('--mode',default=None,choices=['verified','digest','brief','index'],help='verified (default): code-anchored rules only; index: verbatim key rules + topic index (.memlet/wiki/INDEX-RULES.md); digest and brief are EXPERIMENTAL (failed their evaluations; not a replacement for the instructions)')
+    hand_p.add_argument('--budget',default=None,help='Token budget: a number (clamped to 500-2000) or auto (~12%% of the instruction text); default from .memlet/config.json handover.tokenBudget, else 500')
     cmp_p=sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet')
     cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',default='json',choices=['json','markdown'])
     opsec_p=sub.add_parser('opsec-check');opsec_p.add_argument('repo_positional',nargs='?',default=None);opsec_p.add_argument('--file','--repo-path','--repo',dest='target_file',default=None);opsec_p.add_argument('--canon',default=None);opsec_p.add_argument('--history',action='store_true',help='Also scan added lines in the full git history (git log -p --all); exit 2 if history cannot be scanned');opsec_p.add_argument('--require-canon',action='store_true',help='Exit 2 when no persona canon (fingerprint file) is found')
@@ -466,8 +497,8 @@ def main():
     ui_p=sub.add_parser('ui',help='Nocturne Memory & Routing Inspector: self-contained HTML report (AST health, benchmark, handover, Routlet matrix)')
     for p in (insp_p,ui_p):
         p.add_argument('repo_positional',nargs='?',default=None);p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-        p.add_argument('--output',default=None,help='HTML output file');p.add_argument('--output-dir',default=None)
-    pack_p=sub.add_parser('pack',help='Routlet x Memlet Pro Harness Pack: per-stack CLAUDE.md, AGENTS.md, SKILL.md, PITFALLS.md, Routlet preset, design tokens, MANIFEST.json')
+        p.add_argument('--output','--out',dest='output',default=None,help='HTML output file');p.add_argument('--output-dir',default=None)
+    pack_p=sub.add_parser('pack',help='Routlet x Memlet Harness Pack: per-stack CLAUDE.md, AGENTS.md, SKILL.md, PITFALLS.md, Routlet preset, design tokens, MANIFEST.json')
     pack_p.add_argument('repo_positional',nargs='?',default=None,help='Output directory (same as --output)')
     pack_p.add_argument('--stack',default='all',choices=PACK_STACK_CHOICES);pack_p.add_argument('--output',default=None,help='Output directory; omit to compute in memory only')
     pack_p.add_argument('--output-dir',default=None);pack_p.add_argument('--dry-run',action='store_true');pack_p.add_argument('--list',action='store_true',help='List available stack packs')
@@ -519,13 +550,48 @@ def main():
             res=wiki_status(target_repo,dry_run=args.dry_run,output_format=args.format)
         if args.format=='markdown':res['_cli_text']=res['formatted']
         return res
+    if args.action=='slim-plan':
+        from prism_memory.memlet_slim import slim_plan
+        return slim_plan(args.repo_positional or '.',args.out,keep_recent=args.keep_recent,split_rules=args.split_rules)
+    if args.action in ('dream-build','dream'):
+        from prism_memory.memlet_dream import run_dream_build
+        return run_dream_build(
+            snapshot_path=args.snapshot,
+            out_json=args.out_json,
+            candidates_path=args.candidates,
+            out_db=args.out_db,
+            vendor=args.vendor,
+        )
+    if args.action=='dream-recall':
+        from prism_memory.memlet_dream import run_dream_recall
+        res=run_dream_recall(
+            graph_path=args.graph,
+            query_text=' '.join(args.query) if isinstance(args.query,list) else str(args.query or ''),
+            budget_tokens=args.budget,
+            snapshot_path=args.snapshot,
+            out_md=args.out_md,
+        )
+        if args.format=='markdown' and isinstance(res.get('formatted'),str):
+            res['_cli_text']=res['formatted'] if res['formatted'].endswith('\n') else res['formatted']+'\n'
+        return res
+    if args.action in ('rule-context','rule-recall'):
+        from prism_memory.memlet_recall import build_context, recall
+        if args.action=='rule-context':
+            return build_context(args.repo_positional or '.',core_budget=args.core_budget,index_budget=args.index_budget,auto=args.auto,threshold=args.threshold)
+        return recall(args.repo_positional or '.',args.task,k=args.k,safety=args.safety)
+    if args.action=='index-build':
+        from prism_memory.memlet_index import build_index
+        return build_index(args.repo_positional or '.',via=args.via)
+    if args.action=='brief-build':
+        from prism_memory.memlet_brief import build_brief
+        return build_brief(args.repo_positional or '.',via=args.via)
     if args.action in ('import','handover'):
         from prism_memory.memlet_wiki import build_handover, import_rules
         target_repo=args.repo_path or args.repo_positional or '.'
         if args.action=='import':
             res=import_rules(target_repo,source=args.source,dry_run=args.dry_run,output_format=args.format)
         else:
-            res=build_handover(target_repo,next_step=args.next_step,rejected=args.rejected,output_format=args.format,write=args.write)
+            res=build_handover(target_repo,next_step=args.next_step,rejected=args.rejected,output_format=args.format,write=args.write,budget=args.budget,mode=args.mode)
         if args.format=='markdown':res['_cli_text']=res['formatted']
         return res
     if args.action in ('compare-bench','benchmark-compare') or (args.action=='benchmark' and (

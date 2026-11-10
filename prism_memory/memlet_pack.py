@@ -1,4 +1,4 @@
-"""Routlet × Memlet Pro Harness Pack generator (`memlet pack`).
+"""Routlet × Memlet Harness Pack generator (`memlet pack`).
 
 `memlet pack [--stack all|nextjs-supabase|fastapi-postgres|swift-ios] [--output DIR] [--dry-run]` renders a
 stack-specific agent harness bundle into `<DIR>/<stack>/`:
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .memlet_wiki import MEMLET_VERSION
 
-PACK_PRODUCT = "Routlet × Memlet Pro Harness Pack"
+PACK_PRODUCT = "Routlet × Memlet Harness Pack"
 PACK_SCHEMA = "memlet-pack/v1"
 PACK_STACKS = ("nextjs-supabase", "fastapi-postgres", "swift-ios")
 PACK_CHOICES = ("all",) + PACK_STACKS
