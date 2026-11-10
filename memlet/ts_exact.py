@@ -7,6 +7,7 @@ top-level function, arrow / function-expression constant, class (and its methods
 made with it records the basis `tree-sitter-v1.core-X.ts-Y.js-Z`; any version change is a new basis, so such pins
 report `exact_parser_basis_repin_required` instead of being compared with hashes from another grammar.
 
+Exact parsing requires `anchors.exactParsers: ["tree-sitter"]` in `.memlet/config.json`.
 Nothing here is imported unless the packages are installed; a file whose tree has syntax errors is not fingerprinted
 (Memlet then uses the lexical scanner). Set `MEMLET_EXACT_PARSERS=0` to turn the auto-loading off.
 """
@@ -18,7 +19,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-TESTED = {"tree-sitter": "0.23", "tree-sitter-typescript": "0.23", "tree-sitter-javascript": "0.23"}
+TESTED = {"tree-sitter": ("0.23", "0.24"), "tree-sitter-typescript": ("0.23", "0.24"),
+          "tree-sitter-javascript": ("0.23", "0.24")}
 _FUNC_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
 _FUNC_DECLS = {"function_declaration", "generator_function_declaration"}
 _CLASS_DECLS = {"class_declaration", "abstract_class_declaration"}
@@ -33,13 +35,13 @@ def _version(dist: str) -> Optional[str]:
 
 
 def load_provider() -> Optional["TreeSitterProvider"]:
-    """The provider, or None when tree-sitter or a grammar is missing, of an untested minor version, or broken."""
+    """Load tested 0.23 / 0.24 minors; return None for missing, untested, or broken packages."""
     names = ("tree_sitter", "tree_sitter_typescript", "tree_sitter_javascript")
     try:
         if any(importlib.util.find_spec(n) is None for n in names):
             return None
         versions = {dist: _version(dist) for dist in TESTED}
-        if any(not v or not v.startswith(TESTED[dist] + ".") for dist, v in versions.items()):
+        if any(not v or not v.startswith(tuple(p + "." for p in TESTED[dist])) for dist, v in versions.items()):
             return None
         ts, tst, tsj = (importlib.import_module(n) for n in names)
         return TreeSitterProvider(ts, tst, tsj, versions)
