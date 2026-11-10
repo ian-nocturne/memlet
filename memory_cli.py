@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Cross-platform local memory tool for the already-authorized task owner."""
 import argparse
-import hashlib
-import subprocess
 import json
 import os
 import sys
 import time
 from pathlib import Path
 
-from prism_memory.standalone import StandaloneStore as WorkStore
+from prism_memory.standalone import (StandaloneStore as WorkStore,
+                                     default_standalone_task_id as _standalone_task_id,
+                                     legacy_standalone_notice)
 import work_memory
 import memory_intelligence as memory
 
@@ -415,18 +415,6 @@ def _program_name():
     return name if name in PROGRAM_NAMES else 'memlet'
 
 
-def _standalone_task_id():
-    cwd = Path.cwd().resolve()
-    try:
-        proc = subprocess.run(['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
-                              capture_output=True, text=True, check=True)
-        root = Path(proc.stdout.strip()).resolve()
-    except (OSError, subprocess.CalledProcessError):
-        root = cwd
-    digest = hashlib.sha1(os.fsencode(str(root))).hexdigest()[:8]
-    return 'standalone/' + root.name + '-' + digest
-
-
 def main():
     parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet (formerly Ieum Memory / DeltaHarness / PRISM Memory): '+__doc__)
     from prism_memory import VERSION
@@ -479,8 +467,8 @@ def main():
     rctx_p.add_argument('--auto',action='store_true',help='Return the whole instructions when they fit --threshold tokens, else the tiered context');rctx_p.add_argument('--threshold',type=int,default=8000)
     rrec_p=sub.add_parser('rule-recall',help='T2: rules most relevant to a task, quoted verbatim from the instructions (deterministic BM25, no model call)')
     rrec_p.add_argument('query_or_repo',nargs='?',default=None);rrec_p.add_argument('legacy_query',nargs='?',default=None)
-    rrec_p.add_argument('--repo',default='.')
-    rrec_p.add_argument('--task',dest='rule_task',default=None)
+    rrec_p.add_argument('--repo',default=None)
+    rrec_p.epilog='Use rule-recall "<query>" [--repo DIR] or rule-recall <existing-dir> "<query>"; a lone directory is ambiguous and requires a query.'
     rrec_p.add_argument('--k',type=int,default=3);rrec_p.add_argument('--safety',action='store_true',help='Add up to 4 importance-1 rules not already shown (not a guarantee of full coverage)')
     index_p=sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)')
     index_p.add_argument('repo_positional',nargs='?',default=None)
@@ -567,7 +555,12 @@ def main():
         return res
     if args.action=='slim-plan':
         from prism_memory.memlet_slim import slim_plan
-        return slim_plan(args.repo_positional or '.',args.out,keep_recent=args.keep_recent,split_rules=args.split_rules)
+        res=slim_plan(args.repo_positional or '.',args.out,keep_recent=args.keep_recent,split_rules=args.split_rules)
+        # This exact plan outcome is a successful no-op, unlike invalid inputs,
+        # unsafe outputs, failed proofs, or apply collisions.
+        if res.get('why')=='nothing to move (no dated directive blocks beyond the kept ones)':
+            res['exitCode']=0
+        return res
     if args.action in ('dream-build','dream'):
         from prism_memory.memlet_dream import run_dream_build
         return run_dream_build(
@@ -593,14 +586,19 @@ def main():
         from prism_memory.memlet_recall import build_context, recall
         if args.action=='rule-context':
             return build_context(args.repo_positional or '.',core_budget=args.core_budget,index_budget=args.index_budget,auto=args.auto,threshold=args.threshold)
-        query=args.query_or_repo or ''
-        repo=args.repo
-        legacy_task=args.rule_task if args.rule_task is not None else (args.legacy_query if args.legacy_query is not None else args.task)
-        if legacy_task and args.query_or_repo and Path(args.query_or_repo).is_dir():
-            repo=args.query_or_repo
-            query=legacy_task
-        elif legacy_task and not args.query_or_repo:
-            query=legacy_task
+        usage='Use rule-recall "<query>" [--repo DIR] or rule-recall <existing-dir> "<query>".'
+        query=args.query_or_repo
+        repo=args.repo or '.'
+        if args.legacy_query is not None:
+            if not query or not Path(query).is_dir():
+                parser.error('The first of two positionals must be an existing directory. '+usage)
+            if args.repo is not None and Path(query).resolve()!=Path(args.repo).resolve():
+                parser.error('Positional repository conflicts with --repo. '+usage)
+            repo,query=query,args.legacy_query
+        elif query and Path(query).is_dir():
+            parser.error('A lone directory is ambiguous; supply a query. '+usage)
+        if not query or not query.strip():
+            parser.error('A rule query is required. '+usage)
         return recall(repo,query,k=args.k,safety=args.safety)
     if args.action=='index-build':
         from prism_memory.memlet_index import build_index
@@ -657,17 +655,20 @@ def main():
     if args.action=='doctor':return memory.doctor(store)
     if args.action=='backup':return memory.backup(store,dest_dir=args.dest_dir,include_models=args.include_models)
     if args.action=='restore':return memory.restore(store,backup_dir=args.backup_dir)
+    uses_default_task=bool(args.standalone and not args.task)
     if not args.task:
         if args.standalone:
             args.task=_standalone_task_id()
         else:
             raise ValueError('task is required (--task <taskId>)')
     if args.standalone:
-        task=store.ensure_standalone_task(args.task,session=args.session or 'standalone-owner')
-        if not args.session:
-            args.session=task['owner']
+        args.session=args.session or 'standalone-owner'
+        task=store.ensure_standalone_task(args.task,session=args.session)
     else:
         task=store.get(args.task)
+    if uses_default_task:
+        notice=legacy_standalone_notice(store,args.task)
+        if notice:print(notice,file=sys.stderr)
     if args.action=='brief':
         result=store.memory(args.task,include_retrieval=False)
         with store.db() as db:
@@ -713,7 +714,7 @@ def main():
         return memory.export_rules(store,args.task,targets=args.targets,target_dir=args.target_dir,write_files=False,lang=args.lang)
     if task['owner']!=args.session:raise ValueError('current responsible session ID is required')
     runtime=os.environ.get('CODEX_THREAD_ID')
-    if runtime and not args.standalone and not os.environ.get('ANTIGRAVITY_AGENT') and args.session!='codex:'+runtime:
+    if runtime and not (args.standalone and task['owner']=='standalone-owner') and not os.environ.get('ANTIGRAVITY_AGENT') and args.session!='codex:'+runtime:
         raise ValueError('CLI actor does not match the current native Codex session')
     if os.environ.get('PRISM_PARENT_SESSION_ID'):
         raise ValueError('background worker memory writes must be returned to the responsible session')
