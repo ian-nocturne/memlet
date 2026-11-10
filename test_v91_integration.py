@@ -295,7 +295,7 @@ class MultiLineLessons(Scratch):
                      mw.build_handover(self.root,budget=5000,output_format='markdown')['formatted'],
                      mb.changed_check(self.root,files=['export.py'])['formatted'], mb.learn_pending(self.root)['formatted']]:
             self.assertIn(self.symptom,text); self.assertIn(self.fix,text)
-            self.assertIn('RESOLVES source',text)
+            self.assertIn('[RESOLVES]' if text.startswith('## Memlet Handover') else 'RESOLVES source',text)
         from memlet.memlet_cortex import _load_dream_lineage
         cortex=_load_dream_lineage({'path':str(self.root)})
         self.assertEqual([self.symptom,self.fix],cortex['nodes'][0]['quoteLines'])
@@ -839,9 +839,14 @@ class ApprovedReadersIntegration(Scratch):
                             self.assertIn(node['id'], {i['id'] for i in pending['pendingNodes']})
                         if state=='approved' and kind=='SUPERSEDES':
                             for reader,text in texts.items():
-                                self.assertIn('replaced — do not apply as current',text,reader)
-                                self.assertIn('current instruction',text,reader)
-                                self.assertIn('SUPERSEDES source',text,reader)
+                                if reader in ('recall markdown','handover verified','handover digest','handover'):
+                                    self.assertIn('[REPLACED — do not apply as current]',text,reader)
+                                    self.assertIn('[CURRENT]',text,reader)
+                                    self.assertNotIn('old_pin',text,reader)
+                                else:
+                                    self.assertIn('replaced — do not apply as current',text,reader)
+                                    self.assertIn('current instruction',text,reader)
+                                    self.assertIn('SUPERSEDES source',text,reader)
                             self.assertEqual(['replaced','current'],actual[node['id']]['lineRoles'])
                             self.assertTrue(actual[node['id']]['quarantined'])
                         if node['id'] in actual:
@@ -870,6 +875,57 @@ class ApprovedReadersIntegration(Scratch):
                             self.assertEqual(0,result.returncode,(args,fmt,result.stdout,result.stderr))
                             self.assertIn('scripts/deploy.sh',result.stdout)
                             if fmt=='json': json.loads(result.stdout)
+
+    def test_capsule_kind_priority_and_newest_approval(self):
+        repo,nodes=self.fixture('approved',('RESOLVES','BLOCKS','GOVERNS','SUPERSEDES','multi-line'))
+        graph=mb._load_queue(repo)[0]
+        for node in graph['nodes']:
+            node['approval']['at']='2026-01-02T00:00:00Z' if node['title']=='multi-line' else '2026-01-01T00:00:00Z'
+        self.save_graph(repo,graph)
+        hand=mw.build_handover(repo,budget=2000)
+        self.assertEqual([nodes[k]['id'] for k in ('SUPERSEDES','BLOCKS','multi-line','RESOLVES','GOVERNS')],
+                         [i['id'] for i in hand['approvedLessons']])
+        original=mb.dream_items(repo)['items']
+        with mock.patch.object(mb,'dream_items',return_value={'items':list(reversed(original))}):
+            self.assertEqual(hand['approvedLessons'],mw.build_handover(repo,budget=2000)['approvedLessons'])
+
+    def test_default_capsule_carries_live_shape_and_tight_priority(self):
+        repo,nodes=self.fixture('approved',('RESOLVES','SUPERSEDES','BLOCKS'))
+        graph=mb._load_queue(repo)[0]
+        hint=next(n for n in graph['nodes'] if n['title']=='BLOCKS')
+        hint.pop('approval');hint['verdict']='PENDING'
+        self.save_graph(repo,graph)
+        original={i['id']:i for i in mb.dream_items(repo,tiers=('approved','hint'))['items']}
+        expected=[nodes[k]['id'] for k in ('SUPERSEDES','RESOLVES')]
+        for fmt in ('markdown','json'):
+            hand=mw.build_handover(repo,output_format=fmt)
+            self.assertEqual(expected,[i['id'] for i in hand['approvedLessons']])
+            self.assertTrue(mw.verify_handover_checksum(hand))
+            markdown=mw._render_handover(hand,mw.handover_signature(hand))
+            self.assertTrue(mw.verify_handover_markdown(markdown))
+            self.assertLessEqual(hand['tokenEstimate'],500)
+            for item in hand['approvedLessons']:
+                self.assertIn(item['text'],markdown)
+                self.assertNotIn('old_pin',item['text'])
+                for key in ('quoteLines','cites','edgeSources'):
+                    self.assertEqual(original[item['id']][key],item[key])
+            self.assertEqual(1,markdown.count('[REPLACED — do not apply as current]'))
+            self.assertEqual(1,markdown.count('[CURRENT]'))
+        seen=set()
+        for budget in range(500,950,5):
+            hand=mw.build_handover(repo,budget=budget,rejected=['Avoid retry '+str(i)+' '+('old approach '*12) for i in range(4)],output_format='markdown')
+            ids=[i['id'] for i in hand['approvedLessons']]
+            self.assertEqual(expected[:len(ids)],ids)
+            self.assertEqual(2-len(ids),hand['omitted']['approvedLessons'])
+            if len(ids)<2:self.assertFalse(hand['hints'])
+            if hand['omitted']['activeConstraints']:self.assertFalse(ids)
+            self.assertTrue(mw.verify_handover_checksum(hand))
+            seen.add(len(ids))
+        self.assertEqual({0,1,2},seen)
+        recall=mb.unified_recall(repo,'deploy',budget=5000)['formatted']
+        self.assertEqual(1,recall.count('[REPLACED — do not apply as current]'))
+        self.assertEqual(1,recall.count('[CURRENT]'))
+        self.assertNotIn('old_pin',recall)
 
     def test_budget_order_checksum_and_omissions(self):
         repo,nodes=self.fixture('approved',('RESOLVES','BLOCKS'))
@@ -944,8 +1000,8 @@ class ApprovedReadersIntegration(Scratch):
         self.assertNotIn('OLD',{e['dreamId'] for e in mb.promoted_rule_entries(repo)[0]})
         for result in (mb.unified_recall(repo,'deploy',budget=5000),
                        mw.build_handover(repo,budget=2000,output_format='markdown')):
-            self.assertIn('replaced — do not apply as current',result['formatted'])
-            self.assertIn('SUPERSEDES source',result['formatted'])
+            self.assertIn('[REPLACED — do not apply as current]',result['formatted'])
+            self.assertIn('[CURRENT]',result['formatted'])
         # A changed replacement cannot leave its old rule active in the approved group.
         (repo/mb.SNAPSHOT_REL/fid).write_text(snap[fid][0]+'\nchanged replacement\n')
         self.assertEqual([],mb.dream_items(repo)['items'])
@@ -1017,9 +1073,13 @@ class FinalAuditIntegration(Scratch):
                mw.build_handover(inline_repo,budget=4000,output_format='markdown')['formatted'],
                md.run_dream_recall(inline_repo/mb.QUEUE_REL,snapshot_path=inline_repo/mb.SNAPSHOT_REL,query_text='deploy',budget_tokens=4000)['formatted']]
         texts += [contexts[arm]['text'] for arm in ('flat','graph','handover')]
-        for text in texts:
-            self.assertIn('replaced — do not apply as current: Deploy with make release.',text)
-            self.assertIn('current instruction: Deploy only with scripts/deploy.sh.',text)
+        for i,text in enumerate(texts):
+            if i in (0,1,5):
+                self.assertIn('[REPLACED — do not apply as current] Deploy with make release.',text)
+                self.assertIn('[CURRENT] Deploy only with scripts/deploy.sh.',text)
+            else:
+                self.assertIn('replaced — do not apply as current: Deploy with make release.',text)
+                self.assertIn('current instruction: Deploy only with scripts/deploy.sh.',text)
 
     def test_fresh_review_lists_every_line_and_binds_the_displayed_digest(self):
         repo,nodes=self.fixture('approved',('multi-line',))

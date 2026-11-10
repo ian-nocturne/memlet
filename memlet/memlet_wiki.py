@@ -2265,15 +2265,16 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
     if not c["activeConstraints"]:
         lines.append("- (none)")
     if c.get("approvedLessons"):
-        from .memlet_bridge import render_approved_lesson
-        lines += ["", "### Approved lessons (human-approved; transcript citations re-verified)"]
-        lines += [render_approved_lesson(i) for i in c["approvedLessons"]]
+        lines += ["", "### Approved lessons (human-approved; citations re-verified in .memlet/dream/snapshot/)"]
+        lines += [i["text"] for i in c["approvedLessons"]]
     if c.get("hints"):
-        from memlet.memlet_bridge import hint_label, hint_item_label
+        from memlet.memlet_bridge import hint_label
         from .vocabulary import HINT_HELP
         lines += ["", "### " + hint_label(c["hints"]), HINT_HELP]
-        lines += ["- [hint; " + hint_item_label(h) + "]" + ("\n" + _lesson_quote_block(h) if h.get("quoteLines") else
-                  " " + h["text"] + " (`" + "{file}:{start}-{end}".format(**h["cites"][0]) + "`)") for h in c["hints"]]
+        if not c.get("approvedLessons"):
+            lines.append("Citations: .memlet/dream/snapshot/")
+        lines += [h["text"] for h in c["hints"]]
+
     if c.get("lexicalConstraints"):
         lines += ["", "### TS/JS constraints (lexical hash match only; re-check before use)"]
         lines += [f"- {suggested_label(a)}{a['rule']} (`{a['source']}`)" for a in c["lexicalConstraints"]]
@@ -2607,12 +2608,23 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         "rejectedApproaches": [],
     }
     _mark_suggested_items(lists, constraints, by_key)
-    from memlet.memlet_bridge import dream_items
+    from memlet.memlet_bridge import dream_items, render_capsule_lesson, _load_queue
     lesson_items = (dream_items(root, tiers=("approved", TIER_HINT)).get("items", [])
                     if _lesson_items is None else _lesson_items)
-    lists["approvedLessons"] = [i for i in lesson_items if i.get("tier") == "approved"]
+    # Metadata only: eligibility remains exclusively the verified tier provider's decision.
+    try:
+        graph = _load_queue(root)[0] or {}
+    except (OSError, ValueError, TypeError):
+        graph = {}
+    approvals = {n["id"]: str((n.get("approval") or {}).get("at") or "")
+                 for n in graph.get("nodes", [])}
+    approved = sorted((i for i in lesson_items if i.get("tier") == "approved"), key=lambda i: i["id"])
+    approved.sort(key=lambda i: approvals.get(i["id"], ""), reverse=True)
+    priority = ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS")
+    approved.sort(key=lambda i: min([priority.index(k) for k in i.get("edgeTypes", []) if k in priority] or [4]))
+    lists["approvedLessons"] = [dict(i, text=render_capsule_lesson(i)) for i in approved]
     # Only items the tier computation itself calls a hint, whatever a caller's provider returns.
-    lists["hints"] = [{"id": h["id"], "text": h["text"], "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint",
+    lists["hints"] = [{"id": h["id"], "text": render_capsule_lesson(h, hint=True), "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint",
                          **{k: h[k] for k in ("quoteLines", "edgeSources") if k in h}}
                       for h in lesson_items if h.get("tier") == TIER_HINT]
     seen_rejected = set()
@@ -2729,7 +2741,7 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
         if digest and victim in ("projectRules", "activeConstraints"):
             ranked = [k for k in ("projectRules", "activeConstraints") if lists[k]]
             victim = min(ranked, key=lambda k: lists[k][-1]["score"])  # drop the globally least important rule
-        if tokens < token_budget:
+        if tokens <= token_budget:
             break
         if victim is None:
             # The floor is a preference, the budget is a contract: shrink the floor; the WARNING line keeps the count.

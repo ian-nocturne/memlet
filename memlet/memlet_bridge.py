@@ -873,6 +873,36 @@ def _lesson_quote_block(item):
     return "\n".join(lines)
 
 
+def render_capsule_lesson(item, hint=False):
+    """Compact display only; citation and quote evidence remain untouched."""
+    quotes = [safe_lesson_display(q, limit=md.LESSON_TEXT_MAX_CHARS)
+              for q in item.get("quoteLines", [item.get("text", "")])]
+    cites = [Path(c["file"]).name + ":" + str(c["start"]) for c in item.get("cites", [])]
+    kinds = item.get("edgeTypes") or [e["edgeType"] for e in item.get("edgeSources", [])]
+    relation = next((k for k in ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS") if k in kinds), "LESSON")
+    if item.get("quarantined"):
+        parts = sorted(zip(item.get("lineRoles", []), quotes, cites), key=lambda p: p[0] != "replaced")
+        quotes = [("[REPLACED — do not apply as current] " if role == "replaced" else
+                   "[" + item.get("replacementLabel", "CURRENT") + "] ") + quote for role, quote, cite in parts]
+        cites = [cite for role, quote, cite in parts]
+        prefix = ""
+    else:
+        prefix = "[" + relation + "] "
+    if hint:
+        prefix += "[hint; " + hint_item_label(item) + "] "
+    return "- " + prefix + " ⟶ ".join(quotes) + " (" + ", ".join(cites) + ")"
+
+
+def render_recall_lesson(item):
+    if not item.get("quarantined"):
+        return render_approved_lesson(item)
+    lines = ["- [" + item["id"] + "] Superseded Quarantine (`SUPERSEDES`)"]
+    for role, quote, cite in zip(item.get("lineRoles", []), item.get("quoteLines", []), item.get("cites", [])):
+        label = "REPLACED — do not apply as current" if role == "replaced" else item.get("replacementLabel", "CURRENT")
+        lines.append("  [" + label + "] " + quote + " (`{file}:{start}-{end}`)".format(**cite))
+    return "\n".join(lines)
+
+
 def render_approved_lesson(item):
     if not item.get("quoteLines"):
         item = dict(item, quoteLines=[safe_lesson_display(md._LINE_PREFIX_RE.sub("", item.get("text", ""), count=1))])
@@ -1146,7 +1176,7 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
     for item in items:
         item.update(states[item["id"]])
         item["quote"] = item["text"]
-        item["text"] = render_approved_lesson(item)
+        item["text"] = render_recall_lesson(item)
     promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root)[0]}
     entries = []
     for it in items:
