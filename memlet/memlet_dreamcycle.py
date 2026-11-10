@@ -7,8 +7,10 @@ these records. No model text becomes lesson text; quotes come only from snapshot
 import copy
 import hashlib
 import json
+import posixpath
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 from memlet import memlet_bridge as mb
@@ -23,10 +25,13 @@ MAX_CALLS = 64
 MAX_BATCHES = 20
 MAX_WALL_SECONDS = 300
 MAX_OUTPUT_BYTES = 262144
+MAX_HOST_RUN_FILES = 64
+MAX_HOST_RUN_BYTES = 4 * 1024 * 1024
 TRUST_BOUNDARY = ("Vendor launch receipts are local digest integrity records, not signatures: a writer of .memlet "
                   "can forge them and human approval records. MCP and model output cannot create launch receipts. "
                   "Hints are screened against a list of permission phrases, labelled unreviewed, never shown among verified items; "
-                  "the phrase list is not a proof that a hint cannot loosen a rule.")
+                  "the phrase list is not a proof that a hint cannot loosen a rule. "
+                  "A trusted non-SUPPORTED verdict permanently vetoes the hint tier for that content; human approval still wins.")
 HOST_STATE_REL = RUNS_REL + "/host-sessions.json"
 VERDICTS = ("SUPPORTED", "MISSING_CONDITION", "OUT_OF_EVIDENCE", "WRONG_EDGE")
 _ID = re.compile(r"^[a-f0-9]{24}$")
@@ -68,20 +73,52 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
-def trust_content(node):
-    """Exact proposed content, independent of generated queue IDs and human decisions.
+def _canonical_path(value):
+    return posixpath.normpath(unicodedata.normalize("NFKC", str(value or "")).casefold().replace("\\", "/"))
 
-    Title is included conservatively too. Endpoint pins and the entire cited set
-    are bound; mere citation overlap never conveys agreement.
-    """
-    pin = md._pin_identity
-    edges = [{"type": e.get("edgeType"), "from": "self" if e.get("fromId") == node.get("id") else e.get("fromId"),
-              "to": "self" if e.get("toId") == node.get("id") else e.get("toId"),
-              "target": e.get("targetLabel"), "src": pin(e.get("srcPin")), "end": pin(e.get("citedTargetPin", e.get("targetPin")))}
+
+def _pin_lines(pins):
+    """Bind file, line and exact line content; range spelling/order is immaterial."""
+    lines = set()
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        fid, start, end = md.parse_span(pin["span"])
+        quotes = pin["quoteText"].split("\n")
+        if len(quotes) != end - start + 1:
+            raise ValueError("invalid citation lines")
+        for number, quote in zip(range(start, end + 1), quotes):
+            lines.add((fid, number, hashlib.sha256(quote.encode("utf-8")).hexdigest()))
+    return sorted(lines)
+
+
+def _endpoint(node, edge, key):
+    value = edge.get(key)
+    if value == node.get("id"):
+        return "self"
+    if value == str(node.get("id")) + ":NEWER":
+        return "self:NEWER"
+    label = edge.get("targetLabel", "")
+    prefix = "RULE" if edge.get("edgeType") == "SUPERSEDES" else edge.get("edgeType")
+    old_slug = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:40] or "scope"
+    if key == "toId" and value == "%s:%s" % (prefix, old_slug):
+        return {"type": prefix, "target": _canonical_path(label)}
+    return value  # explicit endpoint identities are never loosened
+
+
+def trust_content(node):
+    """Canonical content v2. Titles are display-only; endpoints and lines stay bound."""
+    def pin(value):
+        return _pin_lines([value])
+    edges = [{"type": e.get("edgeType"), "from": _endpoint(node, e, "fromId"),
+              "to": _endpoint(node, e, "toId"),
+              "target": _canonical_path(e.get("targetLabel")), "src": pin(e.get("srcPin")),
+              "end": pin(e.get("citedTargetPin", e.get("targetPin")))}
              for e in node.get("edges", [])]
-    return {"category": node.get("category"), "title": node.get("title"), "scope": node.get("scopeTag"),
-            "primary": pin(node.get("primaryPin")), "supersededBy": pin(node.get("supersededByPin")),
-            "cites": sorted([pin(p) for p in node.get("allPins", [])], key=lambda p: json.dumps(p, sort_keys=True)),
+    cites = _pin_lines(node.get("allPins", []))
+    return {"version": 2, "category": node.get("category"), "scope": _canonical_path(node.get("scopeTag")),
+            "primary": cites[:1], "supersededBy": pin(node.get("supersededByPin")),
+            "cites": cites,
             "edges": sorted(edges, key=lambda e: json.dumps(e, sort_keys=True))}
 
 
@@ -90,12 +127,15 @@ def trust_digest(node):
 
 
 def trusted_record(record, node):
-    return (isinstance(record, dict) and record.get("origin") == "vendor-cli"
-            and record.get("vendor") in vc.VENDORS and record.get("isolation") == "tool-free"
-            and vc.valid_model(record.get("model"))
-            and md._valid_utc_stamp(record.get("at")) and bool(_ID.fullmatch(str(record.get("runId", ""))))
-            and record.get("digest") == trust_digest(node)
-            and record.get("receiptSha256") == _hash({k: v for k, v in record.items() if k != "receiptSha256"}))
+    try:
+        return (isinstance(record, dict) and record.get("origin") == "vendor-cli"
+                and record.get("vendor") in vc.VENDORS and record.get("isolation") == "tool-free"
+                and vc.valid_model(record.get("model"))
+                and md._valid_utc_stamp(record.get("at")) and bool(_ID.fullmatch(str(record.get("runId", ""))))
+                and record.get("digest") == trust_digest(node)
+                and record.get("receiptSha256") == _hash({k: v for k, v in record.items() if k != "receiptSha256"}))
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
 
 
 def _repo(repo):
@@ -130,6 +170,31 @@ def _write(root, rel, value):
     if len(text.encode()) > 4 * 1024 * 1024:
         raise ValueError("Dream run state exceeds limit")
     mw.write_managed_text(root, rel, text, new_mode=0o600)
+    if rel.startswith(RUNS_REL + "/") and _ID.fullmatch(Path(rel).stem) and value.get("lane", "host") == "host":
+        _prune_host_runs(root)
+
+
+def _prune_host_runs(root):
+    """Under the queue lock: bound only regular host run files, oldest first."""
+    hosts = []
+    for path in (root / RUNS_REL).glob("*.json"):
+        if not _ID.fullmatch(path.stem):
+            continue
+        state = _read(root, RUNS_REL + "/" + path.name, {})
+        if state.get("lane", "host") == "host":
+            stat = path.stat()
+            hosts.append((stat.st_mtime_ns, path.name, stat.st_size))
+    total = sum(row[2] for row in hosts)
+    count = len(hosts)
+    for _, name, size in sorted(hosts):
+        if count <= MAX_HOST_RUN_FILES and total <= MAX_HOST_RUN_BYTES:
+            break
+        rel = RUNS_REL + "/" + name
+        if mw.managed_path_problem(root, rel, leaf="file"):
+            raise ValueError("unsafe host run path")
+        (root / rel).unlink()
+        count -= 1
+        total -= size
 
 
 def dream_ingest(repo, transcript_path, *, dry_run=False):
@@ -281,6 +346,7 @@ def _run_state(batch):
 
 def _complete_batch(root, current, state):
     state.setdefault("completed", []).append(current["batchId"])
+    state.setdefault("failed", {}).pop(current["batchId"], None)
     progress_rel = STATE_REL if current["lane"] == "trusted" else HOST_STATE_REL
     sessions = _read(root, progress_rel, {"sessions": {}})
     snapshot, _ = mb._load_snapshot(root)
@@ -370,6 +436,10 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                         raise ValueError("unpinnable citation")
                     if not all((parsed[0], n) in allowed for n in range(parsed[1], parsed[2] + 1)):
                         raise ValueError("citation outside supplied batch")
+                # Pick a stable default source endpoint before pinning. Keep every
+                # cited line below, independently of the legacy three-span limit.
+                source_lines = _pin_lines([md.resolve_pin(snapshot, s, max_lines=4) for s in clean["src_spans"]])
+                clean["src_spans"] = ["%s:%d" % (f, n) for f, n, _ in source_lines[:3]]
                 clean["lesson_id"] = "DRM-" + _hash([clean, lane])[:16]
                 graph = md.dream_pin_and_validate([clean], snapshot, vendor_origin=proposer, add_governs=False)
                 if not graph["nodes"]:
@@ -383,6 +453,10 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                         if pin["span"] not in known:
                             node["allPins"].append(pin)
                             known.add(pin["span"])
+                    cited = _pin_lines(node["allPins"])
+                    node["allPins"] = [md.resolve_pin(snapshot, "%s:%d" % (f, n)) for f, n, _ in cited]
+                    node["primaryPin"] = node["allPins"][0]
+                    node["timestamp"] = md.extract_line_timestamp(node["primaryPin"]["quoteText"])
                 # Preserve endpoint identity even for non-SUPERSEDES edges.
                 for node in graph["nodes"]:
                     for edge, source in zip(node["edges"], clean["edges"]):
@@ -397,6 +471,9 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
             "queueMeta": {"snapshotPath": str(root / mb.SNAPSHOT_REL), "dbPath": Path(mb.DB_REL).name, "approvalRequired": True}}
         added, merged, touched = [], [], []
         for node in built_nodes:
+            if launched and any(_overlap(n, node) and mb._approved_node(n, snapshot)
+                                for n in graph["nodes"]):
+                continue  # Human-approved identical content needs no new receipts or item.
             existing = next((n for n in graph["nodes"] if _overlap(n, node)
                              and md.approval_state(n, "node") == "pending" and n.get("verdict") != md.REJECTED
                              and not any(md.approval_state(e, "edge") == "rejected" for e in n.get("edges", []))
@@ -488,10 +565,14 @@ def _verification_data(node, snapshot):
 def _verification_candidates(root, vendor, model, agreement):
     graph, _ = mb._load_queue(root)
     snapshot, _ = mb._load_snapshot(root)
+    config, _ = mb._load_config(root)
+    config = mb.tier_config(graph, config)
     out = []
     for node in (graph or {}).get("nodes", []):
-        if md.approval_state(node, "node") == "rejected" or node.get("verdict") == md.REJECTED:
+        if md.approval_state(node, "node") != "pending" or node.get("verdict") == md.REJECTED:
             continue
+        if mb.item_tier(node, snapshot=snapshot, config=config) != "pending":
+            continue  # Already a hint: another SUPPORTED verdict cannot promote it.
         if mb._node_edges_verify(node, snapshot or {}):
             continue
         proposers = [r for r in node.get("proposers", []) if trusted_record(r, node)]
@@ -502,6 +583,12 @@ def _verification_candidates(root, vendor, model, agreement):
                and vc.same_model(vendor, r["model"], vendor, model) for r in node.get("verification", [])):
             continue
         if any(md._verify_pin_dict(pin, snapshot or {}, "evidence") for pin in evidence_pins(node)):
+            continue
+        hypothetical = copy.deepcopy(node)
+        supported = _receipt(vendor, hypothetical, "a" * 24, {"model": model})
+        supported["verdict"] = "SUPPORTED"
+        hypothetical.setdefault("verification", []).append(seal_receipt(supported))
+        if mb.item_tier(hypothetical, snapshot=snapshot, config=config) != "hint":
             continue
         out.append(node)
     # Stable queue order resolves ties (timestamps have second precision).
@@ -531,6 +618,12 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
             chosen.append((verify_with, verifier_model))
         if any(not vc.valid_model(m) for _, m in chosen):
             raise ValueError("invalid model id; expected [A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}")
+        if agreement == "model":
+            for index, (vendor, model) in enumerate(chosen):
+                if vendor in vc.MODEL_FAMILIES and vc.model_family(vendor, model) is None:
+                    key = "dream.models.verifier." + vendor if index >= len(vendors) else "dream.models." + vendor
+                    raise ValueError(key + " must contain exactly one known family token under dream.agreement=model; accepted families: "
+                                     + ", ".join(vc.MODEL_FAMILIES[vendor]))
         if verify_with in vendors and agreement == "vendor":
             raise ValueError("same-vendor verification requires dream.agreement=model and a distinct dream.models.verifier model")
         if verify_with and agreement == "model" and any(vc.same_model(v, m, verify_with, verifier_model) for v, m in chosen[:-1]):
@@ -598,6 +691,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                         raise ValueError("invalid verdict")
                 except ValueError:
                     report["droppedOutput"] += 1
+                    report["notices"].append(nid + ": dropped verifier verdict from " + verify_with + "/" + verifier_model + ": invalid or failed output")
                     continue
                 with md.queue_lock(root / mb.QUEUE_REL):
                     graph, _ = mb._load_queue(root)
@@ -723,11 +817,14 @@ def dream_status(repo):
         tiers = mb.dream_items(root, tiers=("approved", "hint", "pending"))
         runs = []
         if (root / RUNS_REL).is_dir():
-            for p in sorted((root / RUNS_REL).glob("*.json"))[:1000]:
+            for p in sorted((root / RUNS_REL).glob("*.json")):
                 if _ID.fullmatch(p.stem):
                     st = _read(root, RUNS_REL + "/" + p.name, {})
-                    runs.append({"runId": p.stem, "completedBatches": len(st.get("completed", [])), "lastRun": st.get("lastRun")})
+                    runs.append({"runId": p.stem, "lane": st.get("lane", "host"), "failedBatches": len(st.get("failed", {})),
+                                 "completedBatches": len(st.get("completed", [])), "lastRun": st.get("lastRun")})
+        runs.sort(key=lambda run: (run["lane"] != "trusted", run["runId"]))
         return {"ok": True, "waiting": sum(s.get("ingested") is True and s["lines"] > s["dreamed"] for s in sessions.values()), "runs": runs,
+                "failedBatches": sum(run["failedBatches"] for run in runs),
                 "counts": tiers["counts"], "items": tiers["items"], "notices": tiers["notices"], "trustBoundary": TRUST_BOUNDARY}
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
         return mb._fail(str(exc), 2)

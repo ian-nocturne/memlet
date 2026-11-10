@@ -25,16 +25,28 @@ _SETTINGS_RISK_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", 
 # Settings routing checks retain the brief runner's scope; unrelated AWS_REGION
 # or another provider's config is not evidence that Claude will use paid auth.
 _SETTINGS_RISK_ENV = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_BEARER_TOKEN")
-_STRIPPED_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_", "OPENAI_", "GOOGLE_", "GEMINI_", "AZURE_")
+_RUNNER_ENV_KEYS = frozenset(("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR",
+    "CLAUDE_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"))
 
 
 def valid_model(model):
     return isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}", model) is not None
 
 
+def model_family(vendor, model):
+    tokens = re.split(r"[^a-z0-9]+", str(model).casefold())
+    families = [t for t in tokens if t in MODEL_FAMILIES.get(vendor, ())]
+    return families[0] if len(families) == 1 else None
+
+
 def same_model(vendor_a, model_a, vendor_b, model_b):
     """Conservative identity, shared by launch and read-time agreement checks."""
     a, b = str(model_a).casefold(), str(model_b).casefold()
+    # An unresolved Claude alias cannot establish model independence, even
+    # against another vendor. Vendor-mode agreement remains a separate policy.
+    if any(v in MODEL_FAMILIES and model_family(v, m) is None
+           for v, m in ((vendor_a, model_a), (vendor_b, model_b))):
+        return True
     if a == b:
         return True
     if vendor_a == vendor_b:
@@ -56,9 +68,7 @@ def static_vendor_refusal(vendor):
 
 
 def _runner_env():
-    env = {k: v for k, v in os.environ.items() if k not in _PAID_ENV
-           and not k.startswith(_STRIPPED_ENV_PREFIXES)
-           and k not in ("NODE_OPTIONS", "BASH_ENV", "ENV", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES")}
+    env = {k: v for k, v in os.environ.items() if k in _RUNNER_ENV_KEYS or k.startswith("LC_")}
     env["MEMLET_DREAMING"] = "1"
     return env
 

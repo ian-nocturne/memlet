@@ -1310,17 +1310,18 @@ def format_flat_memory(
         cat = str(n.get("category") or "repeated_pitfall")
         if cat not in CATEGORIES:
             cat = "repeated_pitfall"
-        scope_lbl = safe_truncate_masked(str(n.get("scopeTag") or "general"), 48)
-        title_lbl = safe_truncate_masked(str(n.get("title") or ""), 128)
+        from memlet.memlet_bridge import safe_lesson_display
+        scope_lbl = safe_lesson_display(str(n.get("scopeTag") or "general"), limit=48)
+        title_lbl = safe_lesson_display(str(n.get("title") or ""), limit=128)
         clean_q = re.sub(r"\s*\d{4}-\d{2}-\d{2}T[^\s]+\s+\[[^\]]+\]\s*", " ", re.sub(r"\s+", " ", str(pp.get("quoteText") or "")).strip()).strip()
         clean_q = re.sub(r"^TOOL_(?:RESULT|USE\s+\w+):\s*", "", clean_q)
-        clean_q = safe_truncate_masked(clean_q, _FLAT_QUOTE_CHARS)
+        clean_q = safe_lesson_display(clean_q, limit=_FLAT_QUOTE_CHARS)
         raw_sp = str(pp.get("span") or "")
         safe_sp = raw_sp if parse_span(raw_sp) else "unpinned"
         safe_sha = re.sub(r"[^0-9a-f]", "", str(pp.get("sha256") or "").lower())[:8] or "none"
         if sp and sp.get("quoteText"):
             clean_sup = re.sub(r"\s*\d{4}-\d{2}-\d{2}T[^\s]+\s+\[[^\]]+\]\s*", " ", re.sub(r"\s+", " ", str(sp.get("quoteText") or "")).strip()).strip()
-            clean_sup = safe_truncate_masked(clean_sup, 165)
+            clean_sup = safe_lesson_display(clean_sup, limit=165)
             raw_sup_sp = str(sp.get("span") or "")
             safe_sup_sp = raw_sup_sp if parse_span(raw_sup_sp) else "unpinned"
             safe_sup_sha = re.sub(r"[^0-9a-f]", "", str(sp.get("sha256") or "").lower())[:12] or "none"
@@ -1723,6 +1724,14 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
 
     included_ids: List[str] = []
     def _window_quote(raw_q: str, is_replacement: bool = False) -> str:
+        from memlet.memlet_bridge import safe_lesson_display, _hidden_character
+        hidden = any(_hidden_character(c) for c in raw_q)
+        raw_q = safe_lesson_display(raw_q)
+        def finish(text, limit):
+            text = safe_truncate_masked(text, limit)
+            if hidden and "contains hidden characters" not in text:
+                text += " [contains hidden characters]"
+            return text
         cleaned = re.sub(
             r"\s*\d{4}-\d{2}-\d{2}T[^\s]+\s+\[[^\]]+\]\s*",
             " ",
@@ -1731,7 +1740,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         cleaned = re.sub(r"^TOOL_(?:RESULT|USE\s+\w+):\s*", "", cleaned)
         max_len = _RECALL_REPLACEMENT_QUOTE_CHARS if is_replacement else _RECALL_QUOTE_CHARS
         if len(cleaned) <= max_len:
-            return safe_truncate_masked(cleaned, max_len)
+            return finish(cleaned, max_len)
         low_c = cleaned.lower()
         late_pos = -1
         for tok in q_tokens:
@@ -1744,8 +1753,8 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             tail_len = max_len - head_len - 3
             w_start = max(head_len, min(len(cleaned) - tail_len, late_pos - 12))
             combined = cleaned[:head_len].rstrip() + " … " + cleaned[w_start : w_start + tail_len].lstrip()
-            return safe_truncate_masked(combined, max_len + 4)
-        return safe_truncate_masked(cleaned, max_len)
+            return finish(combined, max_len + 4)
+        return finish(cleaned, max_len)
 
     for n in ranked:
         n_idx = int(n.get("_idx", -1))
@@ -1777,9 +1786,10 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         ]
         if not typed_labels:
             typed_labels = [str(e.get("targetLabel") or "") for e in node_edges if e.get("targetLabel")]
-        targets = safe_truncate_masked(", ".join(sorted(set(typed_labels))), 56)
-        scope_lbl = safe_truncate_masked(str(n.get("scopeTag") or "general"), 42)
-        title_lbl = safe_truncate_masked(str(n.get("title") or ""), 128)
+        from memlet.memlet_bridge import safe_lesson_display
+        targets = safe_lesson_display(", ".join(sorted(set(typed_labels))), limit=56)
+        scope_lbl = safe_lesson_display(str(n.get("scopeTag") or "general"), limit=42)
+        title_lbl = safe_lesson_display(str(n.get("title") or ""), limit=128)
 
         raw_pp_sp = str(pp.get("span") or "")
         safe_pp_sp = raw_pp_sp if parse_span(raw_pp_sp) else "unpinned"
@@ -2066,15 +2076,15 @@ def build_cortex_lineage_payload(
         nodes_out.append({
             "id": lid,
             "kind": cat,
-            "title": safe_truncate_masked(str(n.get("title") or ""), 110),
-            "scopeTag": safe_truncate_masked(str(n.get("scopeTag") or ""), 48),
+            "title": _display_snapshot_line(safe_truncate_masked(str(n.get("title") or ""), 110)),
+            "scopeTag": _display_snapshot_line(safe_truncate_masked(str(n.get("scopeTag") or ""), 48)),
             "status": st,
             "isSuperseded": st == "superseded",
             "inRecallCapsule": bool(is_approved and ((not has_recall_info) or (lid in included_set))),
             "reviewState": "approved" if is_approved else "pending",
             "vendorOrigins": [safe_truncate_masked(str(v), 48) for v in raw_vendors],
             "srcSpan": safe_truncate_masked(str(pp.get("span") or ""), 64),
-            "quoteLines": [mask_secrets(str(ln)) for ln in raw_q_lines],
+            "quoteLines": [_display_snapshot_line(ln) for ln in raw_q_lines],
             "sha256Pin": str(pp.get("sha256") or ""),
             "supersededBySpan": safe_truncate_masked(str(sp.get("span") or ""), 64) if sp else None,
             "supersededBySha256": str(sp.get("sha256") or "") if sp else None,
@@ -2824,6 +2834,11 @@ def _valid_utc_stamp(value: Any) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _display_snapshot_line(line):
+    from memlet.memlet_bridge import safe_lesson_display
+    return safe_lesson_display(mask_secrets(str(line)))
 
 
 def _pin_identity(pin: Any) -> Optional[Dict[str, Any]]:
