@@ -1,6 +1,6 @@
 # Memlet (`memlet`)
 
-**Your agent's rules, checked against the code.** Memlet ties each rule in `CLAUDE.md`, `AGENTS.md` or `.cursorrules` to the code it talks about, and tells the agent when the two have drifted apart.
+**Agent memory you can re-check.** Memlet ties each rule in `CLAUDE.md`, `AGENTS.md` or `.cursorrules` to the code it talks about and tells the agent when the two have drifted apart. It also turns finished sessions into lessons, each pinned to the lines it came from, that wait for your approval before any agent sees them.
 
 > Twin to **Routlet** under Ian · Nocturne Lab: *Routlet picks the route. Memlet carries the checked context.*
 > Formerly **DeltaHarness** / **Ieum Memory** / PRISM Memory. The legacy executables `ieum-memory`, `deltaharness`, and `prism-memory` still work for this release and print a one-line notice when run in a terminal.
@@ -13,7 +13,23 @@
 
 Every project that uses coding agents (Claude Code, Cursor, Codex) keeps a file of rules for them. The rules describe the code. Then the code changes, nobody updates the rules, and the agent keeps following instructions that are no longer true. Most memory tools make this worse in one specific way: they keep injecting a memory long after the code it describes has changed.
 
-## One example
+## What Memlet believes
+
+Agent memory is converging on three ideas. Agents should **dream**: go back over a finished session and keep its lessons. Memories should form an **ontology**: typed relations instead of a flat pile of notes. And context should be **disclosed progressively**: a little by default, more on demand. Memlet adopts all three and adds one condition of its own:
+
+> **A memory is only worth handing to an agent if it can be re-checked.**
+
+Five principles follow from that. They come from the project's design notes; some were adopted only after an experiment failed.
+
+1. **Every memory has an address you can re-check.** A rule points at code (`file::symbol` plus a fingerprint of that symbol). A lesson points at the exact transcript lines it came from (plus their SHA-256). What has no address is labelled unverified; what no longer matches its address is quarantined.
+2. **The model proposes, code verifies, a person approves.** A dream is a proposal, not a memory. Whether a citation exists, hashes match, and time runs forwards is decided by deterministic code. Nothing is used until someone approves it by name.
+3. **Quote, never rewrite.** Rules and lessons are carried verbatim. We tried letting a model summarise the rules; the summaries dropped conditions, so that path was closed.
+4. **Four relations are enough.** `GOVERNS` (a rule applies to this scope), `SUPERSEDES` (this instruction replaced that one), `RESOLVES` (this workaround fixes that failure), `BLOCKS` (this dead end forbids that action). Small enough to validate without a graph database, and enough to stop an old instruction from coming back as current.
+5. **Send little, and say what was left out.** Small instruction sets go in whole; only large ones are tiered. Anything trimmed for budget is counted, never dropped silently.
+
+All of it runs locally with the Python standard library and SQLite: no model call, no daemon and no graph database on the default path.
+
+## Example 1: a rule and the code it names
 
 Take a rule that names a function. In this example the project's `AGENTS.md` has two such rules, one for a `charge` function and one for a `refund` function, each written as `file::function`:
 
@@ -51,13 +67,53 @@ $ memlet handover . --next-step "Finish the billing refactor"
 
 (Output shortened. `<billing file>` stands for the real path, a Python file under an `app` folder: this README is itself checked by `memlet check`, so it cannot name a file that does not exist in this repository. The commands and lines are otherwise what Memlet printed.)
 
-## How it works
+## Example 2: a dream, and the four relations
 
-1. **Write rules that name code.** Use `path/to/file::symbol` in any instruction file. A rule that names no code is still carried, but only as plain, unverified text.
-2. **Pin them.** `memlet init` records a fingerprint of every function or class a rule names.
-3. **Let Memlet compare.** `check`, `recall`, `handover`, the Claude Code hooks and the MCP tools all compare today's code with the pin and set stale rules apart.
+A session ends. Four things were said in it: a hotfix shortcut that was later withdrawn, a workaround that worked, the instruction that replaced the shortcut, and a ban.
 
-**What "verified" means here.** Memlet checks that an anchored symbol still exists and has not changed since it was pinned. It does not check that the rule's sentence is true. Python symbols are compared by AST. TypeScript/JavaScript symbols are compared by a lexical scan, which cannot prove equivalence, so a TS/JS match is always reported as `compatible-unverified`, never `active`. The default path runs locally and makes no model calls.
+```bash
+memlet learn --transcript <session transcript>   # or let the Stop hook do it
+memlet learn --pending                           # read what was proposed
+```
+
+```console
+- DRM-e2d3… [superseded_directive] Hotfix deploy rule: push straight to main; this rule gets superseded once CI is back.   (cites <transcript>:1)
+- DRM-468b… [workaround draft]     Workaround verified: split the batch into 6k chunks and the E_TIMEOUT error is resolved. (cites <transcript>:2)
+- DRM-3f04… [workaround draft]     The hotfix deploy rule is superseded: always open a pull request before merging to main. (cites <transcript>:3)
+- DRM-cc2c… [repeated_pitfall]     Never call charge() in <billing file> without the retry wrapper; calling it directly is banned. (cites <transcript>:4)
+```
+
+Until someone approves them, none of this reaches an agent: `memlet recall` returns no lessons. After `memlet learn --approve <ids> --by "ray"`, the lessons come back sorted by what they mean for the task:
+
+```console
+## 1. Hard Bans (BLOCKS)
+- Never call charge() in <billing file> without the retry wrapper; calling it directly is banned.
+## 2. Workarounds (RESOLVES)
+- Workaround verified: split the batch into 6k chunks and the E_TIMEOUT error is resolved.
+## 3. Scope Rules (GOVERNS)
+- The hotfix deploy rule is superseded: always open a pull request before merging to main.
+## 4. Superseded Quarantine (SUPERSEDES)
+  old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT]: Hotfix deploy rule: push straight to main; ...
+  replacement_pin [ACTIVE — APPLY THIS]: The hotfix deploy rule is superseded: always open a pull request ...
+```
+
+Two things to notice. The withdrawn shortcut is still there, but fenced off: an agent that finds "push straight to main" in an old log is told it was replaced, and by what. And the ban names a function, so on approval Memlet ties it to that function's fingerprint; it then appears in `memlet handover` next to the rule from Example 1, and goes stale with it if the function changes.
+
+The extraction itself is deliberately modest: keyword rules, no model call. It mislabels things (the replacement instruction above is filed as a "workaround draft"). That is why the approval step exists, and why each proposal cites the line to read before you approve it.
+
+(Output shortened and ids abbreviated; `<transcript>` and `<billing file>` stand for real paths, as in Example 1.)
+
+## From principle to code
+
+| Principle | Design | Built today | Not yet |
+| :--- | :--- | :--- | :--- |
+| 1. An address you can re-check | Code anchors with AST fingerprints; transcript citations with SHA-256; five states (`active`, `compatible-unverified`, `stale`, `unpinned`, `path-exists`) | `init`, `check`, `check --changed` / `--accept`, stale rules set apart in `recall` and `handover`, Claude Code hooks, four MCP tools | TS/JS is a lexical scan and never `active`. No automatic suggestion of anchors for existing rule files. |
+| 2. Propose, verify, approve | Five-step dream: read, propose, pin, validate, queue. Approval is bound to a digest of the lesson and its citations | `learn --transcript` / `--pending` / `--approve` / `--reject`, revocation, per-lesson re-verification, Stop and PreCompact hooks; approval is impossible over MCP | The built-in proposer is keyword rules. Model-written candidates can be fed in (`admin dream-build --candidates`), but no proposer ships. The approval record is an integrity check, not a signature. |
+| 3. Quote, never rewrite | Only a title may be machine-written; bodies are copied from the source. Restructuring moves lines without editing them | Verbatim rules and lessons everywhere; approved lessons promoted to a wiki page with the text you reviewed; `admin slim-plan` with a preservation proof | The model-written brief (`admin brief-build`) failed its fidelity check and is hidden. |
+| 4. Four relations | A four-verb schema; `SUPERSEDES` needs both citations and forward time; no cycles; recall follows one hop from the task | `admin dream-build` / `dream-recall`, two-pass validation, three SQLite tables, lineage view in `memlet ui`, approved lessons linked to code anchors | Recall quality is not measured for this release. |
+| 5. Send little, say what was left out | A safety core, an index, and deterministic BM25 recall; whole-file below about 8,000 tokens; adaptive handover budget | `recall` (works without any index), `admin rule-context --auto`, `admin rule-recall`, handover budget with an `omitted` count | The size router is not wired into the six commands or the hooks. The always-on safety core needs a model-built index (`admin index-build`). |
+
+**What "verified" means here.** Memlet checks that an anchored symbol still exists and has not changed since it was pinned, and that a cited line still says what it said. It does not check that a rule or a lesson is true. Python symbols are compared by AST. TypeScript/JavaScript symbols are compared by a lexical scan, which cannot prove equivalence, so a TS/JS match is always reported as `compatible-unverified`, never `active`.
 
 ## Six commands
 
