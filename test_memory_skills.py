@@ -4043,8 +4043,11 @@ class MemletInitWikiTests(unittest.TestCase):
         self.assertEqual(0, code)
         code, out = self._cli('--help')
         self.assertIn('init', out)
-        self.assertIn('wiki', out)
-        for command in ('import', 'handover', 'compare-bench', 'ui', 'pack'):
+        for command in ('check', 'recall', 'handover', 'learn', 'ui', 'admin'):
+            self.assertIn(command, out)
+        code, out = self._cli('admin', '--help')
+        self.assertEqual(0, code)
+        for command in ('wiki', 'import', 'compare-bench', 'pack'):
             self.assertIn(command, out)
 
 
