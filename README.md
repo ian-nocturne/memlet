@@ -3,7 +3,7 @@
 **Agent memory that checks whether what it remembers is still true — a self-verifying, code-anchored memory engine and instruction drift guard for coding agents.**
 
 > Twin to **Routlet** under Ian · Nocturne Lab: *Routlet picks the route. Memlet carries the verified context.*
-> Formerly **DeltaHarness** / **Ieum Memory** / PRISM Memory. Legacy command names `ieum-memory`, `deltaharness`, and `prism-memory` still work as aliases for this release.
+> Formerly **DeltaHarness** / **Ieum Memory** / PRISM Memory. The legacy executables `ieum-memory`, `deltaharness`, and `prism-memory` still work for this release and print a one-line notice when run in a terminal.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](pyproject.toml)
@@ -11,11 +11,20 @@
 
 Coding agents (`Claude Code`, `Cursor`, `Codex`, `Windsurf`) silently break when repository files move, function signatures change, `.env` keys go missing, or context compaction wipes architectural constraints. Most memory tools make this worse in one specific way: they keep injecting a memory long after the code it describes has changed.
 
-**Memlet** anchors memories and instructions to the code they talk about, and refuses to hand over context it cannot verify. It ships in a single pure-Python package (`Apache-2.0`, stdlib-only core) with two sub-plugins:
+**Memlet** anchors memories and instructions to the code they talk about, and refuses to hand over context it cannot check. It is one pure-Python package (`Apache-2.0`, stdlib-only core) with six everyday commands:
 
-1. **`memlet check` (Instruction & Contract Checker, alias `audit`)**: Audits `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.cursor/rules/*.mdc`, `README.md`, and `SKILL.md` against repository files, symbols (`Python` via stdlib `ast`, `TypeScript`/`JavaScript` via comment-stripped contract & balanced-delimiter parser), monorepo `package.json` scripts (tracking `cd <subdir>` context), and `Makefile` targets. Outputs JSON, Markdown, or GitHub Code Scanning **SARIF v2.1.0**, and returns non-zero exit code (`1`) when broken contracts are found.
-2. **`viberescue` (`memlet rescue`)**: Packages stuck AI-built projects into a secret-scrubbed static diagnostic bundle (`RESCUE_BRIEF.md` + `ONE_PROMPT_RESCUE.md`). Detects missing `.env` keys referenced in code (`process.env.KEY` and `process.env["KEY"]`), client-side secret exposure (respecting `import "server-only"`), cross-migration Supabase RLS & `CREATE POLICY` gaps, and competing lockfiles while recursively scrubbing secret tokens.
-3. **`anti-slop` (`memlet anti-slop`)**: Scans web/app codebases (`HTML`, `CSS`, `TS`, `TSX`, `JS`, `JSX`, `MJS`, `Vue`, `Svelte`, `Markdown`) for 8 static UI & copy signals: purple radial-gradient blobs (including CSS custom property resolution `var(--blob)`), WCAG 2.1 low-contrast text/button pairs (`< 3.0:1`), emoji UI chrome, fractional pixel font sizes, 3+ nested bordered cards, blocked viewport zoom, missing/empty design token locks, and robotic Korean translation-ese copy.
+| Command | What it does |
+| :--- | :--- |
+| `memlet init` | Records a baseline (a *pin*) for every code-anchored rule. `--hooks` installs the automatic loop. |
+| `memlet check` | Audits instruction files against the repository; `--changed` checks only what you just edited. |
+| `memlet recall "<task>"` | Returns the rules, human-approved lessons, and memories relevant to a task, each with its source. |
+| `memlet handover` | Builds a small capsule for the next model: unchanged-since-pinned rules, with stale ones quarantined. |
+| `memlet learn` | Queues lessons from a session transcript as **pending**; nothing is used until a person approves it. |
+| `memlet ui` | Writes a self-contained HTML inspector. |
+
+Everything else (the task-memory store, Dream internals, `rescue`, `anti-slop`, `pack`, benchmarks) lives under `memlet admin <command>`; run `memlet admin --help` for the list.
+
+**What "verified" means here.** Memlet checks that an anchored symbol still exists and has not changed since it was pinned. It does not check that the rule's sentence is true. Python symbols are compared by AST. TypeScript/JavaScript symbols are compared by a lexical scan, which cannot prove equivalence, so a TS/JS match is always reported as `compatible-unverified`, never `active`.
 
 ---
 
@@ -37,14 +46,16 @@ There are good agent memory tools already. Memlet is not trying to be a general 
 
 - **Human-readable Markdown wiki, synced both ways (`.memlet/wiki/`)** — `memlet init` writes `.memlet/config.json` (pinned anchor hashes), `.memlet/wiki/INDEX.md`, and a local SQLite ledger `.memlet/ledger.sqlite3` (`anchor_snapshots` + `wiki_events`). People read, diff, and edit `.memlet/wiki/*.md` directly; `memlet wiki` compares each page body with its last recorded hash and records a changed or new page as a `user_edit` event in that ledger.
 - **Zero-LLM, local, bi-temporal ledger** — Every memory keeps when it was true (`at`) and when the system learned it (`known_at`), with `supersedes` / `retract` lineage. Point-in-time recall (`--at`, `--known-at`) and "why did this change?" both come from the ledger, not from a model's summary.
-- **AST symbol & signature anchoring** — Memories and skills that reference code store the file path, symbol signature, and commit. On each check they resolve to:
-  - `active` — anchor still matches;
-  - `compatible-unverified` — body changed or an optional argument was added; re-verify before trusting;
-  - `stale` — symbol removed, required arguments changed, or file moved; blocked from automatic injection.
+- **Symbol & signature anchoring** — Rules that reference code as `path::symbol` store a hash of that symbol. `memlet init` and `memlet import` record the baseline; read commands never create one. On each check an anchor resolves to:
+  - `active` — a stored pin exists and the symbol is unchanged (Python only);
+  - `compatible-unverified` — the body changed, an optional argument was added, or the match is a TS/JS lexical match; re-verify before trusting;
+  - `stale` — symbol removed, required arguments changed, or file moved; quarantined, never handed over as current;
+  - `unpinned` — the symbol exists but no baseline was recorded yet;
+  - `path-exists` — the rule names a path only, so nothing was hashed.
 - **Session Delta-Prompting** — Within one session, if `coreHash` is unchanged only the delta is sent; a compaction or session restart triggers a fresh baseline.
-- **5-factor admission & poisoning quarantine** — Utility and source trust are scored separately and never summed, so text that arrived from untrusted external input cannot be promoted into a behavioral rule just by being repeated.
+- **Admission gate for the task-memory store** — Each captured item is scored on three factors (utility, novelty, confidence) and low-information text is not stored. Items captured from a model are stored as hypotheses, not as rules.
 - **Import what you already have** — `memlet import` reads rules from `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.cursor/rules/*.mdc`, `.ai-memory/**/*.md`, and `.claude-mem/**/*.md`, checks every code anchor in them right away, and writes the result to one wiki page with a status tag per rule.
-- **Cross-Vendor Handover Capsules** — When you hit a rate limit and move from one agent to another, `memlet handover` builds a signed capsule under 500 tokens: only constraints whose anchors are still `active`, stale anchors listed as quarantined, rejected approaches (dead ends), modified-file count, and the next step. Execution and billing approval are never carried over to the next model. (`memlet capsule` remains for budgeted task-memory capsules.)
+- **Cross-Vendor Handover Capsules** — When you hit a rate limit and move from one agent to another, `memlet handover` builds a capsule under 500 tokens by default: constraints whose anchors are `active`, separately labelled groups for anything not verified, stale anchors listed as quarantined, rejected approaches (dead ends), modified-file count, and the next step. The capsule carries a SHA-256 checksum (integrity only, not a signature) that `memlet handover --verify FILE` re-checks. Execution and billing approval are never carried over to the next model. (`memlet capsule` remains for budgeted task-memory capsules.)
 
 ---
 
@@ -53,17 +64,21 @@ There are good agent memory tools already. Memlet is not trying to be a general 
 ### 1. Install & Initialize (Zero External Dependencies Required)
 
 ```bash
-pip install git+https://github.com/ian-nocturne/deltaharness.git
+pip install git+https://github.com/ian-nocturne/deltaharness.git@v8.4.0
 
 # One-command, zero-daemon setup: .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 memlet init .
 ```
 
-From a source checkout, run the standalone test suite:
+`memlet init` is safe to run again: existing pins and your own settings in `.memlet/config.json` are kept, and only new anchors are added. `memlet init --force` re-pins everything. Add `.memlet/` to your `.gitignore` unless you want to share it; the Dream queue and transcript snapshots under it hold conversation text.
+
+In a terminal the six commands print readable text. When output is piped or captured they print JSON, as before; `--format json|markdown` always wins.
+
+From a source checkout, run the test suite (Python 3.9 or newer):
 
 ```bash
 pip install -e .
-python3 -B -m unittest -v test_memory_skills
+python3 -m unittest discover -s . -p "test_*.py" -t .
 ```
 
 *(Optional)* Enable local ONNX `e5-small` semantic vector acceleration:
@@ -73,47 +88,99 @@ pip install -e ".[semantic]"
 
 ### 2. Check Your Repo Instructions (`CLAUDE.md` / `AGENTS.md` / `.cursorrules`)
 
-Run a zero-setup static & contract audit on any repository:
-
 ```bash
-# Output human-readable Markdown report (exits 1 if errors > 0, or pass --exit-zero)
+# Human-readable report (exits 1 if errors > 0, or pass --exit-zero)
 memlet check . --format markdown
 
-# Git-diff blast radius check (flags invalid_git_ref if base ref does not exist)
+# Git-diff blast radius check (reports invalid_git_ref if a ref does not exist)
 memlet check . --base HEAD~1 --head HEAD --format markdown
 
 # Export SARIF v2.1.0 for GitHub Code Scanning
 memlet check . --format sarif > memlet-check.sarif
+
+# Fast check of only the files you changed (working tree vs HEAD, renames and deletions included);
+# exits 1 when a rule that touches them is stale
+memlet check --changed
+
+# Accept one anchor's new state after you have re-read its rule (instead of re-pinning everything)
+memlet check --accept "mod.py::charge"
 ```
 
-### 3. Project Memory into a Readable Wiki (`memlet wiki`)
+### 3. Recall What Applies to a Task (`memlet recall`)
 
 ```bash
-# Refreshes the INDEX.md status table, adds a per-page AST status header
-# (active / compatible-unverified / stale), and records page edits in .memlet/ledger.sqlite3
-memlet wiki .
+memlet recall "refund retry logic"
 ```
 
-### 4. Import Existing Rules & Hand Over Verified Context (`memlet import` / `memlet handover`)
+One response from up to three sources, each item with a file:line or id you can open:
+
+- **Rules** from your instruction files and wiki pages. Without a built rule index they are parsed directly from the files and labelled as such.
+- **Approved lessons** from the Dream queue. Pending, rejected, or no-longer-verifiable lessons are never returned.
+- **Task memories**, only when you pass `--standalone` or `--task`.
+
+### 4. Import Existing Rules & Hand Over Context (`memlet admin import` / `memlet handover`)
 
 ```bash
-# Preview: tag every imported rule active / compatible-unverified / stale (or unanchored)
-memlet import . --dry-run --format markdown
+# Preview: tag every imported rule with the status the real run would give it
+memlet admin import . --dry-run --format markdown
 
 # Write .memlet/wiki/imported-rules.md, pin anchors in .memlet/config.json, log an import event
-memlet import . --from auto        # or: claude-md | cursorrules | ai-memory | claude-mem
+memlet admin import . --from auto        # or: claude-md | cursorrules | ai-memory | claude-mem
 
-# Signed handover capsule for the next model (Claude / Codex / Gemini); stale anchors are left out
+# Handover capsule for the next model (Claude / Codex / Gemini); stale anchors are quarantined
 memlet handover . --next-step "Finish the refund refactor" \
   --rejected "Retrying inside the webhook handler double-charges" --format markdown
 
-# Also save it as .memlet/wiki/HANDOVER.md and record a handover event in the ledger
+# Also save it as .memlet/wiki/HANDOVER.md, then check later that nobody edited it
 memlet handover . --next-step "Finish the refund refactor" --write
+memlet handover --verify .memlet/wiki/HANDOVER.md
 ```
 
-The capsule carries `repoHead`, `capsuleSignature` (SHA-256 over the canonical payload), `activeConstraints`, `quarantinedStaleAnchors`, `rejectedApproaches` (your `--rejected` items plus bullets under `## Rejected Approaches` / `## Dead-Ends` in wiki pages), `executionProof` (modified-file count and anchor health), `nextAction`, and `authorityBoundary: "read-only-context-only: execution and external side-effect approvals are NOT inherited"`. Rules without any code anchor are counted but not carried, because there is nothing to verify them against.
+The capsule carries `repoHead`, `activeConstraints` (pinned and unchanged), `lexicalConstraints` (TS/JS lexical matches; re-check before use), `pathExistsAnchors` and `unpinnedAnchors` (rule text carried, clearly not verified), `quarantinedStaleAnchors`, `rejectedApproaches` (your `--rejected` items plus bullets under `## Rejected Approaches` / `## Dead-Ends` in wiki pages), `executionProof`, `nextAction`, `checksum`, and `authorityBoundary: "read-only-context-only: execution and external side-effect approvals are NOT inherited"`. `capsuleSignature` is kept as an older name for the same checksum. The checksum detects edits; it does not prove who wrote the capsule.
 
-### 5. Package a Stuck Project for Static Triage (`viberescue`)
+### 5. Learn From a Session, With a Human Approval Gate (`memlet learn`)
+
+```bash
+# Queue candidate lessons from a Claude Code or Codex CLI transcript (.jsonl) or a .log file
+memlet learn --transcript ~/.claude/projects/<project>/<session>.jsonl
+
+# See what is waiting
+memlet learn --pending
+
+# Approve or reject by id; a name is required
+memlet learn --approve DRM-7306e549ab93 --by "ray"
+memlet learn --reject  DRM-bfd29ed9b65e --by "ray" --reason "one-off workaround"
+```
+
+- Extraction is deterministic keyword matching, with no model call. Treat the queue as a draft to review, not as findings.
+- Nothing in the queue reaches `recall`, `handover`, hooks, or the MCP tools until it is approved. Approval is bound to the lesson's text and its cited transcript lines: editing either afterwards puts it back to pending.
+- Approved lessons are written to `.memlet/wiki/dream-approved.md` so `handover` and `recall` read them like any other rule.
+- Only visible user and assistant text is read from a transcript. Tool payloads and hidden reasoning are skipped, and known secret formats and private-key blocks are redacted before anything is stored.
+- The approval record is an integrity check, not authentication: anyone who can rewrite the whole queue file can forge one.
+
+### 6. Make It Automatic (`memlet init --hooks`, MCP)
+
+```bash
+memlet init . --hooks --dry-run     # show exactly what would change
+memlet init . --hooks               # install into .claude/settings.local.json (personal)
+memlet init . --hooks --hooks-scope project   # shared .claude/settings.json; needs `memlet` on PATH
+memlet init . --hooks --git-hooks   # also a warn-only pre-commit and a post-merge re-check
+memlet init . --hooks-remove        # remove only Memlet's entries
+```
+
+Hooks are strictly opt-in and are merged into your existing Claude Code settings; other hooks and keys are left alone, and a backup is written before the first change.
+
+| Claude Code event | What Memlet does |
+| :--- | :--- |
+| `SessionStart` | Injects the pinned-and-unchanged rules, and one line counting stale anchors and lessons awaiting approval. |
+| `PostToolUse` (`Write\|Edit`) | Checks the edited file; if a rule anchored to it went stale, tells the model which rule and why. |
+| `Stop`, `PreCompact` | Queues lessons from the session transcript as pending. Never approves anything. |
+
+A hook never blocks a session: on any error it prints nothing and exits 0. These hooks were tested with synthetic event payloads, not inside a live Claude Code session.
+
+For hosts without lifecycle hooks (Codex, Cursor, any MCP client), `memlet-mcp` exposes four tools next to the existing `prism_memory_*` tools: `memlet_check`, `memlet_recall`, `memlet_handover` (never writes a file), and `memlet_learn` (queue a transcript, list pending). Approving or rejecting a lesson is deliberately not available over MCP; it is a human decision made with `memlet learn --approve`.
+
+### 7. Package a Stuck Project for Static Triage (`memlet admin rescue`)
 
 When an AI-coded app says *"Fixed!"* in chat but fails on login, DB, or deployment:
 
@@ -122,16 +189,16 @@ When an AI-coded app says *"Fixed!"* in chat but fails on login, DB, or deployme
 viberescue pack . --write
 
 # Or run via the memlet CLI
-memlet rescue . --format markdown
+memlet admin rescue . --format markdown
 ```
 
 **Readiness States (Honest Static Classification)**:
 - `NO_TARGETS_FOUND` (exit `2`): Empty directory or zero scannable code/SQL/config files.
 - `BLOCKED` (exit `1`): One or more critical static blockers (e.g., client secret exposure, missing `.env` key when `.env` is present, table without `ENABLE ROW LEVEL SECURITY`).
-- `ENV_UNVERIFIED` (exit `0`): Zero critical code/SQL blockers, but code references environment variables while no local `.env` file is present to verify values.
+- `ENV_UNVERIFIED` (exit `0`, `ok: false`): The only warnings are environment variables that could not be checked because no local `.env` file is present. If any other warning is present the exit code is `1`.
 - `STATIC_CHECKS_PASSED` (exit `0`): All static code, SQL, lockfile, and instruction checks passed. This is a static result, not a guarantee that the live deployment works.
 
-### 6. Score & Fix "AI Slop" UI and Copy (`anti-slop`)
+### 8. Score & Fix "AI Slop" UI and Copy (`memlet admin anti-slop`)
 
 Check your frontend or landing page before shipping:
 
@@ -140,84 +207,77 @@ Check your frontend or landing page before shipping:
 anti-slop scan . --format markdown
 
 # Or run via the memlet CLI
-memlet anti-slop . --format markdown
+memlet admin anti-slop . --format markdown
 
 # Lock a Reference-First Design System (linear-precision, stripe-editorial, or apple-minimal)
 # Protects existing DESIGN.md / design-tokens.css unless --force is passed (creates .bak)
 anti-slop lock . --archetype linear-precision
 ```
 
-### 7. Inspect Memory, Dream Ontology & Routing in One Page (`memlet ui`)
+### 9. Inspect Memory, Dream Ontology & Routing in One Page (`memlet ui`)
 
-The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out.
+The **Nocturne Memory & Routing Inspector** renders one self-contained HTML file (no CDN, no network, no daemon) with the repository's AST anchor health, the refactoring & handover benchmark, the current handover capsule, the 4-edge Dream Ontology lineage graph (`ontologyLineage` when `.memlet/dream/APPROVAL-QUEUE.json` is present; items nobody approved are shown as pending, never as supported), and the Routlet performance / balanced / efficiency matrix. Every repository string is HTML-escaped and absolute host paths are left out.
 
 ```bash
 memlet ui .                                   # writes .memlet/inspector.html after `memlet init` (alias: memlet inspector .)
 memlet ui . --out memlet-inspector.html       # --out and --output are both supported
 ```
 
-### 8. Session Log Ontology & Subgraph Recall (`memlet dream-build` / `dream-recall`)
+### 10. Dream Internals (`memlet admin dream-build` / `dream-recall`) — experimental
 
-`memlet dream-build` (or `python3 -m prism_memory.memlet_dream dream-build`) binds candidate lessons and 4 typed edges (`GOVERNS`, `SUPERSEDES`, `RESOLVES`, `BLOCKS`) to verbatim `file.log:start-end` spans and SHA-256 hashes, rejects unpinned or time-inverted `SUPERSEDES` edges, masks 5 secret families (`[REDACTED_SECRET]`), and writes `.memlet/dream/APPROVAL-QUEUE.json` (plus optional SQLite tables: `ontology_nodes`, `ontology_edges`, `dream_runs`).
+`memlet learn` is the supported way to use Dream. The lower-level commands remain for building a queue from your own candidate JSON:
 
 ```bash
-# Build from cross-vendor candidate JSON + persist to SQLite
-memlet dream-build \
-  --candidates ./dream_candidates.json \
-  --snapshot ./session_logs \
-  --out-json .memlet/dream/APPROVAL-QUEUE.json \
-  --out-db .memlet/dream/ontology.sqlite
+# Build a PENDING approval queue (+ optional SQLite tables) from logs or .jsonl transcripts
+memlet admin dream-build --snapshot ./session_logs --out-json ./queue/APPROVAL-QUEUE.json
 
-# Autonomous deterministic draft (omit --candidates; 0 LLM calls)
-memlet dream-build \
-  --snapshot ./session_logs \
-  --out-json .memlet/dream/APPROVAL-QUEUE.json
+memlet admin dream-pending --graph ./queue/APPROVAL-QUEUE.json
+memlet admin dream-approve --graph ./queue/APPROVAL-QUEUE.json --by "ray" <ID>...
 
-# 1-hop subgraph recall (verifies SHA-256 pins when --snapshot is passed)
-memlet dream-recall \
-  --graph .memlet/dream/APPROVAL-QUEUE.json \
-  --snapshot ./session_logs \
-  --query memlet_wiki.py digest anchor truncation \
-  --max-tokens 1500 \
-  --out-md .memlet/dream/APPROVAL-QUEUE.md \
-  --format markdown
+# 1-hop subgraph recall: approved items only, cited spans re-verified by SHA-256
+memlet admin dream-recall --graph ./queue/APPROVAL-QUEUE.json --query git hooks --max-tokens 1500 --format markdown
 ```
 
 **Contract & Scope Notes:**
-- **Quarantine Labels:** `## 4. Superseded Quarantine (SUPERSEDES)` emits `old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT]` and `replacement_pin [ACTIVE — APPLY THIS]`. If the superseding source node is itself superseded, dropped during pass-2 validation, or omitted by `--max-tokens`, the label switches to `replacement_pin [SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY]` and the capsule is re-trimmed so `tokenEstimate <= tokenBudget`. (`ALREADY_SUPERSEDED` is the JSON node `verdict` field.)
-- **`--candidates` vs. Autonomous Draft:** Omitting `--candidates` runs `extract_candidates_from_snapshot()` (`extractionMode: "autonomous_deterministic"`, 0 LLM calls) to produce an initial draft for review. The C8 benchmark result (`M1 3.7% -> M2-G 63.0%`, 126 runs / 756 judgments at `<= 1,500` tokens) uses cross-vendor candidates supplied via `--candidates`.
-- **Single-Bucket Dedup:** Each recalled node renders once under its highest-priority bucket (`SUPERSEDES` > `RESOLVES` / `BLOCKS` > `GOVERNS`); full edge lists remain in JSON, SQLite, and Cortex UI.
+- **Everything starts pending.** A candidate's own verdict is recorded as `claimedVerdict` and never trusted. Queues built by earlier releases must be approved again before anything is recalled.
+- **Recall re-verifies by default.** Each cited `file:start-end` span is re-hashed against the snapshot. With no snapshot, recall returns nothing and exits `3`; `--allow-unverified` is an explicit, labelled opt-out.
+- **Typed edges.** `GOVERNS`, `SUPERSEDES`, `RESOLVES`, `BLOCKS`. A superseded rule is rendered as `old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT]` next to its `replacement_pin`.
+- **Quality is not measured for this release.** An earlier internal experiment reported recall accuracy for a pipeline that used model-written candidates plus benchmark-specific tuning. That tuning was removed and the experiment was not re-run, so no accuracy number is claimed here.
 
-### 9. Start a New Project With a Stack Harness (`memlet pack`)
+### 11. Start a New Project With a Stack Harness (`memlet admin pack`)
 
 The **Routlet × Memlet Harness Pack** writes one bundle per stack (`nextjs-supabase`, `fastapi-postgres`, `swift-ios`) with 7 files: a `CLAUDE.md` constitution (anchor conventions, session delta rules, human gates), a cross-vendor `AGENTS.md`, a `SKILL.md` with pre-flight checks, receipt and rollback, a `PITFALLS.md` of 5 recorded dead-ends that `memlet handover` carries as rejected approaches, a Routlet routing preset, Linear / Stripe / Toss design tokens (every text pair >= 4.5:1), and a `MANIFEST.json` with SHA-256 checksums.
 
 ```bash
-memlet pack --list                                   # stack metadata
-memlet pack --stack all --format markdown            # compute files and digests in memory, write nothing
-memlet pack --stack nextjs-supabase --output ./harness-packs
+memlet admin pack --list                                   # stack metadata
+memlet admin pack --stack all --format markdown            # compute files and digests in memory, write nothing
+memlet admin pack --stack nextjs-supabase --output ./harness-packs
 ```
 
 ### Command Reference
 
 | Command | Purpose |
 | :--- | :--- |
-| `memlet init .` | Zero-daemon setup: `.memlet/config.json`, `.memlet/ledger.sqlite3`, and `.memlet/wiki/INDEX.md`. |
-| `memlet check .` (alias `audit`) | Static instruction & memory drift audit (Markdown / JSON / SARIF). |
-| `memlet wiki .` | Re-checks wiki anchors, writes per-page AST status headers, and syncs page edits into the ledger. |
-| `memlet import . [--from auto\|claude-md\|cursorrules\|ai-memory\|claude-mem] [--dry-run]` | Imports existing rules and tags each with its live anchor status. |
-| `memlet handover . [--next-step "..."] [--rejected "..."] [--format markdown] [--write]` | Signed, <500-token handover capsule with stale anchors quarantined. |
-| `memlet benchmark [--format markdown]` (alias `compare-bench`) | Reproducible refactoring & handover comparison (see below). |
-| `memlet rescue .` (or `viberescue pack .`) | Secret-scrubbed static triage bundle for stuck projects. |
-| `memlet anti-slop .` (or `anti-slop scan .`) | UI & copy slop score with `file:line` findings. |
-| `memlet ui . [--out\|--output FILE]` (alias `inspector`) | Self-contained, escaped HTML inspector: AST health, benchmark, handover, Dream ontology lineage, Routlet matrix. |
-| `memlet dream-build --snapshot DIR_OR_JSON --out-json FILE [--candidates FILE] [--out-db SQLITE]` (alias `dream`) | Quote-pinned 4-edge ontology builder (`GOVERNS`/`SUPERSEDES`/`RESOLVES`/`BLOCKS`) with SHA-256 verification and optional SQLite persistence. |
-| `memlet dream-recall --graph FILE [--snapshot DIR_OR_JSON] [--query ...] [--max-tokens N] [--out-md FILE]` | 1-hop ontology subgraph recall capsule with dual-pin `SUPERSEDES` quarantine and hard token budget enforcement. |
-| `memlet pack [--stack all\|nextjs-supabase\|fastapi-postgres\|swift-ios] [--output DIR] [--dry-run] [--list]` | Stack harness bundles with a SHA-256 `MANIFEST.json`; no `--output` means nothing is written. |
-| `memlet --standalone capsule --plan "..." --files prism_memory/audit.py` | Budgeted cross-vendor handover capsule. |
-| `memlet --standalone doctor` | Environment & SQLite WAL health check. |
+| `memlet init [.] [--force] [--dry-run]` | Zero-daemon setup and baseline pins. Re-running keeps existing pins and settings. |
+| `memlet init --hooks [--hooks-scope local\|project] [--git-hooks] [--dry-run]` / `--hooks-remove` | Opt-in Claude Code hooks (and git hooks); merge-only, removable. |
+| `memlet check [.] [--base REF --head REF] [--format json\|markdown\|sarif]` | Static instruction & memory drift audit. |
+| `memlet check --changed [--base REF]` / `--accept ANCHOR` / `--repin-legacy-ts` | Changed-files check; accept one anchor; re-pin TS/JS pins made by an earlier release. |
+| `memlet recall "<task>" [--repo DIR] [--budget N]` | Rules + approved lessons (+ task memories with `--standalone`/`--task`). |
+| `memlet handover [.] [--next-step "..."] [--rejected "..."] [--write]` / `--verify FILE` | Handover capsule with a checksum; verify a saved one. |
+| `memlet learn --transcript PATH` / `--pending` / `--approve ID... --by NAME` / `--reject ID... --by NAME` | Pending lesson queue with a human approval gate. |
+| `memlet ui [.] [--out\|--output FILE]` | Self-contained, escaped HTML inspector. |
+| `memlet admin --help` | Every other command, grouped: memory store, rules/wiki, Dream, rescue / anti-slop / pack, benchmarks, maintenance. |
+| `memlet --version` | Prints `8.4.0`. |
 
-Every `memlet` command is also reachable through the legacy aliases `ieum-memory`, `deltaharness`, and `prism-memory`.
+**Upgrading from an earlier release**
+
+- Old top-level names such as `memlet wiki`, `memlet import`, `memlet rescue` still work unchanged. In a terminal they print one line pointing to `memlet admin <name>`; in pipes and CI nothing extra is printed. Set `MEMLET_NO_DEPRECATION=1` to silence it.
+- A command that returns `ok: false` now exits `1` (it used to exit `0` in some cases), and an unexpected error prints its JSON on stderr instead of stdout.
+- `memlet --standalone` without `--task` now uses one task per repository. Memories stored earlier under the shared task are still there: read them with `--task standalone/main`.
+- `rule-recall` takes the query first: `memlet admin rule-recall "<query>" [--repo DIR]`. The older `rule-recall <dir> "<query>"` form still works.
+- Read commands no longer create pins. If `memlet handover` shows rules under "unpinned", run `memlet init` once.
+- TS/JS pins made by an earlier release are reported as `compatible-unverified` (`legacy_ts_basis_repin_required`) until you run `memlet check --repin-legacy-ts`.
+- User-facing messages are English by default.
 
 ---
 
@@ -233,13 +293,13 @@ Scenarios: (1) breaking signature change `def charge(user_id)` → `def charge(a
 | Unverified Wiki (timestamps, 90-day aging, file-exists check) | 66.7% (2/3) | 0% (0/1) | 66.7% (2/3) |
 | Memlet (AST anchors + `reqSigHash` pins + handover quarantine) | **0% (0/3)** | **0% (0/1)** | **100% (3/3)** |
 
-All three modes make 0 external LLM calls. Read the numbers for what they are: these are four synthetic fixtures built to exercise specific failure modes, and "Unverified Wiki" is a simplified model of a timestamped Markdown wiki, not a run of any particular product. The unverified wiki's 0% false-positive rate comes from not checking signatures at all, which is also why it lets the breaking change through.
+All three modes make 0 external LLM calls. Read the numbers for what they are: the dead-ends are recorded where only Memlet's mode reads them, so the 0% in the first row follows from the setup rather than from a measurement of another tool; these are four synthetic fixtures built to exercise specific failure modes, and "Unverified Wiki" is a simplified model of a timestamped Markdown wiki, not a run of any particular product. The unverified wiki's 0% false-positive rate comes from not checking signatures at all, which is also why it lets the breaking change through.
 
 ---
 
 ## 📊 Real-World Open-Source Repository Audit Verification
 
-> **Category sample:** the public-repository numbers below come from 4 repositories pinned at fixed commits (`vercel/ai`, `openai-agents-python`, `AutoGPT`, `claude-code`; 784 docs, 2,745 references, 10 findings). They are not a guarantee for other repositories. "0 false positives" means the 10 findings in this sample were checked by hand.
+> **Category sample:** the public-repository numbers below come from 4 repositories pinned at fixed commits (`vercel/ai`, `openai-agents-python`, `AutoGPT`, `claude-code`; 784 docs, 2,745 references, 10 findings). They are not a guarantee for other repositories. "0 false positives" means the 10 findings in this sample were checked by hand. The numbers were recorded before this release's changes and were not re-run for it; the checker's ignore list also contains entries tuned on these four repositories.
 
 `memlet check` was run against 4 full public AI repositories at the pinned commits below (see `real-oss-audit-results.json`) to verify both true-positive drift detection and monorepo/tutorial false-positive suppression:
 
@@ -259,7 +319,7 @@ Memlet's checker is a **fast, deterministic, zero-network static analyzer** (`~1
 | Capability | Static Method Used | Known Boundary |
 | :--- | :--- | :--- |
 | **Python Symbols** | Stdlib `ast.parse` (functions, classes, methods, args, defaults, decorators) | Dynamic `getattr` / runtime monkeypatching is not evaluated. |
-| **TS/JS Symbols** | Comment-stripped contract extractor + balanced delimiter syntax check (`functions`, `arrow functions`, `React.memo`/`forwardRef`, `classes`, `interfaces`, `types`) | Does not run `tsc` full type-inference across external `node_modules`. |
+| **TS/JS Symbols** | Comment-stripped lexical scanner with balanced-delimiter parameter and return-type parsing (`functions`, `arrow functions`, `React.memo`/`forwardRef`, `classes`, `interfaces`, `types`) | Not a parser: a hash match is reported as `compatible-unverified`, never `active`. JSX text with apostrophes and some regex literals are read as syntax errors; getters/setters and overload signatures are not extracted. Does not run `tsc`. |
 | **SQL RLS Audit** | Cross-migration aggregation of `CREATE TABLE`, `ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`, and multiline `USING (true)` across all `.sql` files | Evaluates static SQL migration files; does not connect to a live remote Supabase Postgres instance. |
 | **WCAG Contrast & Slop** | Static CSS custom property resolver (`:root` / `[data-theme="dark"]`) + WCAG 2.1 relative luminance contrast ratio + HTML nesting depth parser | Evaluates static CSS/HTML/JSX rules; does not launch a headless Chromium layout engine. |
 
@@ -280,7 +340,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/deltaharness@main
+      - uses: ian-nocturne/deltaharness@v8.4.0
         with:
           mode: "audit" # 'audit', 'rescue', 'anti-slop', or 'all'
           repo-path: "."
@@ -288,7 +348,14 @@ jobs:
           fail-on-drift: "true"
 ```
 
-Inputs, outputs (`status`, `finding-count`, `total-finding-count`, `slop-score`), and the default SARIF file name (`deltaharness-audit.sarif`) are unchanged from earlier releases, so existing workflows keep working.
+Outputs (`status`, `finding-count`, `total-finding-count`, `slop-score`) and the default SARIF file name (`deltaharness-audit.sarif`) are unchanged. What changed in this release:
+
+- `format` (`markdown`, `json`, `sarif`) now selects the report that is produced; it was previously ignored.
+- New input `python-version`. The Action no longer installs Python 3.11 by itself: it uses the runner's Python (3.9 or newer) unless you set this input (`python-version: "3.11"` restores the old behaviour).
+- `fail-on-drift` accepts only `true` or `false`; any other value is a configuration error.
+- `rescue` with only unverifiable environment variables, and `anti-slop` on a repository with no UI files, are warnings: the job passes and `status` is `UNVERIFIED`. Real blockers still fail the job.
+- A result the Action cannot interpret fails closed with exit code `2`.
+- The SARIF file is never written through a symbolic link.
 
 ---
 
@@ -302,10 +369,10 @@ Beyond static checking, Memlet includes a complete local-first memory & procedur
 
 ```bash
 # Run the 4-Epoch × 4-Baseline Repo-Evolution Benchmark
-memlet --standalone repo-benchmark
+memlet admin repo-benchmark
 
 # Check environment & SQLite WAL health
-memlet --standalone doctor
+memlet admin doctor
 ```
 
 ---
