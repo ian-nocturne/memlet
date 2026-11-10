@@ -19,8 +19,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-TESTED = {"tree-sitter": ("0.23", "0.24"), "tree-sitter-typescript": ("0.23", "0.24"),
-          "tree-sitter-javascript": ("0.23", "0.24")}
+TESTED = {"tree-sitter": ("0.23", "0.24"), "tree-sitter-typescript": ("0.23",),
+          "tree-sitter-javascript": ("0.23",)}
 _FUNC_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
 _FUNC_DECLS = {"function_declaration", "generator_function_declaration"}
 _CLASS_DECLS = {"class_declaration", "abstract_class_declaration"}
@@ -35,7 +35,10 @@ def _version(dist: str) -> Optional[str]:
 
 
 def load_provider() -> Optional["TreeSitterProvider"]:
-    """Load tested 0.23 / 0.24 minors; return None for missing, untested, or broken packages."""
+    """Load core 0.23 / 0.24 with grammar minor 0.23 only.
+
+    Return None for missing, untested (including 0.24 grammars), or broken packages.
+    """
     names = ("tree_sitter", "tree_sitter_typescript", "tree_sitter_javascript")
     try:
         if any(importlib.util.find_spec(n) is None for n in names):

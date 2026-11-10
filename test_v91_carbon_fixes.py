@@ -107,17 +107,19 @@ class TreeSitterMinorCompatibilityTests(unittest.TestCase):
         ca._EXACT_CACHE.clear()
         return {a["anchor"]: (a["status"], a["reason"]) for a in mw.pinned_anchor_report(self.root)["anchors"]}
 
-    def provider(self, version):
+    def provider(self, core_version):
         # Exercise the real constructor and version-bearing basis without optional modules.
         ts = mock.Mock()
         ts.Language.side_effect = lambda value: value
         provider = ts_exact.TreeSitterProvider(ts, mock.Mock(), mock.Mock(),
-                                             {dist: version for dist in ts_exact.TESTED})
+                                             {"tree-sitter": core_version,
+                                              "tree-sitter-typescript": "0.23.2",
+                                              "tree-sitter-javascript": "0.23.1"})
         provider.fingerprint = mock.Mock(return_value={"charge": {"ast": "a" * 64, "sig": "b" * 64}})
         return provider
 
     def test_version_gating_and_exact_basis(self):
-        accepted = [("0.23.2",) * 3, ("0.24.0",) * 3, ("0.24.0", "0.23.2", "0.23.1")]
+        accepted = [("0.23.2", "0.23.2", "0.23.1"), ("0.24.0", "0.23.2", "0.23.1")]
         modules = {"tree_sitter": mock.Mock(), "tree_sitter_typescript": mock.Mock(),
                    "tree_sitter_javascript": mock.Mock()}
         for versions in accepted:
@@ -130,13 +132,25 @@ class TreeSitterMinorCompatibilityTests(unittest.TestCase):
                 self.assertIsInstance(provider, ts_exact.TreeSitterProvider)
                 self.assertEqual("tree-sitter-v1.core-{}.ts-{}.js-{}".format(*versions), provider.basis)
         for dist in ts_exact.TESTED:
-            for bad in ("0.22.9", "0.25.0", None, ""):
+            for bad in ("0.22.9", "0.25.0", "0.230.1", "0.240.0", None, ""):
                 with self.subTest(dist=dist, bad=bad):
-                    mapping = {d: "0.24.0" for d in ts_exact.TESTED}
+                    mapping = {"tree-sitter": "0.24.0", "tree-sitter-typescript": "0.23.2",
+                               "tree-sitter-javascript": "0.23.1"}
                     mapping[dist] = bad
                     with mock.patch("importlib.metadata.version", side_effect=mapping.__getitem__), \
                             mock.patch.object(ts_exact.importlib.util, "find_spec", return_value=object()):
                         self.assertIsNone(ts_exact.load_provider())
+
+        rejected = [("0.24.0", "0.24.0", "0.23.1"),
+                    ("0.24.0", "0.23.2", "0.24.0"),
+                    ("0.24.0", "0.24.0", "0.24.0")]
+        for versions in rejected:
+            with self.subTest(versions=versions):
+                mapping = dict(zip(ts_exact.TESTED, versions))
+                with mock.patch("importlib.metadata.version", side_effect=mapping.__getitem__), \
+                        mock.patch.object(ts_exact.importlib.util, "find_spec", return_value=object()), \
+                        mock.patch.object(ts_exact.importlib, "import_module", side_effect=modules.__getitem__):
+                    self.assertIsNone(ts_exact.load_provider())
 
     def test_registered_tree_sitter_without_config_stays_lexical(self):
         provider = self.provider("0.24.0")
