@@ -1737,8 +1737,16 @@ def audit_repository(
                          severity="error" if a["status"] == "stale" else "warning",
                          doc_rel=doc, line_no=int(line) if line.isdigit() else 1,
                          target_path=a["path"], symbol=a["symbol"],
-                         message=f"{a['status'].upper()} `{a['anchor']}` ({a['reason']})",
+                         message=f"{a['status'].upper()} `{a['anchor']}` ({a['reason']})"
+                                 + (" [suggested anchor]" if a.get("suggested") else ""),
                          remediation="Re-read the rule and code; explicitly accept the anchor after review.")
+        for d in (pinned.get("sidecar") or {}).get("detached") or []:  # accepted sidecar anchors that no longer attach
+            anchor = str(d.get("anchor") or "")
+            _add_finding(rule_id="sidecar_anchor_" + str(d.get("state") or "detached"), severity="warning",
+                         doc_rel=str(d.get("source") or mw.CONFIG_PATH), line_no=1,
+                         target_path=anchor.rsplit("::", 1)[0], symbol=anchor.rsplit("::", 1)[-1] if "::" in anchor else None,
+                         message=f"{str(d.get('state') or 'detached').upper()} sidecar anchor `{d.get('id')}` `{anchor}` ({d.get('reason')})",
+                         remediation="Run `memlet admin anchors list`; drop the entry or accept a fresh suggestion.")
 
     error_count = sum(1 for f in findings if f["severity"] == "error")
     warning_count = sum(1 for f in findings if f["severity"] == "warning")
