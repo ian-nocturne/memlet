@@ -609,7 +609,7 @@ def _resolve_lesson_anchor(root: Path, node: Dict[str, Any]) -> Optional[Tuple[s
     """A real `path::symbol` for a lesson whose scope names code, only when that symbol exists right now."""
     pp = node.get("primaryPin") if isinstance(node.get("primaryPin"), dict) else {}
     text = f"{node.get('title') or ''}\n{pp.get('quoteText') or ''}"
-    for m in mw.EXPLICIT_ANCHOR_RE.finditer(text):
+    for m in mw.iter_explicit_anchors(text):
         if "::" in m.group(0):
             path, sym = mw._clean_ref_path(m.group("path")), m.group("symbol").rstrip(".-")
             if mw._current_fingerprint(root, path, sym).get("resolution") == "exact":

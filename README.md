@@ -103,7 +103,7 @@ memlet check . --format sarif > memlet-check.sarif
 memlet check --changed
 
 # Accept one anchor's new state after you have re-read its rule (instead of re-pinning everything)
-memlet check --accept "mod.py::charge"
+memlet check --accept "prism_memory/audit.py::audit_repository"
 ```
 
 ### 3. Recall What Applies to a Task (`memlet recall`)
@@ -155,7 +155,7 @@ memlet learn --reject  DRM-bfd29ed9b65e --by "ray" --reason "one-off workaround"
 - Extraction is deterministic keyword matching, with no model call. Treat the queue as a draft to review, not as findings.
 - Nothing in the queue reaches `recall`, `handover`, hooks, or the MCP tools until it is approved. Approval is bound to the lesson's text and its cited transcript lines: editing either afterwards puts it back to pending.
 - Approved lessons are written to `.memlet/wiki/dream-approved.md` so `handover` and `recall` read them like any other rule.
-- Only visible user and assistant text is read from a transcript. Tool payloads and hidden reasoning are skipped, and known secret formats and private-key blocks are redacted before anything is stored.
+- Only visible user and assistant text is read from a transcript. Tool payloads and hidden reasoning are skipped, and known secret formats and private-key blocks are redacted before anything is stored. Very large inputs are skipped rather than partly stored: files over 16 MiB, and single messages or log lines over 16,384 characters; the result lists what was skipped.
 - The approval record is an integrity check, not authentication: anyone who can rewrite the whole queue file can forge one.
 
 ### 6. Make It Automatic (`memlet init --hooks`, MCP)
@@ -168,7 +168,7 @@ memlet init . --hooks --git-hooks   # also a warn-only pre-commit and a post-mer
 memlet init . --hooks-remove        # remove only Memlet's entries
 ```
 
-Hooks are strictly opt-in and are merged into your existing Claude Code settings; other hooks and keys are left alone, and a backup is written before the first change.
+Hooks are strictly opt-in and are merged into your existing Claude Code settings; other hooks and keys are left alone, and a backup is written before the first change. Installation is all-or-nothing: if any part cannot be written, everything this run wrote is rolled back. Indentation, line endings and the final newline of your settings file are kept; other whitespace may be normalised (the backup holds the original bytes). `init --hooks` also runs the normal `init` so the hooks have a `.memlet/` to work with.
 
 | Claude Code event | What Memlet does |
 | :--- | :--- |
@@ -178,7 +178,7 @@ Hooks are strictly opt-in and are merged into your existing Claude Code settings
 
 A hook never blocks a session: on any error it prints nothing and exits 0. These hooks were tested with synthetic event payloads, not inside a live Claude Code session.
 
-For hosts without lifecycle hooks (Codex, Cursor, any MCP client), `memlet-mcp` exposes four tools next to the existing `prism_memory_*` tools: `memlet_check`, `memlet_recall`, `memlet_handover` (never writes a file), and `memlet_learn` (queue a transcript, list pending). Approving or rejecting a lesson is deliberately not available over MCP; it is a human decision made with `memlet learn --approve`.
+For hosts without lifecycle hooks (Codex, Cursor, any MCP client), `memlet-mcp` exposes four tools next to the existing `prism_memory_*` tools: `memlet_check`, `memlet_recall`, `memlet_handover` (never writes a file), and `memlet_learn` (queue a transcript, list pending). Approving or rejecting a lesson is deliberately not available over MCP; it is a human decision made with `memlet learn --approve`. `memlet_learn` works only in a repository where `memlet init` has run, and reads a transcript only if it is a regular `.log`/`.jsonl` file of at most 8 MiB inside the repository or under a known agent transcript folder (`~/.claude/projects`, `~/.codex/sessions`, `~/.muse/sessions`, `~/.prism-memory/sessions`).
 
 ### 7. Package a Stuck Project for Static Triage (`memlet admin rescue`)
 
@@ -228,14 +228,16 @@ memlet ui . --out memlet-inspector.html       # --out and --output are both supp
 `memlet learn` is the supported way to use Dream. The lower-level commands remain for building a queue from your own candidate JSON:
 
 ```bash
-# Build a PENDING approval queue (+ optional SQLite tables) from logs or .jsonl transcripts
-memlet admin dream-build --snapshot ./session_logs --out-json ./queue/APPROVAL-QUEUE.json
+QUEUE=/tmp/memlet-dream/APPROVAL-QUEUE.json   # any path outside .memlet/dream/, which `memlet learn` owns
 
-memlet admin dream-pending --graph ./queue/APPROVAL-QUEUE.json
-memlet admin dream-approve --graph ./queue/APPROVAL-QUEUE.json --by "ray" <ID>...
+# Build a PENDING approval queue (+ optional SQLite tables) from logs or .jsonl transcripts
+memlet admin dream-build --snapshot ./session_logs --out-json "$QUEUE"
+
+memlet admin dream-pending --graph "$QUEUE"
+memlet admin dream-approve --graph "$QUEUE" --by "ray" <ID>...
 
 # 1-hop subgraph recall: approved items only, cited spans re-verified by SHA-256
-memlet admin dream-recall --graph ./queue/APPROVAL-QUEUE.json --query git hooks --max-tokens 1500 --format markdown
+memlet admin dream-recall --graph "$QUEUE" --query git hooks --max-tokens 1500 --format markdown
 ```
 
 **Contract & Scope Notes:**
