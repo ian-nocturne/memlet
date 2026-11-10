@@ -653,6 +653,13 @@ def _validate_modes(args, parser):
         reject('learn ' + mode, flags + (store_flags if mode != '--file' else []))
         if (args.approve or args.reject) and not args.by.strip():
             parser.error('learn --approve/--reject requires --by NAME')
+    if args.action == 'init':
+        if not (args.hooks or args.hooks_remove):
+            flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else [])
+            if flags:
+                parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove')
+        elif args.hooks_remove and args.force:
+            reject('init --hooks-remove', ['--force'])
     if args.action in ('check', 'audit'):
         mode = '--changed' if args.changed else '--accept' if args.accept else '--repin-legacy-ts' if args.repin_legacy_ts else None
         if mode:
@@ -811,6 +818,11 @@ def _build_parser():
     # Freeze legacy option spellings before any router-only options are added.
     for child in set(sub.choices.values()):
         _reserve_legacy_prefixes(child)
+    hooks_mode=init_p.add_mutually_exclusive_group()
+    hooks_mode.add_argument('--hooks',action='store_true',help='Opt-in: also install Memlet hooks for Claude Code (merged into .claude settings, never replacing them)')
+    hooks_mode.add_argument('--hooks-remove',action='store_true',help='Remove only the hook entries Memlet installed')
+    init_p.add_argument('--hooks-scope',choices=['local','project'],default=None,help='local (default): .claude/settings.local.json; project: shared .claude/settings.json (needs memlet on PATH)')
+    init_p.add_argument('--git-hooks',action='store_true',help='With --hooks / --hooks-remove: also the git pre-commit (warn only) and post-merge hooks')
     check_mode=aud_p.add_mutually_exclusive_group()
     check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
     check_mode.add_argument('--accept',action='append',default=[],metavar='ANCHOR',help='Re-pin a named path::symbol anchor (repeatable)')
@@ -872,7 +884,11 @@ def _main(args, parser):
     if args.action in ('init','wiki'):
         from prism_memory.memlet_wiki import init_project, wiki_status
         target_repo=args.repo_path or args.repo_positional or '.'
-        if args.action=='init':
+        if args.action=='init' and (args.hooks or args.hooks_remove):
+            from prism_memory.memlet_hooks import init_hooks_command
+            res=init_hooks_command(target_repo,remove=args.hooks_remove,scope=args.hooks_scope or 'local',git_hooks=args.git_hooks,
+                                   dry_run=args.dry_run,force=args.force,output_format=args.format)
+        elif args.action=='init':
             res=init_project(target_repo,dry_run=args.dry_run,force=args.force,output_format=args.format)
         else:
             res=wiki_status(target_repo,dry_run=args.dry_run,output_format=args.format)
@@ -1090,7 +1106,18 @@ def _main(args, parser):
                                value.get('itemId',''),value['outcome'],value.get('note',''),patch=value.get('patch'))
 
 
+def _hook_runtime(argv):
+    """Hidden `memlet admin hook <event>`: dispatched before argparse so it can never print usage or exit 2."""
+    try:
+        from prism_memory.memlet_hooks import run_hook
+        return run_hook(argv)
+    except BaseException:
+        return 0
+
+
 def cli():
+    if sys.argv[1:3] == ['admin', 'hook']:
+        return _hook_runtime(sys.argv[3:])
     legacy_name = Path(sys.argv[0]).name
     legacy_script = legacy_name in PROGRAM_NAMES[1:]
     previous_notice = os.environ.get('MEMLET_NO_DEPRECATION')

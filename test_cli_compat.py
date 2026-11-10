@@ -157,6 +157,20 @@ class Sandbox:
             ("rule-recall-safety-prefix", ["rule-recall", "deploy release", "--s"]),
             ("read-size-prefix", store + ["read", "--id", "nope", "--s", "5"]),
             ("check-format-prefix", ["check", ".", "--f", "markdown"]),
+            # Unit C1 (opt-in hooks): appended last so every case above runs on an unchanged sandbox.
+            ("init-hooks-dry-run", ["init", ".", "--hooks", "--dry-run"]),
+            ("init-hooks", ["init", ".", "--hooks"]),
+            ("init-hooks-again", ["init", ".", "--hooks"]),
+            ("init-hooks-markdown", ["init", ".", "--hooks", "--format", "markdown"]),
+            ("admin-hook-session-start", ["admin", "hook", "session-start"], '{"session_id": "s1"}'),
+            ("admin-hook-post-tool-use-unrelated", ["admin", "hook", "post-tool-use"],
+             '{"tool_name": "Edit", "tool_input": {"file_path": "docs/release.md"}}'),
+            ("admin-hook-malformed-stdin", ["admin", "hook", "stop"], "not json"),
+            ("admin-hook-unknown-event", ["admin", "hook", "no-such-event"]),
+            ("init-hooks-remove", ["init", ".", "--hooks-remove"]),
+            ("init-hooks-remove-again", ["init", ".", "--hooks-remove"]),
+            ("init-git-hooks-without-hooks", ["init", ".", "--git-hooks"]),
+            ("init-hooks-both-modes", ["init", ".", "--hooks", "--hooks-remove"]),
         ]
 
 

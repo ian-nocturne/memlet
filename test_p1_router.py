@@ -107,9 +107,11 @@ class RouterHelpTests(unittest.TestCase):
         for mode in ('digest', 'brief'):
             self.assertEqual(mode, parser.parse_args(['handover', '--mode', mode]).mode)
 
-    def test_init_does_not_advertise_or_accept_hooks(self):
-        self.assertNotIn('--hooks', invoke(['init', '--help'])[1])
-        self.assertEqual(2, invoke(['init', '--hooks'])[0])
+    def test_init_advertises_hooks_only_as_opt_in_flags(self):
+        # Unit C1 (audit P1 `memlet init --hooks`) made the flags real; they stay opt-in and validated.
+        self.assertIn('--hooks', invoke(['init', '--help'])[1])
+        self.assertEqual(2, invoke(['init', '--git-hooks'])[0])
+        self.assertEqual(2, invoke(['init', '--hooks', '--hooks-remove'])[0])
 
     def test_dream_build_help_explains_pending_jsonl(self):
         out = invoke(['admin', 'dream-build', '--help'])[1]

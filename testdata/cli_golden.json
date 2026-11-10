@@ -1,5 +1,44 @@
 {
  "cases": {
+  "admin-hook-malformed-stdin": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "admin-hook-post-tool-use-unrelated": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "admin-hook-session-start": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "hookSpecificOutput"
+    ],
+    "kind": "json"
+   }
+  },
+  "admin-hook-unknown-event": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
   "anti-slop": {
    "exit": 0,
    "stderr": {
@@ -763,6 +802,158 @@
      "repoHead",
      "repoPath",
      "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-git-hooks-without-hooks": {
+   "exit": 2,
+   "stderr": {
+    "kind": "text"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "init-hooks": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "audit",
+     "baselineNotice",
+     "command",
+     "config",
+     "dryRun",
+     "exitCode",
+     "hooks",
+     "instructionFiles",
+     "next",
+     "ok",
+     "repoHead",
+     "repoPath",
+     "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-hooks-again": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "audit",
+     "baselineNotice",
+     "command",
+     "config",
+     "dryRun",
+     "exitCode",
+     "hooks",
+     "instructionFiles",
+     "next",
+     "ok",
+     "repoHead",
+     "repoPath",
+     "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-hooks-both-modes": {
+   "exit": 2,
+   "stderr": {
+    "kind": "text"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
+  "init-hooks-dry-run": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "anchorSummary",
+     "anchors",
+     "audit",
+     "baselineNotice",
+     "command",
+     "config",
+     "dryRun",
+     "exitCode",
+     "hooks",
+     "instructionFiles",
+     "next",
+     "ok",
+     "repoHead",
+     "repoPath",
+     "skippedPins"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-hooks-markdown": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
+  "init-hooks-remove": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "claude",
+     "command",
+     "diff",
+     "dryRun",
+     "exitCode",
+     "notices",
+     "ok",
+     "remove",
+     "repoPath",
+     "scope"
+    ],
+    "kind": "json"
+   }
+  },
+  "init-hooks-remove-again": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "actions",
+     "claude",
+     "command",
+     "diff",
+     "dryRun",
+     "exitCode",
+     "notices",
+     "ok",
+     "remove",
+     "repoPath",
+     "scope"
     ],
     "kind": "json"
    }
