@@ -113,7 +113,9 @@ def plan(lines: List[str], keep_recent: int = 2, split_rules: bool = False) -> D
             rules += [("src", i) for i in range(s, e)]
             nonblank = [i for i in range(s, e) if lines[i].strip()]
             b = a + ((nonblank[-1] if nonblank else s) - s)
-            rindex.append(("gen", f"- {_clean_title(re.sub(r'^#+\s*', '', lines[s]))} → `{RULES_REL}:{a}-{b}`"))
+            # hoisted out of the f-string: a backslash inside an f-string expression is a SyntaxError before 3.12
+            heading_text = re.sub(r"^#+\s*", "", lines[s])
+            rindex.append(("gen", f"- {_clean_title(heading_text)} → `{RULES_REL}:{a}-{b}`"))
         agents += [("gen", "## Standing rules index (verbatim in the rules file)")] + rindex + [("gen", "")]
         files[RULES_REL] = rules
     else:
