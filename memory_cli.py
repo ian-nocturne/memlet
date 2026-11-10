@@ -434,10 +434,32 @@ ADMIN_GROUPS = (
 )
 
 
-class _OutputFormat(argparse.Action):
+class _ExplicitValue(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, values)
+        setattr(namespace, '_given_' + self.dest, True)
+
+
+class _OutputFormat(_ExplicitValue):
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
         namespace._format_explicit = True
+
+
+def _reserve_legacy_prefixes(parser):
+    """Reserve old unique abbreviations without expanding the visible help.
+
+    Call before adding any new/global options. Exact spellings take precedence
+    in argparse, so a later option cannot make an old abbreviation ambiguous.
+    Multiple old aliases still count as separate matches, as argparse did.
+    """
+    options = dict(parser._option_string_actions)
+    for option, action in options.items():
+        if option.startswith('--'):
+            for length in range(3, len(option)):
+                prefix = option[:length]
+                if prefix not in options and sum(name.startswith(prefix) for name in options) == 1:
+                    parser._option_string_actions[prefix] = action
 
 
 def _add_global_options(parser, *, defaults=False):
@@ -455,6 +477,7 @@ def _add_global_options(parser, *, defaults=False):
             kwargs.update(action='store_true', help='Bootstrap task automatically if it does not exist')
         else:
             kwargs['metavar'] = name.upper()
+            kwargs['action'] = _ExplicitValue
         parser.add_argument(flag, **kwargs)
 
 
@@ -464,10 +487,12 @@ def _configure_help(parser, sub):
     for child in set(commands.values()):
         _add_global_options(child)
     admin = sub.add_parser('admin', help='Advanced and legacy commands.',
+                           allow_abbrev=False,
                            formatter_class=argparse.RawDescriptionHelpFormatter,
                            description='Advanced and legacy Memlet commands.',
                            epilog='\n\n'.join(label + ':\n  ' + names for label, names in ADMIN_GROUPS))
     _add_global_options(admin)
+    _reserve_legacy_prefixes(admin)
     admin.set_defaults(_admin=True)
     nested = admin.add_subparsers(dest='action', required=True, metavar='COMMAND')
     # These are the very same parsers and handlers, including hidden experiments.
@@ -541,8 +566,8 @@ def _route_new(args):
             kwargs.update(store=store, task=task)
         return _bridge_call('unified_recall', args.repo,
                             args.positional_query if args.positional_query is not None else args.query, **kwargs)
-    if args.action == 'learn' and not args.file:
-        if args.transcript:
+    if args.action == 'learn' and args.file is None:
+        if args.transcript is not None:
             return _bridge_call('learn_from_transcript', args.repo, args.transcript, vendor=args.vendor)
         if args.pending:
             return _bridge_call('learn_pending', args.repo)
@@ -601,6 +626,48 @@ def _text_result(result):
     return '\n'.join(lines(result))
 
 
+def _validate_modes(args, parser):
+    """Refuse constraints that a selected repository route cannot honor."""
+    def given(name):
+        return getattr(args, '_given_' + name, False)
+
+    def reject(mode, flags):
+        if flags:
+            parser.error(mode + ' does not support ' + ', '.join(flags))
+
+    store_flags = ['--' + name for name in ('root', 'task', 'session') if given('_global_' + name)]
+    if args.standalone:
+        store_flags.append('--standalone')
+    if args.action == 'recall' and (args.unified or args.positional_query is not None):
+        flags = ['--query'] if args.positional_query is not None and given('query') else []
+        flags += ['--' + name.replace('_', '-') for name in ('at', 'known_at', 'before', 'after')
+                  if getattr(args, name) is not None]
+        flags += ['--' + name for name in ('shared', 'federated') if getattr(args, name)]
+        reject('unified recall (use recall --query for store filters)', flags)
+    if args.action == 'learn':
+        mode = ('--file' if args.file is not None else '--transcript' if args.transcript is not None
+                else '--pending' if args.pending else '--approve' if args.approve else '--reject')
+        allowed = {'--file': (), '--transcript': ('repo', 'vendor'), '--pending': ('repo',),
+                   '--approve': ('repo', 'by'), '--reject': ('repo', 'by', 'reason')}[mode]
+        flags = ['--' + name for name in ('repo', 'vendor', 'by', 'reason') if given(name) and name not in allowed]
+        reject('learn ' + mode, flags + (store_flags if mode != '--file' else []))
+        if (args.approve or args.reject) and not args.by.strip():
+            parser.error('learn --approve/--reject requires --by NAME')
+    if args.action in ('check', 'audit'):
+        mode = '--changed' if args.changed else '--accept' if args.accept else '--repin-legacy-ts' if args.repin_legacy_ts else None
+        if mode:
+            flags = ['--' + name for name in ('base', 'head') if given(name) and not (mode == '--changed' and name == 'base')]
+            if args.exit_zero:
+                flags.append('--exit-zero')
+            if args.dry_run and mode == '--changed':
+                flags.append('--dry-run')
+            if args.format == 'sarif':
+                flags.append('--format sarif (choose json or markdown)')
+            reject('check ' + mode, flags + store_flags)
+        elif args.dry_run:
+            parser.error('--dry-run requires --accept or --repin-legacy-ts')
+
+
 def main():
     parser = _build_parser()
     argv = sys.argv[1:]
@@ -613,8 +680,7 @@ def main():
     for name in ('root', 'task', 'session', 'standalone'):
         if not hasattr(args, name):
             setattr(args, name, getattr(args, '_global_' + name))
-    if args.action == 'learn' and (args.approve or args.reject) and not args.by.strip():
-        parser.error('learn --approve/--reject requires --by NAME')
+    _validate_modes(args, parser)
     if args.action == 'recall' and args.budget is None:
         args.budget = 1200 if args.unified or args.positional_query is not None else 6000
     human = args.action in PRODUCT_COMMANDS
@@ -628,22 +694,21 @@ def main():
 
 
 def _build_parser():
-    parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet: local repository memory.')
+    # Older argparse scans child arguments at the parent level first. Reserve
+    # all valid global prefixes explicitly, then stop the parent from rejecting
+    # a child's legacy --s as ambiguous between --session and --standalone.
+    parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet: local repository memory.',allow_abbrev=False)
     from prism_memory import VERSION
     parser.add_argument('--version',action='version',version=VERSION)
     _add_global_options(parser, defaults=True)
+    _reserve_legacy_prefixes(parser)
     sub=parser.add_subparsers(dest='action',required=True)
     sub.add_parser('schema'); sub.add_parser('brief'); sub.add_parser('stats'); sub.add_parser('scenes'); sub.add_parser('doctor')
     bak_p=sub.add_parser('backup');bak_p.add_argument('--dest-dir',default=None);bak_p.add_argument('--include-models',action='store_true')
     res_p=sub.add_parser('restore');res_p.add_argument('--backup-dir',required=True)
     rb_p=sub.add_parser('repo-benchmark');rb_p.add_argument('--work-dir',default=None)
     aud_p=sub.add_parser('audit',aliases=['check']);aud_p.add_argument('repo_positional',nargs='?',default=None);aud_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
-    aud_p.add_argument('--base',default=None);aud_p.add_argument('--head',default='HEAD');aud_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
-    check_mode=aud_p.add_mutually_exclusive_group()
-    check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
-    check_mode.add_argument('--accept',action='append',default=[],metavar='ANCHOR',help='Re-pin a named path::symbol anchor (repeatable)')
-    check_mode.add_argument('--repin-legacy-ts',action='store_true',help='Re-pin legacy TypeScript anchors')
-    aud_p.add_argument('--dry-run',action='store_true',help='Preview supported anchor updates')
+    aud_p.add_argument('--base',action=_ExplicitValue,default=None);aud_p.add_argument('--head',action=_ExplicitValue,default='HEAD');aud_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
     resc_p=sub.add_parser('rescue',aliases=['viberescue']);resc_p.add_argument('repo_positional',nargs='?',default=None);resc_p.add_argument('extra_positional',nargs='?',default=None);resc_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     resc_p.add_argument('--write',action='store_true');resc_p.add_argument('--output-dir',default=None);resc_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','prompt']);resc_p.add_argument('--exit-zero',action='store_true')
     slop_p=sub.add_parser('anti-slop');slop_p.add_argument('repo_positional',nargs='?',default=None);slop_p.add_argument('extra_positional',nargs='?',default=None);slop_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
@@ -675,18 +740,6 @@ def _build_parser():
     dream_p.add_argument('--snapshot',default=None,help='Optional log directory or JSON snapshot map to verify pins before recall')
     dream_p.add_argument('--out-md',default=None,help='Optional path to write the Markdown approval queue capsule')
     dream_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'],help='Stdout format (json or markdown)')
-    dream_p.add_argument('--allow-unverified',action='store_true',help='Allow recall without a snapshot, labelled UNVERIFIED')
-    for name in ('dream-pending','dream-approve','dream-reject'):
-        p=sub.add_parser(name)
-        p.add_argument('--graph',required=True,help='Path to the Dream approval queue JSON')
-        if name!='dream-pending':
-            p.add_argument('ids',nargs='+',metavar='ID')
-            p.add_argument('--by',required=True,help='Name of the human reviewer')
-            p.add_argument('--db',default=None,help='Optional SQLite ontology database')
-            if name=='dream-approve':
-                p.add_argument('--snapshot',default=None,help='Snapshot used to verify citation pins')
-            else:
-                p.add_argument('--reason',default='')
     rctx_p=sub.add_parser('rule-context',help='T0 safety core (verbatim quotes) + T1 rule index from the verified INDEX-RULES.md (no model call)')
     rctx_p.add_argument('repo_positional',nargs='?',default=None)
     rctx_p.add_argument('--core-budget',type=int,default=600);rctx_p.add_argument('--index-budget',type=int,default=600)
@@ -709,7 +762,6 @@ def _build_parser():
     hand_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown']);hand_p.add_argument('--write',action='store_true',help='Write .memlet/wiki/HANDOVER.md and record a handover ledger event')
     hand_p.add_argument('--mode',default=None,choices=['verified','digest','brief','index'],metavar='{verified,index}',help='verified (default): code-anchored rules; index: verbatim key rules and topic index')
     hand_p.add_argument('--budget',default=None,help='Token budget: a number (clamped to 500-2000) or auto (~12%% of the instruction text); default from .memlet/config.json handover.tokenBudget, else 500')
-    hand_p.add_argument('--verify',metavar='FILE',help='Verify a JSON or Markdown capsule checksum')
     cmp_p=sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet')
     cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     opsec_p=sub.add_parser('opsec-check');opsec_p.add_argument('repo_positional',nargs='?',default=None);opsec_p.add_argument('--file','--repo-path','--repo',dest='target_file',default=None);opsec_p.add_argument('--canon',default=None);opsec_p.add_argument('--history',action='store_true',help='Also scan added lines in the full git history (git log -p --all); exit 2 if history cannot be scanned');opsec_p.add_argument('--require-canon',action='store_true',help='Exit 2 when no persona canon (fingerprint file) is found')
@@ -738,14 +790,9 @@ def _build_parser():
     exp_p.add_argument('--target-dir',default=None);exp_p.add_argument('--write',action='store_true');exp_p.add_argument('--lang',default='ko')
     cap_p=sub.add_parser('capture');cap_p.add_argument('--file',default=None);cap_p.add_argument('--text',default=None)
     cap_p.add_argument('--kind',default='auto');cap_p.add_argument('--command',default='');cap_p.add_argument('--operation-id',default='')
-    recall=sub.add_parser('recall');recall.add_argument('--query',default='');recall.add_argument('--at');recall.add_argument('--known-at')
+    recall=sub.add_parser('recall');recall.add_argument('--query',action=_ExplicitValue,default='');recall.add_argument('--at');recall.add_argument('--known-at')
     recall.add_argument('--before');recall.add_argument('--after');recall.add_argument('--shared',action='store_true');recall.add_argument('--federated',action='store_true')
     recall.add_argument('--budget',type=int,default=None)
-    recall.add_argument('positional_query',nargs='?',help='Recall across repository rules and approved lessons')
-    recall.add_argument('--unified',action='store_true',help='Recall across repository sources')
-    recall.add_argument('--repo',default='.',help='Repository for unified recall')
-    recall.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    ui_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     read=sub.add_parser('read');read.add_argument('--id',required=True);read.add_argument('--offset',type=int,default=0);read.add_argument('--size',type=int,default=6000)
     skills_p=sub.add_parser('skills');skills_p.add_argument('--query',default='');skills_p.add_argument('--include-inactive',action='store_true')
     skills_p.add_argument('--at');skills_p.add_argument('--known-at');skills_p.add_argument('--before');skills_p.add_argument('--after')
@@ -758,18 +805,44 @@ def _build_parser():
     learn=sub.add_parser('learn')
     learn_mode=learn.add_mutually_exclusive_group(required=True)
     learn_mode.add_argument('--file',help='Existing memory-store learning request JSON')
+    sub.add_parser('skill-sync')
+    idx=sub.add_parser('index');idx.add_argument('--limit',type=int,default=200)
+    imp=sub.add_parser('backfill');imp.add_argument('--source-session',required=True);imp.add_argument('--end-byte',type=int)
+    # Freeze legacy option spellings before any router-only options are added.
+    for child in set(sub.choices.values()):
+        _reserve_legacy_prefixes(child)
+    check_mode=aud_p.add_mutually_exclusive_group()
+    check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
+    check_mode.add_argument('--accept',action='append',default=[],metavar='ANCHOR',help='Re-pin a named path::symbol anchor (repeatable)')
+    check_mode.add_argument('--repin-legacy-ts',action='store_true',help='Re-pin legacy TypeScript anchors')
+    aud_p.add_argument('--dry-run',action='store_true',help='Preview supported anchor updates')
+    dream_p.add_argument('--allow-unverified',action='store_true',help='Allow recall without a snapshot, labelled UNVERIFIED')
+    for name in ('dream-pending','dream-approve','dream-reject'):
+        p=sub.add_parser(name)
+        p.add_argument('--graph',required=True,help='Path to the Dream approval queue JSON')
+        if name!='dream-pending':
+            p.add_argument('ids',nargs='+',metavar='ID')
+            p.add_argument('--by',required=True,help='Name of the human reviewer')
+            p.add_argument('--db',default=None,help='Optional SQLite ontology database')
+            if name=='dream-approve':
+                p.add_argument('--snapshot',default=None,help='Snapshot used to verify citation pins')
+            else:
+                p.add_argument('--reason',default='')
+    hand_p.add_argument('--verify',metavar='FILE',help='Verify a JSON or Markdown capsule checksum')
+    recall.add_argument('positional_query',nargs='?',help='Recall across repository rules and approved lessons')
+    recall.add_argument('--unified',action='store_true',help='Recall across repository sources')
+    recall.add_argument('--repo',default='.',help='Repository for unified recall')
+    recall.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
+    ui_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
     learn_mode.add_argument('--transcript',metavar='PATH',help='Add transcript lessons to the PENDING queue')
     learn_mode.add_argument('--pending',action='store_true',help='List lessons awaiting review')
     learn_mode.add_argument('--approve',nargs='+',metavar='ID',help='Approve lessons as a human reviewer')
     learn_mode.add_argument('--reject',nargs='+',metavar='ID',help='Reject lessons as a human reviewer')
-    learn.add_argument('--by',default='',help='Name of the human reviewer (required for decisions)')
-    learn.add_argument('--reason',default='')
-    learn.add_argument('--repo',default='.')
-    learn.add_argument('--vendor',default='autonomous-deterministic')
+    learn.add_argument('--by',action=_ExplicitValue,default='',help='Name of the human reviewer (required for decisions)')
+    learn.add_argument('--reason',action=_ExplicitValue,default='')
+    learn.add_argument('--repo',action=_ExplicitValue,default='.')
+    learn.add_argument('--vendor',action=_ExplicitValue,default='autonomous-deterministic')
     learn.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    sub.add_parser('skill-sync')
-    idx=sub.add_parser('index');idx.add_argument('--limit',type=int,default=200)
-    imp=sub.add_parser('backfill');imp.add_argument('--source-session',required=True);imp.add_argument('--end-byte',type=int)
     _configure_help(parser, sub)
     return parser
 

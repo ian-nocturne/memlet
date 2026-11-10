@@ -283,6 +283,15 @@
     "kind": "json"
    }
   },
+  "check-format-prefix": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "kind": "text"
+   }
+  },
   "compare-bench-markdown": {
    "exit": 0,
    "stderr": {
@@ -782,6 +791,20 @@
     "kind": "json"
    }
   },
+  "learn-file-prefix-stdin": {
+   "exit": 1,
+   "stderr": {
+    "keys": [
+     "error",
+     "ok",
+     "type"
+    ],
+    "kind": "json"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
   "links": {
    "exit": 0,
    "stderr": {
@@ -873,7 +896,47 @@
     "kind": "empty"
    }
   },
+  "read-size-prefix": {
+   "exit": 1,
+   "stderr": {
+    "keys": [
+     "error",
+     "ok",
+     "type"
+    ],
+    "kind": "json"
+   },
+   "stdout": {
+    "kind": "empty"
+   }
+  },
   "recall": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "cases",
+     "current",
+     "experiences",
+     "facts",
+     "history",
+     "hypotheses",
+     "indexing",
+     "links",
+     "recallId",
+     "retrieval",
+     "revision",
+     "skillHistory",
+     "skills",
+     "taskId",
+     "version"
+    ],
+    "kind": "json"
+   }
+  },
+  "recall-shared-prefix": {
    "exit": 0,
    "stderr": {
     "kind": "empty"
@@ -1008,6 +1071,27 @@
    }
   },
   "rule-recall-query": {
+   "exit": 0,
+   "stderr": {
+    "kind": "empty"
+   },
+   "stdout": {
+    "keys": [
+     "command",
+     "formatted",
+     "k",
+     "ok",
+     "repoPath",
+     "scores",
+     "spanKeys",
+     "spans",
+     "stale",
+     "tokenEstimate"
+    ],
+    "kind": "json"
+   }
+  },
+  "rule-recall-safety-prefix": {
    "exit": 0,
    "stderr": {
     "kind": "empty"

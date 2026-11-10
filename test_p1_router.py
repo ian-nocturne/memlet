@@ -117,6 +117,121 @@ class RouterHelpTests(unittest.TestCase):
         self.assertIn('.jsonl', out)
 
 
+# Extracted from `git archive cefe43c`: capture main() at parse_args before
+# any handler runs, then walk each legacy parser's _actions. Keep this independent
+# of the current parser and available in shallow clones without old Git objects.
+LEGACY_OPTION_DESTINATIONS = {
+    'schema': {'-h': 'help', '--help': 'help'},
+    'brief': {'-h': 'help', '--help': 'help'},
+    'stats': {'-h': 'help', '--help': 'help'},
+    'scenes': {'-h': 'help', '--help': 'help'},
+    'doctor': {'-h': 'help', '--help': 'help'},
+    'backup': {'-h': 'help', '--help': 'help', '--dest-dir': 'dest_dir', '--include-models': 'include_models'},
+    'restore': {'-h': 'help', '--help': 'help', '--backup-dir': 'backup_dir'},
+    'repo-benchmark': {'-h': 'help', '--help': 'help', '--work-dir': 'work_dir'},
+    'audit': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--base': 'base', '--head': 'head', '--format': 'format', '--exit-zero': 'exit_zero'},
+    'check': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--base': 'base', '--head': 'head', '--format': 'format', '--exit-zero': 'exit_zero'},
+    'rescue': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--write': 'write', '--output-dir': 'output_dir', '--format': 'format', '--exit-zero': 'exit_zero'},
+    'viberescue': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--write': 'write', '--output-dir': 'output_dir', '--format': 'format', '--exit-zero': 'exit_zero'},
+    'anti-slop': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--lock': 'lock', '--force': 'force', '--archetype': 'archetype', '--format': 'format', '--exit-zero': 'exit_zero'},
+    'init': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--dry-run': 'dry_run', '--force': 'force', '--format': 'format'},
+    'wiki': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--dry-run': 'dry_run', '--format': 'format'},
+    'import': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--from': 'source', '--dry-run': 'dry_run', '--format': 'format'},
+    'slim-plan': {'-h': 'help', '--help': 'help', '--out': 'out', '--keep-recent': 'keep_recent', '--split-rules': 'split_rules'},
+    'dream-build': {'-h': 'help', '--help': 'help', '--candidates': 'candidates', '--snapshot': 'snapshot', '--out-json': 'out_json', '--out-db': 'out_db', '--vendor': 'vendor'},
+    'dream': {'-h': 'help', '--help': 'help', '--candidates': 'candidates', '--snapshot': 'snapshot', '--out-json': 'out_json', '--out-db': 'out_db', '--vendor': 'vendor'},
+    'dream-recall': {'-h': 'help', '--help': 'help', '--graph': 'graph', '--query': 'query', '--budget': 'budget', '--max-tokens': 'budget', '--snapshot': 'snapshot', '--out-md': 'out_md', '--format': 'format'},
+    'rule-context': {'-h': 'help', '--help': 'help', '--core-budget': 'core_budget', '--index-budget': 'index_budget', '--auto': 'auto', '--threshold': 'threshold'},
+    'rule-recall': {'-h': 'help', '--help': 'help', '--repo': 'repo', '--k': 'k', '--safety': 'safety'},
+    'index-build': {'-h': 'help', '--help': 'help', '--via': 'via'},
+    'brief-build': {'-h': 'help', '--help': 'help', '--via': 'via'},
+    'handover': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--next-step': 'next_step', '--rejected': 'rejected', '--format': 'format', '--write': 'write', '--mode': 'mode', '--budget': 'budget'},
+    'compare-bench': {'-h': 'help', '--help': 'help', '--format': 'format'},
+    'benchmark-compare': {'-h': 'help', '--help': 'help', '--format': 'format'},
+    'opsec-check': {'-h': 'help', '--help': 'help', '--file': 'target_file', '--repo-path': 'target_file', '--repo': 'target_file', '--canon': 'canon', '--history': 'history', '--require-canon': 'require_canon'},
+    'opsec-fingerprint': {'-h': 'help', '--help': 'help'},
+    'heal-skills': {'-h': 'help', '--help': 'help', '--dry-run': 'dry_run'},
+    'verify-skill': {'-h': 'help', '--help': 'help', '--id': 'id', '--command': 'command', '--proof-file': 'proof_file', '--operation-id': 'operation_id', '--timeout': 'timeout'},
+    'preflight': {'-h': 'help', '--help': 'help', '--plan': 'plan', '--files': 'files', '--action-type': 'action_type'},
+    'capsule': {'-h': 'help', '--help': 'help', '--plan': 'plan', '--files': 'files', '--worker': 'worker', '--budget': 'budget'},
+    'consolidate': {'-h': 'help', '--help': 'help', '--threshold': 'threshold', '--dry-run': 'dry_run'},
+    'sync-md': {'-h': 'help', '--help': 'help', '--note-path': 'note_path', '--explicit-user': 'explicit_user'},
+    'benchmark': {'-h': 'help', '--help': 'help', '--budget': 'budget', '--format': 'format'},
+    'inspector': {'-h': 'help', '--help': 'help', '--budget': 'budget', '--repo-path': 'repo_path', '--repo': 'repo_path', '--output': 'output', '--out': 'output', '--output-dir': 'output_dir'},
+    'ui': {'-h': 'help', '--help': 'help', '--repo-path': 'repo_path', '--repo': 'repo_path', '--output': 'output', '--out': 'output', '--output-dir': 'output_dir'},
+    'pack': {'-h': 'help', '--help': 'help', '--stack': 'stack', '--output': 'output', '--output-dir': 'output_dir', '--dry-run': 'dry_run', '--list': 'list', '--format': 'format'},
+    'export': {'-h': 'help', '--help': 'help', '--targets': 'targets', '--target-dir': 'target_dir', '--write': 'write', '--lang': 'lang'},
+    'capture': {'-h': 'help', '--help': 'help', '--file': 'file', '--text': 'text', '--kind': 'kind', '--command': 'command', '--operation-id': 'operation_id'},
+    'recall': {'-h': 'help', '--help': 'help', '--query': 'query', '--at': 'at', '--known-at': 'known_at', '--before': 'before', '--after': 'after', '--shared': 'shared', '--federated': 'federated', '--budget': 'budget'},
+    'read': {'-h': 'help', '--help': 'help', '--id': 'id', '--offset': 'offset', '--size': 'size'},
+    'skills': {'-h': 'help', '--help': 'help', '--query': 'query', '--include-inactive': 'include_inactive', '--at': 'at', '--known-at': 'known_at', '--before': 'before', '--after': 'after', '--shared': 'shared', '--federated': 'federated', '--limit': 'limit', '--budget': 'budget'},
+    'skill': {'-h': 'help', '--help': 'help', '--id': 'id'},
+    'cases': {'-h': 'help', '--help': 'help', '--limit': 'limit'},
+    'links': {'-h': 'help', '--help': 'help', '--id': 'id', '--limit': 'limit'},
+    'learn': {'-h': 'help', '--help': 'help', '--file': 'file'},
+    'feedback': {'-h': 'help', '--help': 'help', '--file': 'file'},
+    'skill-manage': {'-h': 'help', '--help': 'help', '--file': 'file'},
+    'skill-sync': {'-h': 'help', '--help': 'help'},
+    'index': {'-h': 'help', '--help': 'help', '--limit': 'limit'},
+    'backfill': {'-h': 'help', '--help': 'help', '--source-session': 'source_session', '--end-byte': 'end_byte'},
+}
+
+
+class LegacyPrefixTests(unittest.TestCase):
+    @staticmethod
+    def option_values(action):
+        if action.nargs == 0:
+            return []
+        if action.choices:
+            return [str(next(iter(action.choices)))]
+        return ['1' if action.type in (int, float) else 'prefix-probe']
+
+    def test_every_unique_base_prefix_resolves_to_its_legacy_destination(self):
+        parser = memory_cli._build_parser()
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        self.assertEqual(set(LEGACY_COMMANDS), set(LEGACY_OPTION_DESTINATIONS))
+        count = 0
+        for name, options in LEGACY_OPTION_DESTINATIONS.items():
+            prefixes = set(options)
+            for option in options:
+                if option.startswith('--'):
+                    prefixes.update(option[:length] for length in range(3, len(option)))
+            for prefix in sorted(prefixes):
+                matches = [option for option in options if option.startswith(prefix)]
+                if prefix not in options and len(matches) != 1:
+                    continue
+                expected = options[prefix if prefix in options else matches[0]]
+                with self.subTest(command=name, prefix=prefix, destination=expected):
+                    resolved = sub.choices[name]._parse_optional(prefix)
+                    # argparse 3.13 returns a list; 3.9 returns the single tuple.
+                    action = (resolved[0] if isinstance(resolved, list) else resolved)[0]
+                    self.assertEqual(expected, action.dest)
+                    required = [a for a in sub.choices[name]._actions if a.required and a is not action]
+                    for group in sub.choices[name]._mutually_exclusive_groups:
+                        if group.required and action not in group._group_actions:
+                            required.append(group._group_actions[0])
+                    setup = []
+                    for needed in required:
+                        setup += [needed.option_strings[0]] + self.option_values(needed)
+                    values = self.option_values(action)
+                    for route in ([name], ['admin', name]):
+                        argv = route + setup + [prefix] + values
+                        if expected == 'help':
+                            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as done:
+                                parser.parse_args(argv)
+                            self.assertEqual(0, done.exception.code)
+                        else:
+                            parsed = parser.parse_args(argv)
+                            value = values[0] if values else True
+                            if action.type is not None and values:
+                                value = action.type(value)
+                            if action.nargs == '*' or isinstance(action, argparse._AppendAction):
+                                value = [value]
+                            self.assertEqual(value, getattr(parsed, expected))
+                count += 1
+        self.assertEqual(1197, count)
+
+
 class DeprecationTests(unittest.TestCase):
     def test_notice_exactly_once_on_stderr_and_suppressible(self):
         want = "memlet: 'schema' is now 'memlet admin schema'; the short form will be removed in a future release.\n"
@@ -260,6 +375,50 @@ class RealRouterTests(unittest.TestCase):
             self.assertEqual((1, ''), (code, err))
             self.assertEqual(1, len(out.splitlines()))
 
+    def test_real_bridge_cli_learning_approval_drift_and_checksum_lifecycle(self):
+        def run_json(argv, expected=0):
+            result = self.box.run(argv)
+            self.assertEqual(expected, result.returncode, result.stderr or result.stdout)
+            self.assertEqual('', result.stderr)
+            return json.loads(result.stdout)
+
+        run_json(['init'])
+        transcript = self.box.tmp / 'claude-session.jsonl'
+        lesson = 'Never call charge() in mod.py without a retry wrapper.'
+        transcript.write_text(json.dumps({'type': 'user', 'timestamp': '2026-11-09T09:00:00Z',
+                                         'message': {'role': 'user', 'content': lesson}}) + '\n', encoding='utf-8')
+        learned = run_json(['learn', '--transcript', str(transcript)])
+        pending = run_json(['learn', '--pending'])
+        ids = [node['id'] for node in pending['pendingNodes']]
+        self.assertTrue(ids)
+        self.assertEqual(set(learned['addedNodeIds']), set(ids))
+        self.assertEqual([], run_json(['recall', 'charge'])['sections']['dream'])
+        queue = self.box.repo / '.memlet/dream/APPROVAL-QUEUE.json'
+        before = queue.read_bytes()
+        for reviewer in ([], ['--by', '  ']):
+            refused = self.box.run(['learn', '--approve'] + ids + reviewer)
+            self.assertEqual(2, refused.returncode)
+            self.assertIn('--by NAME', refused.stderr)
+            self.assertEqual(before, queue.read_bytes())
+        run_json(['learn', '--approve'] + ids + ['--by', 'Reviewer'])
+        recalled = run_json(['recall', 'charge'])
+        self.assertEqual(set(ids), {item['id'] for item in recalled['sections']['dream']})
+        self.assertIn(lesson, json.dumps(run_json(['handover'])))
+        source = self.box.repo / 'mod.py'
+        edited = source.read_text(encoding='utf-8').replace('def charge(amount):', 'def charge(amount, currency):')
+        source.write_text(edited, encoding='utf-8')
+        changed = run_json(['check', '--changed'], expected=1)
+        self.assertGreater(changed['staleCount'], 0)
+        self.assertTrue(any(item['anchor'] == 'mod.py::charge' for item in changed['affected']))
+        self.assertTrue(run_json(['check', '--accept', 'mod.py::charge'])['ok'])
+        written = self.box.run(['handover', '--format', 'markdown', '--write'])
+        self.assertEqual(0, written.returncode, written.stderr or written.stdout)
+        capsule = self.box.repo / '.memlet/wiki/HANDOVER.md'
+        self.assertTrue(capsule.is_file())
+        self.assertEqual(0, self.box.run(['handover', '--verify', str(capsule)]).returncode)
+        capsule.write_text(capsule.read_text(encoding='utf-8') + '\nEdited capsule.\n', encoding='utf-8')
+        self.assertEqual(1, self.box.run(['handover', '--verify', str(capsule)]).returncode)
+
 
 class BridgeWiringTests(unittest.TestCase):
     def setUp(self):
@@ -302,7 +461,7 @@ class BridgeWiringTests(unittest.TestCase):
             self.bridge.unified_recall.assert_not_called()
 
     def test_check_changed_and_base(self):
-        invoke(['check', '/repo', '--changed', '--base', 'main', '--dry-run'])
+        invoke(['check', '/repo', '--changed', '--base', 'main'])
         self.bridge.changed_check.assert_called_once_with('/repo', base='main')
 
     def test_check_accept_repeatable_and_dry_run(self):
@@ -378,6 +537,51 @@ class BridgeWiringTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('memlet_bridge', result['error'])
         self.assertNotIn('Traceback', out + err)
+
+
+class ModeConflictTests(unittest.TestCase):
+    def assert_refused(self, argv, flag):
+        with mock.patch.object(memory_cli, '_main') as dispatch:
+            code, out, err = invoke(argv)
+        self.assertEqual((2, ''), (code, out), err)
+        self.assertIn(flag, err)
+        dispatch.assert_not_called()
+
+    def test_unified_recall_rejects_store_filters_and_duplicate_query(self):
+        for query in (['recall', 'charge'], ['recall', '--unified', '--query', 'charge']):
+            for flags in (['--at', '2000-01-01'], ['--known-at', '2000-01-01'], ['--before', '2000-01-01'],
+                          ['--after', '2000-01-01'], ['--shared'], ['--federated'], ['--s']):
+                with self.subTest(argv=query + flags):
+                    self.assert_refused(query + flags, '--shared' if flags == ['--s'] else flags[0])
+        for value in ('wrong', ''):
+            self.assert_refused(['recall', 'charge', '--query', value], '--query')
+        self.assert_refused(['admin', 'recall', 'charge', '--q', 'wrong'], '--query')
+
+    def test_learn_rejects_ignored_mode_options(self):
+        cases = [(['--transcript', 's.jsonl'], ['--by', 'Reviewer']),
+                 (['--transcript', 's.jsonl'], ['--reason', 'unused']),
+                 (['--pending'], ['--vendor', 'unused']), (['--pending'], ['--by', '']),
+                 (['--pending'], ['--reason', '']),
+                 (['--approve', 'id', '--by', 'Reviewer'], ['--vendor', 'unused']),
+                 (['--approve', 'id', '--by', 'Reviewer'], ['--reason', 'unused']),
+                 (['--reject', 'id', '--by', 'Reviewer'], ['--vendor', 'unused']),
+                 (['--file', '-'], ['--repo', '.']), (['--file', '-'], ['--by', 'Reviewer'])]
+        for mode, extra in cases:
+            with self.subTest(mode=mode, extra=extra):
+                self.assert_refused(['learn'] + mode + extra, extra[0])
+        for flags in (['--root', '/unused'], ['--task', 'unused'], ['--session', 'unused'], ['--standalone']):
+            self.assert_refused(flags + ['learn', '--pending'], flags[0])
+            self.assert_refused(['learn', '--pending'] + flags, flags[0])
+
+    def test_new_check_modes_reject_ignored_options(self):
+        for mode in (['--changed'], ['--accept', 'mod.py::charge'], ['--repin-legacy-ts']):
+            for flags in (['--head', 'HEAD'], ['--exit-zero'], ['--format', 'sarif'], ['--task', 'unused']):
+                with self.subTest(mode=mode, flags=flags):
+                    self.assert_refused(['check'] + mode + flags, flags[0])
+            if mode != ['--changed']:
+                self.assert_refused(['check'] + mode + ['--base', 'HEAD'], '--base')
+        self.assert_refused(['check', '--changed', '--dry-run'], '--dry-run')
+        self.assert_refused(['check', '--dry-run'], '--dry-run')
 
 
 class GlobalAndFormatTests(unittest.TestCase):
