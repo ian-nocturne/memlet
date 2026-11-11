@@ -170,3 +170,34 @@ GRAPH_REPLACED_BY_MARKER = "[REPLACED — do not apply as current; replaced by %
 GRAPH_INCOMPLETE_MARKER = "Incomplete groups: "
 
 GRAPH_ORDER_ITEM_NOTICE = "Decision order conflict for %s: history before the current queue record is unknown; the current record remains authoritative from its timestamp onward."
+
+
+# --- Unit K1 (9.2 hooks, final fixes) ---------------------------------------------------------------------------
+HOOK_GUARD_INVALID = ('Memlet: %s is %s, not one of "deny", "ask" or "off"; the guard is off until it is set to one '
+                      'of those.')
+GUARD_DENY_PARTIAL_TAIL = ("Shown in full above: %s. Not shown in full, only pointed to: %s. Once you have read the "
+                           "lessons shown in full, the same call may be repeated; Memlet does not stop it again for "
+                           "this file and these lessons in this session.")
+GUARD_ASK_PARTIAL_TAIL = ("Shown in full above: %s. Not shown in full, only pointed to: %s. Memlet asks once per file "
+                          "and these lessons in a session; the next edit of this file is not asked again for them.")
+
+
+def _literal_pieces(*templates):
+    """The fixed literal parts (20+ characters) of hook texts, with their `%s` / `%d` slots cut out."""
+    import re as _re
+    out = []
+    for t in templates:
+        for piece in _re.split(r"%[sd]", t):
+            piece = piece.strip(" `")
+            if len(piece) >= 20 and piece not in out:
+                out.append(piece)
+    return tuple(out)
+
+
+# Text only Memlet's own hooks print. A transcript line (one visible message) containing any of these quotes a
+# hook's output, not something the person said: hook-path learning (Stop / PreCompact) drops such lines before
+# learning or ingesting. Library transcript readers should drop them too (same constant).
+HOOK_OWN_TEXT_MARKERS = _literal_pieces(
+    JIT_HEAD, GUARD_DENY_HEAD, GUARD_DENY_TAIL, GUARD_ASK_HEAD, GUARD_ASK_TAIL, GUARD_DENY_PARTIAL_TAIL,
+    GUARD_ASK_PARTIAL_TAIL, HOOK_QUOTE_NOTE, HOOK_POINTER, HOOK_OMITTED, HOOK_RULE_REPLACED, CAPSULE_COMPACT_HEAD,
+    CAPSULE_AFTER_COMPACT, CAPSULE_AFTER_RESUME, CAPSULE_STATUS_HEAD, *HOOK_GROUP_LABELS.values())

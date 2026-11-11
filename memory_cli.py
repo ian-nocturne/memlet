@@ -511,9 +511,11 @@ def _validate_modes(args, parser):
         if (args.approve or args.reject or args.paths) and not args.by.strip():
             parser.error('learn --approve/--reject requires --by NAME')
     if args.action == 'init':
+        new_flags = ['--' + name for name in ('jit', 'guard', 'capsule') if getattr(args, name)]
+        if new_flags and not args.hooks:  # 9.2 opt-ins install something: --hooks-remove takes none of them
+            parser.error(', '.join(new_flags) + ' requires --hooks')
         if not (args.hooks or args.hooks_remove):
             flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else []) + (['--dream'] if args.dream else [])
-            flags += ['--' + name for name in ('jit', 'guard', 'capsule') if getattr(args, name)]
             if flags:
                 parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove')
         elif args.hooks_remove and args.force:
