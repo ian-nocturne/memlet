@@ -241,9 +241,24 @@ Approved lessons travel in the capsule too (`approvedLessons`, after the active 
 
 #### Routlet reads the handover
 
-`memlet handover --write` also replaces `.memlet/handover.json` and `.memlet/capsules.json` for Routlet, under the same write lock as the Markdown page. They carry anchored active or compatible-unverified rules and approved lessons only; stale anchors are quarantined, and approved `BLOCKS` lessons and replaced instructions go under rejected approaches. No hint, pending lesson or model verdict enters either file.
+`memlet handover --write` also replaces `.memlet/handover.json` and `.memlet/capsules.json` for Routlet, under the same write lock as the Markdown page. Only rules whose every symbol anchor is `active` become constraints. Approved lessons, including `BLOCKS` prohibitions, become lesson references; only the old side of an approved supersession becomes a rejected approach. No hint, pending lesson or model verdict enters either file, and promoted Dream page rules never become a second authority path.
 
-These are snapshots: re-run `--write` after code or approvals change. Routlet compares commit heads for constraints but does not re-check working-tree edits; its reference summaries also retain no anchor status. Long quotes have a visible truncation marker and a source citation in the JSON, and omitted entries are counted. `memlet handover --verify .memlet/handover.json` checks integrity, not authentication; Routlet itself does not check that digest. A failed write lists which files were replaced; the three replacements are not atomic together.
+| Memlet evidence | Routlet file / list | Export policy |
+| --- | --- | --- |
+| Rule with every symbol anchor active | `handover.json` / `activeConstraints` | Full rule or file-and-entry pointer; no rule copy in `capsules.json` |
+| Compatible-unverified rule | Neither | Counted as `compatibleUnverifiedRules`; re-verify in Memlet |
+| Rule matching an approved replaced quote | Neither | Counted as `replacedRules`; recall/handover name the rule and replacing lesson, while Memlet's own active list stays intact |
+| Stale anchor | `handover.json` / `quarantinedStaleAnchors` | Quarantine only |
+| Approved `RESOLVES`, `GOVERNS`, `BLOCKS`, current `SUPERSEDES` | `capsules.json` / `capsules` | Verified cited text only |
+| Approved supersession's old side | `handover.json` / `rejectedApproaches` | Once per replaced line; never a lesson ref |
+
+Replacement checks cover all approved supersessions by citation and normalised text. In A→B→C, B is marked replaced in recall, handover and the promoted page, with a pointer to the lesson that replaced it. Repeated quotes across sessions and multiple replacements follow the same rule. All exported tags use the `memlet-` namespace. Lesson paths name existing files with exact directory-entry spelling; scope tags contribute a path only when they name such a file. Non-contiguous citations remain separate ranges.
+
+These are snapshots: re-run `--write` after code or approvals change. Routlet head-checks constraint entries, but **lesson refs are not head-checked**, and neither path re-checks working-tree edits. Committing the snapshots changes HEAD too. A repository with no commit exports `repoHead: "unverified"`; the reader cannot detect drift from that head.
+
+Each file is limited to 128 KiB and each list to 40 entries. Routlet's display limits are 140 characters for a rule, 110 for a rejected approach, and 120 for a compiled lesson summary (attachment allows 200). Text that exceeds its display limit is replaced by a fixed sentence naming the JSON file and entry id; `truncated: true` and `fullText` preserve the complete safe text in that entry. No quote prefix is exported. Final values, including pointers and `fullText`, pass residual-secret checks; entries the reader would quarantine, including strings over its 2,000-character privacy limit, are omitted and counted. The reader's compact renderer has a separate 400–700-character total budget, may shorten combined sections, and does not render lesson refs; the full renderer and JSON retain the pointers. Pointers pass the field limits and the compact single-entry checks. Byte trimming processes lessons first, then rejected approaches, stale anchors, and constraints.
+
+`memlet handover --verify` accepts either JSON bridge file and checks integrity, not authentication; Routlet itself does not check that digest. The three replacements are not atomic together. A failed write names each written/unwritten file, including the ledger if recording fails. After any successful replacement, unwritten bridge files are removed where possible; a cleanup failure explicitly identifies a stale file still read by Routlet. A later successful `--write` heals the snapshot.
 
 ### 5. Lessons: propose, check, approve
 
@@ -356,7 +371,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 ## Upgrading
 
-- From 9.1.0: additive changes only; nothing changes without `handover --write` or `dream --verify-with`. The former writes the two Routlet snapshots; the latter now permits distinct models of the same vendor under `dream.agreement: "vendor"` as a review aid, while the hint policy stays the same.
+- From 9.1.0: `handover --write` adds the two Routlet snapshots, and `dream --verify-with` permits distinct models of the same vendor under `dream.agreement: "vendor"` as a review aid, while the hint policy stays the same. Chained supersessions now mark intermediate instructions as replaced in every lesson reader; anchored rules with matching replaced text gain a notice. Other handover JSON and Markdown stay byte-identical.
 
 ### From 9.0
 
@@ -381,7 +396,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 ## How far it has been tested
 
-- 797 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23.2, grammars 0.23).
+- 824 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23.2, grammars 0.23).
 - `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design twice: see the row format and the failed-batch rule in section 5.
 - On 9.1 code, hooks installed with `--hooks --dream` ran in one headless Claude Code session (the checked rules arrived at session start, and the session was snapshotted at Stop without a model call), and six MCP tools, including `memlet_dream_next` and `memlet_dream_submit`, were called from one `codex exec` session; the submitted lesson stayed pending as an untrusted `host` proposal. The PostToolUse and PreCompact hooks were last exercised in a real session on 9.0-era code.
 - The on-disk bridge was checked locally against Routlet’s actual reader, including commit drift and edits without a refreshed snapshot; no model was called.

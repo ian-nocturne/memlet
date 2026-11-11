@@ -769,14 +769,14 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
             chosen.append((verify_with, verifier_model))
         if any(not vc.valid_model(m) for _, m in chosen):
             raise ValueError("invalid model id; expected [A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}")
-        if agreement == "model":
+        if agreement == "model" or verify_with:
             for index, (vendor, model) in enumerate(chosen):
                 if vendor in vc.MODEL_FAMILIES and vc.model_family(vendor, model) is None:
                     key = "dream.models.verifier." + vendor if index >= len(vendors) else "dream.models." + vendor
-                    raise ValueError(key + " must contain exactly one known family token under dream.agreement=model; accepted families: "
+                    raise ValueError(key + " must contain exactly one known family token under dream.agreement=" + agreement + "; no recognisable family; accepted families: "
                                      + ", ".join(vc.MODEL_FAMILIES[vendor]))
         if verify_with and any(vc.same_model(v, m, verify_with, verifier_model) for v, m in chosen[:-1]):
-            raise ValueError("dream.models.verifier must differ from every proposer model under dream.agreement=model")
+            raise ValueError("dream.models.verifier has the same family as a proposer under dream.agreement=" + agreement)
         if runner is None:
             for vendor in dict.fromkeys(v for v, _ in chosen):
                 refusal = vc.static_vendor_refusal(vendor)

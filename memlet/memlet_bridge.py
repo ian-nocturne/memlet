@@ -866,6 +866,9 @@ def _lesson_quote_block(item):
         if role == "replaced":
             prefix = "  old_pin [" + item.get("oldLabel", "SUPERSEDED — DO NOT APPLY AS CURRENT") + "]" + pin
             label = "replaced — do not apply as current: "
+            replacing = item.get("lineReplacements", {}).get(cite.get("span"))
+            if replacing:
+                prefix += " [replaced by " + ", ".join(replacing) + "]"
         elif role == "current":
             prefix = "  replacement_pin [" + item.get("replacementLabel", "ACTIVE — APPLY THIS") + "]" + pin
             label = "current instruction: "
@@ -882,8 +885,13 @@ def render_capsule_lesson(item, hint=False):
     relation = next((k for k in ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS") if k in kinds), "LESSON")
     if item.get("quarantined"):
         parts = sorted(zip(item.get("lineRoles", []), quotes, cites), key=lambda p: p[0] != "replaced")
-        quotes = [("[REPLACED — do not apply as current] " if role == "replaced" else
-                   "[" + item.get("replacementLabel", "CURRENT") + "] ") + quote for role, quote, cite in parts]
+        replacements = {Path(c["file"]).name + ":" + str(c["start"]): ids
+                        for c in item.get("cites", [])
+                        for ids in [item.get("lineReplacements", {}).get(c.get("span"))] if ids}
+        quotes = [("[REPLACED — do not apply as current" +
+                   ("; replaced by " + ", ".join(replacements[cite]) if cite in replacements else "") + "] "
+                   if role == "replaced" else "[" + item.get("replacementLabel", "CURRENT") + "] ") + quote
+                  for role, quote, cite in parts]
         cites = [cite for role, quote, cite in parts]
         prefix = ""
     else:
@@ -899,6 +907,9 @@ def render_recall_lesson(item):
     lines = ["- [" + item["id"] + "] Superseded Quarantine (`SUPERSEDES`)"]
     for role, quote, cite in zip(item.get("lineRoles", []), item.get("quoteLines", []), item.get("cites", [])):
         label = "REPLACED — do not apply as current" if role == "replaced" else item.get("replacementLabel", "CURRENT")
+        replacing = item.get("lineReplacements", {}).get(cite.get("span"))
+        if replacing:
+            label += "; replaced by " + ", ".join(replacing)
         lines.append("  [" + label + "] " + quote + " (`{file}:{start}-{end}`)".format(**cite))
     return "\n".join(lines)
 
@@ -1194,7 +1205,9 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         for key in ("anchorStatus", "anchorReason", "anchors"):
             item[key] = entry[key]
         item["text"] += f" [{entry['anchorStatus']}: {entry['anchorReason']}]"
-    notices = []
+    rules = mw._rules_from_files(root, mw.import_source_files(root, "auto"))
+    mw._verify_rules(root, rules, mw._config_pins(root), pin_source="pinned")
+    notices = replaced_rule_notices(root, rules, list(states.values()))
     failures = res.get("unverifiableItems", [])
     if failures:
         notices.append(md.citation_failure_notice(failures))
@@ -1202,6 +1215,21 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
                    "unapprovedCount": stats.get("pendingNodes", 0), "rejectedCount": stats.get("rejectedNodes", 0),
                    "pinVerification": res.get("pinVerification"), "unverifiableCount": len(failures),
                    "unverifiableNodeIds": [f["id"] for f in failures], "unverifiableItems": failures}, notices
+
+
+def replaced_rule_notices(root, rules, approved):
+    from .handover_bridge import _rule_text
+    texts = md.replaced_line_index(approved)[1]
+    cache, notices = {}, []
+    for rule in rules:
+        if rule["source"] == PROMOTED_PAGE or not rule.get("anchors"):
+            continue
+        text = _rule_text(root, rule, cache)
+        ids = texts.get(md.normalised_quote(text)) if text else None
+        if ids:
+            notices.append("Rule %s:%s is replaced by lesson %s; re-verify before use." %
+                           (rule["source"], rule["line"], ", ".join(sorted(ids))))
+    return notices
 
 
 def _memory_items(store: Any, task: Any, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1326,7 +1354,8 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
 
     est = mw.estimate_tokens
     failures = sources["dream"].get("unverifiableItems", [])
-    verification_notice = md.citation_failure_notice(failures)
+    verification_notice = "\n- ".join([n for n in [md.citation_failure_notice(failures)] if n]
+                                       + [n for n in notices if n.startswith("Rule ") and "is replaced by lesson" in n])
     fixed_heading = _render_recall({}, None, rules_mode, verification_notice)
     unavailable = [f"{s} ({sources[s]['reason']})" for s in wanted if not sources[s]["available"]]
     footer = ("- Not consulted: " + "; ".join(unavailable)) if unavailable else None
@@ -1893,7 +1922,7 @@ def dream_tiers(graph, *, snapshot, config):
         if not isinstance(node, dict):
             continue
         state = item_trust(node, snapshot=snapshot, config=config)
-        display_node = md.supersession_display_node(node, approved_graph)
+        display_node = md._supersession_pair(node, approved_graph)
         if state["tier"] == TIER_APPROVED and _node_edges_verify(display_node, snapshot or {}):
             state["tier"] = TIER_PENDING
         result[str(node["id"])] = state
@@ -1941,6 +1970,12 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
         config = tier_config(graph, config)
         trust = dream_tiers(graph, snapshot=snapshot, config=config)
         approved_graph = md.approved_view(graph)[0]
+        approved_graph = dict(approved_graph, nodes=[n for n in approved_graph.get("nodes", [])
+                              if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED])
+        live_ids = {n["id"] for n in approved_graph["nodes"]}
+        approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
+                                   if e.get("fromId") in live_ids or e.get("toId") in live_ids]
+        projection = md.supersession_projection(approved_graph)
         items, notices = [], dream_settings(config)[2]
         query_terms = md._query_terms(str(query))
         requested = {_canonical_path(f) for f in files} if files is not None else None
@@ -1960,7 +1995,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             counts[tier] += 1
             if tier not in tiers:
                 continue
-            display_node = md.supersession_display_node(node, approved_graph)
+            display_node = md.supersession_display_node(node, approved_graph, projection)
             text = lesson_text(display_node)
             scope = safe_lesson_display(node.get("scopeTag") or "")
             if query_terms and not query_terms & md._query_terms(text + " " + scope):

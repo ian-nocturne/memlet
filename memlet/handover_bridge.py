@@ -12,7 +12,7 @@ import unicodedata
 
 from . import memlet_wiki as mw, memlet_bridge as mb, memlet_dream as md
 from .vocabulary import (APPROVED, BRIDGE_RULE, BRIDGE_SUGGESTED_ANCHOR, BRIDGE_RELATIONS,
-                         BRIDGE_BLOCKED_REASON, BRIDGE_REPLACED_REASON, BRIDGE_TRUNCATED,
+                         BRIDGE_REPLACED_REASON,
                          BRIDGE_RULE_STATES, LESSON_SEPARATOR)
 
 HANDOVER_FILE = ".memlet/handover.json"
@@ -24,7 +24,7 @@ MAX_BYTES = 128 * 1024
 LIST_CAP = 40
 # Reader L170, L566: attach normalizes/cuts at 200, compile normalizes/cuts at 120.
 SUMMARY_CHARS = 120
-_ALLOWED = BRIDGE_RULE_STATES[:2]
+_ALLOWED = ("active",)
 # Reader L274-284, L335-356: residual secret forms, also after control removal.
 # Memlet masks first; residuals (including short keys and Bearer [REDACTED])
 # cause the entry to be omitted, never a partial prefix to be exported.
@@ -46,7 +46,7 @@ def integrity(value):
 
 
 def verify(value):
-    if not isinstance(value, dict) or value.get("schema_version") != HANDOVER_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema_version") not in (HANDOVER_SCHEMA, CAPSULES_SCHEMA):
         return False
     expected = value.get("integritySha256")
     return (isinstance(expected, str) and bool(re.fullmatch(r"[a-f0-9]{64}", expected))
@@ -65,6 +65,9 @@ def _masked(value):
 
 def _poisoned(value):
     if isinstance(value, str):
+        # Routlet telemetry_reader._privacy_errors also rejects long strings.
+        if len(value) > 2000:
+            return True
         stripped = ''.join(c for c in value if unicodedata.category(c) != 'Cf')
         bare = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', stripped)
         return any(_SECRET.search(v) or md.has_unmasked_secret_or_canary(v)
@@ -76,11 +79,10 @@ def _poisoned(value):
     return False
 
 
-def _clip(text, limit):
-    # Check normalized length too: neither reader may silently cut this again.
-    if len(text) <= limit:
-        return text, False
-    return text[:limit - len(BRIDGE_TRUNCATED)].rstrip() + BRIDGE_TRUNCATED, True
+def _pointer(field, ident):
+    # Closed vocabulary + hash-derived ids: never quote user text in a pointer.
+    file = CAPSULES_FILE if field == "summary" else HANDOVER_FILE
+    return "Read %s entry %s for full text." % (file, ident)
 
 
 def _id(kind, identity):
@@ -88,13 +90,32 @@ def _id(kind, identity):
 
 
 def _source(cites):
-    # Full citations also remain in `cites`. Use a single range per snapshot for
-    # the reader's 120-character rejectedApproaches.source (L555).
+    # Merge only overlapping/adjacent intervals, never uncited gaps.
     groups = {}
     for c in cites:
-        a, b = groups.get(c["file"], (c["start"], c["end"]))
-        groups[c["file"]] = (min(a, c["start"]), max(b, c["end"]))
-    return ", ".join("%s:%d-%d" % (f, a, b) for f, (a, b) in groups.items())
+        groups.setdefault(c["file"], []).append((c["start"], c["end"]))
+    sources = []
+    for file, intervals in groups.items():
+        merged = []
+        for a, b in sorted(intervals):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+            else:
+                merged.append((a, b))
+        sources.extend("%s:%d-%d" % (file, a, b) for a, b in merged)
+    return ", ".join(sources)
+
+
+def _exact_file(root, path):
+    cursor = root
+    try:
+        for part in path.split("/"):
+            if part not in {p.name for p in cursor.iterdir()}:
+                return False
+            cursor = cursor / part
+        return cursor.is_file()
+    except OSError:
+        return False
 
 
 def _paths(root, scope, text):
@@ -106,7 +127,7 @@ def _paths(root, scope, text):
     for path in raw:
         path = path.replace("\\", "/").removeprefix("./")
         if (path and len(path) <= 80 and not mw.contained_path_problem(root, path)
-                and (root / path).is_file() and path not in paths):
+                and _exact_file(root, path) and path not in paths):
             paths.append(path)
     return paths[:8]
 
@@ -135,7 +156,7 @@ def build(root, rules, anchors, approved, head, updated_at):
             "updated_at": updated_at, "authorityBoundary": mw.AUTHORITY_BOUNDARY,
             "activeConstraints": [], "rejectedApproaches": [], "quarantinedStaleAnchors": [],
             "omitted": {"activeConstraints": 0, "rejectedApproaches": 0, "quarantinedStaleAnchors": 0,
-                        "ineligibleRules": 0, "secretEntries": 0}}
+                        "ineligibleRules": 0, "compatibleUnverifiedRules": 0, "replacedRules": 0, "secretEntries": 0}}
     # Reader L50-57, L121-138, L166-171: id, paths, tags, summary, updated_at.
     caps = {"schema_version": CAPSULES_SCHEMA, "capsules": [],
             "omitted": {"capsules": 0, "secretEntries": 0}}
@@ -146,15 +167,28 @@ def build(root, rules, anchors, approved, head, updated_at):
         address_changed = any(masked.get(k) != entry.get(k) for k in
                               ("id", "paths", "path", "anchor", "source", "cites"))
         entry = masked
+        truncated = False
+        for field, limit in limits.items():
+            if len(entry[field]) <= limit:
+                continue
+            if field in ("summary", "rule", "approach"):
+                entry["fullText"] = entry[field]
+                entry[field] = _pointer(field, entry["id"])
+                assert len(entry[field]) <= limit
+                truncated = True
+            elif field == "source":
+                # Exact intervals remain in cites; never invent a clipped range.
+                entry[field] = "See cites in " + HANDOVER_FILE
+            else:
+                document["omitted"][key] += 1
+                return
+        entry["truncated"] = truncated
+        # Check exactly the final disk representation, including fullText and
+        # pointers, after masking/control neutralisation. No post-check edits.
         if address_changed or _poisoned(entry):
             document["omitted"]["secretEntries"] += 1
             document["omitted"][key] += 1
             return
-        truncated = False
-        for field, limit in limits.items():
-            entry[field], clipped = _clip(entry[field], limit)
-            truncated |= clipped
-        entry["truncated"] = truncated
         if len(document[key]) >= LIST_CAP:
             document["omitted"][key] += 1
         else:
@@ -162,11 +196,15 @@ def build(root, rules, anchors, approved, head, updated_at):
 
     by_key = {a["anchor"]: a for a in anchors}
     cache = {}
+    replaced_cites, replaced_texts = md.replaced_line_index(approved)
     for rule in rules:
         # Promoted pages are a rendering of lessons, not another authority path.
         if rule["source"] == mw.DREAM_PROMOTED_PAGE:
             continue
         keys = rule.get("anchors", [])
+        if keys and any(by_key[k]["status"] == "compatible-unverified" for k in keys):
+            hand["omitted"]["compatibleUnverifiedRules"] += 1
+            continue
         if not keys or any(by_key[k]["status"] not in _ALLOWED or not by_key[k].get("symbol") for k in keys):
             hand["omitted"]["ineligibleRules"] += 1
             continue
@@ -174,12 +212,14 @@ def build(root, rules, anchors, approved, head, updated_at):
         text = _rule_text(root, rule, cache)
         if text is None or len(paths) > 8 or any(len(p) > 80 for p in paths):
             hand["omitted"]["activeConstraints"] += 1
-            caps["omitted"]["capsules"] += 1
+            continue
+        if md.normalised_quote(text) in replaced_texts:
+            hand["omitted"]["replacedRules"] += 1
             continue
         status = rule["status"]
-        tags = [BRIDGE_RULE, status]
+        tags = ["memlet-" + BRIDGE_RULE, "memlet-" + status]
         if rule.get("suggestedAnchors"):
-            tags.append(BRIDGE_SUGGESTED_ANCHOR)
+            tags.append("memlet-" + BRIDGE_SUGGESTED_ANCHOR)
         ident = _id(BRIDGE_RULE, [rule["source"], rule["ruleSha256"], sorted(keys), rule.get("sidecarIds", {})])
         source = "%s:%s" % (rule["source"], rule["line"])
         entry = {"id": ident, "anchor": keys[0], "anchor_status": status, "paths": paths,
@@ -187,18 +227,17 @@ def build(root, rules, anchors, approved, head, updated_at):
         # Reader L521 rule <=140; L566 reference summary <=120. Extra source,
         # tags, truncated are retained on disk but ignored by the reader.
         admit(hand, "activeConstraints", entry, {"rule": 140})
-        admit(caps, "capsules", {"id": ident, "paths": paths, "tags": tags, "summary": text,
-              "updated_at": updated_at, "source": source}, {"summary": SUMMARY_CHARS})
     for anchor in anchors:
         if anchor["status"] != "stale":
             continue
-        tags = [BRIDGE_RULE, "stale"]
+        tags = ["memlet-" + BRIDGE_RULE, "memlet-stale"]
         if anchor.get("suggested"):
-            tags.append(BRIDGE_SUGGESTED_ANCHOR)
+            tags.append("memlet-" + BRIDGE_SUGGESTED_ANCHOR)
         admit(hand, "quarantinedStaleAnchors", {"anchor": anchor["anchor"], "path": anchor["path"],
               "status": "stale", "reason": anchor["reason"], "tags": tags},
               {"anchor": 80, "path": 80, "reason": 90})
 
+    rejected_seen_cites, rejected_seen_texts = set(), set()
     for lesson in approved:
         if lesson.get("tier") != APPROVED:
             continue
@@ -213,8 +252,19 @@ def build(root, rules, anchors, approved, head, updated_at):
         if "SUPERSEDES" in relations and (not lesson.get("quarantined") or len(roles) != len(quotes)):
             caps["omitted"]["capsules"] += 1
             continue
-        groups = [(False, [i for i, role in enumerate(roles) if role != "replaced"]),
-                  (True, [i for i, role in enumerate(roles) if role == "replaced"])]
+        # Global projection covers repeated quotes across sessions too. Each old
+        # line is emitted exactly once, even if multiple lessons replace it.
+        old, current = [], []
+        for i, (quote, cite, role) in enumerate(zip(quotes, cites, roles)):
+            key, norm = md.citation_key(cite), md.normalised_quote(quote)
+            if role == "replaced" or key in replaced_cites or norm in replaced_texts:
+                if key not in rejected_seen_cites and norm not in rejected_seen_texts:
+                    old.append(i)
+                    rejected_seen_cites.add(key)
+                    rejected_seen_texts.add(norm)
+            else:
+                current.append(i)
+        groups = [(False, current)] + [(True, [i]) for i in old]
         for replaced, indices in groups:
             if not indices:
                 continue
@@ -226,15 +276,17 @@ def build(root, rules, anchors, approved, head, updated_at):
             selected = [cites[i] for i in indices]
             text = LESSON_SEPARATOR.join(quotes[i] for i in indices)
             source = _source(selected)
-            ident = lesson["id"] + ("-old" if replaced else "")
+            ident = lesson["id"] + (("-old" if len(old) == 1 else "-old%d" % indices[0]) if replaced else "")
             status_entry = {"quote": text, "source": source}
             mw.classify_rule_quotes(root, [status_entry])
-            tags = relations + [APPROVED, status_entry["anchorStatus"]]
+            tags = ["memlet-" + r.lower() for r in relations] + ["memlet-approved", "memlet-" + status_entry["anchorStatus"]]
+            if "SUPERSEDES" in relations:
+                tags.append("memlet-supersedes-replaced" if replaced else "memlet-supersedes-current")
             cite_fields = [{k: c[k] for k in ("file", "start", "end", "sha256")} for c in selected]
-            if replaced or "BLOCKS" in relations:
+            if replaced:
                 # Reader L384-387 renders these as "DO NOT REPEAT", never active.
                 admit(hand, "rejectedApproaches", {"id": ident, "approach": text,
-                      "reason": BRIDGE_REPLACED_REASON if replaced else BRIDGE_BLOCKED_REASON,
+                      "reason": BRIDGE_REPLACED_REASON,
                       "source": source, "cites": cite_fields, "tags": tags}, {"approach": 110, "source": 120})
             elif relations:
                 admit(caps, "capsules", {"id": ident, "paths": _paths(root, lesson.get("scope", ""), text),
@@ -242,8 +294,8 @@ def build(root, rules, anchors, approved, head, updated_at):
                       "updated_at": updated_at}, {"summary": SUMMARY_CHARS})
 
     # Bound encoded bytes independently of text length (Unicode and paths count).
-    for document, lists in ((hand, ("activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")),
-                            (caps, ("capsules",))):
+    for document, lists in ((caps, ("capsules",)),
+                            (hand, ("rejectedApproaches", "quarantinedStaleAnchors", "activeConstraints"))):
         while len((_canonical(document) + "\n").encode("utf-8")) + 100 > MAX_BYTES:
             key = next((k for k in lists if document[k]), None)
             if key is None:

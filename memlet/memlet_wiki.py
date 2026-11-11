@@ -2137,7 +2137,7 @@ def estimate_tokens(text: str) -> int:
 def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
     # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
     extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
-    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints", "approvedLessons", "listCapOmitted") if k in capsule)
+    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints", "approvedLessons", "listCapOmitted", "replacedRuleNotices") if k in capsule)
     return HANDOVER_SIGNED_FIELDS + extra + observations
 
 
@@ -2158,7 +2158,7 @@ def verify_handover_checksum(capsule: Dict[str, Any]) -> bool:
     """
     if not isinstance(capsule, dict):
         return False
-    if capsule.get("schema_version") == "memlet.handover_bridge.v1":
+    if capsule.get("schema_version") in ("memlet.handover_bridge.v1", "memlet.capsules.v1"):
         from .handover_bridge import verify
         return verify(capsule)
     if capsule.get("mode") not in (None,) + HANDOVER_MODES:
@@ -2267,6 +2267,8 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                          ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
     if not c["activeConstraints"]:
         lines.append("- (none)")
+    if c.get("replacedRuleNotices"):
+        lines.extend("- " + notice for notice in c["replacedRuleNotices"])
     if c.get("approvedLessons"):
         lines += ["", "### Approved lessons (human-approved; citations re-verified in .memlet/dream/snapshot/)"]
         lines += [i["text"] for i in c["approvedLessons"]]
@@ -2645,6 +2647,8 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     approved.sort(key=lambda i: approvals.get(i["id"], ""), reverse=True)
     priority = ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS")
     approved.sort(key=lambda i: min([priority.index(k) for k in i.get("edgeTypes", []) if k in priority] or [4]))
+    from .memlet_bridge import replaced_rule_notices
+    replacement_notices = replaced_rule_notices(root, constraints, approved)
     lists["approvedLessons"] = [dict(i, text=render_capsule_lesson(i)) for i in approved]
     # Only items the tier computation itself calls a hint, whatever a caller's provider returns.
     lists["hints"] = [{"id": h["id"], "text": render_capsule_lesson(h, hint=True), "cites": h["cites"], "label": h.get("agreementLabel") or "unreviewed hint",
@@ -2747,6 +2751,8 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
                    "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
+        if replacement_notices:
+            capsule["replacedRuleNotices"] = replacement_notices
         if any(capped.values()):
             capsule["listCapOmitted"] = {k: {"count": v, "cap": caps[k]} for k, v in capped.items() if v}
         if digest:
@@ -2784,7 +2790,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
 
     actions: List[Dict[str, str]] = []
     write_refused: Optional[str] = None
-    files_written, files_not_written = [], []
+    files_written, files_not_written, file_status = [], [], {}
     if write:
         from . import handover_bridge as hb
         write_paths = [HANDOVER_PAGE, hb.HANDOVER_FILE, hb.CAPSULES_FILE]
@@ -2817,6 +2823,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
                         actions.append({"op": "update" if existed else "create", "path": rel})
                         files_written.append(rel)
                         files_not_written.remove(rel)
+                    files_not_written.append(LEDGER_PATH)
                     existed = ledger.is_file()
                     with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
                         with conn:
@@ -2824,8 +2831,26 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
                             _sync_snapshots(conn, [a for a in anchors if a["symbol"]], now)
                             _record_page(conn, HANDOVER_PAGE, _page_body_sha256(page), "handover", now)
                     actions.append({"op": "update" if existed else "create", "path": LEDGER_PATH})
-            except (OSError, ValueError) as exc:
+                    files_not_written.remove(LEDGER_PATH)
+            except (OSError, ValueError, sqlite3.Error) as exc:
                 write_refused = str(exc)
+                if files_written:
+                    for rel in (hb.HANDOVER_FILE, hb.CAPSULES_FILE):
+                        if rel not in files_not_written:
+                            continue
+                        try:
+                            problem = first_managed_problem(root, (rel,))
+                            if problem:
+                                raise OSError(problem)
+                            (root / rel).unlink(missing_ok=True)
+                            file_status[rel] = "not written and removed"
+                        except OSError:
+                            file_status[rel] = "not written and still in place (stale, still read by Routlet)"
+        for rel in write_paths + ([LEDGER_PATH] if LEDGER_PATH in files_not_written else []):
+            file_status.setdefault(rel, "written" if rel in files_written else
+                                   ("not written and still in place (stale, still read by Routlet)"
+                                    if rel in (hb.HANDOVER_FILE, hb.CAPSULES_FILE) and (root / rel).exists()
+                                    else "not written"))
 
     over = tokens >= token_budget
     refused_write = write and write_refused is not None
@@ -2848,11 +2873,12 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     if budget_source != "default":  # additive only when a budget was chosen: the default report stays byte-identical
         report["tokenBudgetSource"] = budget_source
     if write:
-        report.update(filesWritten=files_written, filesNotWritten=files_not_written)
+        report.update(filesWritten=files_written, filesNotWritten=files_not_written, fileStatus=file_status)
     if refused_write:
         report["written"] = False
         report["error"] = (str(write_refused) + "; written: " + (", ".join(files_written) or "none")
-                           + "; not written: " + (", ".join(files_not_written) or "none"))
+                           + "; not written: " + (", ".join(files_not_written) or "none")
+                           + "; " + "; ".join(path + ": " + status for path, status in file_status.items()))
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = markdown
     return report
