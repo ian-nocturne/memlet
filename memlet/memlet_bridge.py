@@ -31,6 +31,7 @@ from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT
                          LESSON_VIA_SCOPE, LESSON_VIA_PATH)
 
 import contextlib
+import contextvars
 import copy
 import hashlib
 import json
@@ -541,22 +542,81 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
     return res
 
 
-def valid_lesson_path(root, path):
+# A projection shares this context through existing reader APIs without global
+# caches or monkeypatching. Nested/concurrent projections restore their own state.
+_lesson_path_active = contextvars.ContextVar("lesson_path_active", default=None)
+
+
+class _LessonPathContext(dict):
+    def __init__(self, root, work=None):
+        super().__init__(root=root, loaded=False, trust={}, is_git=False, tracked=set(),
+                         initialized=False, directories=work.directories if work else {},
+                         valid={}, literal={}, work=work)
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        if "snapshot" in values and not self["loaded"] and self["work"]:
+            self["work"].count("snapshotReads")
+            self["work"].count("tierPasses")
+        super().update(values)
+
+
+@contextlib.contextmanager
+def _lesson_path_projection(root, work):
+    context = _LessonPathContext(root, work)
+    token = _lesson_path_active.set(context)
+    try:
+        yield context
+    finally:
+        _lesson_path_active.reset(token)
+
+
+def _lesson_path_available(context):
+    return not context.get("work") or context["work"].available()
+
+
+def valid_lesson_path(root, path, *, context=None):
     """Exact, contained regular file; an attachment names a location, not content identity.
 
     Recreating a removed file at that location reactivates it, just like a file anchor.
-    No normalization is allowed for a human approval.
+    No normalization is allowed for a human approval. Caches live for one read only.
     """
     root = Path(root)
-    if (not isinstance(path, str) or not path or len(path) > 240
+    if context is None:
+        active = _lesson_path_active.get()
+        context = active if active is not None and active["root"] == root else _LessonPathContext(root)
+    if not _lesson_path_available(context):
+        return False
+    if not isinstance(path, str):
+        return False
+    if path in context["valid"]:
+        return context["valid"][path]
+    result = _valid_lesson_path(root, path, context)
+    context["valid"][path] = result
+    return result
+
+
+def _valid_lesson_path(root, path, context):
+    if (not path or len(path) > 240
             or any(c in path for c in "\\*?[]`<>") or unsafe_contributed_string(path) or path.startswith("/")
             or any(p in ("", ".", "..", ".git", ".memlet") for p in path.split("/"))
             or mw._is_secret_path(path) or mw.contained_path_problem(root, path)):
         return False
     cursor = root
+    directories = context["directories"]
     try:
         for part in path.split("/"):
-            if part not in {p.name for p in cursor.iterdir()}:
+            if not _lesson_path_available(context):
+                return False
+            if cursor not in directories:
+                work = context.get("work")
+                if work and work.counters is not None:
+                    key = cursor.relative_to(root).as_posix()
+                    counts = work.counters["directoryListings"]
+                    counts[key] = counts.get(key, 0) + 1
+                directories[cursor] = set()  # also cache an unreadable directory
+                directories[cursor] = {p.name for p in cursor.iterdir()}
+            if part not in directories[cursor]:
                 return False
             cursor = cursor / part
             if cursor != root / path and (cursor / ".git").exists():
@@ -567,35 +627,48 @@ def valid_lesson_path(root, path):
 
 
 def lesson_path_context(repo_path="."):
-    """One bounded tracked-file lookup per projection; lazy citation context for human paths.
+    """One bounded tracked-file lookup and one set of evidence reads per projection.
 
     An invalid/unreadable git work tree fails closed for automatic attachments.
     """
     root = mw._resolve_root(repo_path)
+    context = _lesson_path_active.get()
+    if context is None or context["root"] != root:
+        context = _LessonPathContext(root)
+    if context["initialized"]:
+        return context
+    context["initialized"] = True
     is_git = any((p / ".git").exists() for p in [root] + list(root.parents))
-    tracked = set()
-    if is_git:
+    context["is_git"] = is_git
+    if is_git and _lesson_path_available(context):
         process = None
         selector = selectors.DefaultSelector()
+        complete = False
+        work = context.get("work")
         try:
+            if work:
+                work.count("gitCalls")
             process = subprocess.Popen(["git", "ls-files", "-z", "--cached", "--"], cwd=str(root),
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             selector.register(process.stdout, selectors.EVENT_READ)
             data = bytearray()
             deadline = time.monotonic() + .5
-            complete = False
-            while time.monotonic() < deadline and len(data) <= 4 * 1024 * 1024:
-                if not selector.select(max(0, deadline - time.monotonic())):
+            while time.monotonic() < deadline and len(data) <= 4 * 1024 * 1024 and _lesson_path_available(context):
+                remaining = max(0, deadline - time.monotonic())
+                if work and work.bounded:
+                    remaining = min(remaining, max(0, work.deadline - work.clock()))
+                if not selector.select(remaining):
                     break
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if not chunk:
                     complete = True
                     break
                 data.extend(chunk)
-            if complete and len(data) <= 4 * 1024 * 1024 and process.wait(timeout=.1) == 0:
-                tracked = set(data.decode("utf-8", "surrogateescape").split("\0"))
+            complete = complete and len(data) <= 4 * 1024 * 1024 and process.wait(timeout=.1) == 0
+            if complete:
+                context["tracked"] = set(data.decode("utf-8", "surrogateescape").split("\0"))
         except (OSError, subprocess.SubprocessError):
-            pass
+            complete = False
         finally:
             selector.close()
             if process is not None:
@@ -603,7 +676,33 @@ def lesson_path_context(repo_path="."):
                     process.kill()
                 process.wait()
                 process.stdout.close()
-    return {"root": root, "is_git": is_git, "tracked": tracked, "loaded": False, "trust": {}}
+        if not complete and work:
+            from .vocabulary import GRAPH_FILES_NOTICE
+            work.skip(GRAPH_FILES_NOTICE)
+    return context
+
+
+_lesson_token = re.compile(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*")
+_lesson_punctuation = re.compile(r"[.,;:!?)\]\"'`]+(?=\s|$)")
+
+
+def _lesson_path_tokens(text):
+    raw, named = [], set()
+    for match in _lesson_token.finditer(text):
+        path = match.group().rstrip(".")
+        raw.append(path)
+        end = match.start() + len(path)
+        before = text[match.start()-1:match.start()] if match.start() else ""
+        after = text[end:end+1]
+        boundary = end == len(text) or text[end].isspace() or _lesson_punctuation.match(text, end)
+        if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
+            named.add(path.removeprefix("./"))
+    return raw, named
+
+
+def _lesson_path_candidates(text):
+    """Shared lexical prefilter; no file or tier decision is made here."""
+    return _lesson_path_tokens(text)[1]
 
 
 def literal_lesson_paths(root, scope, text, *, context=None):
@@ -614,27 +713,27 @@ def literal_lesson_paths(root, scope, text, *, context=None):
     """
     context = lesson_path_context(root) if context is None else context
     root = context["root"]
+    if not _lesson_path_available(context):
+        return []
+    if text in context["literal"]:
+        return list(context["literal"][text])
+    # Preserve the legacy ordering (explicit references first), but scan token
+    # boundaries once. Long lines with repeated words cannot cause nested scans.
     raw = [p for p, _ in mw._line_refs(text)]
-    # Enumerate maximal path-like tokens, then strip terminal sentence punctuation.
-    raw += [m.group().rstrip(".") for m in re.finditer(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*", text)]
+    tokens, named = _lesson_path_tokens(text)
+    raw.extend(tokens)
     out = []
-    punctuation = ".,;:!?)]\"'`"
-    for path in raw:
+    for path in dict.fromkeys(raw):
+        if not _lesson_path_available(context):
+            break
         path = path.replace("\\", "/").removeprefix("./")
-        named = False
-        for match in re.finditer(r"(?<![\w/.-])(?:\./)?" + re.escape(path), text):
-            before = text[match.start()-1:match.start()] if match.start() else ""
-            tail = text[match.end():]
-            after = tail[:1]
-            terminal = re.match("[" + re.escape(punctuation) + "]+(?=\\s|$)", tail)
-            boundary = not tail or tail[0].isspace() or terminal is not None
-            if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
-                named = True
-                break
-        if (named and len(path) <= 80 and valid_lesson_path(root, path) and path not in out
-                and (not context["is_git"] or path in context["tracked"])):
+        if (path in named and len(path) <= 80 and (not context["is_git"] or path in context["tracked"])
+                and valid_lesson_path(root, path, context=context) and path not in out):
             out.append(path)
-    return out[:8]
+            if len(out) == 8:
+                break
+    context["literal"][text] = tuple(out)
+    return out
 
 
 def _lesson_literal_paths(node, root, context):
@@ -644,12 +743,17 @@ def _lesson_literal_paths(node, root, context):
     further evidence. Each line is matched separately so joins cannot invent tokens.
     """
     scope = node.get("scopeTag") or ""
-    fields = md.lesson_display_fields(node)
+    # Ordinary lessons need only citation identities, not sanitised display
+    # strings. Supersessions still use the authoritative role computation.
+    fields = (md.lesson_display_fields(node) if md.superseded_lesson(node) or node.get("_lineReplacements")
+              else {"cites": md.lesson_lines(node)})
     roles = fields.get("lineRoles", ["current"] * len(fields.get("cites", [])))
     paths = []
     evidence = list(zip(fields.get("cites", []), roles))
     replaced = {c["span"] for c, role in evidence if role == "replaced"}
     for edge in node.get("edges", []):
+        if not _lesson_path_available(context):
+            return []
         if md.approval_state(edge, "edge") == TIER_APPROVED and edge.get("edgeVerdict") == "VALID":
             for pin in md._item_pins(edge, "edge") + [edge.get("citedTargetPin")]:
                 if not isinstance(pin, dict) or md._verify_pin_dict(pin, context["snapshot"] or {}, "path"):
@@ -660,9 +764,16 @@ def _lesson_literal_paths(node, root, context):
                         span = "%s:%d" % (parsed[0], number)
                         if span not in replaced:
                             evidence.append((md.resolve_pin(context["snapshot"], span), "current"))
+    seen = set()
     for cite, role in evidence:
-        if role != "current":
+        if not _lesson_path_available(context):
+            break
+        identity = (cite["span"], cite.get("sha256"))
+        if role != "current" or identity in seen:
             continue
+        seen.add(identity)
+        if len(paths) >= 8:
+            break
         pin = md.resolve_pin(context["snapshot"] or {}, cite["span"])
         if not pin or pin.get("sha256") != cite.get("sha256"):
             continue
@@ -682,6 +793,8 @@ def lesson_paths(node, repo_path=".", *, context=None):
         snapshot, _ = _load_snapshot(context["root"])
         config, _ = _load_config(context["root"])
         graph, _ = _load_queue(context["root"])
+        if context.get("work"):
+            context["work"].count("queueReads")
         context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config),
                        trust=dream_tiers(graph or {}, snapshot=snapshot, config=config))
     state = context["trust"].get(node["id"])
@@ -690,7 +803,7 @@ def lesson_paths(node, repo_path=".", *, context=None):
         context["trust"][node["id"]] = state
     if state["tier"] != TIER_APPROVED:
         return []
-    return [p for p in node.get("approvedPaths", []) if valid_lesson_path(context["root"], p)]
+    return [p for p in node.get("approvedPaths", []) if valid_lesson_path(context["root"], p, context=context)]
 
 
 def _decision_event_write(root, events):
@@ -1606,7 +1719,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         if stale_dream:
             sources["staleRules"] = {"available": True, "reason": "anchored code changed"}
     if "hints" in wanted:
-        hints = dream_items(root, tiers=(TIER_HINT,), query=query)
+        hints = dream_items(root, tiers=(TIER_HINT,), query=query, files=files)
         sources["hints"] = {"available": hints["ok"], "reason": "", "label": hint_label(hints["items"])}
         for hint in hints["items"]:
             citation = hint["cites"][0]
@@ -2260,7 +2373,12 @@ def hint_item_label(item):
 
 
 def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None):
-    """Fixed in-repo snapshot, per-item rehash, disjoint tiers. Rejected items never leave this reader."""
+    """Fixed in-repo snapshot, per-item rehash, disjoint tiers; rejected items never leave.
+
+    File-filtered hints use current literal citations only. Their optional
+    ``paths`` field is display-only, never approval or guard authority. Calls
+    without ``files`` retain the legacy hint output without a paths field.
+    """
     from memlet.memlet_dreamcycle import evidence_pins, _canonical_path
     counts = {TIER_APPROVED: 0, TIER_HINT: 0, TIER_PENDING: 0}
     try:
@@ -2313,11 +2431,17 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             if query_terms and not query_terms & md._query_terms(text + " " + scope):
                 continue
             attached = lesson_paths(node, root, context=path_context) if tier == TIER_APPROVED else []
-            paths = list(dict.fromkeys(attached + _lesson_literal_paths(display_node, root, path_context))) if tier == TIER_APPROVED else []
+            literal = _lesson_literal_paths(display_node, root, path_context) if tier in (TIER_APPROVED, TIER_HINT) else []
+            selected_paths = list(dict.fromkeys(attached + literal))
+            if tier == TIER_HINT:
+                path_context.setdefault("hintPaths", {})[node["id"]] = literal
+            # Preserve no-files hint bytes while sharing the same selection
+            # with recall and graph; human attachments remain approved-only.
+            paths = selected_paths if tier == TIER_APPROVED or requested is not None else []
             inactive = [p for p in node.get("approvedPaths", []) if p not in attached]
             if inactive and tier == TIER_APPROVED:
                 notices.append(node["id"] + INACTIVE_APPROVAL_PATHS + ", ".join(inactive))
-            if requested is not None and not any(f in paths for f in requested):
+            if requested is not None and not any(f in selected_paths for f in requested):
                 continue
             cites, seen = [], set()
             for pin in evidence_pins(display_node):

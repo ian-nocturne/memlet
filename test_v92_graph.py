@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import shutil
+import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -15,13 +18,195 @@ import test_v91_integration as fixtures
 import memlet_mcp
 from memlet import memlet_graph as graph, memlet_bridge as mb, memlet_dream as md
 from memlet import memlet_wiki as mw, memlet_anchors as ma, memlet_dreamcycle as dc
-from memlet import vendor_cli, cli_plugins, memlet_eval
+from memlet import vendor_cli, cli_plugins, memlet_eval, handover_bridge as hb
 from memlet.vocabulary import HINT_LABEL, HINT_HELP, GRAPH_WHY
 
 
+# Frozen E3 e46bd70 rule: differential oracle, never imported by production.
+_LEGACY_PATH_RULE = r'''
+def valid_lesson_path(root, path):
+    """Exact, contained regular file; an attachment names a location, not content identity.
+
+    Recreating a removed file at that location reactivates it, just like a file anchor.
+    No normalization is allowed for a human approval.
+    """
+    root = Path(root)
+    if (not isinstance(path, str) or not path or len(path) > 240
+            or any(c in path for c in "\\*?[]`<>") or unsafe_contributed_string(path) or path.startswith("/")
+            or any(p in ("", ".", "..", ".git", ".memlet") for p in path.split("/"))
+            or mw._is_secret_path(path) or mw.contained_path_problem(root, path)):
+        return False
+    cursor = root
+    try:
+        for part in path.split("/"):
+            if part not in {p.name for p in cursor.iterdir()}:
+                return False
+            cursor = cursor / part
+            if cursor != root / path and (cursor / ".git").exists():
+                return False
+        return cursor.is_file()
+    except OSError:
+        return False
+
+def lesson_path_context(repo_path="."):
+    """One bounded tracked-file lookup per projection; lazy citation context for human paths.
+
+    An invalid/unreadable git work tree fails closed for automatic attachments.
+    """
+    root = mw._resolve_root(repo_path)
+    is_git = any((p / ".git").exists() for p in [root] + list(root.parents))
+    tracked = set()
+    if is_git:
+        process = None
+        selector = selectors.DefaultSelector()
+        try:
+            process = subprocess.Popen(["git", "ls-files", "-z", "--cached", "--"], cwd=str(root),
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            selector.register(process.stdout, selectors.EVENT_READ)
+            data = bytearray()
+            deadline = time.monotonic() + .5
+            complete = False
+            while time.monotonic() < deadline and len(data) <= 4 * 1024 * 1024:
+                if not selector.select(max(0, deadline - time.monotonic())):
+                    break
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    complete = True
+                    break
+                data.extend(chunk)
+            if complete and len(data) <= 4 * 1024 * 1024 and process.wait(timeout=.1) == 0:
+                tracked = set(data.decode("utf-8", "surrogateescape").split("\0"))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            selector.close()
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                process.stdout.close()
+    return {"root": root, "is_git": is_git, "tracked": tracked, "loaded": False, "trust": {}}
+
+def literal_lesson_paths(root, scope, text, *, context=None):
+    """Extract whole path tokens from text; Git requires tracked files.
+
+    ``scope`` is retained for caller compatibility but never attaches a path: it
+    is only a display label and recall filter term, regardless of proposer/tier.
+    """
+    context = lesson_path_context(root) if context is None else context
+    root = context["root"]
+    raw = [p for p, _ in mw._line_refs(text)]
+    # Enumerate maximal path-like tokens, then strip terminal sentence punctuation.
+    raw += [m.group().rstrip(".") for m in re.finditer(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*", text)]
+    out = []
+    punctuation = ".,;:!?)]\"'`"
+    for path in raw:
+        path = path.replace("\\", "/").removeprefix("./")
+        named = False
+        for match in re.finditer(r"(?<![\w/.-])(?:\./)?" + re.escape(path), text):
+            before = text[match.start()-1:match.start()] if match.start() else ""
+            tail = text[match.end():]
+            after = tail[:1]
+            terminal = re.match("[" + re.escape(punctuation) + "]+(?=\\s|$)", tail)
+            boundary = not tail or tail[0].isspace() or terminal is not None
+            if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
+                named = True
+                break
+        if (named and len(path) <= 80 and valid_lesson_path(root, path) and path not in out
+                and (not context["is_git"] or path in context["tracked"])):
+            out.append(path)
+    return out[:8]
+
+def _lesson_literal_paths(node, root, context):
+    """Match original hashed lines, never a sanitised display projection.
+
+    Own citations were approved with the node; only approved-valid edges may add
+    further evidence. Each line is matched separately so joins cannot invent tokens.
+    """
+    scope = node.get("scopeTag") or ""
+    fields = md.lesson_display_fields(node)
+    roles = fields.get("lineRoles", ["current"] * len(fields.get("cites", [])))
+    paths = []
+    evidence = list(zip(fields.get("cites", []), roles))
+    replaced = {c["span"] for c, role in evidence if role == "replaced"}
+    for edge in node.get("edges", []):
+        if md.approval_state(edge, "edge") == TIER_APPROVED and edge.get("edgeVerdict") == "VALID":
+            for pin in md._item_pins(edge, "edge") + [edge.get("citedTargetPin")]:
+                if not isinstance(pin, dict) or md._verify_pin_dict(pin, context["snapshot"] or {}, "path"):
+                    continue
+                parsed = md.parse_span(pin.get("span", ""))
+                if parsed:
+                    for number in range(parsed[1], parsed[2] + 1):
+                        span = "%s:%d" % (parsed[0], number)
+                        if span not in replaced:
+                            evidence.append((md.resolve_pin(context["snapshot"], span), "current"))
+    for cite, role in evidence:
+        if role != "current":
+            continue
+        pin = md.resolve_pin(context["snapshot"] or {}, cite["span"])
+        if not pin or pin.get("sha256") != cite.get("sha256"):
+            continue
+        for line in str(pin.get("quoteText", "")).split("\n"):
+            for path in literal_lesson_paths(root, scope, line, context=context):
+                if path not in paths:
+                    paths.append(path)
+    return paths[:8]
+
+def lesson_paths(node, repo_path=".", *, context=None):
+    """Human-attached locations: approved tier, exact existing file; tracking is optional."""
+    if not node.get("approvedPaths") or md.approval_state(node, "node") != TIER_APPROVED:
+        return []
+    context = lesson_path_context(repo_path) if context is None else context
+    if not context["loaded"]:
+        snapshot, _ = _load_snapshot(context["root"])
+        config, _ = _load_config(context["root"])
+        graph, _ = _load_queue(context["root"])
+        context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config),
+                       trust=dream_tiers(graph or {}, snapshot=snapshot, config=config))
+    state = context["trust"].get(node["id"])
+    if state is None:
+        state = {"tier": TIER_PENDING}
+        context["trust"][node["id"]] = state
+    if state["tier"] != TIER_APPROVED:
+        return []
+    return [p for p in node.get("approvedPaths", []) if valid_lesson_path(context["root"], p)]
+'''
+
+
 class GraphTests(fixtures.Scratch):
+    _graph_test_python = None
+
     def setUp(self):
-        super().setUp()
+        # Same hermetic roots as Scratch, without its unused MCP server/store.
+        # Probe the test interpreter once per process, not once per graph case.
+        self.tmp = tempfile.TemporaryDirectory(prefix='memlet-graph-')
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.root = self.base / 'repo'
+        self.root.mkdir()
+        for name in ('home', 'tmp', 'bin'):
+            (self.base / name).mkdir()
+        env = dict(os.environ, HOME=str(self.base / 'home'), TMPDIR=str(self.base / 'tmp'),
+                   CLAUDE_CONFIG_DIR=str(self.base / 'home/claude'), CODEX_HOME=str(self.base / 'home/codex'),
+                   GIT_CEILING_DIRECTORIES=str(self.base), GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM='1', MEMLET_LOCK_DIR=str(self.base / 'locks'), MEMLET_DREAMING='0',
+                   MEMLET_HOME=str(self.base / 'unused'), MEMLET_TRANSCRIPT_DIRS=str(self.root))
+        for key in ('PYTHONHOME', 'PYTHONEXECUTABLE', '__PYVENV_LAUNCHER__', 'CODEX_THREAD_ID', 'MEMLET_PARENT_SESSION_ID'):
+            env.pop(key, None)
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(tempfile, 'tempdir', str(self.base / 'tmp'))
+        patch.start(); self.addCleanup(patch.stop)
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True, env=dict(os.environ))
+        if GraphTests._graph_test_python is None:
+            for python in dict.fromkeys([sys.executable, shutil.which('python3'), '/usr/bin/python3']):
+                if python and Path(python).is_file():
+                    probe = subprocess.run([python, '-c', 'pass'], env=dict(os.environ), capture_output=True)
+                    if probe.returncode == 0:
+                        GraphTests._graph_test_python = python
+                        break
+        self.python = GraphTests._graph_test_python
+        self.assertIsNotNone(self.python)
         # Functional and work-bound assertions must not depend on machine load.
         patch = mock.patch.object(graph, '_monotonic', return_value=0.0)
         patch.start(); self.addCleanup(patch.stop)
@@ -60,6 +245,105 @@ class GraphTests(fixtures.Scratch):
         self.assertLessEqual(len(result['formatted']), 8000)
         self.assertLessEqual(result['tokens'], kw.get('budget', 600))
         return result
+
+    def test_shared_rule_differential_e3_attachment_tables(self):
+        import test_v92_lessons as e3
+        legacy = dict(vars(mb))
+        exec(_LEGACY_PATH_RULE, legacy)
+        compared = {'valid_lesson_path': 0, 'literal_lesson_paths': 0, 'lesson_paths': 0}
+        def checked(name):
+            current = getattr(mb, name)
+            def check(*args, **kwargs):
+                result = current(*args, **kwargs)
+                old_kw = dict(kwargs)
+                if name == 'valid_lesson_path':
+                    old_kw.pop('context', None)
+                expected = legacy[name](*args, **old_kw)
+                self.assertEqual(expected, result, (name, args[1:] if len(args) > 1 else args))
+                compared[name] += 1
+                return result
+            return check
+        # Execute E3's existing tables unchanged; compare every individual path
+        # and attachment read on those same fixtures, including transitions.
+        cases = [(e3.Lessons, 'test_scope_never_attaches_across_readers_and_human_paths'),
+                 (e3.Lessons, 'test_multiselect_paths_literal_order_and_edge_tier_gate'),
+                 (e3.Lessons, 'test_literal_attachments_use_raw_cited_lines'),
+                 (e3.ReviewRegressions, 'test_raw_token_boundaries_and_dot_prefix')]
+        with contextlib.ExitStack() as stack:
+            for name in compared:
+                stack.enter_context(mock.patch.object(mb, name, side_effect=checked(name)))
+            for cls, method in cases:
+                result = unittest.TestResult()
+                cls(method).run(result)
+                self.assertEqual([], result.errors, method)
+                self.assertEqual([], result.failures, method)
+        self.assertTrue(all(n > 0 for n in compared.values()), compared)
+        print('I5 differential E3 path tables:', compared)
+
+    def assert_reader_agreement(self, repo, target):
+        approved = {i['id']: i for i in mb.dream_items(repo)['items']}
+        built = graph.build_graph(repo)
+        self.assertTrue(built['ok'], built)
+        projected = {i['id']: i for i in built['nodes'] if i.get('recordType') == 'item' and i['tier'] == 'approved'}
+        self.assertEqual(set(approved), set(projected))
+        for ident, item in approved.items():
+            self.assertEqual(item.get('paths', []), projected[ident]['paths'])
+            self.assertEqual(item['edgeTypes'], projected[ident]['edgeTypes'])
+            self.assertEqual(item.get('lineRoles'), projected[ident].get('lineRoles'))
+        selected = {i for i, item in approved.items() if target in item.get('paths', [])}
+        self.assertEqual(selected, {i['id'] for i in mb.dream_items(repo, files=[target])['items']})
+        recall = mb.unified_recall(repo, files=[target], budget=32000)
+        self.assertEqual(selected, {i['id'] for i in recall['sections']['dream']})
+        changed = mb.changed_check(repo, files=[target])
+        self.assertEqual(selected, {i['id'] for i in changed['approvedLessons'] if i['via'] == 'path'})
+        self.assertTrue(all(i['via'] in ('path', 'scope') for i in changed['approvedLessons']))
+        hand = mw.build_handover(repo, budget=32000, write=True)
+        self.assertEqual(set(approved), {i['id'] for i in hand['approvedLessons']})
+        capsules = json.loads((repo / hb.CAPSULES_FILE).read_text())['capsules']
+        exported = json.loads((repo / hb.HANDOVER_FILE).read_text())
+        for capsule in capsules:
+            item = approved[capsule['id']]
+            self.assertEqual(item.get('paths', []), capsule['paths'])
+            self.assertTrue(all('memlet-' + relation.lower() in capsule['tags'] for relation in item['edgeTypes']))
+        for rejected in exported['rejectedApproaches']:
+            ident = next(i for i in approved if rejected['id'].startswith(i + '-old'))
+            self.assertIn('replaced', projected[ident]['lineRoles'])
+        for item in approved.values():
+            if not item.get('quarantined'):
+                self.assertIn(item['id'], {i['id'] for i in capsules})
+
+    def test_recall_hint_files_normalisation_and_unfiltered_bytes(self):
+        repo, nodes = self.fixture('hint', ('BLOCKS',))
+        (repo / 'other.py').write_text('x = 1\n')
+        original = mb.dream_items
+        # Reproduce the old no-files branch exactly, then compare all bytes.
+        def old_hints(*args, **kwargs):
+            if kwargs.get('tiers') == ('hint',):
+                kwargs.pop('files', None)
+            return original(*args, **kwargs)
+        with mock.patch.object(mb, 'dream_items', side_effect=old_hints):
+            before = mb.unified_recall(repo, budget=8000)
+        self.assertEqual(before, mb.unified_recall(repo, budget=8000))
+        self.assertEqual([nodes['BLOCKS']['id']], [i['id'] for i in before['sections']['hints']])
+        alias = self.base / 'recall-alias'; alias.symlink_to(repo, target_is_directory=True)
+        for files in (['other.py'], str(repo / 'other.py'), [str(alias / 'other.py')], ['OTHER.py']):
+            self.assertEqual([], mb.unified_recall(repo, files=files, budget=8000)['sections']['hints'])
+        expected = {nodes['BLOCKS']['id']}
+        selected = mb.dream_items(repo, tiers=('hint',), files=['deploy.py'])['items']
+        self.assertEqual(expected, {i['id'] for i in selected})
+        self.assertEqual(['deploy.py'], selected[0]['paths'])
+        self.assertNotIn('paths', mb.dream_items(repo, tiers=('hint',))['items'][0])
+        self.assertEqual(expected, {i['id'] for i in mb.unified_recall(repo, files=['deploy.py'])['sections']['hints']})
+        self.assertEqual(expected, {i['id'] for i in self.result(repo, 'deploy.py', tiers=('approved', 'hint'))['groups']['hints']})
+        self.assert_reader_agreement(repo, 'deploy.py')
+        for path in (hb.HANDOVER_FILE, hb.CAPSULES_FILE):
+            self.assertNotIn(nodes['BLOCKS']['id'], (repo / path).read_text())
+
+    def test_scope_only_reader_agreement(self):
+        repo, _ = self.fixture('approved', ('BLOCKS',), cited_path=False)
+        self.assert_reader_agreement(repo, 'deploy.py')
+        self.assertFalse(any(self.result(repo, 'deploy.py')['groups'].values()))
+        self.assertEqual('scope', mb.changed_check(repo, files=['deploy.py'])['approvedLessons'][0]['via'])
 
     def test_nodes_edges_provenance_and_no_containment_relation(self):
         self.anchors()
@@ -149,23 +433,53 @@ class GraphTests(fixtures.Scratch):
             built = graph.build_graph(repo)
             self.assertTrue(built['ok'], built)
             projected = {n['id']: n for n in built['nodes'] if n.get('recordType') == 'item'}
-            recall = mb.unified_recall(repo, 'deploy release make', budget=32000)
-            hand = mw.build_handover(repo, budget=32000)
+            recall = mb.unified_recall(repo, 'deploy release make', files=['deploy.py'], budget=32000)
+            changed = mb.changed_check(repo, files=['deploy.py'])
+            hand = mw.build_handover(repo, budget=32000, write=True)
+            routlet_hand = json.loads((repo / hb.HANDOVER_FILE).read_text())
+            capsules = json.loads((repo / hb.CAPSULES_FILE).read_text())['capsules']
             by_reader = {'dream_items': {i['id']: i['tier'] for i in read},
                          'graph': {i: n['tier'] for i, n in projected.items()},
                          'recall': {i['id']: 'approved' for i in recall['sections']['dream']},
-                         'handover': {i['id']: 'approved' for i in hand['approvedLessons']}}
+                         'handover': {i['id']: 'approved' for i in hand['approvedLessons']},
+                         'changed': {i['id']: 'approved' for i in changed['approvedLessons']},
+                         'capsules': {i['id']: 'approved' for i in capsules}}
             for kind, node in nodes.items():
                 row = {reader: values.get(node['id']) for reader, values in by_reader.items()}
                 table.append((kind, state, row))
                 self.assertEqual(row['dream_items'], row['graph'], (kind, state, row))
                 self.assertEqual(row['graph'] == 'approved', row['recall'] == 'approved', (kind, state, row))
                 self.assertEqual(row['graph'] == 'approved', row['handover'] == 'approved', (kind, state, row))
+                for reader in ('changed', 'capsules'):
+                    self.assertEqual(row['graph'] == 'approved', row[reader] == 'approved', (kind, state, row))
                 if node['id'] in projected:
                     original = next(i for i in read if i['id'] == node['id'])
                     self.assertEqual(original.get('lineRoles'), projected[node['id']].get('lineRoles'))
                     self.assertEqual(original['cites'], projected[node['id']]['cites'])
+                    if original['tier'] == 'approved':
+                        capsule = next(i for i in capsules if i['id'] == node['id'])
+                        self.assertEqual(original.get('paths', []), capsule['paths'])
+                        self.assertEqual(original.get('paths', []), projected[node['id']]['paths'])
+                    else:
+                        self.assertNotIn('paths', original)  # E3 hints are display only.
+            old = routlet_hand['rejectedApproaches']
+            self.assertEqual(state == 'approved', bool(old))
+            for entry in old:
+                self.assertTrue(entry['id'].startswith(nodes['SUPERSEDES']['id'] + '-old'))
+            # The same explicit file selection must also exclude unrelated
+            # hints; before I5, recall's hints branch ignored files entirely.
+            (repo / 'unrelated.py').write_text('x = 1\n')
+            filtered = mb.dream_items(repo, tiers=('approved', 'hint'), files=['unrelated.py'])
+            filtered_recall = mb.unified_recall(repo, files=['unrelated.py'], budget=32000)
+            filtered_graph = self.result(repo, 'unrelated.py', tiers=('approved', 'hint'), budget=8000)
+            self.assertEqual([], filtered['items'])
+            self.assertEqual([], filtered_recall['sections']['dream'])
+            self.assertEqual([], filtered_recall['sections']['hints'])
+            self.assertFalse(any(filtered_graph['groups'].values()))
             result = self.result(repo, 'deploy.py', tiers=('approved', 'hint'), budget=8000)
+            filtered_hints = {i['id'] for i in mb.dream_items(repo, tiers=('hint',), files=['deploy.py'])['items']}
+            self.assertEqual(filtered_hints, {i['id'] for i in recall['sections']['hints']}, state)
+            self.assertEqual(filtered_hints, {i['id'] for i in result['groups']['hints']}, state)
             for group in ('governs', 'blocks', 'resolves', 'replaced'):
                 self.assertTrue(all(i['tier'] == 'approved' for i in result['groups'][group]))
         self.assertEqual(48, len(table))
@@ -221,6 +535,7 @@ class GraphTests(fixtures.Scratch):
         built = graph.build_graph(repo)
         lesson_edges = [e for e in built['edges'] if e['src'] == node['id']]
         self.assertEqual(['BLOCKS'], [e['type'] for e in lesson_edges])
+        self.assert_reader_agreement(repo, 'deploy.py')
 
     def test_attachment_exact_tracked_regular_literal_only(self):
         repo, nodes = self.fixture('approved', ('BLOCKS',), cited_path=False)
@@ -271,7 +586,7 @@ class GraphTests(fixtures.Scratch):
         self.assertEqual('approved', mb.dream_items(repo)['items'][0]['tier'])
         self.assertEqual([], self.result(repo, 'deploy.py')['groups']['blocks'])
 
-    def pair_history(self):
+    def pair_history(self, approve=True):
         self.write('auth.py', 'def one():\n    return 1\n')
         old = 'Always use `auth.py::one` for deployment.'
         middle = 'Deploy with the warmed cache in auth.py.'
@@ -291,11 +606,13 @@ class GraphTests(fixtures.Scratch):
                                    edges=[dict(edge_type='SUPERSEDES', target='deploy', src_span=b, target_span=a)]))
         self.assertTrue(dc.dream_run(self.root, runner=lambda *a, **kw: json.dumps(candidates))['ok'])
         ids = [n['id'] for n in mb._load_queue(self.root)[0]['nodes']]
-        self.assertTrue(mb.learn_approve(self.root, ids, approver='reviewer')['ok'])
+        if approve:
+            self.assertTrue(mb.learn_approve(self.root, ids, approver='reviewer')['ok'])
         return ids, old, middle, newest
 
     def test_chained_cross_session_replacement_quarantines_matching_rule(self):
         ids, old, middle, newest = self.pair_history()
+        self.assert_reader_agreement(self.root, 'auth.py')
         built = graph.build_graph(self.root)
         self.assertTrue(built['ok'], built)
         result = self.result(budget=4000)
@@ -347,10 +664,10 @@ class GraphTests(fixtures.Scratch):
                 db.execute('CREATE TABLE IF NOT EXISTS dream_decision_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, '
                            'at TEXT, item_id TEXT, kind TEXT, decision TEXT, by TEXT, digest TEXT, paths TEXT)')
                 db.execute('INSERT INTO dream_decision_events (at,item_id,kind,decision,by,digest,paths) VALUES (?,?,?,?,?,?,?)',
-                           (at, item_id, kind, decision, 'reviewer', digest, json.dumps(node.get('paths', []))))
+                           (at, item_id, kind, decision, 'reviewer', digest, json.dumps(node.get('approvedPaths', []))))
 
     def test_as_of_pin_approve_supersede_reject_and_reapprove(self):
-        ids, old, middle, newest = self.pair_history()
+        ids, old, middle, newest = self.pair_history(approve=False)
         data = mb._load_queue(self.root)[0]
         first, second = sorted(data['nodes'], key=lambda n: n['primaryPin']['quoteText'])
         first = next(n for n in data['nodes'] if old in n['primaryPin']['quoteText'])
@@ -359,13 +676,10 @@ class GraphTests(fixtures.Scratch):
         config['pinnedAnchors']['auth.py::one']['pinnedAt'] = '2026-01-01T00:00:00Z'
         mw.write_managed_text(self.root, mw.CONFIG_PATH, json.dumps(config))
         for node, day in ((first, 2), (second, 3)):
-            self.event(node, '2026-01-0%dT00:00:00Z' % day)
-            for edge in node['edges']:
-                self.event(edge, '2026-01-0%dT00:00:00Z' % day, kind='edge')
-        self.event(second, '2026-01-04T00:00:00Z', 'rejected')
-        for e in second['edges']:
-            self.event(e, '2026-01-04T00:00:00Z', 'rejected', 'edge')
-        self.assertTrue(mb.learn_reject(self.root, [second['id']], approver='reviewer')['ok'])
+            with mock.patch.object(md, '_utc_now_iso', return_value='2026-01-0%dT00:00:00Z' % day):
+                self.assertTrue(mb.learn_approve(self.root, [node['id']], approver='reviewer')['ok'])
+        with mock.patch.object(md, '_utc_now_iso', return_value='2026-01-04T00:00:00Z'):
+            self.assertTrue(mb.learn_reject(self.root, [second['id']], approver='reviewer')['ok'])
         for day, count in ((1, 0), (2, 1), (3, 2), (4, 1)):
             with self.subTest(day=day):
                 built = graph.build_graph(self.root, as_of='2026-01-0%dT12:00:00Z' % day)
@@ -381,15 +695,63 @@ class GraphTests(fixtures.Scratch):
                     cited = next(n for n in built['nodes'] if n.get('recordType') == 'citation' and n['text'] == middle)
                     self.assertEqual('2026-01-02T00:00:00Z', cited['validFrom'])
                     self.assertEqual('2026-01-03T00:00:00Z', cited['validTo'])
-        self.assertTrue(mb.learn_approve(self.root, [second['id']], approver='reviewer', reconsider=True)['ok'])
-        self.event(second, '2026-01-05T00:00:00Z')
-        for e in second['edges']:
-            self.event(e, '2026-01-05T00:00:00Z', kind='edge')
+        with mock.patch.object(md, '_utc_now_iso', return_value='2026-01-05T00:00:00Z'):
+            self.assertTrue(mb.learn_approve(self.root, [second['id']], approver='reviewer', reconsider=True)['ok'])
         after = graph.build_graph(self.root, as_of='2026-01-05T12:00:00Z')
         self.assertEqual(2, after['counts']['lessonItems'])
         node = next(n for n in after['nodes'] if n['id'] == second['id'])
         self.assertEqual([{'validFrom': '2026-01-03T00:00:00Z', 'validTo': '2026-01-04T00:00:00Z'},
                           {'validFrom': '2026-01-05T00:00:00Z', 'validTo': None}], node['validity'])
+
+    def test_real_path_decisions_replay_and_newest_log_recovery(self):
+        node = self.time_fixture(approved=False)
+        nid = node['id']
+        self.write('human.py', '# untracked\n')
+        self.write('second.py', '# untracked\n')
+        def decide(day, fn, **kwargs):
+            with mock.patch.object(md, '_utc_now_iso', return_value='2026-01-0%dT00:00:00Z' % day):
+                result = fn(self.root, [nid], approver='Reviewer', **kwargs)
+                self.assertTrue(result['ok'], result)
+        decide(2, mb.learn_approve, paths=['human.py'])
+        # The real CLI --paths dispatcher, with only its timestamp source injected.
+        script = ("import sys,runpy; sys.path.insert(0,sys.argv[1]); "
+                  "from memlet import memlet_dream; memlet_dream._utc_now_iso=lambda:'2026-01-03T00:00:00Z'; "
+                  "sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+        cli = subprocess.run([self.python, '-c', script, str(fixtures.CLI.parent), str(fixtures.CLI),
+                              'learn', '--paths', nid, '--by', 'Reviewer', '--path', 'second.py', '--repo', str(self.root)],
+                             capture_output=True, text=True, env=dict(os.environ))
+        self.assertEqual(0, cli.returncode, cli.stderr + cli.stdout)
+        decide(4, mb.learn_reject)
+        decide(5, mb.learn_approve, reconsider=True)
+        events = mb.decision_events(self.root, nid)
+        self.assertEqual(['approved', 'paths-changed', 'revoked', 'reconsidered'], [e['decision'] for e in events])
+        for day, expected in ((1, None), (2, ['human.py', 'deploy.py']),
+                              (3, ['second.py', 'deploy.py']), (4, None), (5, ['second.py', 'deploy.py'])):
+            with self.subTest(day=day):
+                items = self.graph_lessons(as_of='2026-01-0%dT12:00:00Z' % day)
+                self.assertEqual(expected, items.get(nid, {}).get('paths'))
+        self.assertEqual([{'validFrom': '2026-01-02T00:00:00Z', 'validTo': '2026-01-03T00:00:00Z'},
+                          {'validFrom': '2026-01-03T00:00:00Z', 'validTo': '2026-01-04T00:00:00Z'},
+                          {'validFrom': '2026-01-05T00:00:00Z', 'validTo': None}], self.graph_lessons()[nid]['validity'])
+        # Flood only unrelated items. The bridge's global newest window now
+        # excludes every real decision, but per-item histories remain complete.
+        with contextlib.closing(sqlite3.connect(str(self.root / mw.LEDGER_PATH))) as db, db:
+            db.executemany('INSERT INTO dream_decision_events(at,item_id,kind,decision,by,digest,paths) VALUES (?,?,?,?,?,?,?)',
+                           [('2026-01-06T00:00:00Z', 'unrelated', 'node', 'rejected', 'Reviewer', '', '[]')] * 4100)
+        self.assertTrue(mb.decision_events(self.root).truncated)
+        with mock.patch.object(mb, 'decision_events', wraps=mb.decision_events) as reader:
+            self.assertEqual(['human.py', 'deploy.py'], self.graph_lessons(as_of='2026-01-02T12:00:00Z')[nid]['paths'])
+            self.assertIn(mock.call(self.root, item_id=nid), reader.call_args_list)
+            self.assertIn(mock.call(self.root, item_id=node['edges'][0]['edgeId']), reader.call_args_list)
+
+        snapshot_file = self.root / mb.SNAPSHOT_REL / 'review.log'
+        snapshot_file.write_text(snapshot_file.read_text().replace('Never edit', 'Never change'))
+        mb.learn_pending(self.root)
+        decide(6, mb.learn_approve, refresh_citations=True)
+        self.assertEqual('citations-refreshed', mb.decision_events(self.root, nid)[-1]['decision'])
+        self.assertEqual({}, self.graph_lessons(as_of='2026-01-05T12:00:00Z'))
+        refreshed = self.graph_lessons(as_of='2026-01-06T12:00:00Z')[nid]
+        self.assertEqual('2026-01-06T00:00:00Z', refreshed['validFrom'])
 
     def test_timestamp_grammar_unknown_since_and_future_knowledge(self):
         self.anchors()
@@ -449,30 +811,36 @@ class GraphTests(fixtures.Scratch):
         folder = self.base / 'nongit'
         folder.mkdir()
         (folder / 'auth.py').write_text('# fixture\n')
-        files = graph._Files(folder)
-        self.assertFalse(files.in_git)
-        self.assertTrue(files.accepts('auth.py'))
-        self.assertFalse(files.accepts('AUTH.py'))
+        context = mb.lesson_path_context(folder)
+        self.assertFalse(context['is_git'])
+        self.assertEqual(['auth.py'], mb.literal_lesson_paths(folder, '', 'auth.py', context=context))
+        self.assertEqual([], mb.literal_lesson_paths(folder, '', 'AUTH.py', context=context))
 
     def test_shared_attachment_context_and_untracked_human_path(self):
         repo, nodes = self.fixture('approved', ('BLOCKS',))
-        target = repo / 'human.py'
-        target.write_text('# deliberately untracked\n')
-        data = mb._load_queue(repo)[0]
-        data['nodes'][0]['approvedPaths'] = ['human.py']
-        # The base version has no path approval field; the injected reader is
-        # the E3 adapter boundary. Production never trusts this raw field itself.
-        data['nodes'][0]['approval']['digest'] = md.node_approval_digest(data['nodes'][0])
-        data['nodes'][0]['approval']['paths'] = ['human.py']
-        self.save_graph(repo, data)
-        shared = object()
-        with mock.patch.object(mb, 'lesson_path_context', return_value=shared, create=True) as context, \
-             mock.patch.object(mb, 'literal_lesson_paths', return_value=[], create=True), \
-             mock.patch.object(mb, 'lesson_paths', return_value=['human.py'], create=True) as human:
-            result = self.result(repo, 'human.py')
+        (repo / 'human.py').write_text('# deliberately untracked\n')
+        nid = nodes['BLOCKS']['id']
+        self.assertTrue(mb.learn_paths(repo, [nid], approver='Reviewer', paths=['human.py'])['ok'])
+        contexts = []
+        real = mb.lesson_path_context
+        def capture(*args, **kwargs):
+            context = real(*args, **kwargs)
+            contexts.append(context)
+            return context
+        with mock.patch.object(mb, 'lesson_path_context', side_effect=capture), \
+             mock.patch.object(mb, 'lesson_paths', wraps=mb.lesson_paths) as human, \
+             mock.patch.object(mb, '_load_snapshot', wraps=mb._load_snapshot) as snapshot, \
+             mock.patch.object(mb, '_load_queue', wraps=mb._load_queue) as queue, \
+             mock.patch.object(mb, 'dream_tiers', wraps=mb.dream_tiers) as tiers:
+            counters = {}
+            result = self.result(repo, 'human.py', _counters=counters)
             self.assertEqual('lesson-path', result['groups']['blocks'][0]['why'])
-            context.assert_called_once_with(repo)
-            self.assertIs(shared, human.call_args.kwargs['context'])
+            self.assertEqual(1, len(contexts))
+            self.assertTrue(all(call.kwargs['context'] is contexts[0] for call in human.call_args_list))
+            self.assertEqual((1, 1, 1), (snapshot.call_count, queue.call_count, tiers.call_count))
+            self.assertEqual((1, 1, 1, 1), tuple(counters[k] for k in ('snapshotReads', 'queueReads', 'tierPasses', 'gitCalls')))
+        self.assertEqual(['human.py', 'deploy.py'], mb.dream_items(repo)['items'][0]['paths'])
+        self.assert_reader_agreement(repo, 'human.py')
 
     def test_hostile_rule_bounds_and_hidden_characters(self):
         self.write('auth.py', fixtures.CODE)
@@ -589,12 +957,18 @@ class GraphTests(fixtures.Scratch):
             self.seal(edge, 'edge'); self.seal(node)
         return node
 
-    def queue_fixture(self, lines, build):
+    def queue_fixture(self, lines, build, *, database=True):
         self.write(mb.SNAPSHOT_REL + '/review.log', '\n'.join(lines) + '\n')
         pin = lambda n: md.resolve_pin({'review.log': lines}, 'review.log:%d' % n)
         nodes, top = build(pin)
-        self.save_graph(self.root, dict(schema=md.DREAM_ONTOLOGY_SCHEMA, nodes=nodes,
-                                       edges=[copy.deepcopy(e) for n in nodes for e in n['edges']] + top))
+        data = dict(schema=md.DREAM_ONTOLOGY_SCHEMA, nodes=nodes,
+                    edges=[copy.deepcopy(e) for n in nodes for e in n['edges']] + top)
+        if database:
+            self.save_graph(self.root, data)
+        else:
+            # Cost fixtures exercise the real JSON queue reader. An ontology DB
+            # is not a graph authority; avoid paying to populate unused rows.
+            self.write(mb.QUEUE_REL, json.dumps(data))
         return nodes
 
     def time_fixture(self, approved=True):
@@ -704,13 +1078,16 @@ class GraphTests(fixtures.Scratch):
             self.event(node, at)
             for e in node['edges']:
                 self.event(e, at, kind='edge')
-            with contextlib.closing(sqlite3.connect(str(self.root / mw.LEDGER_PATH))) as db, db:
-                db.execute('UPDATE dream_decision_events SET paths=NULL')
             items = self.graph_lessons(as_of='2026-03-01')
             self.assertEqual(expected, items.get(node['id'], {}).get('validFrom'))
             if expected:
                 before = graph._stamp(expected) - __import__('datetime').timedelta(microseconds=1)
                 self.assertEqual({}, self.graph_lessons(as_of=before.isoformat()))
+            with contextlib.closing(sqlite3.connect(str(self.root / mw.LEDGER_PATH))) as db, db:
+                db.execute('UPDATE dream_decision_events SET paths=NULL')
+            result = graph.build_graph(self.root, as_of='2026-03-01')
+            self.assertEqual(0, result['counts']['lessonItems'])
+            self.assertIn(graph.v.GRAPH_CORRUPT_HISTORY_NOTICE, result['notices'])
             with contextlib.closing(sqlite3.connect(str(self.root / mw.LEDGER_PATH))) as db, db:
                 db.execute('DELETE FROM dream_decision_events')
 
@@ -789,6 +1166,7 @@ class GraphTests(fixtures.Scratch):
             self.assertFalse(graph.neighbors(repo, h['id'], tiers=('approved', 'hint'))['ok'], shape)
             self.assertFalse(any(self.result(repo, 'deploy.py', tiers=('approved', 'hint'))['groups'].values()))
             self.assertEqual(0, graph.build_graph(repo)['counts']['lessonItems'])
+            self.assert_reader_agreement(repo, 'deploy.py')
 
     def test_review_literal_adjacency_and_attachment_table(self):
         self.time_fixture()
@@ -840,12 +1218,46 @@ class GraphTests(fixtures.Scratch):
                  '2026-01-02T00:00:00Z [assistant] The fix is in deploy.py for now.']
         def build(pin):
             n = self.queue_node('DRM-A', pin(1))
+            n['timestamp'] = md.extract_line_timestamp(pin(1)['quoteText'])
+            n['edges'][0]['srcTimestamp'] = n['timestamp']
             n['edges'].append(dict(edgeId='E-P', edgeType='RESOLVES', fromId='DRM-A', toId='RESOLVES:x',
-                                   targetLabel='deploy.py', srcPin=pin(2), edgeVerdict='PENDING'))
+                                   targetLabel='deploy.py', srcPin=pin(2), srcTimestamp=md.extract_line_timestamp(pin(2)['quoteText']), edgeVerdict='PENDING'))
             return [n], []
         self.queue_fixture(lines, build)
         self.assertEqual([], self.graph_lessons()['DRM-A']['paths'])
         self.assertFalse(any(self.result(target='deploy.py')['groups'].values()))
+        self.assertTrue(mb.learn_approve(self.root, ['E-P'], approver='Reviewer')['ok'])
+        result = self.result(target='deploy.py')
+        self.assertEqual(['DRM-A'], [i['id'] for i in result['groups']['blocks']])
+        self.assert_reader_agreement(self.root, 'deploy.py')
+
+    def test_file_slice_keeps_literal_at_start_of_another_cited_line(self):
+        self.write('deploy.py', 'x = 1\n'); self.tracked('deploy.py')
+        def build(pin):
+            node = self.queue_node('DRM-line-start', pin(1))
+            node['allPins'].append(pin(2)); self.seal(node)
+            return [node], []
+        self.queue_fixture(['Never use the cold cache.', 'deploy.py requires review.'], build)
+        self.assertEqual(['deploy.py'], mb.dream_items(self.root)['items'][0]['paths'])
+        self.assertEqual(['DRM-line-start'], [i['id'] for i in self.result(target='deploy.py')['groups']['blocks']])
+        self.assert_reader_agreement(self.root, 'deploy.py')
+
+    def test_hint_selection_uses_current_lines_after_global_replacement(self):
+        self.pair_history()
+        data = mb._load_queue(self.root)[0]
+        old_pin = next(n['primaryPin'] for n in data['nodes'] if 'warmed cache' in n['primaryPin']['quoteText'])
+        hint = self.queue_node('DRM-hint-replaced', old_pin, approved=False)
+        hint['timestamp'] = md.extract_line_timestamp(old_pin['quoteText'])
+        hint['edges'][0]['srcTimestamp'] = hint['timestamp']
+        hint['proposers'] = [dc._receipt(vendor, hint, 'f' * 24, {'model': 'haiku' if vendor == 'claude' else 'codex'})
+                             for vendor in ('claude', 'codex')]
+        data['nodes'].append(hint); data['edges'].extend(copy.deepcopy(hint['edges']))
+        self.save_graph(self.root, data)
+        item = next(i for i in mb.dream_items(self.root, tiers=('hint',))['items'] if i['id'] == hint['id'])
+        self.assertEqual(['replaced'], item['lineRoles'])
+        self.assertEqual([], mb.dream_items(self.root, tiers=('hint',), files=['auth.py'])['items'])
+        self.assertEqual([], mb.unified_recall(self.root, files=['auth.py'])['sections']['hints'])
+        self.assertEqual([], self.result(target='auth.py', tiers=('approved', 'hint'))['groups']['hints'])
 
     def test_review_hint_scope_does_not_attach_m23_and_id_why(self):
         repo, nodes = self.fixture('hint', ('BLOCKS',), cited_path=False)
@@ -856,6 +1268,12 @@ class GraphTests(fixtures.Scratch):
         self.assertEqual([], next(n for n in graph.build_graph(repo)['nodes'] if n.get('id') == node['id'])['paths'])
         own = self.result(repo, node['id'], tiers=('approved', 'hint'))['groups']['hints'][0]
         self.assertEqual('target-item', own['why'])
+        self.assertEqual([], mb.dream_items(repo, tiers=('hint',), files=['deploy.py'])['items'])
+        self.assertEqual([], mb.unified_recall(repo, files=['deploy.py'])['sections']['hints'])
+        self.assert_reader_agreement(repo, 'deploy.py')
+        for path in (hb.HANDOVER_FILE, hb.CAPSULES_FILE):
+            self.assertNotIn(node['id'], (repo / path).read_text())
+
 
     def test_review_alias_ancestor_exact_case_and_target_safety(self):
         self.anchors()
@@ -937,14 +1355,17 @@ class GraphTests(fixtures.Scratch):
             self.assertTrue(result['groups']['blocks'])
             self.assertTrue(result['groups']['stale'])
             self.assertIn(v.GRAPH_EVENTS_NOTICE, result['notices'])
-        bad_git = subprocess.CompletedProcess(['git'], 0, b'x' * (8 * 1024 * 1024 + 1), b'')
-        with mock.patch.object(graph.subprocess, 'run', return_value=bad_git):
+        real_read = mb.os.read
+        def oversized(fd, size):
+            # Popen also reads its exec-error pipe; only replace git stdout.
+            return b'x' * (4 * 1024 * 1024 + 1) if size == 65536 else real_read(fd, size)
+        with mock.patch.object(mb.os, 'read', side_effect=oversized):
             result = self.result(target='deploy.py')
             self.assertTrue(result['groups']['stale'])
             self.assertFalse(result['groups']['blocks'])
             self.assertIn(v.GRAPH_FILES_NOTICE, result['notices'])
             self.assertIn('blocks', result['incompleteGroups'])
-        with mock.patch.object(graph.subprocess, 'run', side_effect=subprocess.TimeoutExpired('git', 2)):
+        with mock.patch.object(mb.subprocess, 'Popen', side_effect=subprocess.TimeoutExpired('git', .5)):
             result = self.result(target='deploy.py')
             self.assertIn(v.GRAPH_FILES_NOTICE, result['notices'])
 
@@ -985,7 +1406,7 @@ class GraphTests(fixtures.Scratch):
         self.tracked('src')
         lines = ['2026-01-01T00:00:00Z [user] Keep src/f0001.py checked. ' + ' '.join(
                  'src/f%04d.py' % ((i * 7 + j) % 5000) for j in range(20)) for i in range(2000)]
-        self.queue_fixture(lines, lambda pin: ([self.queue_node('DRM-%d' % i, pin(i + 1)) for i in range(2000)], []))
+        self.queue_fixture(lines, lambda pin: ([self.queue_node('DRM-%d' % i, pin(i + 1)) for i in range(2000)], []), database=False)
         times = []
         real = Path.iterdir
         for _ in range(2):
@@ -1003,7 +1424,8 @@ class GraphTests(fixtures.Scratch):
             self.assertIn('blocks', result['incompleteGroups'])
             self.assertIn('replaced', result['incompleteGroups'])
             self.assertLessEqual(calls.get(self.root / 'src', 0), 1)
-            self.assertTrue(all(n <= 1 for n in counters['directoryListings'].values()))
+            self.assertEqual({'.': 1, 'src': 1}, counters['directoryListings'])
+            self.assertEqual((1, 1, 1), tuple(counters[k] for k in ('snapshotReads', 'queueReads', 'tierPasses')))
             self.assertEqual(1, counters['gitCalls'])
             self.assertEqual(1, counters['anchorsClassified'])
             self.assertEqual(graph.MAX_NEIGHBOR_CANDIDATES, counters['lessonCandidatesValidated'])
@@ -1013,7 +1435,8 @@ class GraphTests(fixtures.Scratch):
         self.assertEqual(2000, counters['anchorsClassified'])
         self.assertEqual(2000, counters['lessonCandidatesValidated'])
         self.assertEqual(1, counters['gitCalls'])
-        self.assertTrue(all(n <= 1 for n in counters['directoryListings'].values()))
+        self.assertEqual({'.': 1, 'src': 1}, counters['directoryListings'])
+        self.assertEqual((1, 1, 1), tuple(counters[k] for k in ('snapshotReads', 'queueReads', 'tierPasses')))
         self.assertLessEqual(counters['rebindingFilesParsed'], 1)
         self.assertTrue(built['ok'], built)
         self.assertEqual(2000, built['counts']['lessonItems'])
@@ -1089,7 +1512,7 @@ class GraphTests(fixtures.Scratch):
                                      at='2026-01-02T00:00:00Z', digest=md.node_approval_digest(n))
                 nodes.append(n)
             return nodes, []
-        self.queue_fixture(lines, build)
+        self.queue_fixture(lines, build, database=False)
         counters = {}
         start = time.perf_counter(); result = self.result(target='deploy.py', _counters=counters); elapsed = time.perf_counter() - start
         self.assertEqual(1, len(result['groups']['blocks']))
@@ -1116,7 +1539,7 @@ class GraphTests(fixtures.Scratch):
                              allPins=[old, new], supersededByPin=new, edges=[e], verdict='ALREADY_SUPERSEDED')
                     self.seal(e, 'edge'); self.seal(n); nodes.append(n)
                 return nodes, []
-            self.queue_fixture(lines, build)
+            self.queue_fixture(lines, build, database=False)
             counters = {}
             start = time.perf_counter(); result = self.result(target='deploy.py', _counters=counters); elapsed = time.perf_counter() - start
             print('E1 review supersession chain %d: %.3fs' % (size, elapsed))
@@ -1365,12 +1788,56 @@ class GraphTests(fixtures.Scratch):
         self.assertIn(graph.v.GRAPH_WORK_NOTICE, result['notices'])
         self.assertEqual(0, counters['anchorsClassified'])
         self.assertEqual(0, counters['lessonCandidatesValidated'])
+        self.assertEqual(0, counters['gitCalls'])
+        self.assertEqual(0, counters['snapshotReads'])
+
+    def test_shared_rule_caches_unreadable_directory_once(self):
+        self.write('one.py', 'x\n'); self.write('two.py', 'x\n')
+        context = mb.lesson_path_context(self.root)
+        with mock.patch.object(Path, 'iterdir', side_effect=PermissionError('fixture')) as listed:
+            self.assertFalse(mb.valid_lesson_path(self.root, 'one.py', context=context))
+            self.assertFalse(mb.valid_lesson_path(self.root, 'two.py', context=context))
+            self.assertEqual(1, listed.call_count)
+
+    def test_decision_item_queries_have_an_independent_cap(self):
+        node = self.time_fixture()
+        self.event(node, '2026-01-02T00:00:00Z')
+        data = dict(nodes=[dict(id='DRM-%d' % i, edges=[]) for i in range(10)], edges=[])
+        with mock.patch.object(graph, 'MAX_HISTORY_QUERIES', 2), \
+             mock.patch.object(mb, 'decision_events', side_effect=[mb.DecisionEvents(truncated=True), [], []]) as reader:
+            history = graph._History(self.root, graph=data)
+        self.assertEqual(3, reader.call_count)  # one global read plus two item reads
+        self.assertIn(graph.v.GRAPH_EVENTS_NOTICE, history.notices)
+        self.assertEqual({}, history.decisions)
+
+    def test_clock_bound_covers_shared_directory_work(self):
+        node = self.time_fixture()
+        self.write('src/extra.py', 'x = 1\n'); self.tracked('src/extra.py')
+        data = mb._load_queue(self.root)[0]
+        # A human path makes shared validation traverse a directory not needed
+        # by target-id resolution or rule discovery.
+        self.assertTrue(mb.learn_paths(self.root, [node['id']], approver='Reviewer', paths=['src/extra.py'])['ok'])
+        clock = [0.0]
+        real = Path.iterdir
+        def listed(path):
+            result = real(path)
+            if path == self.root:
+                clock[0] = 3.0
+            return result
+        counters = {}
+        with mock.patch.object(Path, 'iterdir', listed):
+            result = self.result(target=node['id'], _clock=lambda: clock[0], _counters=counters)
+        self.assertEqual(sorted(graph.GROUPS), result['incompleteGroups'])
+        self.assertFalse(any(result['groups'].values()))
+        self.assertEqual({'.': 1}, counters['directoryListings'])
+        self.assertEqual(1, counters['snapshotReads'])
+        self.assertEqual(1, counters['queueReads'])
         self.assertEqual(1, counters['gitCalls'])
 
     def test_review_long_cited_line_token_scan_is_linear(self):
         text = ('do not repeat ' * 150000) + 'deploy.py'
         start = time.perf_counter()
-        paths = graph._candidate_paths(text)
+        paths = mb._lesson_path_candidates(text)
         elapsed = time.perf_counter() - start
         self.assertEqual({'do', 'not', 'repeat', 'deploy.py'}, paths)
         print('E1 long cited line %d bytes: %.3fs token scan' % (len(text), elapsed))

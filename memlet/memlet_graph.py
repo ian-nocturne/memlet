@@ -19,7 +19,6 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-import subprocess
 import time
 import unicodedata
 
@@ -36,6 +35,7 @@ MAX_RULES = 5000
 MAX_LESSONS = 5000
 MAX_EDGES = 20000
 MAX_EVENTS = 100000
+MAX_HISTORY_QUERIES = 256
 MAX_RULE_CHARS = 16384
 MAX_FORMATTED_CHARS = 8000
 MAX_SUPERSESSION_SLICE = 512
@@ -44,8 +44,6 @@ MAX_NEIGHBOR_ANCHORS = 256
 MAX_NEIGHBOR_EVENTS = 4096
 MAX_NEIGHBOR_SECONDS = 2.5
 _monotonic = time.monotonic  # separately injectable; never patches the stdlib clock
-_LITERAL_PATH = re.compile(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*")
-_PATH_PUNCTUATION = re.compile(r"[.,;:!? )\]\"'`]+(?=\s|$)".replace(" ", ""))
 
 
 def _id(kind, value):
@@ -95,11 +93,13 @@ class _Work:
         self.parse_start = ca._PYTHON_BINDING_PARSE_COUNT
         if counters is not None:
             counters.update(directoryListings={}, gitCalls=0, anchorsClassified=0,
-                            lessonCandidatesValidated=0, rebindingFilesParsed=0)
+                            lessonCandidatesValidated=0, rebindingFilesParsed=0,
+                            snapshotReads=0, queueReads=0, tierPasses=0)
         self.incomplete = set()
         self.notices = []
         self.directories = {}
         self.known_ids = {}
+        self.exhausted = False
 
     def count(self, key, amount=1):
         if self.counters is not None:
@@ -115,7 +115,10 @@ class _Work:
         self.incomplete.update(groups)
 
     def available(self):
+        if self.exhausted:
+            return False
         if self.bounded and self.clock() >= self.deadline:
+            self.exhausted = True
             self.skip(v.GRAPH_WORK_NOTICE)
             return False
         return True
@@ -151,6 +154,7 @@ def _clean_path(root, value, *, exists=True, directories=None, indexed=False, co
         for part in p.parts:
             try:
                 if cursor not in directories:
+                    directories[cursor] = set()
                     is_directory = cursor.is_dir()
                     if is_directory and counters is not None:
                         key = cursor.relative_to(root).as_posix()
@@ -170,91 +174,18 @@ def _clean_path(root, value, *, exists=True, directories=None, indexed=False, co
     return rel
 
 
-class _Files:
-    """One tracked-name index and one containment check per literal candidate."""
-    def __init__(self, root, work=None):
-        self.root, self.checked = root, {}
-        self.work = work or _Work()
-        self.names = set()
-        self.in_git = True
-        try:
-            self.work.count("gitCalls")
-            result = subprocess.run(["git", "ls-files", "-z", "--cached"], cwd=str(root),
-                                    capture_output=True, timeout=2)
-            if result.returncode == 0 and len(result.stdout) <= 8 * 1024 * 1024:
-                self.names = set(result.stdout.decode("utf-8", "strict").split("\0"))
-                return
-            if result.returncode == 128 and b"not a git repository" in result.stderr:
-                self.in_git = False
-                return
-        except (OSError, subprocess.SubprocessError, UnicodeError):
-            pass
-        self.work.skip(v.GRAPH_FILES_NOTICE)
-
-    def accepts(self, path):
-        if path not in self.checked:
-            self.checked[path] = ((not self.in_git or path in self.names)
-                and _clean_path(self.root, path, directories=self.work.directories,
-                                indexed=self.in_git, counters=self.work.counters) == path)
-        return self.checked[path]
-
-
-def _candidate_paths(text):
-    # Match the shared literal rule: maximal tokens, terminal sentence
-    # punctuation, original bytes and no scope. Scan once, not once per path.
-    paths = set()
-    for line in text.split("\n"):
-        for match in _LITERAL_PATH.finditer(line):
-            raw = match.group().rstrip(".")
-            end = match.start() + len(raw)
-            boundary = end == len(line) or line[end].isspace() or _PATH_PUNCTUATION.match(line, end)
-            adjacent = line[max(0, match.start()-1):match.start()] + line[end:end+1]
-            if raw and len(raw) <= 80 and boundary and not any(_path_adjacent(c) for c in adjacent):
-                paths.add(raw.removeprefix("./"))
-    return paths
-
-
-def _attached(root, node, item, files, context=None):
-    """E3 adapter: human paths and the shared literal attachment computation."""
-    from .memlet_dreamcycle import evidence_pins
-    evidence = node
+def _attached(root, node, item, context):
+    """Approved paths are the reader's result; hint paths are display-only."""
     if item["tier"] == APPROVED:
-        evidence = dict(node, edges=[e for e in node.get("edges", []) if md.approval_state(e, "edge") == APPROVED])
-    # Attachment is tested against original cited bytes. Rendered quotes strip
-    # hidden characters and would otherwise turn a poisoned path into a match.
-    replaced = {c.get("span") for c, role in zip(item.get("cites", []), item.get("lineRoles", []))
-                if role == "replaced"}
-    lines = [p["quote"] for p in md.lesson_lines(dict(allPins=evidence_pins(evidence)))
-             if p.get("span") not in replaced]
-    literal = getattr(mb, "literal_lesson_paths", None)
-    paths = []
-    if literal:
-        for line in lines:
-            found = literal(root, "", line, context=context) if context is not None else literal(root, "", line)
-            paths.extend(p for p in found if p not in paths)
-            if len(paths) >= 8:
-                break
-        paths = paths[:8]
-    else:
-        named_paths = {p for line in lines for p in _candidate_paths(line)}
-        for p in sorted(named_paths):
-            if not files.work.available():
-                break
-            if p and files.accepts(p):
-                paths.append(p)
-                if len(paths) == 8:
-                    break
-    result = {p: GRAPH_WHY[3] for p in paths}
-    if item["tier"] == APPROVED:
-        reader = getattr(mb, "lesson_paths", None)
-        paths = (reader(node, root, context=context) if context is not None else reader(node, root)) if reader else ()
-        for p in paths:
-            result[p] = GRAPH_WHY[2]
-    return dict(sorted(result.items()))
+        human = set(mb.lesson_paths(node, root, context=context))
+        return {p: GRAPH_WHY[2] if p in human else GRAPH_WHY[3] for p in item.get("paths", [])}
+    # The shared reader retains legacy unfiltered hint bytes, and exposes its
+    # literal selection through the call-local context for display here only.
+    return {p: GRAPH_WHY[3] for p in context.get("hintPaths", {}).get(item["id"], [])}
 
 
 class _History:
-    def __init__(self, root, work=None):
+    def __init__(self, root, work=None, graph=None):
         work = work or _Work()
         event_bound = min(MAX_EVENTS, MAX_NEIGHBOR_EVENTS) if work.bounded else MAX_EVENTS
         self.decisions, self.sidecars, self.conflicts = {}, {}, set()
@@ -267,19 +198,51 @@ class _History:
             with contextlib.closing(mw.connect_managed_sqlite(root, mw.LEDGER_PATH, readonly=True)) as db:
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if "dream_decision_events" in tables:
-                    rows = db.execute("SELECT seq, at, item_id, kind, decision, by, digest, paths "
-                                      "FROM dream_decision_events ORDER BY seq LIMIT ?", (event_bound + 1,)).fetchall()
+                    rows = mb.decision_events(root)
+                    if getattr(rows, "truncated", False):
+                        # The public reader returns the newest 4096, not a page
+                        # of the oldest history. Recover complete per-item sets;
+                        # a truncated item is explicitly unknown, never a prefix.
+                        ids = {n.get("id") for n in (graph or {}).get("nodes", [])}
+                        ids.update(e.get("edgeId") for n in (graph or {}).get("nodes", []) for e in n.get("edges", []))
+                        ids.update(e.get("edgeId") for e in (graph or {}).get("edges", []))
+                        recovered = []
+                        if not ids:
+                            self.notice(v.GRAPH_EVENTS_NOTICE)
+                        for number, ident in enumerate(sorted(i for i in ids if isinstance(i, str))):
+                            if number >= min(event_bound, MAX_HISTORY_QUERIES):
+                                self.notice(v.GRAPH_EVENTS_NOTICE)
+                                break
+                            if not work.available() or len(recovered) >= event_bound:
+                                self.notice(v.GRAPH_EVENTS_NOTICE)
+                                break
+                            item_rows = mb.decision_events(root, item_id=ident)
+                            if getattr(item_rows, "truncated", False):
+                                self.notice(v.GRAPH_EVENTS_NOTICE)
+                                continue
+                            if getattr(item_rows, "skipped", 0):
+                                self.notice(v.GRAPH_CORRUPT_HISTORY_NOTICE)
+                                continue
+                            if len(recovered) + len(item_rows) > event_bound:
+                                self.notice(v.GRAPH_EVENTS_NOTICE)
+                                break
+                            recovered.extend(item_rows)
+                        rows = sorted(recovered, key=lambda r: r["seq"])
+                    elif getattr(rows, "skipped", 0):
+                        self.notice(v.GRAPH_CORRUPT_HISTORY_NOTICE)
+                        rows = []
                     if len(rows) > event_bound:
                         self.notice(v.GRAPH_EVENTS_NOTICE)
                         rows = []
-                    for seq, at, ident, kind, decision, by, digest, paths in rows:
+                    for row in rows:
                         if not work.available():
                             self.decisions, self.conflicts = {}, set()
                             self.notice(v.GRAPH_EVENTS_NOTICE)
                             break
+                        seq, ident, kind = row["seq"], row["item_id"], row["kind"]
                         decision = {"reconsidered": APPROVED, "paths-changed": APPROVED,
-                                    "citations-refreshed": APPROVED, "revoked": "rejected"}.get(decision, decision)
-                        at = _time(at)
+                                    "citations-refreshed": APPROVED, "revoked": "rejected"}.get(row["decision"], row["decision"])
+                        at = _time(row["at"])
                         if at is None:
                             continue
                         key = (kind, ident)
@@ -288,7 +251,7 @@ class _History:
                             self.conflicts.add(key)
                             self.notice(v.GRAPH_ORDER_NOTICE)
                             self.notice(v.GRAPH_ORDER_ITEM_NOTICE % mb.safe_lesson_display(str(ident), limit=160))
-                        events.append(dict(seq=seq, at=at, decision=decision, by=by, digest=digest, paths=paths))
+                        events.append(dict(seq=seq, at=at, decision=decision, by=row["by"], digest=row["digest"], paths=row["paths"]))
                     for events in self.decisions.values():
                         events.sort(key=lambda r: (_stamp(r["at"]), r["seq"]))
                 if ma.LEDGER_TABLE in tables:
@@ -310,18 +273,26 @@ class _History:
     def _matches(self, item, kind, record):
         # Only content still available to recompute is admissible. A digest in
         # a log row is not proof that old, deleted content ever existed.
-        digest = md.node_approval_digest(item) if kind == "node" else md.edge_approval_digest(item)
-        if record.get("digest") != digest:
-            return False
+        candidate = item
         if kind == "node" and record.get("paths") is not None:
             try:
                 paths = record["paths"]
                 paths = json.loads(paths) if isinstance(paths, str) else paths
-                if not isinstance(paths, list) or paths != item.get("approvedPaths", []):
+                if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
                     return False
+                candidate = dict(item, approvedPaths=paths)
             except (ValueError, TypeError):
                 return False
-        return True
+        digest = md.node_approval_digest(candidate) if kind == "node" else md.edge_approval_digest(candidate)
+        if record.get("digest") == digest:
+            return True
+        # E3 preserves legacy no-path digest bytes. Empty paths in the log
+        # cannot distinguish absent from explicitly empty; verify both forms.
+        if kind == "node" and candidate.get("approvedPaths") == []:
+            legacy = dict(candidate)
+            legacy.pop("approvedPaths", None)
+            return record.get("digest") == md.node_approval_digest(legacy)
+        return False
 
     def _original(self, item, kind):
         return self.originals.get((kind, item.get("id" if kind == "node" else "edgeId")), item)
@@ -335,7 +306,7 @@ class _History:
             if as_of is None and not _before(r["at"], self.now):
                 self.notice(v.GRAPH_FUTURE_NOTICE)
                 continue
-            if _before(r["at"], cutoff) and self._matches(item, kind, r):
+            if _before(r["at"], cutoff) and (r["decision"] == "rejected" or self._matches(item, kind, r)):
                 result.append(r)
         current = item.get("approval", {})
         if isinstance(current, dict) and _before(_time(current.get("at")), cutoff):
@@ -413,7 +384,13 @@ class _History:
                 paths = record["paths"]
                 paths = json.loads(paths) if isinstance(paths, str) else paths
                 item["approval"]["paths"] = paths
-            item["verdict" if kind == "node" else "edgeVerdict"] = md.PENDING
+                if kind == "node":
+                    item["approvedPaths"] = paths
+                    if paths == [] and record.get("digest") != md.node_approval_digest(item):
+                        item.pop("approvedPaths", None)
+            item["verdict" if kind == "node" else "edgeVerdict"] = (
+                ("ALREADY_SUPERSEDED" if md.superseded_lesson(item) else "SUPPORTED") if kind == "node"
+                else "VALID") if record.get("decision") == APPROVED else md.PENDING
             if kind == "node":
                 item["proposers"], item["verification"] = [], []
         for node in view.get("nodes", []):
@@ -543,10 +520,15 @@ def _fresh_classification(root, rules, pins, work):
     return list(anchors.values())
 
 
-def _queue(root):
+def _queue(root, work=None):
+    if work:
+        work.count("queueReads")
     if mb._symlinked(root, (mb.QUEUE_REL, mb.SNAPSHOT_REL)):
         raise ValueError(v.GRAPH_UNSAFE_DREAM)
-    graph, _ = mb._load_queue(root)
+    try:
+        graph, _ = mb._load_queue(root)
+    except (ValueError, OSError, TypeError, KeyError) as exc:
+        raise ValueError(v.GRAPH_QUEUE_UNREADABLE) from exc
     graph = graph or {"nodes": [], "edges": []}
     if len(graph.get("nodes", [])) > MAX_LESSONS or len(graph.get("edges", [])) > MAX_EDGES:
         raise ValueError(v.GRAPH_QUEUE_BOUND)
@@ -578,8 +560,17 @@ def _slice(graph, path, ident, work=None):
             # Incomplete veto/context indexing cannot authorize a prefix.
             return dict(graph, nodes=[], edges=[])
         nid = node.get("id")
-        text = "\n".join(p["quote"] for p in md.lesson_lines(node))
-        paths = _candidate_paths(text)
+        paths = {path for part in md.lesson_lines(node) for line in part["quote"].split("\n")
+                 for path in mb._lesson_path_candidates(line)}
+        # An approved edge may cite a different line from its owning node.
+        # This only selects candidates; the shared reader still verifies pins,
+        # current roles, the node tier and the exact path before attaching it.
+        for edge in node.get("edges", []):
+            if md.approval_state(edge, "edge") == APPROVED and edge.get("edgeVerdict") == "VALID":
+                for pin in md._item_pins(edge, "edge") + [edge.get("citedTargetPin")]:
+                    if isinstance(pin, dict):
+                        for line in str(pin.get("quoteText", "")).split("\n"):
+                            paths.update(mb._lesson_path_candidates(line))
         paths.update(p for p in node.get("approvedPaths", []) if isinstance(p, str))
         if path in paths or nid == ident:
             candidates.append(nid)
@@ -601,50 +592,19 @@ def _slice(graph, path, ident, work=None):
                        if e.get("fromId") in selected or e.get("toId") in selected])
 
 
-def _approved_relations(graph, items):
-    """Keep the sole computed tier; do not promote an unapproved edge with it.
-
-    Legacy dream_items may expose all edge types of an approved node, including
-    pending edges. Its inline supersession display also predates this gate.
-    Re-use its display/projection computations on the approved-valid edge view;
-    this adapter becomes a no-op once the shared reader filters those edges.
-    """
-    approved_ids = {i["id"] for i in items if i["tier"] == APPROVED}
-    if not any(n.get("id") in approved_ids and any(md.approval_state(e, "edge") != APPROVED
-               for e in n.get("edges", [])) for n in graph.get("nodes", [])):
-        return items
-    approved = md.approved_view(graph)[0]
-    approved["nodes"] = [n for n in approved.get("nodes", []) if n.get("id") in approved_ids]
-    for node in approved["nodes"]:
-        node["edges"] = [e for e in node.get("edges", []) if e.get("edgeVerdict") == "VALID"]
-    approved["edges"] = [e for e in approved.get("edges", []) if e.get("edgeVerdict") == "VALID"
-                         and (e.get("fromId") in approved_ids or e.get("toId") in approved_ids)]
-    projection = md.supersession_projection(approved)
-    by_id = {n["id"]: n for n in approved["nodes"]}
-    out = []
-    for item in items:
-        if item["tier"] != APPROVED:
-            out.append(item)
-            continue
-        node = md.supersession_display_node(by_id[item["id"]], approved, projection)
-        fields = mb._lesson_fields(node)
-        verified = {md.citation_key(c): c.get("verified") is True for c in item["cites"]}
-        fields["cites"] = [dict(c, verified=verified.get(md.citation_key(c), False)) for c in fields.get("cites", [])]
-        if not fields["cites"] or not all(c["verified"] for c in fields["cites"]):
-            continue
-        clean = {k: v for k, v in item.items() if k not in
-                 ("quarantined", "lineRoles", "lineReplacements", "replacementLabel")}
-        out.append(dict(clean, **fields, text=md.lesson_text(node),
-                        edgeTypes=sorted({e["edgeType"] for e in node.get("edges", [])})))
-    return out
-
-
 def _project(root, as_of, *, path=None, symbol=None, ident=None, queue=None, work=None):
     work = work or _Work()
-    history = _History(root, work)
+    with mb._lesson_path_projection(root, work) as context:
+        return _project_context(root, as_of, path=path, symbol=symbol, ident=ident,
+                                queue=queue, work=work, path_context=context)
+
+
+def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_context):
+    queue = _queue(root, work) if queue is None else queue
+    history = _History(root, work, graph=queue)
     config, error = mw.read_config(root)
     config = config or {}
-    graph = history.replay(_queue(root) if queue is None else queue, as_of)
+    graph = history.replay(queue, as_of)
     work.known_ids.update({n["id"]: "lesson" for n in graph.get("nodes", [])})
     replacement_unknown = len(_supersession_ids(graph)) > MAX_SUPERSESSION_SLICE
     if replacement_unknown:
@@ -657,10 +617,10 @@ def _project(root, as_of, *, path=None, symbol=None, ident=None, queue=None, wor
     if not work.available():
         graph = dict(graph, nodes=[], edges=[])
     work.count("lessonCandidatesValidated", len(graph.get("nodes", [])))
-    read = mb.dream_items(root, tiers=(APPROVED,) if as_of else (APPROVED, HINT), _graph=graph)
+    read = (mb.dream_items(root, tiers=(APPROVED,) if as_of else (APPROVED, HINT), _graph=graph)
+            if work.available() else dict(ok=True, items=[], notices=[]))
     if not read["ok"]:
         raise ValueError(v.GRAPH_EVIDENCE_ERROR)
-    read["items"] = _approved_relations(graph, read["items"])
     notices = [GRAPH_TIME_NOTICE] + ([GRAPH_HISTORY_NOTICE] if as_of else [])
     notices.extend(read.get("notices", []))
     if error:
@@ -689,9 +649,6 @@ def _project(root, as_of, *, path=None, symbol=None, ident=None, queue=None, wor
         rules = [r for r in rules if md.normalised_quote(_rule_text(r, texts) or "") in old]
     anchors = {a["anchor"]: a for a in _fresh_classification(root, rules, pins, work)}
     nodes, edges, attachments = {}, [], {}
-    context_factory = getattr(mb, "lesson_path_context", None)
-    path_context = context_factory(root) if context_factory else None
-    files = _Files(root, work) if path_context is None else None
     replaced_projection = md.replaced_line_index(read["items"])[1]
     lesson_times = {i["id"]: history.interval(raw[i["id"]], "node", as_of)[0] for i in read["items"]}
     safe_rule_paths = {}
@@ -715,7 +672,7 @@ def _project(root, as_of, *, path=None, symbol=None, ident=None, queue=None, wor
             start = None
         if as_of and not _before(start, as_of):
             continue
-        attached = _attached(root, node, item, files, path_context)
+        attached = _attached(root, node, item, path_context)
         attachments[item["id"]] = attached
         item = dict(item, kind="lesson", recordType="item", validFrom=start, validTo=end,
                     current=not item.get("quarantined", False),
@@ -863,7 +820,14 @@ def _counts(nodes, edges):
 
 def _refusal(exc):
     message = str(exc)
-    return message if message in v.GRAPH_REFUSALS else v.GRAPH_UNAVAILABLE
+    if message in v.GRAPH_REFUSALS:
+        return message
+    for kind, reason in ((OSError, v.GRAPH_FILE_UNREADABLE), (KeyError, v.GRAPH_MISSING_FIELD),
+                         (TypeError, v.GRAPH_BAD_TYPE), (AttributeError, v.GRAPH_BAD_TYPE),
+                         (RecursionError, v.GRAPH_NESTING_BOUND), (ValueError, v.GRAPH_BAD_VALUE)):
+        if isinstance(exc, kind):
+            return reason
+    return v.GRAPH_UNAVAILABLE
 
 
 def build_graph(repo_path=".", *, as_of=None, _counters=None):
@@ -960,7 +924,7 @@ def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=
             if re.fullmatch(r"rule-[a-f0-9]{24}", target):
                 ident = target
             else:
-                queue = _queue(root)
+                queue = _queue(root, work)
                 if any(n.get("id") == target for n in queue.get("nodes", [])):
                     ident = target
         path, symbol = None, None

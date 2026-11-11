@@ -102,7 +102,13 @@ GRAPH_STATUS_LABELS = {status: "[" + status + "] " for status in
 GRAPH_STATS_LINE = "- %s: %s"
 GRAPH_STATS_UNATTACHED = "Lessons attached to no file"
 GRAPH_STATS_UNANCHORED = "Rules with no anchor"
-GRAPH_UNAVAILABLE = "Graph unavailable: repository evidence is unsafe, unreadable or exceeds its input bound."
+GRAPH_UNAVAILABLE = "Graph projection failed while interpreting repository evidence."
+GRAPH_FILE_UNREADABLE = "A repository evidence file could not be read."
+GRAPH_MISSING_FIELD = "A repository evidence record is missing a required field."
+GRAPH_BAD_TYPE = "A repository evidence record has an invalid value type."
+GRAPH_BAD_VALUE = "Repository evidence contains an invalid value or text encoding."
+GRAPH_NESTING_BOUND = "Repository evidence exceeds the supported nesting depth."
+GRAPH_QUEUE_UNREADABLE = "Dream queue is malformed, unreadable or exceeds its byte limit."
 GRAPH_INVALID_TIME = "invalid as_of timestamp"
 GRAPH_UNSAFE_DREAM = "unsafe Dream input"
 GRAPH_QUEUE_BOUND = "Dream graph exceeds graph work bound"
@@ -114,7 +120,7 @@ GRAPH_INVALID_SYMBOL = "invalid symbol target"
 GRAPH_INVALID_TARGET = "target is outside the repository, unsafe, or differs from the exact on-disk spelling"
 GRAPH_UNKNOWN_ID = "unknown rule or lesson id"
 GRAPH_UNKNOWN_FILE = "unknown file target"
-GRAPH_REFUSALS = (GRAPH_INVALID_TIME, GRAPH_UNSAFE_DREAM, GRAPH_QUEUE_BOUND, GRAPH_EVIDENCE_ERROR,
+GRAPH_REFUSALS = (GRAPH_QUEUE_UNREADABLE, GRAPH_INVALID_TIME, GRAPH_UNSAFE_DREAM, GRAPH_QUEUE_BOUND, GRAPH_EVIDENCE_ERROR,
                   GRAPH_INVALID_TIERS, GRAPH_INVALID_BUDGET, GRAPH_TARGET_REQUIRED, GRAPH_INVALID_SYMBOL,
                   GRAPH_INVALID_TARGET, GRAPH_UNKNOWN_ID, GRAPH_UNKNOWN_FILE)
 GRAPH_CLI_HELP = "Inspect the typed, time-aware memory attached to code."
