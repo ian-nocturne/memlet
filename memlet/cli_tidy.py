@@ -18,12 +18,22 @@ def _days(text):
     return value
 
 
+def _min_seen(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid int value: %r" % text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be an integer of at least 1")
+    return value
+
+
 def register(sub):
-    parser = sub.add_parser("tidy", prog="memlet admin tidy", help=COMMANDS["tidy"]["help"])
-    parser.add_argument("--repo", default=".")
-    parser.add_argument("--stale-days", type=_days, default=180, metavar="N")
-    parser.add_argument("--min-seen", type=int, default=3, metavar="N")
-    cli_plugins.add_format_option(parser)
+    parser = sub.add_parser("tidy", prog="memlet admin tidy", help=COMMANDS["tidy"]["help"], description=COMMANDS["tidy"]["help"])
+    parser.add_argument("--repo", default=".", help="Repository to inspect (default: current directory).")
+    parser.add_argument("--stale-days", type=_days, default=180, metavar="N", help="Age for old unseen lessons in days (default: 180).")
+    parser.add_argument("--min-seen", type=_min_seen, default=3, metavar="N", help="Sessions needed for promotion (default: 3).")
+    parser.add_argument("--format", choices=("json", "markdown"), default="json", help="Output format (default: json).")
 
 
 def dispatch(args):

@@ -25,16 +25,17 @@ def register(sub) -> None:
         "skillbook",
         prog="memlet admin skillbook",
         help=COMMANDS["skillbook"]["help"],
+        description=COMMANDS["skillbook"]["help"],
     )
-    parser.add_argument("--repo", action=_RepoAction, default=".")
+    parser.add_argument("--repo", action=_RepoAction, default=".", help="Memlet repository (default: current directory).")
     parser.add_argument("--name", default=v.SKILL_DEFAULT_NAME, help=v.SKILL_CLI_NAME_HELP)
-    parser.add_argument("--max-lines", type=int, default=500)
-    parser.add_argument("--budget", type=int, default=5000)
+    parser.add_argument("--max-lines", type=int, default=500, help="Maximum body lines (default: 500).")
+    parser.add_argument("--budget", type=int, default=5000, help="Approximate body token budget (default: 5000).")
     parser.add_argument("--write", action="store_true", help=v.SKILL_CLI_WRITE_HELP)
     parser.add_argument("--out", default=None, metavar="DIR", help=v.SKILL_CLI_OUT_HELP)
     parser.add_argument("--force", action="store_true", help=v.SKILL_CLI_FORCE_HELP)
     parser.add_argument("--check", default=None, metavar="PATH", help=v.SKILL_CLI_CHECK_HELP)
-    cli_plugins.add_format_option(parser)
+    parser.add_argument("--format", choices=("json", "markdown"), default="json", help="Output format (default: json).")
 
 
 def dispatch(args) -> Dict[str, Any]:

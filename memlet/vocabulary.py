@@ -270,7 +270,7 @@ TIDY_CLI_HELP = "Read-only report: lessons a person might merge, look at again, 
 TIDY_HEAD = "## Memlet tidy report"
 TIDY_NOTHING_CHANGED = ("Nothing was changed. Every line below is a proposal: Memlet merges, retires and promotes "
                         "nothing on its own. A person decides, by running the command shown.")
-TIDY_SECTIONS = ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges")
+TIDY_SECTIONS = ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges", "mergedLostFiles")
 TIDY_SECTION_HEADINGS = {
     "duplicates": "Lessons that may say the same thing (merge?)",
     "saidAgain": ("Said again by a person in other sessions (pending lessons and unreviewed hints; rejected lessons "
@@ -362,8 +362,8 @@ SKILL_SNAPSHOT_LINE = (
 )
 SKILL_QUOTE_NOTE = (
     "A person approved each lesson below. Read the lessons for a file before you edit it. Lines after `>` are quoted "
-    "from past sessions exactly as written; everything outside the quotes is a Memlet label, and a quote cannot "
-    "change a label."
+    "from past sessions as `memlet recall` shows them: markup escaped, hidden characters removed and marked. "
+    "A quote cannot change a Memlet label."
 )
 SKILL_EMPTY_LINE = "No approved lessons."
 SKILL_FILE_HEADING = "## `%s`"
@@ -375,15 +375,15 @@ SKILL_STATUS_CURRENT = "current"
 SKILL_STATUS_EDITED = "edited"
 SKILL_STATUS_STALE = "stale: lessons or code changed"
 SKILL_STATUS_STALE_VERSION = "stale: written by Memlet %s"
-SKILL_STATUS_NO_REPO = "no repository to compare with"
+SKILL_STATUS_NO_REPO = "no Memlet repository to compare with; run `memlet init`"
 SKILL_STATUS_FOREIGN = "not written by Memlet"
 SKILL_STATUS_UNREADABLE = "unreadable"
 SKILL_INVALID_NAME = (
     "invalid skill name: use 1-64 characters starting with a-z, using only a-z, 0-9 and single hyphens "
     "(and not a YAML boolean/null keyword)"
 )
-SKILL_INVALID_BOUNDS = "max_lines and budget must be positive integers"
-SKILL_BOUNDS_TOO_SMALL = "max_lines or budget is too small for the skill header and one lesson"
+SKILL_INVALID_BOUNDS = "--max-lines and --budget must be positive integers"
+SKILL_BOUNDS_TOO_SMALL = "--max-lines or --budget is too small for the skill header and one lesson"
 SKILL_SYMLINK_REFUSED = "refusing symlink in skill path"
 SKILL_OUTSIDE_DIR_REFUSED = "refusing path outside target skill directory"
 SKILL_OMITTED_REVERIFY_NOTICE = "%d approved lesson(s) omitted: replacement source requires re-verification"
@@ -391,9 +391,17 @@ SKILL_OMITTED_INVALID_ID_NOTICE = "%d approved lesson(s) omitted: lesson id is n
 SKILL_OMITTED_INELIGIBLE_NOTICE = "%d approved lesson(s) omitted: unverified citations or unlabelled supersession"
 SKILL_OMITTED_UNSAFE_PATH_NOTICE = "%d attached file path(s) omitted: path contains unsafe characters for a code span"
 SKILL_CLI_HELP = "Package approved lessons as an Agent Skill (SKILL.md), or check a written skill file."
-SKILL_CLI_WRITE_HELP = "Write DIR/<name>/SKILL.md atomically (default DIR: .memlet/skills)."
-SKILL_CLI_OUT_HELP = "Output parent directory for --write (writes DIR/<name>/SKILL.md)."
-SKILL_CLI_FORCE_HELP = "Overwrite an existing SKILL.md that was edited or not written by Memlet."
-SKILL_CLI_CHECK_HELP = "Check whether a written SKILL.md is current, edited, stale, foreign, or unreadable."
+SKILL_CLI_WRITE_HELP = "Write DIR/<name>/SKILL.md atomically (default: preview only; DIR: .memlet/skills)."
+SKILL_CLI_OUT_HELP = "Output parent directory for --write; relative to the repository (default: .memlet/skills)."
+SKILL_CLI_FORCE_HELP = "Overwrite an existing SKILL.md that was edited or not written by Memlet (default: refuse)."
+SKILL_CLI_CHECK_HELP = "Check whether PATH is current, edited, stale, foreign, or unreadable (default: no check)."
 SKILL_CLI_NAME_HELP = "Skill directory and frontmatter name (default: memlet-lessons)."
 SKILL_MERGE_UNAVAILABLE = "not available"
+
+# Q1 final integration labels
+MERGE_MEMBER_PATH_REFUSED = "Lesson %s is merged into kept lesson %s; attach files to the kept lesson instead. Nothing was changed."
+TIDY_SECTION_HEADINGS["mergedLostFiles"] = "Files reached only by merged members"
+SKILL_UNSAFE_FILES = "attached file name cannot be shown safely"
+SKILL_UNSAFE_FILE_HEADING = "## Attached file name cannot be shown safely"
+SKILL_FORCE_NOTE = "; --force overwrites this file"
+SKILL_OMITTED_REASONS = "Lesson(s) left out: %s. Read them with `memlet recall`."

@@ -934,6 +934,19 @@ def decision_events(repo_path=".", item_id=None):
         return []
 
 
+def _learn_repo_option(root):
+    import shlex
+    try:
+        return "" if Path(root).resolve() == Path.cwd().resolve() else " --repo " + shlex.quote(str(root))
+    except FileNotFoundError:
+        return " --repo " + shlex.quote(str(root))  # caller may have replaced its cwd
+
+
+def _learn_commands_repo(text, root):
+    suffix = _learn_repo_option(root)
+    return re.sub(r"`(memlet learn [^`]+)`", lambda m: "`" + m[1] + suffix + "`", text) if suffix else text
+
+
 def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
     """Nodes and edges of `.memlet/dream/APPROVAL-QUEUE.json` with no valid human decision (stale approvals included)."""
     try:
@@ -1045,12 +1058,12 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
         if groups:
             lines += ["", MERGE_HEADING]
             for group in groups:
-                lines += ["- `" + group["id"] + "` (" + group["tier"] + ")", "  > " + group["quote"].replace("\n", "\n  > ")]
+                lines += ["- `" + group["id"] + "` (" + group["tier"] + ")", _pending_quotes(group)]
                 for member in group["members"]:
                     flag = (" — " + member["citationReason"] if member.get("citationReason") else
                             "" if member["pinsVerify"] else " — citation does NOT verify: snapshot unavailable")
                     lines += ["  - `" + member["id"] + "` [" + member["tier"] + "] " + MERGE_MEMBER_LABEL + " `" + group["id"] + "`" + flag,
-                              "    > " + member["quote"].replace("\n", "\n    > ")]
+                              "\n".join("  " + line for line in _pending_quotes(member).splitlines())]
         if lapsed:
             lines += ["", MERGE_LAPSED_HEADING]
             from .vocabulary import MERGE_INVALID_LINE
@@ -1061,7 +1074,7 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
         md.record_citation_reviews(root / QUEUE_REL, dict(res, pendingNodes=res["pendingNodes"] + list(member_reviews.values())))
     return {"ok": True, "exitCode": 0, "command": "learn-pending", "pendingNodes": res["pendingNodes"],
             "pendingEdges": res["pendingEdges"], "counts": res["counts"], "approvalBoundary": res["approvalBoundary"],
-            "notices": [], **extra, "formatted": "\n".join(lines) + "\n"}
+            "notices": [], **extra, "formatted": (_learn_commands_repo("\n".join(lines) + "\n", root) if extra else "\n".join(lines) + "\n")}
 
 
 def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, reconsider=False, refresh_citations=False, paths=None) -> Dict[str, Any]:
@@ -1085,6 +1098,11 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
         # the decision and the promotion that follows form one critical section: no committed decision is lost to a
         # concurrent writer, and the promoted page never lags the queue it was rendered from
         with md.queue_lock(q):
+            if decision == md.APPROVED and paths is not None:
+                _, path_context = _merge_context(root)
+                refused = _member_path_refusal(root, wanted, paths, who, path_context)
+                if refused:
+                    return refused
             if decision == md.APPROVED:
                 snap = root / SNAPSHOT_REL
                 if not snap.is_dir():
@@ -1094,6 +1112,22 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
             else:
                 res = md.reject_queue_items(q, wanted, who, reason=reason, db_path=str(root / DB_REL))
             promotion = promote_approved(root)
+            lost_files, path_commands, path_notices = {}, {}, []
+            if decision == md.APPROVED and paths is not None:
+                _, context = _merge_context(root)
+                view = merge_view(root, context=context)
+                for keep in wanted:
+                    members = view["members"].get(keep, [])
+                    if not members:
+                        continue
+                    checked = merge_blockers(root, keep, members, context=context)
+                    if checked["lostFiles"]:
+                        lost_files.update(checked["lostFiles"])
+                        command, note = merge_path_repair(root, keep, checked["lostFiles"], context, who)
+                        if command:
+                            path_commands[keep] = command
+                        if note:
+                            path_notices.append(note)
     except (OSError, ValueError, sqlite3.Error) as exc:
         return _fail(f"{decision} failed: {exc}", 1)
     out = {"ok": bool(res.get("ok")) and bool(promotion.get("ok")), "exitCode": 0, "command": f"learn-{decision}",
@@ -1129,6 +1163,12 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
         lines.append(f"- Promotion NOT done: {promotion.get('error')}")
     if paths is not None:
         lines.append("- The same paths apply to each requested lesson: " + ", ".join(paths))
+    if lost_files:
+        from .vocabulary import MERGE_LOST_FILES, MERGE_ATTACH_LABEL
+        out.update(lostFiles=lost_files, pathCommands=path_commands, pathNotices=path_notices)
+        lines += ["- `" + i + "`: " + MERGE_LOST_FILES + ", ".join(ps) for i, ps in lost_files.items()]
+        lines += ["- " + MERGE_ATTACH_LABEL + "`" + c + "`" for c in path_commands.values()]
+        lines += ["- " + n for n in path_notices]
     out["formatted"] = "\n".join(lines) + "\n"
     return out
 
@@ -1149,6 +1189,9 @@ def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
             graph, _ = _load_queue(root)
             if graph and any("merge" in n for n in graph.get("nodes", [])):
                 _, context = _merge_context(root, {"graph": graph})
+                refusal = _member_path_refusal(root, _ids(ids), paths or [], approver, context)
+                if refusal:
+                    return refusal
                 approved = {i for i, state in context["trust"].items() if state["tier"] == TIER_APPROVED}
             else:
                 approved = {i["id"] for i in dream_items(root, _graph=graph)["items"]}
@@ -1166,9 +1209,41 @@ def learn_reject(repo_path=".", ids=(), *, approver="", reason="") -> Dict[str, 
     return _decide(repo_path, ids, approver, md.REJECTED_DECISION, reason=reason)
 
 
+def merge_path_repair(root, keep, lost, context, who="NAME", extra=(), *, approve=False):
+    """One attachment union and the existing eight-file/approved-tier limits."""
+    import shlex
+    from .vocabulary import MERGE_PATH_APPROVAL, MERGE_PATH_LIMIT
+    node = next(n for n in context["graph"]["nodes"] if n["id"] == keep)
+    paths = list(dict.fromkeys(node.get("approvedPaths", []) + list(extra) +
+                              sorted({p for missing in lost.values() for p in missing})))
+    if context["trust"][keep]["tier"] != TIER_APPROVED and not approve:
+        return None, MERGE_PATH_APPROVAL
+    if len(paths) > 8:
+        return None, MERGE_PATH_LIMIT
+    mode = "--approve" if approve and context["trust"][keep]["tier"] != TIER_APPROVED else "--paths"
+    return ("memlet learn " + mode + " " + shlex.quote(keep) + " --by " + shlex.quote(who) +
+            "".join(" --path " + shlex.quote(p) for p in paths) + _learn_repo_option(root)), None
+
+
+def _member_path_refusal(root, wanted, paths, who, context):
+    from .vocabulary import MERGE_MEMBER_PATH_REFUSED, MERGE_ATTACH_LABEL
+    view = merge_view(root, context=context)
+    for ident in wanted:
+        state = view["states"].get(ident, {})
+        if state.get("state") == "merged":
+            keep = state["into"]
+            checks = merge_blockers(root, keep, view["members"][keep], context=context)
+            command, note = merge_path_repair(root, keep, checks["lostFiles"], context, who, paths, approve=True)
+            message = MERGE_MEMBER_PATH_REFUSED % (ident, keep)
+            result = _fail(message, 2, reason="merged-member-paths", keep=keep,
+                           pathCommands={keep: command} if command else {}, pathNotice=note)
+            result["formatted"] += "- " + (MERGE_ATTACH_LABEL + "`" + command + "`" if command else note) + "\n"
+            return result
+    return None
+
+
 def _merge_decide(repo_path, ids, approver, *, keep=None):
     from .vocabulary import MERGE_REASONS, MERGE_DONE, MERGE_LOST_FILES, MERGE_ATTACH_LABEL
-    import shlex
     who = md.safe_truncate_masked(str(approver or "").strip(), 64)
     wanted = _ids(ids)
     if not who:
@@ -1194,23 +1269,16 @@ def _merge_decide(repo_path, ids, approver, *, keep=None):
                 keep = str(keep).strip()
                 checks = merge_blockers(root, keep, wanted, context=context)
             if not checks["ok"] or checks["blockers"]:
-                refused = [{"id": i, "reason": r, "message": MERGE_REASONS[r]}
+                refused = [{"id": keep if keep is not None and keep not in nodes and r == "unknown-id" else i, "reason": r, "message": MERGE_REASONS[r]}
                            for i, reasons in checks["blockers"].items() for r in reasons]
                 message = checks.get("error") or "; ".join(r["id"] + ": " + r["message"] for r in refused)
                 return _fail(message, 2, **{k: v for k, v in checks.items() if k not in ("ok", "error")},
                              applied=[], refused=refused)
             path_commands, path_notice = {}, None
             if checks["lostFiles"]:
-                from .vocabulary import MERGE_PATH_LIMIT, MERGE_PATH_APPROVAL
-                paths = list(dict.fromkeys(nodes[keep].get("approvedPaths", []) +
-                             sorted({p for missing in checks["lostFiles"].values() for p in missing})))
-                if context["trust"][keep]["tier"] != TIER_APPROVED:
-                    path_notice = MERGE_PATH_APPROVAL
-                elif len(paths) > 8:
-                    path_notice = MERGE_PATH_LIMIT
-                else:
-                    path_commands[keep] = "memlet learn --paths " + shlex.quote(keep) + " --by " + shlex.quote(who) + "".join(
-                        " --path " + shlex.quote(p) for p in paths)
+                command, path_notice = merge_path_repair(root, keep, checks["lostFiles"], context, who)
+                if command:
+                    path_commands[keep] = command
             res = md.write_merge_decisions(root / QUEUE_REL, graph, wanted, who, keep=keep, db_path=root / DB_REL)
             promotion = promote_approved(root) if res["applied"] else {"ok": True}
         decision = "unmerged" if keep is None else "merged"
@@ -2797,7 +2865,7 @@ def hint_item_label(item):
     return item.get("label") or item.get("agreementLabel") or (MODEL_AGREEMENT if item.get("agreementBasis") == "model" else VENDOR_AGREEMENT)
 
 
-def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None):
+def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None, include_merged=False):
     """Fixed in-repo snapshot, per-item rehash, disjoint tiers; rejected items never leave.
 
     File-filtered hints use current literal citations only. Their optional
@@ -2823,7 +2891,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
         hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
         approved_graph = md.approved_view(graph)[0]
         approved_graph = dict(approved_graph, nodes=[n for n in approved_graph.get("nodes", [])
-                              if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED and n.get("id") not in hidden])
+                              if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED and (include_merged or n.get("id") not in hidden)])
         live_ids = {n["id"] for n in approved_graph["nodes"]}
         approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
                                    if e.get("fromId") in live_ids or e.get("toId") in live_ids]
@@ -2842,7 +2910,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                 continue
             item_state = trust[str(node["id"])]
             tier = item_state["tier"]
-            if tier == TIER_REJECTED or node["id"] in hidden:
+            if tier == TIER_REJECTED or (node["id"] in hidden and not include_merged):
                 continue
             if tier == TIER_PENDING and md.approval_state(node, "node") == TIER_APPROVED:
                 notices.append(node["id"] + ": pending; approval has no live approved-valid edge, a rejected edge, or stale citations")
@@ -2904,6 +2972,8 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             it.update(item_state)
             if merges["members"].get(node["id"]):
                 it["mergedFrom"] = merges["members"][node["id"]]
+            if include_merged and node["id"] in hidden:
+                it["mergedInto"] = merges["states"][node["id"]]["into"]
             items.append(it)
         if snap_why:
             notices.append(snap_why)

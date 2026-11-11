@@ -246,9 +246,9 @@ def _format_cite(c: Dict[str, Any]) -> str:
     return f"{f}:{a}" + (f"-{b}" if b != a else "")
 
 
-def _render_item_lines(item: Dict[str, Any], item_files: Sequence[str]) -> List[str]:
+def _render_item_lines(item: Dict[str, Any], item_files: Sequence[str], unsafe=False) -> List[str]:
     """Render one lesson item as markdown lines.
-    Every Memlet label is on a line outside the block quote; `  > ` lines contain only the quoted line (S2, Note 2)."""
+    Quotes use recall display escaping and hidden-character markers; relation and file labels stay outside."""
     rels = [r for r in v.BRIDGE_RELATIONS if r in (item.get("edgeTypes") or [])] or ["LESSON"]
     quotes = list(item.get("quoteLines") or [item.get("text") or ""])
     cites = list(item.get("cites") or [])
@@ -258,7 +258,11 @@ def _render_item_lines(item: Dict[str, Any], item_files: Sequence[str]) -> List[
     if "replaced" in roles:
         parts = sorted(parts, key=lambda p: p[0] != "replaced")
     cite_strs = [_format_cite(c) for _, _, c in parts]
-    file_strs = [f"`{f}`" for f in item_files] if item_files else [v.SKILL_ANY_FILE]
+    file_strs = [f"`{f}`" for f in item_files]
+    if unsafe:
+        file_strs.append(v.SKILL_UNSAFE_FILES)
+    if not file_strs:
+        file_strs = [v.SKILL_ANY_FILE]
     head = v.SKILL_ITEM_HEAD % (
         ", ".join(rels),
         str(item.get("id") or ""),
@@ -285,6 +289,7 @@ def _render_body(
     *,
     rendered_items: Optional[Dict[str, List[str]]] = None,
     unsafe_path_lessons: Optional[Set[str]] = None,
+    omitted_reasons=None,
 ) -> str:
     lines: List[str] = [
         v.SKILL_BODY_TITLE,
@@ -292,18 +297,21 @@ def _render_body(
         v.SKILL_SNAPSHOT_LINE % (repo_head, len(kept)),
         v.SKILL_QUOTE_NOTE,
     ]
-    if not kept and omitted == 0:
+    if not kept and omitted == 0 and not any((omitted_reasons or {}).values()):
         lines.extend(["", v.SKILL_EMPTY_LINE])
     elif kept:
         by_file: Dict[str, List[Dict[str, Any]]] = {}
         unattached: List[Dict[str, Any]] = []
+        unsafe_items: List[Dict[str, Any]] = []
         unsafe_set = unsafe_path_lessons or set()
         for it in kept:
             lid = it["id"]
             lfiles = lesson_files.get(lid, ())
             for fpath in lfiles:
                 by_file.setdefault(fpath, []).append(it)
-            if not lfiles or lid in unsafe_set:
+            if lid in unsafe_set:
+                unsafe_items.append(it)
+            elif not lfiles:
                 unattached.append(it)
 
         for fpath in ordered_files:
@@ -317,23 +325,26 @@ def _render_body(
                 item_lines = (
                     rendered_items[lid]
                     if rendered_items is not None and lid in rendered_items
-                    else _render_item_lines(it, lesson_files.get(lid, ()))
+                    else _render_item_lines(it, lesson_files.get(lid, ()), lid in unsafe_set)
                 )
                 lines.extend(item_lines)
 
-        if unattached:
+        for unattached, heading in ((unattached, v.SKILL_ANY_FILE_HEADING), (unsafe_items, v.SKILL_UNSAFE_FILE_HEADING)):
+            if not unattached:
+                continue
             unattached.sort(key=lambda it: (_item_rank(it), str(it.get("id") or "")))
-            lines.extend(["", v.SKILL_ANY_FILE_HEADING])
+            lines.extend(["", heading])
             for it in unattached:
                 lid = it["id"]
                 item_lines = (
                     rendered_items[lid]
                     if rendered_items is not None and lid in rendered_items
-                    else _render_item_lines(it, lesson_files.get(lid, ()))
+                    else _render_item_lines(it, lesson_files.get(lid, ()), lid in unsafe_set)
                 )
                 lines.extend(item_lines)
-    if omitted > 0:
-        lines.extend(["", v.HOOK_OMITTED % omitted])
+    footer = _omission_line(omitted, omitted_reasons or {})
+    if footer:
+        lines.extend(["", footer])
     return "\n".join(lines) + "\n"
 
 
@@ -378,6 +389,12 @@ def _assemble_skill_text(
     return text, digest
 
 
+def _omission_line(budget, reasons):
+    counts = dict(reasons, budget=budget)
+    return (v.SKILL_OMITTED_REASONS % "; ".join("%s: %d" % (k, n) for k, n in counts.items() if n)
+            if any(counts.values()) else "")
+
+
 def _int_token_cost(n: int) -> int:
     return -(-len(str(n)) // 4)
 
@@ -418,7 +435,9 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
             "error": v.SKILL_INVALID_BOUNDS,
         }
     try:
-        root = mw._resolve_root(repo_path)
+        root = _resolve_memlet_repo(repo_path)
+        if root is None:
+            raise ValueError(v.SKILL_STATUS_NO_REPO)
     except (OSError, ValueError) as exc:
         msg = str(exc)
         return {
@@ -527,6 +546,7 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
     if omitted_unsafe_paths > 0:
         notices.append(v.SKILL_OMITTED_UNSAFE_PATH_NOTICE % omitted_unsafe_paths)
 
+    omitted_reasons = {"invalid-id": omitted_invalid_id, "ineligible": omitted_ineligible, "reverify": omitted_reverify}
     all_ordered_files = sorted(file_counts, key=lambda f: (-file_counts[f], f))
     file_order_index = {f: idx for idx, f in enumerate(all_ordered_files)}
 
@@ -546,7 +566,6 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
         + (mw.estimate_tokens(v.SKILL_SNAPSHOT_LINE % (repo_head, 0)) - 1)
         + mw.estimate_tokens(v.SKILL_QUOTE_NOTE)
     )
-    omitted_base_tokens = mw.estimate_tokens(v.HOOK_OMITTED % 0) - 1
     any_heading_tokens = mw.estimate_tokens(v.SKILL_ANY_FILE_HEADING)
     file_heading_tokens: Dict[str, int] = {}
 
@@ -581,7 +600,7 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
         running_lines = 4
         running_tokens = header_base_tokens
         seen_files: Set[str] = set()
-        seen_unattached = False
+        seen_unattached = set()
         best_k = 0
 
         for idx, it in enumerate(ordered_lessons):
@@ -595,7 +614,7 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
             if running_lines + 2 * num_appearances > max_lines and idx > 0:
                 break
 
-            item_lines = _render_item_lines(it, lfiles)
+            item_lines = _render_item_lines(it, lfiles, lid in unsafe_path_lessons)
             rendered_map[lid] = item_lines
             item_line_count = len(item_lines)
             item_token_cost = mw.estimate_tokens("\n".join(item_lines))
@@ -609,21 +628,23 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
                         htok = mw.estimate_tokens(v.SKILL_FILE_HEADING % fpath)
                         file_heading_tokens[fpath] = htok
                     running_tokens += htok
-            if in_any and not seen_unattached:
-                seen_unattached = True
+            heading = v.SKILL_UNSAFE_FILE_HEADING if lid in unsafe_path_lessons else v.SKILL_ANY_FILE_HEADING
+            if in_any and heading not in seen_unattached:
+                seen_unattached.add(heading)
                 running_lines += 2
-                running_tokens += any_heading_tokens
+                running_tokens += mw.estimate_tokens(heading)
 
             running_lines += num_appearances * item_line_count
             running_tokens += num_appearances * item_token_cost
 
             k = idx + 1
             rem = total_lessons - k
-            cand_lines = running_lines + (2 if rem > 0 else 0)
+            footer = _omission_line(rem, omitted_reasons)
+            cand_lines = running_lines + (2 if footer else 0)
             cand_tokens = (
                 running_tokens
                 + _int_token_cost(k)
-                + (omitted_base_tokens + _int_token_cost(rem) if rem > 0 else 0)
+                + mw.estimate_tokens(footer)
             )
             if cand_lines <= max_lines and cand_tokens <= budget:
                 best_k = k
@@ -664,6 +685,7 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
         omitted,
         rendered_items=rendered_map,
         unsafe_path_lessons=unsafe_path_lessons,
+        omitted_reasons=omitted_reasons,
     )
     description = _build_description(kept_ordered_files)
     text, digest = _assemble_skill_text(name, description, body, repo_head)
@@ -674,7 +696,8 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
         "text": text,
         "digest": digest,
         "items": len(kept),
-        "omitted": omitted,
+        "omitted": omitted + sum(omitted_reasons.values()),
+        "omittedReasons": dict(omitted_reasons, budget=omitted),
         "files": list(kept_ordered_files),
         "notices": notices,
     }
@@ -797,50 +820,32 @@ def _check_no_symlinks_in_out(
     *,
     cwd: Optional[Path] = None,
 ) -> Tuple[Optional[Path], Optional[str]]:
-    """Resolve and validate the output directory `base_dir` for `--write`.
-    Note 6: a relative `--out` is relative to the current directory (`cwd`).
-    Refuses symlinks in `base_dir` or anywhere below `base_dir` (`<name>` and `<name>/SKILL.md`)."""
-    if out is None:
-        problem = mw.contained_path_problem(root, f"{v.SKILL_DEFAULT_DIR}/{name}/{v.SKILL_FILENAME}", leaf="file")
+    """Relative output is repository-relative; in-repo ancestors may never be symlinks."""
+    if out is not None and (not isinstance(out, (str, os.PathLike)) or not str(out).strip() or "\x00" in str(out)):
+        return None, v.SKILL_OUTSIDE_DIR_REFUSED
+    raw = Path(v.SKILL_DEFAULT_DIR if out is None else out)
+    if ".." in raw.parts:
+        return None, v.SKILL_OUTSIDE_DIR_REFUSED
+    base_dir = raw if raw.is_absolute() else root / raw
+    # /tmp and /private/tmp (or a caller's alias of the repository) must obey
+    # the same below-root rule without resolving away a hostile child symlink.
+    for ancestor in [base_dir] + list(base_dir.parents):
+        try:
+            if ancestor.samefile(root):
+                base_dir = root / base_dir.relative_to(ancestor)
+                break
+        except OSError:
+            continue
+    try:
+        relative = base_dir.relative_to(root)
+    except ValueError:
+        relative = None
+    if relative is not None:
+        problem = mw.contained_path_problem(root, (relative / name / v.SKILL_FILENAME).as_posix(), leaf="file")
         if problem:
             return None, v.SKILL_SYMLINK_REFUSED if "symlink" in problem else problem
-        base_dir = root / v.SKILL_DEFAULT_DIR
-    else:
-        if not isinstance(out, (str, os.PathLike)) or not str(out).strip() or "\x00" in str(out):
-            return None, v.SKILL_OUTSIDE_DIR_REFUSED
-
-        raw_out = Path(out)
-        if not raw_out.is_absolute():
-            rel_str = str(raw_out).replace("\\", "/")
-            while rel_str.startswith("./"):
-                rel_str = rel_str[2:]
-            parts = tuple(p for p in rel_str.split("/") if p and p != ".")
-            if not parts or any(p == ".." for p in parts):
-                return None, v.SKILL_OUTSIDE_DIR_REFUSED
-            anchor_dir = (cwd or Path.cwd()).resolve()
-            rel_target = "/".join(parts + (name, v.SKILL_FILENAME))
-            problem = mw.contained_path_problem(anchor_dir, rel_target, leaf="file")
-            if problem:
-                return None, v.SKILL_SYMLINK_REFUSED if "symlink" in problem else problem
-            if anchor_dir != root:
-                repo_problem = mw.contained_path_problem(root, rel_target, leaf="file")
-                if repo_problem and "symlink" in repo_problem:
-                    return None, v.SKILL_SYMLINK_REFUSED
-            base_dir = anchor_dir.joinpath(*parts)
-        else:
-            if ".." in raw_out.parts:
-                return None, v.SKILL_OUTSIDE_DIR_REFUSED
-            base_dir = raw_out
-
-    if os.path.lexists(str(base_dir)):
-        try:
-            st = os.lstat(str(base_dir))
-        except OSError as exc:
-            return None, str(exc)
-        if stat.S_ISLNK(st.st_mode):
-            return None, v.SKILL_SYMLINK_REFUSED
-        if not stat.S_ISDIR(st.st_mode):
-            return None, f"{base_dir} is not a directory"
+    if base_dir.exists() and not base_dir.is_dir():
+        return None, str(base_dir) + " is not a directory"
 
     skill_dir = base_dir / name
     if os.path.lexists(str(skill_dir)):
@@ -916,7 +921,7 @@ def _ensure_skill_dirs(base_dir: Path, name: str) -> Path:
             raise mw.UnsafePathError(v.SKILL_SYMLINK_REFUSED)
 
     st_base = os.lstat(str(base_dir))
-    if stat.S_ISLNK(st_base.st_mode) or not stat.S_ISDIR(st_base.st_mode):
+    if not base_dir.is_dir():
         raise mw.UnsafePathError(v.SKILL_SYMLINK_REFUSED)
 
     skill_dir = base_dir / name
@@ -933,7 +938,19 @@ def _ensure_skill_dirs(base_dir: Path, name: str) -> Path:
     return skill_dir
 
 
-def write_skill(
+def write_skill(repo_path=".", *, out=None, name="memlet-lessons", max_lines=500, budget=5000, force=False):
+    """Serialize build through rename with the repository's existing write lock."""
+    root = _resolve_memlet_repo(repo_path)
+    if root is None:
+        return {"ok": False, "written": False, "reason": v.SKILL_STATUS_NO_REPO, "error": v.SKILL_STATUS_NO_REPO}
+    try:
+        with mw.memlet_write_lock(root):
+            return _write_skill_locked(root, out=out, name=name, max_lines=max_lines, budget=budget, force=force)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "written": False, "reason": str(exc), "error": str(exc)}
+
+
+def _write_skill_locked(
     repo_path=".",
     *,
     out=None,
@@ -972,7 +989,7 @@ def write_skill(
             "ok": False,
             "name": name,
             "written": False,
-            "reason": existing_problem,
+            "reason": existing_problem + (v.SKILL_FORCE_NOTE if existing_problem in (v.SKILL_STATUS_EDITED, v.SKILL_STATUS_FOREIGN) else ""),
             "error": existing_problem,
         }
 
@@ -1056,6 +1073,9 @@ def check_skill(path, *, repo_path=None, max_lines=500, budget=5000) -> Dict[str
     """Check whether a written SKILL.md is `current`, `edited`, `stale: written by Memlet X`,
     `stale: lessons or code changed`, `no repository to compare with`, `not written by Memlet`,
     or `unreadable`. Never writes."""
+    repo_root = _resolve_memlet_repo(repo_path)
+    if repo_root is None:
+        return {"ok": True, "current": False, "reason": v.SKILL_STATUS_NO_REPO}
     if not isinstance(path, (str, os.PathLike)) or not str(path).strip() or "\x00" in str(path):
         return {"ok": True, "current": False, "reason": v.SKILL_STATUS_UNREADABLE}
 

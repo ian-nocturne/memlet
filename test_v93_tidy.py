@@ -516,7 +516,7 @@ class Bounds(Base):
         repo = self.make_repo(agents='# Rules\n' + ''.join('- %s\n' % r for r in rules))
         for i in range(2):  # two pending pairs: two duplicate groups, four said-again entries
             self.learn(repo, 'p%d.log' % i, *['2026-11-0%dT10:00:00Z [user] %s' % (i + 1, t) for t in pair])
-        approved = self.learn(repo, 'r.log', *['2026-11-01T11:00:00Z [user] ' + t for t in rules + free])
+        approved = self.learn(repo, 'r.log', *['2026-11-01T11:00:00Z [user] ' + t for t in rules + free + ['Never call refund() in billing.py on weekends.', 'Never edit billing.py without a checklist.']])
         self.assertTrue(mb.learn_approve(repo, approved, approver='Ray')['ok'])
         ids = self.node_ids_by_line(repo)
         lapsed = [ids['2026-11-01T11:00:00Z [user] ' + t] for t in free]
@@ -530,6 +530,8 @@ class Bounds(Base):
             with mock.patch.object(v, 'TIDY_SECTION_CAP', 1):
                 capped = self.report(repo, min_seen=1)
         for section in v.TIDY_SECTIONS:
+            if section == "mergedLostFiles":
+                continue  # holding merges are capped with the real adapter in the integration tests
             with self.subTest(section=section):
                 self.assertGreaterEqual(len(full[section]), 2)
                 self.assertEqual(1, len(capped[section]))
@@ -811,8 +813,8 @@ class Merge(Base):
         self.assertEqual((keep, 'keep-changed'), (entry['into'], entry['reason']))
         self.assertEqual(['memlet', 'learn', '--unmerge=' + lapsed, '--by=NAME', '--repo=' + str(repo)],
                          shlex.split(entry['command']))
-        self.assertEqual(['memlet', 'learn', '--merge=' + keep, '--same=' + lapsed, '--by=NAME', '--repo=' + str(repo)],
-                         shlex.split(entry['commands'][1]))
+        self.assertEqual([entry['command']], entry['commands'])
+        self.assertIsNone(report['duplicates'][0]['command'])
         group = report['duplicates'][0]
         self.assertEqual(sorted([lapsed, twin]), sorted([group['keep']] + group['same']))
         self.assertEqual({m: ['member-approved-keep-not'] for m in group['same']}, group['blockers'])
@@ -936,7 +938,7 @@ class ReadOnlyAndCompatibility(Base):
         outputs = dict(self.cli_state_unchanged(repo, '--min-seen', '2'))
         data = json.loads(outputs['json'])
         self.assertIn(v.TIDY_LEDGER_SIDE_EFFECTS, data['notices'])
-        self.assertEqual([(None, v.TIDY_NOT_CHECKED)], [(e['suggestedAnchor'], e['anchorNote']) for e in data['promote']])
+        self.assertEqual([], data['promote'])  # an exact pasted rule is no longer a promotion candidate
         anchors = [e['details'].get('anchor') for e in data['retire']]
         self.assertIn({'anchor': 'billing.py::refund', 'reason': v.TIDY_NOT_CHECKED}, anchors)
         self.assertNotIn('anchored-code-changed', json.dumps([e['reasons'] for e in data['retire']]))
@@ -987,9 +989,11 @@ class ReadOnlyAndCompatibility(Base):
         for key in ('duplicates', 'saidAgain', 'retire', 'unattached', 'promote', 'lapsedMerges', 'omitted',
                     'complete', 'notices', 'formatted'):
             self.assertIn(key, data)
-        code, out, _ = run_cli(['admin', 'tidy', '--repo', str(repo), '--min-seen', '0'])
+        code, out, err = run_cli(['admin', 'tidy', '--repo', str(repo), '--min-seen', '0'])
         self.assertEqual(2, code)
-        self.assertEqual(v.TIDY_INVALID_ARGUMENT, json.loads(out)['error'])
+        self.assertEqual('', out)
+        self.assertIn('--min-seen', err)
+        self.assertIn('at least 1', err)
         for days in ('1' + '0' * 100, '-1', str(mt.MAX_STALE_DAYS + 1)):
             code, out, err = run_cli(['admin', 'tidy', '--repo', str(repo), '--stale-days', days])
             self.assertEqual(2, code)

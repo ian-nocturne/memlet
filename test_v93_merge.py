@@ -383,7 +383,7 @@ class MergeTests(fixtures.Scratch):
         self.assertTrue(mb.learn_paths(self.root, ['B'], approver='R', paths=['src.py','other.py'])['ok'])
         result = self.merge()
         self.assertEqual({'B':['other.py']}, result['lostFiles'])
-        command = 'memlet learn --paths A --by Reviewer --path other.py'
+        command = 'memlet learn --paths A --by Reviewer --path other.py' + mb._learn_repo_option(self.root)
         self.assertEqual(command, result['pathCommands']['A']); self.assertIn(command, result['formatted'])
         self.assertEqual([], mg.neighbors(self.root, 'other.py')['groups']['blocks'])
         out = self.hook_outputs('guard')
@@ -491,7 +491,9 @@ class MergeTests(fixtures.Scratch):
             self.assertEqual(['src.py','other.py','third.py'], self.graph()['nodes'][0]['approvedPaths'])
             self.assertEqual(['A'], [i['id'] for i in mb.dream_items(self.root, files=['third.py'])['items']])
             # A member attachment is also outside merge identity, while approvals remain sealed.
-            self.assertTrue(mb.learn_paths(self.root, ['B'], approver='R', paths=['src.py'])['ok'])
+            before_paths = (self.root / mb.QUEUE_REL).read_bytes()
+            self.assertFalse(mb.learn_paths(self.root, ['B'], approver='R', paths=['src.py'])['ok'])
+            self.assertEqual(before_paths, (self.root / mb.QUEUE_REL).read_bytes())
             self.assertEqual('merged', self.state()['state'])
             old=json.loads(self.run_code(self.baseline(), "from memlet import memlet_bridge as b, memlet_dream as d; from pathlib import Path; import sys,json; print(json.dumps([d.approval_state(n,'node') for n in b._load_queue(Path(sys.argv[1]))[0]['nodes']]))"))
             self.assertEqual(['approved']*3, old)
