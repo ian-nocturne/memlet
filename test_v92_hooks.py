@@ -539,7 +539,7 @@ class JitTests(_Case):
         (self.repo / "mod.py").write_text(MOD_STALE)                  # an anchor status changed
         stale = ctx(self.pre("mod.py"))
         self.assertIn(voc.HOOK_GROUP_LABELS["stale"], stale)
-        self.assertIn("STALE `mod.py::charge`", stale)
+        self.assertRegex(stale, r"\n- STALE[^\n]*: rule at AGENTS\.md:3\n")
         self.assertNotIn(voc.HOOK_GROUP_LABELS["governs"] + "\n- rule at AGENTS.md:3", stale)
 
     def test_dedupe_survives_compaction_of_the_same_session(self):
@@ -876,7 +876,7 @@ class CapsuleTests(_Case):
         (self.repo / "mod.py").write_text(MOD_STALE)
         text = self.compact()
         self.assertIn(voc.HOOK_GROUP_LABELS["stale"], text)
-        self.assertIn("STALE `mod.py::charge`", text)
+        self.assertRegex(text, r"\n- STALE[^\n]*: rule at AGENTS\.md:3\n")
 
     def test_ingest_still_happens_and_nothing_touched_means_9_1_1_output(self):
         transcript = self.tmp / "transcripts" / "late.jsonl"
@@ -1107,6 +1107,14 @@ class AdapterTests(_Case):
     def setUp(self):
         super().setUp()
         self.set_hooks(jit=True, guard="deny", capsule=True)
+
+    def test_contract_shaped_items_without_fallback_extras_render(self):
+        rule = {"id": "rule-9", "kind": "rule", "relation": "GOVERNS", "status": "stale", "text": "Stale stub rule",
+                "quoteLines": ["Stale stub rule"], "cites": [], "source": "AGENTS.md:7", "why": "anchor-symbol"}
+        stub = {"ok": True, "groups": {"stale": [rule]}, "omitted": {}}
+        with mock.patch.object(mh, "_graph_neighbors", return_value=lambda *a, **k: stub):
+            text = ctx(self.pre("mod.py", sid="plain-contract"))
+        self.assertIn("- STALE: rule at AGENTS.md:7\n  > Stale stub rule", text)
 
     def test_contract_function_is_used_when_present(self):
         calls = []

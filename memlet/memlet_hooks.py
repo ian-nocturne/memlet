@@ -2002,9 +2002,10 @@ def _item_lines(item: Dict[str, Any], group: str) -> List[str]:
     if item.get("kind") == "rule":
         source = _clean(item.get("source"), 100)
         anchor = _clean(item.get("anchor"), 120)
-        if group == "stale":
-            head = (f"- {_clean(item.get('status'), 30).upper()} `{anchor}` ({_clean(item.get('reason'), 60)}): "
-                    f"rule at {source}")
+        if group == "stale":  # `anchor` / `reason` are fallback extras, not part of the `neighbors` item contract
+            reason = _clean(item.get("reason"), 60)
+            head = (f"- {_clean(item.get('status'), 30).upper()}" + (f" `{anchor}`" if anchor else "")
+                    + (f" ({reason})" if reason else "") + f": rule at {source}")
         elif group == "replaced":
             head = f"- {voc.HOOK_RULE_REPLACED} rule at {source}"
             by = item.get("replacedBy")
