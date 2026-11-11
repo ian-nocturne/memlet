@@ -1452,6 +1452,12 @@ def recall_subgraph(
                     node["verdict"] = PENDING
     else:
         view = _quote_integrity_view(graph)  # raw mode: an edited stored quote is still never shown
+    if any("merge" in n for n in graph.get("nodes", [])):
+        from .memlet_bridge import _merge_nodes, dream_tiers, merge_state
+        nodes = _merge_nodes(graph, dream_tiers(graph, snapshot=snapshot_files, config={}))
+        hidden = {i for i, n in nodes.items() if merge_state(n, nodes)["state"] == "merged"}
+        view = dict(view, nodes=[n for n in view.get("nodes", []) if n.get("id") not in hidden],
+                    edges=[e for e in view.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden])
     header = "# Memlet Dream Subgraph Capsule\n"
     if not require_approval:
         header += UNAPPROVED_LABEL
@@ -3966,6 +3972,50 @@ def _decide_locked(
         "dbPath": str(db_target) if (db_target and done) else None,
         "approvalBoundary": APPROVAL_BOUNDARY,
     }
+
+
+def write_merge_decisions(queue_path, graph, ids, who, *, keep=None, db_path=None):
+    """Persist a preflighted batch under the caller's queue lock, like approvals.
+
+    Merge records never enter approval digests. History is advisory and written
+    only after the atomic queue/ontology commit succeeds.
+    """
+    from .memlet_bridge import _decision_event_write
+    from .vocabulary import MERGE_SCHEMA
+    q = Path(queue_path)
+    prior_sha = graph_sha256(graph)
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    at, applied, unchanged, events = _utc_now_iso(), [], [], []
+    for ident in ids:
+        node = nodes[ident]
+        old = node.get("merge")
+        if keep is None:
+            if old is None:
+                unchanged.append(ident)
+                continue
+            node.pop("merge", None)
+            record = old
+        else:
+            record = dict(schema=MERGE_SCHEMA, into=keep, by=who, at=at,
+                          memberDigest=node_approval_digest(node), keepDigest=node_approval_digest(nodes[keep]))
+            if (isinstance(old, dict) and isinstance(old.get("by"), str) and old["by"].strip()
+                    and _valid_utc_stamp(old.get("at")) and all(old.get(k) == record[k]
+                    for k in ("schema", "into", "memberDigest", "keepDigest"))):
+                unchanged.append(ident)
+                continue
+            node["merge"] = record
+        applied.append(ident)
+        events.append((at, ident, "node", "unmerged" if keep is None else "merged", who,
+                       _canonical_digest(record), "[]"))
+    errors = []
+    if applied:
+        _commit_queue_and_db(q, json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+                             Path(db_path) if db_path else None, graph, replaces_sha=prior_sha)
+        try:
+            _decision_event_write(q.parent.parent.parent, events)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            errors.append("decision recorded; missing dream_decision_events: " + str(exc))
+    return dict(ok=not errors, applied=applied, unchanged=unchanged, eventErrors=errors)
 
 
 def approve_queue_items(

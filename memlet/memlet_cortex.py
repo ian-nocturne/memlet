@@ -66,6 +66,11 @@ def _load_dream_lineage(ws: Dict[str, Any]) -> Any:
         # stored quotes hash to their pins and every pin verifies against that snapshot; anything that cannot be
         # verified (no snapshot, changed snapshot, edited quote) is shown as pending with `citationVerified: false`.
         snap, _why = mb._load_snapshot(root_p)
+        if any("merge" in n for n in g.get("nodes", [])):
+            states = mb.merge_view(root_p, context=dict(graph=g, snapshot=snap))["states"]
+            hidden = {i for i, st in states.items() if st["state"] == "merged"}
+            g = dict(g, nodes=[n for n in g["nodes"] if n.get("id") not in hidden],
+                     edges=[e for e in g.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden])
         verified = copy.deepcopy(g)
         keep = []
         for n in verified.get("nodes") or []:

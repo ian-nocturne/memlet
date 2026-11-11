@@ -189,6 +189,7 @@ class _History:
         work = work or _Work()
         event_bound = min(MAX_EVENTS, MAX_NEIGHBOR_EVENTS) if work.bounded else MAX_EVENTS
         self.decisions, self.sidecars, self.conflicts = {}, {}, set()
+        self.merges = {}
         self.notices = []
         self.originals = {}
         self.now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -248,6 +249,9 @@ class _History:
                         at = _time(row["at"])
                         if at is None:
                             continue
+                        if kind == "node" and decision in ("merged", "unmerged"):
+                            self.merges.setdefault(ident, []).append(dict(at=at, seq=seq, decision=decision))
+                            continue  # merge rows never change an approval interval or digest
                         key = (kind, ident)
                         events = self.decisions.setdefault(key, [])
                         if events and _stamp(at) < _stamp(events[-1]["at"]):
@@ -396,7 +400,15 @@ class _History:
                 else "VALID") if record.get("decision") == APPROVED else md.PENDING
             if kind == "node":
                 item["proposers"], item["verification"] = [], []
+        hidden = set()
+        for ident, rows in self.merges.items():
+            past = sorted((r for r in rows if _before(r["at"], as_of)), key=lambda r: (_stamp(r["at"]), r["seq"]))
+            if past and past[-1]["decision"] == "merged":
+                hidden.add(ident)
+        view["nodes"] = [n for n in view.get("nodes", []) if n.get("id") not in hidden]
+        view["edges"] = [e for e in view.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden]
         for node in view.get("nodes", []):
+            node.pop("merge", None)  # present records cannot hide a lesson before its historical merged row
             restore(node, "node")
             for edge in node.get("edges", []):
                 restore(edge, "edge")
@@ -581,6 +593,21 @@ def _slice(graph, path, ident, work=None):
     selected.update(supersessions)
     if ident:
         selected.add(ident)
+    # Keep each selected merge component: both validity dependencies and mergedFrom
+    # must agree with a full read even when the kept lesson reaches another file.
+    adjacent = {}
+    for node in graph.get("nodes", []):
+        rec = node.get("merge")
+        if isinstance(rec, dict) and isinstance(rec.get("into"), str):
+            a, b = node.get("id"), rec["into"]
+            adjacent.setdefault(a, set()).add(b)
+            adjacent.setdefault(b, set()).add(a)
+    pending = list(selected)
+    while pending:
+        for other in adjacent.get(pending.pop(), ()):
+            if other not in selected:
+                selected.add(other)
+                pending.append(other)
     # Use tier_config's predicate, including verdict-only edge/node rejections.
     # Keep the matching twins themselves because dream_items builds this set.
     relevant_rejected = {quote_hashes[i] for i in selected if quote_hashes.get(i) in rejected}

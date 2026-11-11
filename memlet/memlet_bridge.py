@@ -349,6 +349,8 @@ def _merge(old: Optional[Dict[str, Any]], built: Dict[str, Any], snap: Dict[str,
         if o is not None and md.node_approval_digest(o) == md.node_approval_digest(candidate) and _intact(o):
             out_nodes.append(o)
         else:
+            if o is not None and "merge" in o:
+                n = dict(n, merge=copy.deepcopy(o["merge"]))  # changed content lapses; it does not erase the decision
             out_nodes.append(n)
             info["added" if o is None else "replacedChanged"].append(nid)
     for o in old_nodes:
@@ -964,6 +966,11 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
             res["pendingNodes"].append({"id": node["id"], "category": node["category"],
                 "categoryLabel": md.category_label(node["category"]), "quote": lesson_text(node), "span": pp.get("span"),
                 "staleApproval": True, "citationReason": "approval has no live approved-valid edge, a rejected edge, or stale citations"})
+    merges = merge_view(root, context=dict(graph=graph, snapshot=snap, config=config, trust=trust))
+    hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
+    res["pendingNodes"] = [i for i in res["pendingNodes"] if i["id"] not in hidden]
+    res["pendingEdges"] = [e for e in res["pendingEdges"] if e.get("fromId") not in hidden]
+    res["counts"]["pendingEdges"] = len(res["pendingEdges"])
     res["counts"]["pendingNodes"] = len(res["pendingNodes"])
     res["counts"]["approvedNodes"] = sum(t["tier"] == TIER_APPROVED for t in trust.values())
     for item in res["pendingNodes"]:
@@ -1011,11 +1018,36 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
             lines += ["  > [" + ("changed" if c["changed"] else "unchanged") + "] " + c["quote"]
                       + " (`" + SNAPSHOT_REL + "/" + c["span"] + "`)" for c in edge["currentCitations"]]
             lines.append("  After review: `memlet learn --approve " + edge["edgeId"] + " --by NAME --refresh-citations`")
+    extra = {}
+    if any("merge" in n for n in by_id.values()):
+        from .vocabulary import MERGE_REASONS, MERGE_HEADING, MERGE_LAPSED_HEADING, MERGE_MEMBER_LABEL
+        def detail(ident):
+            n = by_id[ident]
+            return dict(id=ident, tier=trust[ident]["tier"], quote=safe_lesson_display(lesson_text(n)), **_lesson_fields(n))
+        groups = [dict(detail(keep), mergedFrom=members, members=[detail(i) for i in members])
+                  for keep, members in sorted(merges["members"].items())]
+        lapsed = [dict(detail(i), into=st["into"], reason=st["reason"], message=MERGE_REASONS[st["reason"]])
+                  for i, st in merges["states"].items() if st["state"] == "lapsed"]
+        extra.update(mergedLessons=groups, lapsedMerges=lapsed)
+        for item in res["pendingNodes"]:
+            if merges["members"].get(item["id"]):
+                item["mergedFrom"] = merges["members"][item["id"]]
+                item["members"] = [detail(i) for i in item["mergedFrom"]]
+        if groups:
+            lines += ["", MERGE_HEADING]
+            for group in groups:
+                lines += ["- `" + group["id"] + "` (" + group["tier"] + ")", "  > " + group["quote"].replace("\n", "\n  > ")]
+                for member in group["members"]:
+                    lines += ["  - `" + member["id"] + "` " + MERGE_MEMBER_LABEL + " `" + group["id"] + "`",
+                              "    > " + member["quote"].replace("\n", "\n    > ")]
+        if lapsed:
+            lines += ["", MERGE_LAPSED_HEADING]
+            lines += ["- `" + i["id"] + "` → `" + str(i["into"]) + "`: " + i["reason"] + " — " + i["message"] for i in lapsed]
     if _record_review:
         md.record_citation_reviews(root / QUEUE_REL, res)
     return {"ok": True, "exitCode": 0, "command": "learn-pending", "pendingNodes": res["pendingNodes"],
             "pendingEdges": res["pendingEdges"], "counts": res["counts"], "approvalBoundary": res["approvalBoundary"],
-            "notices": [], "formatted": "\n".join(lines) + "\n"}
+            "notices": [], **extra, "formatted": "\n".join(lines) + "\n"}
 
 
 def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, reconsider=False, refresh_citations=False, paths=None) -> Dict[str, Any]:
@@ -1114,6 +1146,72 @@ def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
 def learn_reject(repo_path=".", ids=(), *, approver="", reason="") -> Dict[str, Any]:
     """`memlet_dream.reject_queue_items` (rejected items are never recalled), then `promote_approved`."""
     return _decide(repo_path, ids, approver, md.REJECTED_DECISION, reason=reason)
+
+
+def _merge_decide(repo_path, ids, approver, *, keep=None):
+    from .vocabulary import MERGE_REASONS, MERGE_DONE, MERGE_LOST_FILES, MERGE_ATTACH_LABEL
+    import shlex
+    who = md.safe_truncate_masked(str(approver or "").strip(), 64)
+    wanted = _ids(ids)
+    if not who:
+        return _fail(MERGE_REASONS["by-required"], 2, reason="by-required")
+    if not wanted:
+        reason = "ids-required" if keep is None else "same-required"
+        return _fail(MERGE_REASONS[reason], 2, reason=reason)
+    if keep is not None and not str(keep).strip():
+        return _fail(MERGE_REASONS["keep-required"], 2, reason="keep-required")
+    try:
+        root = mw._resolve_root(repo_path)
+        bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL, PROMOTED_PAGE) + _DB_FILES + mw._LEDGER_FILES)
+        if bad:
+            return _fail(_refusing(bad), 2)
+        with md.queue_lock(root / QUEUE_REL):
+            root, context = _merge_context(root)
+            graph = context["graph"]
+            nodes = {n["id"]: n for n in graph["nodes"]}
+            if keep is None:
+                checks = dict(ok=all(i in nodes for i in wanted), keep=None,
+                              blockers={i: ["unknown-id"] for i in wanted if i not in nodes}, lostFiles={})
+            else:
+                keep = str(keep).strip()
+                checks = merge_blockers(root, keep, wanted, context=context)
+            if not checks["ok"]:
+                refused = [{"id": i, "reason": r, "message": MERGE_REASONS[r]}
+                           for i, reasons in checks["blockers"].items() for r in reasons]
+                message = checks.get("error") or "; ".join(r["id"] + ": " + r["message"] for r in refused)
+                return _fail(message, 2, **{k: v for k, v in checks.items() if k not in ("ok", "error")},
+                             applied=[], refused=refused)
+            path_commands = {}
+            for ident, missing in checks["lostFiles"].items():
+                paths = list(dict.fromkeys(nodes[keep].get("approvedPaths", []) + missing))
+                path_commands[ident] = "memlet learn --paths " + shlex.quote(keep) + " --by " + shlex.quote(who) + "".join(
+                    " --path " + shlex.quote(p) for p in paths)
+            res = md.write_merge_decisions(root / QUEUE_REL, graph, wanted, who, keep=keep, db_path=root / DB_REL)
+            promotion = promote_approved(root) if res["applied"] else {"ok": True}
+        decision = "unmerged" if keep is None else "merged"
+        lines = [MERGE_DONE % (decision, who), ""]
+        lines += ["- " + decision + ": `" + i + "`" + (" → `" + keep + "`" if keep else "") for i in res["applied"]]
+        lines += ["- unchanged: `" + i + "`" for i in res["unchanged"]]
+        for ident, missing in checks["lostFiles"].items():
+            lines += ["- `" + ident + "`: " + MERGE_LOST_FILES + ", ".join(missing),
+                      "  " + MERGE_ATTACH_LABEL + "`" + path_commands[ident] + "`"]
+        errors = res["eventErrors"] + ([promotion["error"]] if not promotion["ok"] else [])
+        return dict(ok=not errors, exitCode=1 if errors else 0, command="learn-unmerge" if keep is None else "learn-merge",
+                    keep=keep, approver=who, applied=res["applied"], unchanged=res["unchanged"],
+                    lostFiles=checks["lostFiles"], pathCommands=path_commands, refused=[],
+                    **({"error": "; ".join(errors)} if errors else {}), formatted="\n".join(lines) + "\n")
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return _fail(str(exc), 1)
+
+
+def learn_merge(repo_path=".", keep="", same=(), *, approver=""):
+    """A person records that members say the same thing as the kept lesson."""
+    return _merge_decide(repo_path, same, approver, keep=keep)
+
+
+def learn_unmerge(repo_path=".", ids=(), *, approver=""):
+    """Remove merge records, including lapsed ones, in one atomic batch."""
+    return _merge_decide(repo_path, ids, approver)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1526,11 +1624,13 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
     snap, _why = _load_snapshot(root)
     by_id = {str(n.get("id")): n for n in (graph or {}).get("nodes") or [] if isinstance(n, dict)}
     view_by_id = {str(n.get("id")): n for n in (md.approved_view(graph)[0].get("nodes") or [])} if graph else {}
+    merges = merge_view(root) if any("merge" in n for n in by_id.values()) else {"states": {}}
+    hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
     quarantined = {i["id"] for i in dream_items(root)["items"] if i.get("quarantined")}
     fresh, stale = [], []
     for r in rules:
         node = by_id.get(r["id"])
-        if r["id"] in quarantined or (node and md.superseded_lesson(node)):
+        if r["id"] in hidden or r["id"] in quarantined or (node and md.superseded_lesson(node)):
             continue  # quarantine is never a wiki rule, even if explicitly code-anchored
         topic = f"approved lesson · {md.category_label((node or {}).get('category') or 'dream')}"
         imp = md._safe_imp((node or {}).get("importance"), 2)
@@ -2459,6 +2559,157 @@ def dream_tiers(graph, *, snapshot, config):
     return result
 
 
+def _merge_nodes(graph, trust):
+    """Call-local nodes with the one reader's tiers; never persisted or digested."""
+    return {str(n["id"]): dict(n, tier=trust.get(str(n["id"]), {}).get("tier", TIER_PENDING))
+            for n in (graph or {}).get("nodes", []) if isinstance(n, dict)}
+
+
+def merge_state(node, nodes_by_id):
+    """Pure merge validity. Mapping values may carry tiers from dream_tiers.
+
+    Without read context, approval_state supplies the stored decision only; use
+    merge_view for repository reads, including citation/edge demotions. Cycles
+    fail open (all their members lapse), without recursion or a persisted cache.
+    """
+    from .vocabulary import MERGE_SCHEMA
+    none = {"state": "none", "into": None, "reason": None}
+    chain, visited = [], set()
+    current = node
+    while True:
+        rec = current.get("merge")
+        if rec is None:
+            result = none
+            break
+        into = rec.get("into") if isinstance(rec, dict) else None
+        reason = None
+        if (not isinstance(rec, dict) or rec.get("schema") != MERGE_SCHEMA
+                or not isinstance(into, str) or not into
+                or not isinstance(rec.get("by"), str) or not rec["by"].strip()
+                or not md._valid_utc_stamp(rec.get("at"))):
+            reason = "invalid-record"
+        elif md.node_approval_digest(current) != rec.get("memberDigest"):
+            reason = "member-changed"
+        elif into not in nodes_by_id:
+            reason = "keep-missing"
+        else:
+            kept = nodes_by_id[into]
+            if md.node_approval_digest(kept) != rec.get("keepDigest"):
+                reason = "keep-changed"
+            elif (kept.get("tier") == TIER_REJECTED or md.approval_state(kept, "node") == TIER_REJECTED
+                  or kept.get("verdict") == md.REJECTED):
+                reason = "keep-rejected"
+            elif (current.get("tier", md.approval_state(current, "node")) == TIER_APPROVED
+                  and kept.get("tier", md.approval_state(kept, "node")) != TIER_APPROVED):
+                reason = "keep-not-approved"
+        if reason:
+            result = {"state": "lapsed", "into": into, "reason": reason}
+            break
+        ident = str(current.get("id"))
+        if ident in visited:
+            return {"state": "lapsed", "into": node["merge"].get("into"), "reason": "merge-cycle"}
+        visited.add(ident)
+        chain.append(into)
+        current = nodes_by_id[into]
+    for into in reversed(chain):
+        result = ({"state": "lapsed", "into": into, "reason": "keep-is-member"}
+                  if result["state"] == "merged" else {"state": "merged", "into": into, "reason": None})
+    return result
+
+
+def _merge_context(repo_path, context=None):
+    context = context if context is not None else {}
+    root = mw._resolve_root(repo_path)
+    bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL, mw.CONFIG_PATH))
+    if bad:
+        raise ValueError(_refusing(bad))
+    if "graph" not in context:
+        context["graph"] = _load_queue(root)[0] or {"nodes": [], "edges": []}
+    if "snapshot" not in context:
+        context["snapshot"] = _load_snapshot(root)[0]
+    if "config" not in context:
+        context["config"] = _load_config(root)[0]
+    if "trust" not in context or context.get("loaded") is False:
+        context["trust"] = dream_tiers(context["graph"], snapshot=context["snapshot"], config=context["config"])
+    context["loaded"] = True
+    return root, context
+
+
+def merge_view(repo_path=".", *, context=None):
+    """Read-only merge states using the same current tiers as dream_items."""
+    try:
+        _root, context = _merge_context(repo_path, context)
+        nodes = _merge_nodes(context["graph"], context["trust"])
+        states = {ident: merge_state(node, nodes) for ident, node in nodes.items()}
+        members = {}
+        for ident, state in states.items():
+            if state["state"] == "merged":
+                members.setdefault(state["into"], []).append(ident)
+        return {"ok": True, "states": states, "members": {k: sorted(v) for k, v in members.items()}}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "states": {}, "members": {}, "error": str(exc)}
+
+
+def merge_blockers(repo_path=".", keep="", same=(), *, context=None):
+    """Read-only, whole-batch eligibility and lost reach; never changes a tier."""
+    wanted = _ids(same)
+    keep = str(keep or "").strip()
+    try:
+        root, context = _merge_context(repo_path, context)
+        graph, trust, snapshot = context["graph"], context["trust"], context["snapshot"]
+        nodes = _merge_nodes(graph, trust)
+        view = merge_view(root, context=context)
+        if not view["ok"]:
+            raise ValueError(view["error"])
+        kept = nodes.get(keep)
+        replacements = set()
+        for edge in list(graph.get("edges", [])) + [e for n in nodes.values() for e in n.get("edges", [])]:
+            if edge.get("edgeType") == "SUPERSEDES":
+                replacements.update((edge.get("fromId"), edge.get("toId")))
+        replacements.update(n["id"] for n in nodes.values()
+                            if any(e.get("edgeType") == "SUPERSEDES" for e in n.get("edges", [])))
+        def relations(n):
+            return {e["edgeType"] for e in _approved_projection(n or {}, snapshot).get("edges", [])}
+        path_context = lesson_path_context(root)
+        path_context.update(loaded=True, snapshot=snapshot, config=context["config"], trust=trust)
+        def reach(n):
+            if not n or n["tier"] not in (TIER_APPROVED, TIER_HINT):
+                return set()
+            display = _approved_projection(n, snapshot) if n["tier"] == TIER_APPROVED else n
+            return set(lesson_paths(n, root, context=path_context) + _lesson_literal_paths(display, root, path_context))
+        keep_paths, blockers, lost = reach(kept), {}, {}
+        for ident in wanted:
+            node, reasons = nodes.get(ident), []
+            if not kept or not node:
+                reasons.append("unknown-id")
+            if ident == keep:
+                reasons.append("same-as-keep")
+            if kept and kept["tier"] == TIER_REJECTED:
+                reasons.append("keep-rejected")
+            if node and node["tier"] == TIER_REJECTED:
+                reasons.append("member-rejected")
+            if node and kept and node["tier"] == TIER_APPROVED and kept["tier"] != TIER_APPROVED:
+                reasons.append("keep-not-approved")
+            if view["states"].get(keep, {}).get("state") == "merged":
+                reasons.append("keep-is-member")
+            if view["members"].get(ident):
+                reasons.append("member-has-members")
+            if keep in replacements or ident in replacements:
+                reasons.append("supersedes")
+            if node and kept and not relations(node) <= relations(kept):
+                reasons.append("relation-types")
+            if reasons:
+                blockers[ident] = reasons
+            missing = sorted(reach(node) - keep_paths)
+            if missing:
+                lost[ident] = missing
+        if not keep or not wanted:
+            blockers[keep] = ["keep-required" if not keep else "same-required"]
+        return {"ok": not blockers, "keep": keep, "blockers": blockers, "lostFiles": lost}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "keep": keep, "blockers": {}, "lostFiles": {}, "error": str(exc)}
+
+
 def _agreement_basis(node, config):
     from memlet.memlet_dreamcycle import trusted_record
     from memlet.vendor_cli import same_model
@@ -2504,9 +2755,12 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             return {"ok": True, "items": [], "counts": counts, "notices": [why] + dream_settings(config)[2]}
         config = tier_config(graph, config)
         trust = dream_tiers(graph, snapshot=snapshot, config=config)
+        merges = (merge_view(root, context=dict(graph=graph, snapshot=snapshot, config=config, trust=trust))
+                  if any("merge" in n for n in graph.get("nodes", [])) else {"states": {}, "members": {}})
+        hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
         approved_graph = md.approved_view(graph)[0]
         approved_graph = dict(approved_graph, nodes=[n for n in approved_graph.get("nodes", [])
-                              if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED])
+                              if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED and n.get("id") not in hidden])
         live_ids = {n["id"] for n in approved_graph["nodes"]}
         approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
                                    if e.get("fromId") in live_ids or e.get("toId") in live_ids]
@@ -2525,7 +2779,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                 continue
             item_state = trust[str(node["id"])]
             tier = item_state["tier"]
-            if tier == TIER_REJECTED:
+            if tier == TIER_REJECTED or node["id"] in hidden:
                 continue
             if tier == TIER_PENDING and md.approval_state(node, "node") == TIER_APPROVED:
                 notices.append(node["id"] + ": pending; approval has no live approved-valid edge, a rejected edge, or stale citations")
@@ -2585,6 +2839,8 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                     (md.resolve_pin(snapshot, c["span"]) or {}).get("sha256") == c["sha256"])) for c in fields["cites"]]
                 it.update(fields)
             it.update(item_state)
+            if merges["members"].get(node["id"]):
+                it["mergedFrom"] = merges["members"][node["id"]]
             items.append(it)
         if snap_why:
             notices.append(snap_why)

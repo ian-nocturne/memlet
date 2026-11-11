@@ -215,3 +215,36 @@ RESEALED_RELATIONS = "Re-sealed relations: "
 UNTOUCHED_RELATIONS = "Relations left alone: "
 RECALL_FILES_HELP = "Select lessons and hints by the attachment rule, and rules by code anchors."
 MEMLET_ECHO_NOTICE = "Memlet echo lines or duplicate approved lesson quotes skipped: %d"
+
+# N1 — a person says lessons say the same thing.
+MERGE_SCHEMA = "memlet.dream_merge.v1"
+MERGE_REASONS = {
+    "unknown-id": "The lesson id is unknown.",
+    "keep-required": "--merge requires a kept lesson id.",
+    "same-required": "--merge requires --same ID [ID ...].",
+    "ids-required": "--unmerge requires at least one lesson id.",
+    "by-required": "A merge decision requires --by NAME.",
+    "same-without-merge": "--same requires --merge.",
+    "same-as-keep": "The kept lesson cannot also be a member.",
+    "keep-rejected": "The kept lesson is rejected or revoked.",
+    "member-rejected": "The member is rejected or revoked.",
+    "keep-not-approved": "An approved member requires an approved kept lesson.",
+    "keep-is-member": "The kept lesson is already a member of a holding merge.",
+    "member-has-members": "A member cannot have holding members of its own.",
+    "supersedes": "A lesson with an incoming or outgoing SUPERSEDES relation cannot be merged.",
+    "relation-types": "The member's approved relation types must be a subset of the kept lesson's.",
+    "invalid-record": "The merge record is incomplete or invalid.",
+    "member-changed": "The member's approval digest changed.",
+    "keep-missing": "The kept lesson no longer exists.",
+    "keep-changed": "The kept lesson's approval digest changed.",
+    "merge-cycle": "The merge records form a cycle.",
+}
+MERGE_HEADING = "## Merged lessons"
+MERGE_LAPSED_HEADING = "## Lapsed merges"
+MERGE_MEMBER_LABEL = "says the same as"
+MERGE_LOST_FILES = "The member will no longer reach these files: "
+MERGE_ATTACH_LABEL = "To attach them to the kept lesson: "
+MERGE_DONE = "## Memlet learn — %s by %s"
+MERGE_HELP = "Keep one lesson; a person says the members say the same thing"
+UNMERGE_HELP = "Show the named members separately again"
+MERGE_SAME_HELP = "Lessons that say the same thing as the kept lesson"
