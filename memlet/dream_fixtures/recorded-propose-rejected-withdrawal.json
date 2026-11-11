@@ -1,0 +1,67 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "recorded",
+  "vendor": "claude",
+  "model": "haiku",
+  "memletVersion": "9.1.1",
+  "date": "2026-11-11T09:43:58Z",
+  "note": "Explicit capture; model answer and input masked before writing.",
+  "kind": "propose",
+  "input": "{\"id\": \"session2.log-631d66fac8.log:1\", \"text\": \"2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.\"}\n{\"id\": \"session2.log-631d66fac8.log:2\", \"text\": \"2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold.\"}\n{\"id\": \"session2.log-631d66fac8.log:3\", \"text\": \"2026-11-11T10:06:00Z [user] From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first.\"}\n{\"id\": \"session2.log-631d66fac8.log:4\", \"text\": \"2026-11-11T10:09:00Z [assistant] Deployed with scripts/deploy.sh and the smoke test passed.\"}\n{\"id\": \"session2.log-631d66fac8.log:5\", \"text\": \"2026-11-11T10:10:00Z [user] And the old tip about passing --skip-smoke is withdrawn, never use it.\"}",
+  "answer": "[{\"category\":\"verified_workaround\",\"title\":\"Deploy via scripts/deploy.sh, which warms cache before smoke test\",\"scope_tag\":\"deploy\",\"src_spans\":[\"session2.log-631d66fac8.log:3\",\"session2.log-631d66fac8.log:4\"],\"edges\":[{\"edge_type\":\"SUPERSEDES\",\"target\":\"session2.log-631d66fac8.log:1\",\"src_span\":\"session2.log-631d66fac8.log:3\",\"target_span\":\"session2.log-631d66fac8.log:1\"},{\"edge_type\":\"RESOLVES\",\"target\":\"session2.log-631d66fac8.log:2\",\"src_span\":\"session2.log-631d66fac8.log:4\",\"target_span\":\"session2.log-631d66fac8.log:2\"}]},{\"category\":\"superseded_directive\",\"title\":\"Do not use make release for deploys; use scripts/deploy.sh\",\"scope_tag\":\"deploy\",\"src_spans\":[\"session2.log-631d66fac8.log:1\",\"session2.log-631d66fac8.log:3\"],\"superseded_by_src\":\"session2.log-631d66fac8.log:3\",\"edges\":[{\"edge_type\":\"SUPERSEDES\",\"target\":\"session2.log-631d66fac8.log:1\",\"src_span\":\"session2.log-631d66fac8.log:3\",\"target_span\":\"session2.log-631d66fac8.log:1\"}]},{\"category\":\"repeated_pitfall\",\"title\":\"make release smoke test failed due to cold cache\",\"scope_tag\":\"deploy\",\"src_spans\":[\"session2.log-631d66fac8.log:2\"],\"edges\":[{\"edge_type\":\"BLOCKS\",\"target\":\"session2.log-631d66fac8.log:1\",\"src_span\":\"session2.log-631d66fac8.log:2\",\"target_span\":\"session2.log-631d66fac8.log:1\"}]},{\"category\":\"superseded_directive\",\"title\":\"--skip-smoke tip withdrawn; never use it\",\"scope_tag\":\"deploy\",\"src_spans\":[\"session2.log-631d66fac8.log:5\"],\"edges\":[{\"edge_type\":\"BLOCKS\",\"target\":\"session2.log-631d66fac8.log:5\",\"src_span\":\"session2.log-631d66fac8.log:5\",\"target_span\":\"session2.log-631d66fac8.log:5\"}]}]\n",
+  "expected": {
+    "failed": false,
+    "items": [
+      {
+        "category": "verified_workaround",
+        "relations": [
+          "RESOLVES",
+          "SUPERSEDES"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:1",
+          "session2.log-631d66fac8.log:2",
+          "session2.log-631d66fac8.log:3",
+          "session2.log-631d66fac8.log:4"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.",
+          "2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold.",
+          "2026-11-11T10:06:00Z [user] From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first.",
+          "2026-11-11T10:09:00Z [assistant] Deployed with scripts/deploy.sh and the smoke test passed."
+        ]
+      },
+      {
+        "category": "superseded_directive",
+        "relations": [
+          "SUPERSEDES"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:1",
+          "session2.log-631d66fac8.log:3"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.",
+          "2026-11-11T10:06:00Z [user] From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first."
+        ]
+      },
+      {
+        "category": "repeated_pitfall",
+        "relations": [
+          "BLOCKS"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:1",
+          "session2.log-631d66fac8.log:2"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.",
+          "2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold."
+        ]
+      }
+    ],
+    "rejectionCodes": [
+      "missing_superseded_by_pin"
+    ]
+  }
+}
