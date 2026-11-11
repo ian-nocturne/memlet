@@ -93,7 +93,7 @@ $ memlet dream --via claude --verify-with claude --transcript session2.log
 - Rejected candidates: 0
 ```
 
-Memlet started `claude -p` itself, with every tool off, in an empty temporary folder, and showed it each line with an id. The model may send back only a category, a scope, relation types, line citations and a short title. Here one model (haiku) proposed and a second (sonnet) checked each proposal. Nothing is approved yet:
+Memlet started `claude -p` itself, with every tool off, in an empty temporary folder, and showed it each line with an id. The model may send back only a category, a scope, relation types, line citations and a short title. Here one model (haiku) proposed and a second (sonnet) checked each eligible proposal, with `dream.agreement: "model"` enabled for same-vendor hints. Nothing is approved yet:
 
 ```console
 $ memlet learn --pending
@@ -144,7 +144,7 @@ Things to notice:
 - **The second model can disagree.** It judged the pitfall on line 2 `MISSING_CONDITION`. That veto is permanent for the hint tier; only a person can still approve it.
 - **`SUPERSEDES` always needs a person.** Line 3 replaced line 1, so the pair is cited together and checked for time order, but only `BLOCKS` and `RESOLVES` can become hints. Once approved, `recall` and `handover` show the pair as a quarantine: the old line marked `[REPLACED — do not apply as current]`, the new one `[CURRENT]`. `GOVERNS`, the fourth relation, ties a lesson to a scope and likewise needs approval.
 
-(Output shortened; `<snapshot>` stands for the stored copy of the transcript under `.memlet/dream/snapshot/`, and `<deploy script>` for a script path in the transcript, for the same reason as `<billing file>` above. Without a model, `memlet learn --transcript` proposes lessons with keyword rules instead; the queue and the approval step are the same.)
+(Output shortened. This run was made with 9.1.0 and `dream.agreement: "model"`, so the checked items show as hints; 9.1.1 also prints a "Second-model checks" line in the run summary, shown in section 5. `<snapshot>` stands for the stored copy of the transcript under `.memlet/dream/snapshot/`, and `<deploy script>` for a script path in the transcript, for the same reason as `<billing file>` above. Without a model, `memlet learn --transcript` proposes lessons with keyword rules instead; the queue and the approval step are the same.)
 
 ## From principle to code
 
@@ -180,7 +180,7 @@ In a terminal these print readable text. When output is piped or captured they p
 ### 1. Install and initialise
 
 ```bash
-pip install git+https://github.com/ian-nocturne/memlet.git@v9.1.0
+pip install git+https://github.com/ian-nocturne/memlet.git@v9.1.1
 memlet init .     # writes .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 ```
 
@@ -239,6 +239,27 @@ The capsule carries `repoHead`, `activeConstraints`, `lexicalConstraints` (TS/JS
 
 Approved lessons travel in the capsule too (`approvedLessons`, after the active constraints): one line each, relation first, and a replaced instruction is marked `[REPLACED — do not apply as current]` next to `[CURRENT]`. When space is short, hints are dropped first, then approved lessons, then the rest. `omitted` counts what the token budget dropped; `listCapOmitted` counts what a per-group item cap dropped.
 
+#### Routlet reads the handover
+
+`memlet handover --write` also replaces `.memlet/handover.json` and `.memlet/capsules.json` for Routlet, under the same write lock as the Markdown page. Only rules whose every symbol anchor is `active` become constraints. Approved lessons, including `BLOCKS` prohibitions, become lesson references; only the old side of an approved supersession becomes a rejected approach. No hint, pending lesson or model verdict enters either file, and promoted Dream page rules never become a second authority path.
+
+| Memlet evidence | Routlet file / list | Export policy |
+| --- | --- | --- |
+| Rule with every symbol anchor active | `handover.json` / `activeConstraints` | Full rule or file-and-entry pointer; no rule copy in `capsules.json` |
+| Compatible-unverified rule | Neither | Counted as `compatibleUnverifiedRules`; re-verify in Memlet |
+| Rule matching an approved replaced quote | Neither | Counted as `replacedRules`; recall/handover name the rule and replacing lesson, while Memlet's own active list stays intact |
+| Stale anchor | `handover.json` / `quarantinedStaleAnchors` | Quarantine only |
+| Approved `RESOLVES`, `GOVERNS`, `BLOCKS`, current `SUPERSEDES` | `capsules.json` / `capsules` | Verified cited text only |
+| Approved supersession's old side | `handover.json` / `rejectedApproaches` | Once per replaced line; never a lesson ref |
+
+Replacement checks cover all approved supersessions by citation and normalised text. In A→B→C, B is marked replaced in recall, handover and the promoted page, with a pointer to the lesson that replaced it. Repeated quotes across sessions and multiple replacements follow the same rule. All exported tags use the `memlet-` namespace. Lesson paths name existing files with exact directory-entry spelling; scope tags contribute a path only when they name such a file. Non-contiguous citations remain separate ranges.
+
+These are snapshots: re-run `--write` after code or approvals change. Routlet head-checks constraint entries, but **lesson refs are not head-checked**, and neither path re-checks working-tree edits. Committing the snapshots changes HEAD too. A repository with no commit exports `repoHead: "unverified"`; the reader cannot detect drift from that head.
+
+Each file is limited to 128 KiB and each list to 40 entries. Routlet's display limits are 140 characters for a rule, 110 for a rejected approach, and 120 for a compiled lesson summary (attachment allows 200). Text that exceeds its display limit is replaced by a fixed sentence naming the JSON file and entry id; `truncated: true` and `fullText` preserve the complete safe text in that entry. No quote prefix is exported. Final values, including pointers and `fullText`, pass residual-secret checks; entries the reader would quarantine, including strings over its 2,000-character privacy limit, are omitted and counted. The reader's compact renderer has a separate 400–700-character total budget, may shorten combined sections, and does not render lesson refs; the full renderer and JSON retain the pointers. Pointers pass the field limits and the compact single-entry checks. Byte trimming processes lessons first, then rejected approaches, stale anchors, and constraints.
+
+`memlet handover --verify` accepts either JSON bridge file and checks integrity, not authentication; Routlet itself does not check that digest. The three replacements are not atomic together. A failed write names each written/unwritten file, including the ledger if recording fails. After any successful replacement, unwritten bridge files are removed where possible; a cleanup failure explicitly identifies a stale file still read by Routlet. A later successful `--write` heals the snapshot.
+
 ### 5. Lessons: propose, check, approve
 
 Two ways to propose, one queue (`.memlet/dream/APPROVAL-QUEUE.json`), one approval step.
@@ -267,18 +288,31 @@ memlet learn --approve DRM-7306e549ab93 --by "ray" --reconsider   # change your 
 - `hint`: not approved, but two trusted parties agreed on the same content, every citation verifies, it carries only `BLOCKS` or `RESOLVES` relations, nobody rejected the same quote, no trusted checker vetoed it, and its lines pass a permission-phrase screen. Hints appear only under "Unreviewed hints — not approved by a person" in `recall`, `handover` and, for the files you changed, `check --changed`. They are trimmed before verified content and never become active constraints or promoted wiki rules. Check the cited code and conditions before relying on one.
 - `pending`: everything else.
 
-Agreement settings in `.memlet/config.json`:
+A second model of the same vendor can check proposals under the default `dream.agreement: "vendor"`, provided its family differs from every proposer. It needs no configuration: the default proposer is `haiku` and the default verifier `sonnet`. Its verdict is a review aid: supported items stay pending and do not reach agents, while a trusted disagreement still vetoes hints. Switching to `"model"` later makes eligible supported items hints on the next read; switching back demotes them without another model call. With nothing configured, a real run on the session from Example 2 printed:
 
-```json
-{"dream": {"agreement": "model", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}}
+```console
+$ memlet dream --via claude --verify-with claude --transcript session2.log
+## Dream run
+
+- Batches: 1; calls: 3; failed batches: 0
+- Second-model checks: 2 item(s) checked; 0 became hints; 2 remain pending. Same-vendor checks are a review aid under dream.agreement: "vendor"; they cannot make hints under the current setting.
+- Rejected candidates: 0
 ```
 
-- `dream.agreement` defaults to `"vendor"`: the two parties must be different vendors. Only `claude` can be launched today, so with the default no hint can appear. `"model"` lets two different Claude model families agree (each model id must contain exactly one of `haiku`, `sonnet`, `opus`, `fable`, `mythos`, and the verifier must differ from every proposer); those hints say "two models of the same vendor agreed".
+and `memlet learn --pending` then labels each checked item `a second model of the same vendor checked it; review aid, not a hint under dream.agreement: "vendor"`.
+
+Agreement settings in `.memlet/config.json`, shown with their defaults (change `"vendor"` to `"model"` to allow same-vendor hints):
+
+```json
+{"dream": {"agreement": "vendor", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}}
+```
+
+- `dream.agreement` defaults to `"vendor"`: a hint needs agreement from different vendors. Only `claude` can be launched today, so with the default no hint can appear. `"model"` lets two different Claude model families agree (each model id must contain exactly one of `haiku`, `sonnet`, `opus`, `fable`, `mythos`, and the verifier must differ from every proposer); those hints say "two models of the same vendor agreed".
 - A `MISSING_CONDITION`, `OUT_OF_EVIDENCE` or `WRONG_EDGE` verdict from a trusted checker vetoes the hint tier for that content permanently ("vetoed by VENDOR/MODEL: VERDICT"); a person can still approve it.
 - `dream.hints: false` hides the hint tier everywhere.
 - Lessons submitted by keyword rules or over MCP never count toward agreement.
 
-**When a run goes wrong.** A batch whose candidates were all rejected is recorded as failed, with the reasons at the top of the summary. `dream` carries on with later batches, stops after three failed batches in a row, and retries failed ones only when you run it again; `memlet dream --skip-failed BATCH_ID` marks one as done. If a cited line changes after approval, the lesson goes back to pending: `memlet learn --pending` shows every cited line, changed or not; read them, then approve again with `--refresh-citations`.
+**When a run goes wrong.** A model's answer may arrive inside one code fence or wrapped as `{"items": [...]}`; those two envelopes are removed and the content is then parsed strictly. Anything else unparseable fails the batch and its raw output is kept for inspection. A batch whose candidates were all rejected is recorded as failed, with the reasons at the top of the summary. `dream` carries on with later batches, stops after three failed batches in a row, and retries failed ones only when you run it again; `memlet dream --skip-failed BATCH_ID` marks one as done. If a cited line changes after approval, the lesson goes back to pending: `memlet learn --pending` shows every cited line, changed or not; read them, then approve again with `--refresh-citations`.
 
 **Transcripts.** Only what you typed and what the assistant finally answered is read. Tool payloads, hidden reasoning, progress narration and injected instruction files are skipped. These secret formats are redacted before anything is stored: OpenAI/Anthropic `sk-`, Stripe, GitHub, Slack, AWS access key ids, Google `AIza`, GitLab, npm, PyPI and Polar tokens, database connection URLs, URL credentials, JWTs, PEM/OpenSSH/PGP/PuTTY private-key blocks, and assignments whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH`. Other formats are not detected. Very large inputs are skipped rather than partly stored (files over 16 MiB, messages or lines over 16,384 characters), and the result lists what was skipped.
 
@@ -342,11 +376,15 @@ Arms: `none` (no memory), `handover` (a capsule built from the approved lessons)
 | `memlet admin anchors suggest\|accept\|list\|drop` | Proposed anchors for rules that only mention code. |
 | `memlet admin eval init\|questions\|run\|score\|report\|resolve\|selftest` | Sealed, time-split memory experiment. |
 | `memlet admin --help` | Every other command: memory store, rules/wiki, Dream internals (`dream-build`, `dream-recall`), benchmarks, maintenance. |
-| `memlet --version` | Prints `9.1.0`. |
+| `memlet --version` | Prints `9.1.1`. |
 
 Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in exact parser), `compatible-unverified` (changed but signature-compatible, a TS/JS lexical match, or a Python name rebound elsewhere in the module: `symbol_rebound_in_module`), `stale` (removed, required arguments changed, or file moved), `unpinned` (no baseline yet), `path-exists` (the rule names a path only).
 
-## Upgrading from 9.0
+## Upgrading
+
+- From 9.1.0: `handover --write` adds the two Routlet snapshots, and `dream --verify-with` permits distinct models of the same vendor under `dream.agreement: "vendor"` as a review aid, while the hint policy stays the same. Chained supersessions now mark intermediate instructions as replaced in every lesson reader; anchored rules with matching replaced text gain a notice. Other handover JSON and Markdown stay byte-identical.
+
+### From 9.0
 
 - Nothing changes unless you opt in. No command calls a model unless you run `memlet dream --via …` (or `admin eval` with `--via`). Hooks keep their 9.0 behaviour unless you re-install them with `--hooks --dream`. No anchor is suggested into use until you accept it. Exact TS/JS parsing stays off until you set `anchors.exactParsers`.
 - New anchor reason `symbol_rebound_in_module`: a Python function or class that is reassigned elsewhere in its module is now `compatible-unverified`, not `active`. Hashes are unchanged; no re-pin is needed.
@@ -369,9 +407,10 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 ## How far it has been tested
 
-- 771 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23).
-- `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design twice: see the row format and the failed-batch rule in section 5.
+- 826 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23).
+- `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design three times: see the row format, the failed-batch rule and the accepted answer envelopes in section 5. The default second-model check of 9.1.1 was run once the same way.
 - On 9.1 code, hooks installed with `--hooks --dream` ran in one headless Claude Code session (the checked rules arrived at session start, and the session was snapshotted at Stop without a model call), and six MCP tools, including `memlet_dream_next` and `memlet_dream_submit`, were called from one `codex exec` session; the submitted lesson stayed pending as an untrusted `host` proposal. The PostToolUse and PreCompact hooks were last exercised in a real session on 9.0-era code.
+- The on-disk bridge was checked locally against Routlet’s actual reader, including commit drift and edits without a refreshed snapshot; no model was called.
 - Linux, Windows, other MCP hosts and interactive sessions are untested.
 
 ---
@@ -419,7 +458,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/memlet@v9.1.0
+      - uses: ian-nocturne/memlet@v9.1.1
         with:
           mode: "audit" # only supported mode
           repo-path: "."

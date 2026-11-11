@@ -1766,7 +1766,9 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             return finish(combined, max_len + 4)
         return finish(cleaned, max_len)
 
+    replacement_projection = supersession_projection(graph)
     for n in ranked:
+        projected = supersession_display_node(n, graph, replacement_projection)
         n_idx = int(n.get("_idx", -1))
         base_lid = str(n.get("_base_lid") or sanitize_node_id(n.get("id"), "L-000"))
         lid = str(n.get("_disp_lid") or base_lid)
@@ -1782,7 +1784,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             sp = cand_sp if isinstance(cand_sp, dict) else None
         quote_one = _window_quote(str(pp.get("quoteText") or ""), is_replacement=False)
         node_edges = node_surv_edges_by_idx.get(n_idx, node_surv_edges.get(str(n.get("id") or ""), []))
-        b_kind = node_bucket_kind(n)
+        b_kind = "supersedes" if projected.get("_lineReplacements") else node_bucket_kind(n)
         matching_type = {
             "blocks": "BLOCKS",
             "resolves": "RESOLVES",
@@ -1806,7 +1808,6 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         safe_pp_sha = re.sub(r"[^0-9a-f]", "", str(pp.get("sha256") or "").lower())[:8] or "none"
 
         if b_kind == "supersedes":
-            projected = supersession_display_node(n, graph)
             if projected is not n and not bound_sup_edge:
                 n = projected
                 sp = projected.get("supersededByPin")
@@ -1849,7 +1850,10 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
                     elif src_node_idx in superseded_indices or (san_from not in duplicate_ids and san_from in superseded_ids):
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
-            item = render_superseded_quarantine(dict(lesson_display_fields(dict(n, supersededByPin=sp, statusKind="superseded_rule")), id=lid), repl_label)
+            display = dict(n, supersededByPin=sp, statusKind="superseded_rule")
+            if projected.get("_lineReplacements"):
+                display["_lineReplacements"] = projected["_lineReplacements"]
+            item = render_superseded_quarantine(dict(lesson_display_fields(display), id=lid), repl_label)
             bucket = sec_supersedes
         elif b_kind == "resolves":
             item = (
@@ -3245,25 +3249,25 @@ def lesson_quote_digest(node):
 
 def lesson_edge_sources(node):
     return [{"edgeType": e.get("edgeType"), "span": e["srcPin"]["span"]}
-            for e in node.get("edges", []) if isinstance(e.get("srcPin"), dict) and parse_span(e["srcPin"].get("span", ""))]
+            for e in node.get("edges", []) if isinstance(e, dict) and isinstance(e.get("srcPin"), dict) and parse_span(e["srcPin"].get("span", ""))]
 
 
 def superseded_lesson(node):
     """The same quarantine gate used by typed graph recall and every lesson reader."""
     return (node.get("statusKind") == "superseded_rule" or node.get("category") == "superseded_directive"
             or node.get("verdict") == "ALREADY_SUPERSEDED" or isinstance(node.get("supersededByPin"), dict)
-            or any(e.get("edgeType") == "SUPERSEDES" and e.get("toId") == node.get("id") for e in node.get("edges", [])))
+            or any(e.get("edgeType") == "SUPERSEDES" and e.get("toId") == node.get("id") for e in node.get("edges", []) if isinstance(e, dict)))
 
 
-def supersession_display_node(node, approved_graph):
+def _supersession_pair(node, approved_graph):
     """Project incoming approved SUPERSEDES edges without changing any stored node/digest."""
-    pin = node.get("primaryPin") or {}
-    incoming = [e for e in approved_graph.get("edges", []) if e.get("edgeType") == "SUPERSEDES"
+    pin = node.get("primaryPin") if isinstance(node.get("primaryPin"), dict) else {}
+    incoming = [e for e in approved_graph.get("edges", []) if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES"
                 and e.get("edgeVerdict") == "VALID" and e.get("toId") == node.get("id")
-                and (e.get("targetPin") or {}).get("sha256") == pin.get("sha256")]
+                and isinstance(e.get("targetPin"), dict) and e["targetPin"].get("sha256") == pin.get("sha256")]
     if not incoming:
         # An active source can carry the old target inline rather than as a separate node.
-        outgoing = [e for e in node.get("edges", []) if e.get("edgeType") == "SUPERSEDES"
+        outgoing = [e for e in node.get("edges", []) if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES"
                     and isinstance(e.get("targetPin"), dict) and isinstance(e.get("srcPin"), dict)
                     and e.get("toId") not in {n.get("id") for n in approved_graph.get("nodes", [])}]
         if not outgoing:
@@ -3284,6 +3288,52 @@ def supersession_display_node(node, approved_graph):
         if source_node is None or source_node.get("verdict") != "SUPPORTED" or source_replaced:
             display["replacementLabel"] = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
     return display
+
+
+def normalised_quote(text):
+    """Match repeated instructions across transcripts and instruction files."""
+    from .memlet_bridge import safe_lesson_display
+    return " ".join(safe_lesson_display(_LINE_PREFIX_RE.sub("", text, count=1)).split()).casefold()
+
+
+def citation_key(cite):
+    return tuple(cite.get(k) for k in ("file", "start", "end", "sha256"))
+
+
+def replaced_line_index(items):
+    """One citation/text index of approved OLD sides, never hints or stale evidence."""
+    citations, texts = {}, {}
+    for item in items:
+        if item.get("tier") != "approved" or not item.get("quarantined"):
+            continue
+        for role, quote, cite in zip(item.get("lineRoles", []), item.get("quoteLines", []), item.get("cites", [])):
+            if role != "replaced" or cite.get("verified") is False:
+                continue
+            # Projected intermediate lines point to their actual replacing lesson.
+            ids = item.get("lineReplacements", {}).get(cite.get("span"), [item["id"]])
+            for table, key in ((citations, citation_key(cite)), (texts, normalised_quote(quote))):
+                table.setdefault(key, set()).update(ids)
+    return citations, texts
+
+
+def supersession_projection(approved_graph):
+    pairs = [dict(lesson_display_fields(_supersession_pair(n, approved_graph)), id=n["id"], tier="approved")
+             for n in approved_graph.get("nodes", []) if isinstance(n, dict) and n.get("id")]
+    return replaced_line_index(pairs)
+
+
+def supersession_display_node(node, approved_graph, projection=None):
+    """Apply the global replacement index without changing stored approval evidence."""
+    display = _supersession_pair(node, approved_graph)
+    citations, texts = projection if projection is not None else supersession_projection(approved_graph)
+    fields = lesson_display_fields(display)
+    replacements = {}
+    for role, quote, cite in zip(fields.get("lineRoles", ["current"] * len(fields.get("quoteLines", []))),
+                                 fields.get("quoteLines", []), fields.get("cites", [])):
+        ids = citations.get(citation_key(cite), set()) | texts.get(normalised_quote(quote), set())
+        if role != "replaced" and ids:
+            replacements[cite["span"]] = sorted(ids)
+    return dict(display, _lineReplacements=replacements) if replacements else display
 
 
 def lesson_text(node):
@@ -3320,6 +3370,12 @@ def lesson_display_fields(node):
             fields["replacementLabel"] = node["replacementLabel"]
         fields["lineRoles"] = ["current" if parsed and p["file"] == parsed[0] and parsed[1] <= p["start"] <= parsed[2]
                                else "replaced" for p in parts]
+    replacements = node.get("_lineReplacements")
+    if replacements:
+        fields["quarantined"] = True
+        fields["lineRoles"] = ["replaced" if c["span"] in replacements else role
+                               for role, c in zip(fields.get("lineRoles", ["current"] * len(parts)), fields["cites"])]
+        fields["lineReplacements"] = replacements
     return fields
 
 

@@ -173,7 +173,10 @@ class SubmitRunTests(DreamFixture):
 
     def test_independent_verification_all_verdicts_strict_json(self):
         for answer, expected in [(json.dumps({"verdict": v}), v == "SUPPORTED") for v in dc.VERDICTS] + [
-                ('```json\n{"verdict":"SUPPORTED"}\n```', False),
+                # 9.1.1: one surrounding code fence is an envelope real models add; the verdict inside is still strict.
+                ('```json\n{"verdict":"SUPPORTED"}\n```', True),
+                ('Sure. {"verdict":"SUPPORTED"}', False),
+                ('```json\n{"verdict":"SUPPORTED"}\n```\n```json\n{"verdict":"SUPPORTED"}\n```', False),
                 ('{"verdict":"WRONG_EDGE","verdict":"SUPPORTED"}', False),
                 ('{"verdict":"SUPPORTED","approval":true}', False)]:
             with self.subTest(answer=answer), tempfile.TemporaryDirectory(dir=str(self.base)) as temp:
@@ -307,12 +310,32 @@ class TierConsumerTests(DreamFixture):
         n["proposers"][1] = dict(n["proposers"][1], model="b")
         self.assertEqual("pending", mb.item_tier(n, snapshot=snap, config={"dream": {"agreement": "model"}}))
 
+    def test_default_verifier_is_a_different_family_and_only_a_review_aid_under_vendor(self):
+        self.ingest()
+        seen = []
+        def runner(vendor, prompt, **kw):
+            seen.append(kw.get("model"))
+            return self.proposer(vendor, prompt, **kw)
+        result = dc.dream_run(self.repo, via=("claude",), verify_with="claude", runner=runner)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual({"haiku", "sonnet"}, set(seen))
+        self.assertEqual("sonnet", vc.DEFAULT_VERIFIER_MODELS["claude"])
+        self.assertFalse(vc.same_model("claude", vc.DEFAULT_MODELS["claude"], "claude", vc.DEFAULT_VERIFIER_MODELS["claude"]))
+        counts = mb.dream_items(self.repo, tiers=("approved", "hint", "pending"))["counts"]
+        self.assertEqual(0, counts["hint"])            # default agreement is "vendor": a same-vendor check is a review aid
+        self.assertGreaterEqual(counts["pending"], 1)
+        self.assertEqual([], mb.unified_recall(self.repo, "cache", budget=4000)["sections"].get("hints", []))
+
     def test_model_agreement_run_refusals_labels_and_config_demotion(self):
         self.ingest()
-        self.assertFalse(dc.dream_run(self.repo, via=("claude",), verify_with="claude", runner=self.proposer)["ok"])
         path = self.repo / mw.CONFIG_PATH
         cfg = json.loads(path.read_text())
-        cfg["dream"] = {"agreement": "model"}
+        # 9.1.1: with nothing configured the default verifier (sonnet) differs from the default proposer (haiku),
+        # so the refusal now needs a verifier explicitly set to the proposer's family; it holds in both modes.
+        cfg["dream"] = {"models": {"verifier": {"claude": "haiku"}}}
+        path.write_text(json.dumps(cfg))
+        self.assertFalse(dc.dream_run(self.repo, via=("claude",), verify_with="claude", runner=self.proposer)["ok"])
+        cfg["dream"] = {"agreement": "model", "models": {"verifier": {"claude": "haiku"}}}
         path.write_text(json.dumps(cfg))
         self.assertFalse(dc.dream_run(self.repo, via=("claude",), verify_with="claude", runner=self.proposer)["ok"])
         cfg["dream"]["models"] = {"claude": "haiku", "verifier": {"claude": "sonnet"}}
@@ -750,9 +773,37 @@ class ReviewRegressionTests(DreamFixture):
         self.assertFalse(dc.PROPOSE_PROMPT.startswith("-"))
         self.assertFalse(dc.VERIFY_PROMPT.startswith("-"))
 
+    def test_real_model_envelopes_fence_and_items_wrapper_are_accepted_and_nothing_else(self):
+        # What haiku actually returned in a live run: a ```json fence around {"items": [...]}.
+        b = self.ingest()
+        cand = self.candidate(b)
+        for label, text, ok in [
+                ("fence", "```json\n" + json.dumps([cand]) + "\n```", True),
+                ("bare fence", "```\n" + json.dumps([cand]) + "\n```\n", True),
+                ("items wrapper", json.dumps({"items": [cand]}), True),
+                ("fence + items wrapper", "```json\n" + json.dumps({"items": [cand]}) + "\n```", True),
+                ("wrapper with another key", json.dumps({"items": [cand], "note": "x"}), False),
+                ("other wrapper key", json.dumps({"candidates": [cand]}), False),
+                ("prose before", "Result:\n```json\n" + json.dumps([cand]) + "\n```", False),
+                ("two fences", "```json\n[]\n```\n```json\n" + json.dumps([cand]) + "\n```", False)]:
+            with self.subTest(case=label):
+                if ok:
+                    self.assertEqual([cand], dc._model_json(text, unwrap_items=True))
+                else:
+                    with self.assertRaises(ValueError):
+                        value = dc._model_json(text, unwrap_items=True)
+                        if not isinstance(value, list):
+                            raise ValueError("expected bounded candidate array")
+        result = dc.dream_run(self.repo, runner=lambda *a, **k: "```json\n" + json.dumps({"items": [cand]}) + "\n```")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(0, result["failedBatches"])
+        self.assertIn("first character of your answer is `[`", dc.PROPOSE_PROMPT)
+        self.assertNotIn('"maxItems": ' + str(dc.MAX_CANDIDATES) + ', "type": "array"', dc.PROPOSE_PROMPT)
+
     def test_unparseable_batch_failed_raw_kept_and_retries_only_next_invocation(self):
         b = self.ingest()
-        bad = "```json\n"+json.dumps([self.candidate(b)])+"\n```"
+        # Prose around the JSON stays unparseable (a single code fence alone is accepted since 9.1.1).
+        bad = "Here are the lessons:\n"+json.dumps([self.candidate(b)])
         result = dc.dream_run(self.repo, runner=lambda *a,**k: bad)
         self.assertFalse(result["ok"])
         self.assertEqual((1,1), (result["calls"],result["failedBatches"]))

@@ -21,6 +21,18 @@ VERDICT_HELP = {
 }
 MODEL_AGREEMENT = "two models of the same vendor agreed"
 VENDOR_AGREEMENT = "two vendors agreed"
+SAME_VENDOR_REVIEW = ('a second model of the same vendor checked it; review aid, not a hint under '
+                      'dream.agreement: "vendor"')
+VERIFICATION_SUMMARY = "Second-model checks: %d item(s) checked; %d became hints; %d remain pending."
+VENDOR_REVIEW_SUMMARY = ('Same-vendor checks are a review aid under dream.agreement: "vendor"; '
+                         'they cannot make hints under the current setting.')
+BRIDGE_RULE = "rule"
+BRIDGE_RULE_STATES = ("active", "compatible-unverified", "stale", "unpinned", "path-exists", "unanchored")
+BRIDGE_SUGGESTED_ANCHOR = "suggested-anchor"
+BRIDGE_RELATIONS = ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS")
+BRIDGE_BLOCKED_REASON = "approved BLOCKS lesson"
+BRIDGE_REPLACED_REASON = "replaced — do not apply as current"
+BRIDGE_TRUNCATED = " [truncated; see source]"
 JUDGE_UNAVAILABLE = ("Only claude can currently be launched, so a judge from a different vendor cannot exist in practice; "
                      "keyed questions are scored deterministically; judged scoring needs a second vendor with a tool-free mode.")
 
