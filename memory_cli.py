@@ -206,6 +206,38 @@ class _OutputFormat(_ExplicitValue):
         namespace._format_explicit = True
 
 
+class _LearnParser(argparse.ArgumentParser):
+    """New learn spellings are exact-only; all old abbreviation rules survive."""
+    _merge_options = ("--merge", "--unmerge", "--same")
+
+    def _get_option_tuples(self, option_string):
+        return [entry for entry in super()._get_option_tuples(option_string)
+                if entry[1] not in self._merge_options]
+
+    def parse_known_args(self, args=None, namespace=None):
+        self._uses_merge_options = any(a.split("=", 1)[0] in self._merge_options for a in (args or []))
+        return super().parse_known_args(args, namespace)
+
+    def error(self, message):
+        if getattr(self, "_uses_merge_options", False):
+            return super().error(message)
+        # Match legacy error text and usage, including the required-mode list.
+        actions = self._actions
+        groups = [(g, g._group_actions) for g in self._action_groups + self._mutually_exclusive_groups]
+        def old(action):
+            return not any(o in self._merge_options for o in action.option_strings)
+        try:
+            self._actions = [a for a in actions if old(a)]
+            for group, entries in groups:
+                group._group_actions = [a for a in entries if old(a)]
+            message = message.replace(" --merge --unmerge", "")
+            super().error(message)
+        finally:
+            self._actions = actions
+            for group, entries in groups:
+                group._group_actions = entries
+
+
 def _reserve_legacy_prefixes(parser):
     """Reserve old unique abbreviations without expanding the visible help.
 
@@ -404,6 +436,10 @@ def _route_new(args):
             return _bridge_call('learn_from_transcript', args.repo, args.transcript, vendor=args.vendor)
         if args.pending:
             return _bridge_call('learn_pending', args.repo)
+        if args.merge:
+            return _bridge_call('learn_merge', args.repo, keep=args.merge, same=args.same, approver=args.by)
+        if args.unmerge:
+            return _bridge_call('learn_unmerge', args.repo, ids=args.unmerge, approver=args.by)
         if args.paths:
             return _bridge_call('learn_paths', args.repo, ids=args.paths, approver=args.by, paths=args.path)
         if args.approve:
@@ -499,8 +535,9 @@ def _validate_modes(args, parser):
         reject('unified recall (use recall --query for store filters)', flags)
     if args.action == 'learn':
         mode = ('--file' if args.file is not None else '--transcript' if args.transcript is not None
-                else '--pending' if args.pending else '--approve' if args.approve or args.paths else '--reject')
+                else '--pending' if args.pending else '--merge' if args.merge else '--unmerge' if args.unmerge else '--approve' if args.approve or args.paths else '--reject')
         allowed = {'--file': (), '--transcript': ('repo', 'vendor'), '--pending': ('repo',),
+                   '--merge': ('repo', 'by'), '--unmerge': ('repo', 'by'),
                    '--approve': ('repo', 'by'), '--reject': ('repo', 'by', 'reason')}[mode]
         flags = ['--' + name for name in ('repo', 'vendor', 'by', 'reason') if given(name) and name not in allowed]
         reject('learn ' + mode, flags + (store_flags if mode != '--file' else []))
@@ -510,6 +547,13 @@ def _validate_modes(args, parser):
             parser.error("--path requires --approve or --paths")
         if args.paths and not args.path:
             parser.error("--paths requires --path FILE")
+        from memlet.vocabulary import MERGE_REASONS
+        if args.same and not args.merge:
+            parser.error(MERGE_REASONS['same-without-merge'])
+        if args.merge and not args.same:
+            parser.error(MERGE_REASONS['same-required'])
+        if (args.merge or args.unmerge) and not args.by.strip():
+            parser.error(MERGE_REASONS['by-required'])
         if (args.approve or args.reject or args.paths) and not args.by.strip():
             parser.error('learn --approve/--reject requires --by NAME')
     if args.action == 'init':
@@ -545,6 +589,23 @@ def main():
         sub = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
         if command in sub.choices:
             _deprecated(command, 'memlet admin ' + command)
+    if command == 'learn' and any(token.partition('=')[0] in ('--sa', '--sam', '--same') for token in argv):
+        # A lone --same has no mode for argparse's required group. Diagnose the
+        # dependency first, resolving options through the frozen legacy aliases.
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        learn_options = [sub.choices['learn']._parse_optional(token) for token in argv[argv.index('learn') + 1:]]
+        selected = set()
+        for options in learn_options:
+            # Python 3.13 returns a list of alternatives; 3.9 returns one tuple.
+            # Leave ambiguous abbreviations to argparse's existing diagnostic.
+            if isinstance(options, list) and len(options) != 1:
+                continue
+            for parsed in options if isinstance(options, list) else [options]:
+                if parsed and parsed[0] is not None:
+                    selected.add(parsed[0].dest)
+        if 'same' in selected and 'merge' not in selected:
+            from memlet.vocabulary import MERGE_REASONS
+            parser.error(MERGE_REASONS['same-without-merge'])
     args = parser.parse_args(argv)
     for name in ('root', 'task', 'session', 'standalone'):
         if not hasattr(args, name):
@@ -661,6 +722,7 @@ def _build_parser():
     for name in ('feedback','skill-manage'):
         sub.add_parser(name).add_argument('--file',required=True)
     learn=sub.add_parser('learn')
+    learn.__class__ = _LearnParser
     learn_mode=learn.add_mutually_exclusive_group(required=True)
     learn_mode.add_argument('--file',help='Existing memory-store learning request JSON')
     sub.add_parser('skill-sync')
@@ -718,6 +780,10 @@ def _build_parser():
     learn.add_argument('--repo',action=_ExplicitValue,default='.')
     learn.add_argument('--vendor',action=_ExplicitValue,default='autonomous-deterministic')
     learn.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
+    from memlet.vocabulary import MERGE_HELP, UNMERGE_HELP, MERGE_SAME_HELP
+    learn_mode.add_argument('--merge', metavar='KEEP', help=MERGE_HELP)
+    learn_mode.add_argument('--unmerge', metavar='ID', nargs='+', help=UNMERGE_HELP)
+    learn.add_argument('--same', metavar='ID', nargs='+', help=MERGE_SAME_HELP)
     _register_plugins(sub)
     _configure_help(parser, sub)
     return parser
