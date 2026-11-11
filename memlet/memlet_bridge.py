@@ -1271,7 +1271,12 @@ def _merge_decide(repo_path, ids, approver, *, keep=None):
             if not checks["ok"] or checks["blockers"]:
                 refused = [{"id": keep if keep is not None and keep not in nodes and r == "unknown-id" else i, "reason": r, "message": MERGE_REASONS[r]}
                            for i, reasons in checks["blockers"].items() for r in reasons]
-                message = checks.get("error") or "; ".join(r["id"] + ": " + r["message"] for r in refused)
+                said = []  # one sentence per (id, message): an unknown kept id is not repeated once per member
+                for r in refused:
+                    line = r["id"] + ": " + r["message"]
+                    if line not in said:
+                        said.append(line)
+                message = checks.get("error") or "; ".join(said)
                 return _fail(message, 2, **{k: v for k, v in checks.items() if k not in ("ok", "error")},
                              applied=[], refused=refused)
             path_commands, path_notice = {}, None

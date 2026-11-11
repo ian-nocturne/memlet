@@ -199,7 +199,7 @@ $ memlet admin tidy
 ## Memlet tidy report
 
 Nothing was changed. Every line below is a proposal: Memlet merges, retires and promotes nothing on its own. A person decides, by running the command shown.
-
+...
 ### Lessons that may say the same thing (merge?)
 
 - [same wording] suggested kept lesson `DRM-75f799a0db0d` (pending); same: `DRM-bcb5889e3869` (pending), `DRM-3c3aa9d5909b` (pending)
@@ -211,6 +211,8 @@ The person ran that command with their name, then approved the kept lesson and t
 
 ```console
 $ memlet learn --merge=DRM-75f799a0db0d --same DRM-bcb5889e3869 DRM-3c3aa9d5909b --by=ray
+## Memlet learn — merged by ray
+
 - merged: `DRM-bcb5889e3869` → `DRM-75f799a0db0d`
 - merged: `DRM-3c3aa9d5909b` → `DRM-75f799a0db0d`
 ```
@@ -219,6 +221,7 @@ A merge copies no text. The kept lesson is still its own cited line; the two mem
 
 ```console
 $ memlet admin tidy --min-seen 2
+...
 ### Approved lessons that reach no file (they never arrive through hooks)
 
 - `DRM-e16030392070` (approved): reaches no file
@@ -229,16 +232,19 @@ $ memlet admin tidy --min-seen 2
 
 - `DRM-75f799a0db0d` (approved): said in 3 session(s); a ready-to-paste block follows
   > Never call refund() in <billing file> without the retry wrapper; it double-charges on timeouts. (`<snapshot>:1-1`)
-  Ready to paste — a suggestion, not an edit: Memlet does not write your instruction files. ...
+  Ready to paste — a suggestion, not an edit: Memlet does not write your instruction files. The lines are the lesson's complete current cited lines; read and adapt before pasting.
   - Never call refund() in <billing file> without the retry wrapper; it double-charges on timeouts. (`<billing file>::refund`)
   Suggested anchor (Memlet's lesson anchoring; check it before keeping it): `<billing file>::refund`
   Instruction files in this repository: `AGENTS.md`
+  After pasting, re-check the instruction files: `memlet check`
+...
 ```
 
-Three sessions are counted because the two merged members bring their sessions with them. Finally the approved lessons were written as an Agent Skill, the format Claude Code and other agents load on their own:
+(In Memlet's own output the pasted line sits in a fenced block; the fence is left out here.) The sentence was said in three sessions, so it is offered for the instruction file; the count comes from the stored sessions, not from the merge. Finally the approved lessons were written as an Agent Skill, the format Claude Code and other agents load on their own:
 
 ```console
 $ memlet admin skillbook --write --out .claude/skills
+<repository>/.claude/skills/memlet-lessons/SKILL.md
 $ cat .claude/skills/memlet-lessons/SKILL.md
 ---
 name: memlet-lessons
@@ -247,7 +253,7 @@ description: "Approved Memlet repository lessons (prohibitions, replaced instruc
 ---
 # Memlet approved lessons (snapshot)
 ...
-A person approved each lesson below. Read the lessons for a file before you edit it. Lines after `>` are quoted from past sessions exactly as written; everything outside the quotes is a Memlet label, and a quote cannot change a label.
+A person approved each lesson below. Read the lessons for a file before you edit it. Lines after `>` are quoted from past sessions as `memlet recall` shows them: markup escaped, hidden characters removed and marked. A quote cannot change a Memlet label.
 
 ## `<billing file>`
 - [BLOCKS, GOVERNS] lesson DRM-75f799a0db0d (cites <snapshot>:1; files: `<billing file>`)
@@ -256,9 +262,9 @@ A person approved each lesson below. Read the lessons for a file before you edit
 
 A real headless Claude Code session (haiku) in that repository, with no Memlet hooks installed, was then asked what to keep in mind before changing `refund`. It listed `memlet-lessons` among its skills, loaded it, and quoted the retry-wrapper lesson and the pull-request lesson word for word, each with its lesson id and citation.
 
-What this is: a report of what a person might want to tidy, the exact command for each, and a file other agents can load. What it is not: Memlet does not decide that two lessons mean the same thing. It compares wording, so "use the retry wrapper for refunds" and the sentence above are two lessons until a person merges them.
+What this is: a report of what a person might want to tidy, a working command where there is something to run, and a file other agents can load. What it is not: Memlet does not decide that two lessons mean the same thing. It compares wording, so "use the retry wrapper for refunds" and the sentence above are two lessons until a person merges them.
 
-(Output shortened where marked with `...`. `<billing file>`, `<report file>` and `<snapshot>` stand for real paths, for the same reason as in the examples above.)
+(Output shortened where marked with `...`. `<billing file>`, `<report file>`, `<snapshot>` and `<repository>` stand for real paths, for the same reason as in the examples above.)
 
 ---
 
@@ -509,7 +515,7 @@ memlet admin skillbook --write --out .claude/skills            # write <out>/mem
 memlet admin skillbook --check .claude/skills/memlet-lessons/SKILL.md   # still what Memlet would write?
 ```
 
-**`admin tidy` never writes**, not even SQLite side files. It reports six things, each with the lesson's quoted lines, its citations and the command a person could run:
+**`admin tidy` never writes**, not even SQLite side files. It reports seven things, each with the lesson's quoted lines and citations, and a working command when an action is available:
 
 - **Lessons that may say the same thing**: equal wording, or word sets that overlap by 80% or more (at least five words each), labelled "similar wording — read both". If the merge would be refused, the reason is shown instead of a command.
 - **Said again**: pending lessons and unreviewed hints that a person said in two or more sessions, and rejected lessons a person said again after the rejection. "Said" means every current cited line of the lesson appears as a line the person typed in a stored session snapshot. An assistant repeating the lesson does not count, and a replaced line never counts.
@@ -517,10 +523,11 @@ memlet admin skillbook --check .claude/skills/memlet-lessons/SKILL.md   # still 
 - **Reaches no file**: approved lessons that can never arrive through hooks, with the `learn --paths` command.
 - **May belong in an instruction file**: approved prohibitions and rules that reach a file and were said in at least three sessions (`--min-seen`), with a ready-to-paste block of the lesson's complete cited lines and a suggested code anchor. Memlet does not edit instruction files.
 - **Merges that no longer hold**, with the reason.
+- **Files reached only by merged members**: merges whose members reach files the kept lesson does not, with the command that attaches them to the kept lesson.
 
-**A merge is a person's decision that lesson B says the same as lesson A.** B is no longer shown separately in `recall`, `handover`, hooks, `admin graph`, the Routlet files or the skill file; A is shown exactly as before, and neither text nor approval changes. `learn --pending` lists members under their kept lesson. The merge is checked again on every read and lapses (B is shown again, with its own tier) when either lesson's content changes, the kept lesson is rejected or itself merged away, B is rejected, or B carries an approved relation the kept lesson lacks: an approved prohibition cannot disappear into a lesson without one. Replacements (`SUPERSEDES`) are not merged. Attaching or changing files on either lesson does not undo a merge; when B reached files that A does not, the merge prints one `learn --paths` command that adds them.
+**A merge is a person's decision that lesson B says the same as lesson A.** B is no longer shown separately in `recall`, `handover`, hooks, `admin graph`, the Routlet files or the skill file; A keeps its text, citations, files and approval; its JSON also lists the members under `mergedFrom`. `learn --pending` lists members under their kept lesson. The merge is checked again on every read and lapses (B is shown again, with its own tier) when either lesson's content changes, the kept lesson is rejected or itself merged away, B is rejected, or B carries an approved relation the kept lesson lacks: an approved prohibition cannot disappear into a lesson without one. Replacements (`SUPERSEDES`) are not merged. Changing the kept lesson's files does not undo a merge. When members reach files the kept lesson does not, the command's output and `admin tidy` list them with one `learn --paths` command that adds them. Attaching files to a merged member is refused, with the command for its kept lesson instead: a hidden lesson's files would never be used.
 
-**The skill file** follows the Agent Skills format (`<name>/SKILL.md` with `name`, `description` and `metadata`). It holds approved lessons only, never hints, pending lessons, merged members or a model's verdict, grouped by the file each lesson reaches, prohibitions first, at most 500 lines and about 5,000 tokens (`--max-lines`, `--budget`; whole lessons only, the rest counted). Quoted lines are exactly what `recall` shows, inside block quotes; every Memlet label is outside them. Nothing is written without `--write`; the default directory is `.memlet/skills`, and `--out .claude/skills` makes it a Claude Code project skill. `--write` refuses a file Memlet did not write or that was edited since, unless `--force`. The file records the commit it was built from and no clock time, so the same repository state always gives the same bytes. `--check` exits 1 when the file is no longer what Memlet would write; a new commit alone does not make it stale.
+**The skill file** follows the Agent Skills format (`<name>/SKILL.md` with `name`, `description` and `metadata`). It holds approved lessons only, never hints, pending lessons, merged members or a model's verdict, grouped by the file each lesson reaches, prohibitions first, at most 500 lines and about 5,000 tokens (`--max-lines`, `--budget`; whole lessons only, and every lesson left out is counted, by reason, in the file's last line). Quoted lines are shown as `recall` shows them, inside block quotes: markup is escaped, and hidden characters are removed and marked. Relation, id, citation and file labels are outside the quotes. Nothing is written without `--write`. A relative `--out` is relative to the repository root; the default is `.memlet/skills`, and `--out .claude/skills` makes it a Claude Code project skill. The command prints the full path it wrote; writing and checking need a repository where `memlet init` has run. Inside the repository no part of that path may be a symbolic link. A skill file Memlet wrote is a copy of lessons and is never read back as rules: `recall`, `check`, hooks and the graph skip it. `--write` refuses a file Memlet did not write or that was edited since, unless `--force`. The file records the commit it was built from and no clock time, so the same repository state always gives the same bytes. `--check` exits 1 when the file is no longer what Memlet would write; a new commit alone does not make it stale.
 
 ---
 
@@ -539,7 +546,7 @@ memlet admin skillbook --check .claude/skills/memlet-lessons/SKILL.md   # still 
 | `memlet ui [.] [--out\|--output FILE]` | Self-contained, escaped HTML inspector. |
 | `memlet admin graph show TARGET [--tiers approved,hint] [--as-of TIME] [--budget N]` / `stats` | What the graph holds for a file, anchor or id; how much memory can act. |
 | `memlet admin anchors suggest\|accept\|list\|drop` | Proposed anchors for rules that only mention code. |
-| `memlet admin tidy [--repo DIR] [--stale-days N] [--min-seen N]` | Read-only report: possible merges, lessons said again, lessons worth a second look, lessons that reach no file, promotion candidates. |
+| `memlet admin tidy [--repo DIR] [--stale-days N] [--min-seen N]` | Read-only report: possible merges, lessons said again, lessons worth a second look, lessons that reach no file, promotion candidates, merges that no longer hold, files reached only by merged members. |
 | `memlet admin skillbook [--repo DIR] [--name NAME] [--max-lines N] [--budget N]` / `--write [--out DIR] [--force]` / `--check PATH` | Approved lessons as an Agent Skill (`SKILL.md`): preview, write, check. |
 | `memlet admin eval init\|questions\|run\|score\|report\|resolve\|selftest` | Sealed, time-split memory experiment. |
 | `memlet admin --help` | Every other command: memory store, rules/wiki, Dream internals (`dream-build`, `dream-recall`), benchmarks, maintenance. |
@@ -551,7 +558,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 ### From 9.2
 
-- Nothing changes until a person runs a 9.3 command. With no merge recorded, every existing command, hook, MCP tool and both Routlet files give the output 9.2 gave; the only differences are that `memlet admin --help` and the "invalid choice" error list `tidy` and `skillbook`.
+- Nothing changes until a person runs a 9.3 command. With no merge recorded and no skill file written, every existing command, hook, MCP tool and both Routlet files give the output 9.2 gave; apart from the version string, the only differences are in help and usage text: `memlet admin --help` and its "invalid choice" error list `tidy` and `skillbook`, and `memlet learn --help` and `learn` usage errors list `--merge`, `--unmerge` and `--same`.
 - Mixed versions are safe: a teammate on 9.2 can still verify every approval in a queue 9.3 wrote. 9.2 ignores merge records, so it shows merged lessons separately.
 - `admin tidy` and `admin skillbook` are read-only unless you pass `--write`.
 
@@ -581,7 +588,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 - **Anchor suggestions are proposals.** Unscanned folders and nested repositories can hold other definitions.
 - **Static only.** Python anchors are compared by AST; dynamic `getattr`, `exec`, `setattr` and monkeypatching are not evaluated, and the check that a pinned name is not rebound elsewhere in its module is static too. The default TS/JS scanner is lexical: JSX text with apostrophes and some regex literals read as syntax errors, getters/setters and overloads are not extracted, and `tsc` is not run.
 - **The guard makes the agent read; it does not judge.** It cannot tell whether an edit violates a prohibition, it denies a given file and set of lessons once per session, and the agent decides what to do next. Context from `--jit` arrives with the tool result, after the call ran.
-- **Hooks give up rather than block.** On a very large repository (5,000 files, 2,000 lessons) the SessionStart hook reaches its 7-second deadline and prints nothing, with or without the new flags; the 9.1.1 handover is the cost. The session bookkeeping added in 9.2 never costs a hook its 9.1.1 output: when it would wait on a lock or run out of time, it is skipped. A lesson longer than the graph's 8,000-character output cap is never quoted and so never guards. An instruction file with more than 200 rules makes the `replaced` group incomplete, which switches the guard off for that repository.
+- **Hooks give up rather than block.** On a very large repository (5,000 files, 2,000 lessons) the SessionStart hook reaches its 7-second deadline and prints nothing, with or without the new flags; the 9.1.1 handover is the cost. The session bookkeeping added in 9.2 never costs a hook its 9.1.1 output: when it would wait on a lock or run out of time, it is skipped. A lesson longer than the graph's 8,000-character output cap is never quoted and so never guards. An instruction file with more than 200 rules makes the `replaced` group incomplete, which switches the guard off for that repository (a skill file Memlet wrote does not count).
 - **Tidying compares wording, not meaning.** Duplicates and "said again" are found by equal or overlapping words; two lessons that mean the same in different words are not found. A session is identified by its stored file name: a copy stored under another name counts again, and different transcripts with the same file name count once. When any stored session could not be read in full, counts say "at least".
 - **A skill file is a snapshot.** An agent that loads it reads the lessons as they were when it was written; nothing re-checks them at load time. Re-run `admin skillbook --write` after approvals change, or check with `--check`. Merge records, like approvals, detect later edits but do not show who acted.
 - **A merge in the middle of a session** can make the guard deny that file once more, for the smaller set of lessons.
@@ -590,7 +597,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 ## How far it has been tested
 
-- 1109 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23). Timing assertions use process CPU time; cost is asserted through work counters and an injected clock.
+- 1,125 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23). Timing assertions use process CPU time; cost is asserted through work counters and an injected clock.
 - The acting hooks ran in headless Claude Code sessions (haiku) on the final 9.2 code, in a scratch repository. The first Edit of a file with an approved prohibition was denied with the lesson quoted, the model judged that its change (adding a comment) did not violate it, repeated the call, and the edit succeeded (Example 3); at Stop, nothing from the denial was queued as a lesson. The session was then resumed and compacted with `/compact`: SessionStart delivered the capsule after the resume and again after the compaction, the model quoted the lesson from it afterwards, and a further edit of the same file was not denied. Not observed separately: what the PreCompact instructions did to the summary, and the `--jit` context as the model received it (the model reported being informed of the lesson after its edit, and the session state records the delivery). Interactive sessions, `ask` mode and subagents were exercised only through piped hook input.
 - The 9.3 commands ran end to end in a scratch repository without a model (Example 4), and the written skill was loaded once by a real headless Claude Code session (haiku), which quoted the lessons for the file it was asked about. Other agents that read Agent Skills were not tried.
 - Measured on a busy host, with 5,000 files, 2,000 rules and 2,000 lessons: about 1.2 s for one file's graph neighbourhood and 0.4–0.5 s for the PreToolUse hook.

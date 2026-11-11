@@ -131,6 +131,14 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.assertTrue(mb.learn_unmerge(repo, [second], approver='Ray')['ok'])
         self.assertEqual(both['text'], sb.build_skill(repo)['text'])  # same state, same bytes
 
+    def test_an_unknown_kept_lesson_is_named_once(self):
+        repo, first, second, third = self.fixture()
+        code, out, err = run_cli(['learn', '--merge', 'DRM-nope', '--same', first, second, '--by', 'Ray',
+                                  '--repo', str(repo), '--format', 'markdown'])
+        self.assertEqual(2, code)
+        self.assertEqual(1, (out + err).count('DRM-nope: '), out + err)
+        self.assertNotIn(first + ': ', out + err)
+
     def test_tidy_stays_read_only_with_merges_present(self):
         repo, first, second, third = self.fixture()
         self.assertTrue(mb.learn_merge(repo, first, [second], approver='Ray')['ok'])
