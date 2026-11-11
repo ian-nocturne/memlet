@@ -32,7 +32,7 @@ MAX_REJECTION_RECORDS = 100
 MAX_REJECTION_BYTES = 32768
 from .vocabulary import HINT_HELP
 TRUST_BOUNDARY = ("Vendor launch receipts are local digest integrity records, not signatures: a writer of .memlet "
-                  "can forge them and human approval records. MCP and model output cannot create launch receipts. " + HINT_HELP + ".")
+                  "can forge them and human approval records. MCP and model output cannot create launch receipts. " + HINT_HELP)
 HOST_STATE_REL = RUNS_REL + "/host-sessions.json"
 VERDICTS = ("SUPPORTED", "MISSING_CONDITION", "OUT_OF_EVIDENCE", "WRONG_EDGE")
 _ID = re.compile(r"^[a-f0-9]{24}$")
@@ -312,7 +312,7 @@ def _plan_rows(snapshot, spec, tokens):
     return [[f, n, t if mw.estimate_tokens(_snapshot_row(f, n, t)) <= tokens else None] for f, n, t in raw]
 
 
-def _next(root, run_id, batch_tokens, *, lane="host", snapshot_override=None):
+def _next(root, run_id, batch_tokens, *, lane="host", snapshot_override=None, skip_batches=(), requested_batch=None):
     if type(batch_tokens) is not int or not 128 <= batch_tokens <= 16000:
         raise ValueError("batch_tokens must be 128..16000")
     snapshot = snapshot_override
@@ -322,6 +322,22 @@ def _next(root, run_id, batch_tokens, *, lane="host", snapshot_override=None):
             return {"ok": True, "done": True, "reason": reason}
     if run_id is not None and not _ID.fullmatch(str(run_id)):
         raise ValueError("invalid run_id")
+    if run_id is None and lane == "trusted" and snapshot_override is None:
+        # Finish an existing plan before advancing its per-session cursor; failed
+        # batches are retried only when this explicit invocation starts.
+        for path in sorted((root / RUNS_REL).glob("*.json")):
+            if not _ID.fullmatch(path.stem):
+                continue
+            prior = _read(root, RUNS_REL + "/" + path.name, {})
+            if prior.get("lane") != lane or len(prior.get("completed", [])) >= len(prior.get("plan", [])):
+                continue
+            try:
+                for spec in prior["plan"]:
+                    _plan_rows(snapshot, spec, prior["batchTokens"])
+            except ValueError:
+                continue  # changed snapshots create a new plan, never reuse old evidence
+            run_id = path.stem
+            break
     state = _read(root, RUNS_REL + "/" + run_id + ".json", {}) if run_id else {}
     if state:
         if state.get("lane", "host") != lane:
@@ -346,7 +362,8 @@ def _next(root, run_id, batch_tokens, *, lane="host", snapshot_override=None):
             "plan": plan, "starts": starts, "lane": lane}
     for i, spec in enumerate(plan):
         bid = _hash([run_id, i, spec])[:24]
-        if bid not in state.get("completed", []):
+        if (bid not in state.get("completed", []) and bid not in skip_batches
+                and (requested_batch is None or bid == requested_batch)):
             rows = _plan_rows(snapshot, spec, batch_tokens)
             data = _snapshot_text(rows)
             return dict(base, done=False, batchId=bid, batchIndex=i, stdinText=data, rows=rows,
@@ -364,9 +381,16 @@ def _complete_batch(root, current, state):
     progress_rel = STATE_REL if current["lane"] == "trusted" else HOST_STATE_REL
     sessions = _read(root, progress_rel, {"sessions": {}})
     snapshot, _ = mb._load_snapshot(root)
-    for f, n, _ in current["rows"]:
-        session = sessions["sessions"].setdefault(f, {"lines": len(snapshot[f]), "dreamed": 0})
-        session["dreamed"] = max(session["dreamed"], n)
+    # Advance only across contiguous completed ranges, so a later successful
+    # batch cannot erase a failed earlier batch from the next explicit run.
+    for index, spec in enumerate(state["plan"]):
+        bid = _hash([state["runId"], index, spec])[:24]
+        if bid not in state.get("completed", []):
+            continue
+        for f, first, last in spec["ranges"]:
+            session = sessions["sessions"].setdefault(f, {"lines": len(snapshot[f]), "dreamed": 0})
+            if first <= session["dreamed"] + 1:
+                session["dreamed"] = max(session["dreamed"], last)
     _write(root, progress_rel, sessions)
 
 
@@ -434,6 +458,7 @@ def _normalize_spans(clean):
 
 
 REJECTION_MEANINGS = {
+    "candidate_ontology_invalid": "the candidate violates the pinned ontology contract",
     "candidate_not_object": "the candidate is not a JSON object",
     "candidate_schema_invalid": "the candidate has invalid fields, unsafe characters or exceeds schema bounds",
     "unpinnable_citation": "the cited id does not match a line that was shown",
@@ -517,7 +542,7 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
     with md.queue_lock(root / mb.QUEUE_REL):
         lane = "trusted" if launched else "host"
         # Always re-read under the queue lock, even with a caller-supplied batch.
-        current = _next(root, run_id, 6000, lane=lane)
+        current = _next(root, run_id, 6000, lane=lane, requested_batch=batch_id if batch is not None else None)
         if not current.get("ok") or current.get("done") or current.get("runId") != run_id or current.get("batchId") != batch_id:
             raise ValueError("unknown, completed or mismatched batch")
         snapshot, _ = mb._load_snapshot(root)
@@ -538,10 +563,11 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                         raise ValueError("unpinnable citation")
                     if not all((parsed[0], n) in allowed for n in range(parsed[1], parsed[2] + 1)):
                         raise ValueError("citation outside supplied batch")
-                # Pick a stable default source endpoint before pinning. Keep every
-                # cited line below, independently of the legacy three-span limit.
-                source_lines = _pin_lines([md.resolve_pin(snapshot, s, max_lines=4) for s in clean["src_spans"]])
-                clean["src_spans"] = ["%s:%d" % (f, n) for f, n, _ in source_lines[:3]]
+                # An omitted edge source has always meant the canonical first cited line.
+                # Keep that default stable without rewriting the node's semantic primary pin.
+                canonical = _pin_lines([md.resolve_pin(snapshot, span, max_lines=4) for span in clean["src_spans"]])[0]
+                for edge in clean["edges"]:
+                    edge.setdefault("src_span", "%s:%d" % canonical[:2])
                 clean["lesson_id"] = "DRM-" + _hash([clean, lane])[:16]
                 graph = md.dream_pin_and_validate([clean], snapshot, vendor_origin=proposer, add_governs=False)
                 if not graph["nodes"]:
@@ -556,14 +582,19 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                             node["allPins"].append(pin)
                             known.add(pin["span"])
                     cited = _pin_lines(node["allPins"])
-                    node["allPins"] = [md.resolve_pin(snapshot, "%s:%d" % (f, n)) for f, n, _ in cited]
-                    node["primaryPin"] = node["allPins"][0]
+                    primary = node["primaryPin"]
+                    covered = {(f, n) for f, n, _ in _pin_lines([primary])}
+                    node["allPins"] = [primary] + [md.resolve_pin(snapshot, "%s:%d" % (f, n))
+                                                   for f, n, _ in cited if (f, n) not in covered]
                     node["timestamp"] = md.extract_line_timestamp(node["primaryPin"]["quoteText"])
                 # Preserve endpoint identity even for non-SUPERSEDES edges.
                 for node in graph["nodes"]:
                     for edge, source in zip(node["edges"], clean["edges"]):
                         if source.get("target_span"):
                             edge["citedTargetPin"] = md.resolve_pin(snapshot, source["target_span"], max_lines=4)
+                check = md.verify_ontology_contract(graph, snapshot)
+                if not check["ok"]:
+                    raise ValueError("candidate_ontology_invalid")
                 md._mark_pending(graph)
                 built_nodes += graph["nodes"]
             except (ValueError, TypeError, KeyError) as exc:
@@ -598,7 +629,8 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                 target = node
                 added.append(node["id"])
             record = _receipt(proposer, node, run_id, launched)
-            record["citations"] = copy.deepcopy(node["allPins"])
+            record["citations"] = [md.resolve_pin(snapshot, "%s:%d" % (f, n))
+                                   for f, n, _ in _pin_lines(node["allPins"])]
             seal_receipt(record)
             records = target.setdefault("proposers", [])
             if not any(r.get("vendor") == proposer and r.get("origin") == record["origin"] and r.get("digest") == record["digest"] and r.get("model") == record["model"] and r.get("citations") == record["citations"] for r in records if isinstance(r, dict)):
@@ -834,12 +866,15 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                 report["prompts"].append(prompt_record(verify_with, verifier_model, "verify", VERIFY_PROMPT, _verification_data(node, snapshot)))
             report["plannedExistingVerificationCalls"] = min(len(existing), MAX_CALLS)
             state = _read(root, state_rel, {})
+            report["retryFailedBatches"] = []
             for i, spec in enumerate(first["plan"]):
                 bid = _hash([run_id, i, spec])[:24]
                 if bid in state.get("completed", []):
                     continue
                 if report["batches"] >= max_batches or len(report["prompts"]) + len(vendors) > MAX_CALLS:
                     break
+                if bid in state.get("failed", {}):
+                    report["retryFailedBatches"].append(bid)
                 rows = _plan_rows(snapshot, spec, 6000)
                 data = _snapshot_text(rows)
                 report["batches"] += 1
@@ -861,14 +896,16 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     _write(root, state_rel, state)
                 if verify_with:
                     verify_pending()
+                attempted_batches, consecutive_failures = set(), 0
                 for _ in range(max_batches):
-                    batch = _next(root, run_id, 6000, lane="trusted")
+                    batch = _next(root, run_id, 6000, lane="trusted", skip_batches=attempted_batches)
                     if batch.get("done"):
-                        report["done"] = True
+                        report["done"] = not _next(root, run_id, 6000, lane="trusted").get("batchId")
                         break
                     if not budget():
                         break
                     report["batches"] += 1
+                    attempted_batches.add(batch["batchId"])
                     success = True
                     for v in vendors:
                         if not budget():
@@ -903,9 +940,14 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             success = False
                             break
                     if not success:
-                        break  # retry only in a subsequent explicit invocation
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            report["consecutiveFailureStopped"] = True
+                            break
+                        continue  # move forward; retry this batch only in a later explicit invocation
+                    consecutive_failures = 0
                     with md.queue_lock(root / mb.QUEUE_REL):
-                        current = _next(root, run_id, 6000, lane="trusted")
+                        current = _next(root, run_id, 6000, lane="trusted", requested_batch=batch["batchId"])
                         if current.get("batchId") != batch["batchId"]:
                             raise ValueError("completed or mismatched batch")
                         state = _read(root, state_rel, _run_state(batch))
@@ -944,6 +986,7 @@ def dream_status(repo):
                     st = _read(root, RUNS_REL + "/" + p.name, {})
                     runs.append({"runId": p.stem, "lane": st.get("lane", "host"), "failedBatches": len(st.get("failed", {})),
                                  "completedBatches": len(st.get("completed", [])), "lastRun": st.get("lastRun"),
+                                 "failedBatchIds": sorted(st.get("failed", {})), "skippedBatches": st.get("skipped", []),
                                  "rejectedCandidates": st.get("rejectedCandidates", 0),
                                  "normalizedSpans": st.get("normalizedSpans", 0),
                                  "rejections": st.get("rejections", []), "rejectionsOmitted": st.get("rejectionsOmitted", 0)})
@@ -953,4 +996,34 @@ def dream_status(repo):
                 "rejectedCandidates": sum(run["rejectedCandidates"] for run in runs),
                 "counts": tiers["counts"], "items": tiers["items"], "notices": tiers["notices"], "trustBoundary": TRUST_BOUNDARY}
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        return mb._fail(str(exc), 2)
+
+
+def dream_skip_failed(repo, batch_id, *, dry_run=False):
+    """Explicit, recorded completion with rejections; never launches a model."""
+    try:
+        root, _ = _repo(repo)
+        if not _ID.fullmatch(str(batch_id)):
+            raise ValueError("invalid failed batch id")
+        with md.queue_lock(root / mb.QUEUE_REL):
+            matches = []
+            for path in sorted((root / RUNS_REL).glob("*.json")):
+                if _ID.fullmatch(path.stem):
+                    state = _read(root, RUNS_REL + "/" + path.name, {})
+                    if batch_id in state.get("failed", {}):
+                        matches.append(state)
+            if len(matches) != 1:
+                raise ValueError("expected exactly one failed batch; inspect dream --status")
+            state = matches[0]
+            entry = {"batchId": batch_id, "at": md._utc_now_iso(), "status": "completed-with-rejections",
+                     "failure": state["failed"][batch_id]}
+            if not dry_run:
+                current = _next(root, state["runId"], state["batchTokens"], lane=state.get("lane", "host"), requested_batch=batch_id)
+                if current.get("batchId") != batch_id:
+                    raise ValueError("failed batch is no longer pending")
+                state.setdefault("skipped", []).append(entry)
+                _complete_batch(root, current, state)
+                _write(root, RUNS_REL + "/" + state["runId"] + ".json", state)
+            return {"ok": True, "runId": state["runId"], "skippedBatches": [entry], "dryRun": dry_run, "calls": 0}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         return mb._fail(str(exc), 2)

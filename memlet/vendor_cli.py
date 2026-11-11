@@ -106,9 +106,18 @@ def _settings_risks(config_dir):
     return risks
 
 
+PLATFORM_REFUSAL = "the vendor runner needs POSIX process groups; not available on this platform"
+
+
+def _posix_runner_available():
+    return os.name == "posix" and all(hasattr(os, name) for name in ("killpg", "set_blocking", "setsid")) and hasattr(signal, "SIGKILL")
+
+
 def check_vendor(vendor, *, config=None, timeout=60):
     def result(ok, reason):
         return {"ok": ok, "vendor": vendor, "reason": reason, "isolation": "tool-free"}
+    if not _posix_runner_available():
+        return result(False, PLATFORM_REFUSAL)
     refusal = static_vendor_refusal(vendor)
     if refusal:
         return result(False, refusal)
@@ -134,6 +143,8 @@ def check_vendor(vendor, *, config=None, timeout=60):
 
 def _capture(argv, data, timeout, limit, cwd):
     """Bound both pipes while draining them; kill the process group on excess/timeout."""
+    if not _posix_runner_available():
+        raise ValueError(PLATFORM_REFUSAL)
     deadline = time.monotonic() + timeout
     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           cwd=cwd, env=_runner_env(), start_new_session=True) as p:
@@ -182,6 +193,8 @@ def _capture(argv, data, timeout, limit, cwd):
 def run_vendor(vendor, prompt, *, stdin_text="", timeout=120, max_output_bytes=262144, runner=None, model=None, config=None):
     model = DEFAULT_MODELS.get(vendor, "") if model is None else model
     result = {"ok": False, "vendor": vendor, "model": model, "text": "", "error": "", "isolation": "tool-free"}
+    if not _posix_runner_available():
+        return dict(result, error=PLATFORM_REFUSAL)
     if vendor not in VENDORS:
         return dict(result, error=static_vendor_refusal(vendor))
     if not valid_model(model):

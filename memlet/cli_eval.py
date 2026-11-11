@@ -8,7 +8,7 @@ COMMANDS = {'eval': {'help': 'Measure memory on sealed held-out questions.', 'pr
 
 
 def register(sub):
-    parser = sub.add_parser('eval', help=COMMANDS['eval']['help'])
+    parser = sub.add_parser('eval', prog='memlet admin eval', help=COMMANDS['eval']['help'])
     parser.add_argument('--repo', default='.')
     commands = parser.add_subparsers(dest='eval_action', required=True)
     for name in ('init', 'questions', 'run', 'score', 'report', 'selftest', 'resolve'):
@@ -49,7 +49,13 @@ def dispatch(args):
     op = values['eval_action']
     try:
         if op == 'selftest':
-            return ev.eval_selftest()
+            res = ev.eval_selftest()
+            if values.get('format') == 'markdown':
+                rows = ["## Memlet eval selftest", "", "Result: " + ("PASS" if res.get('ok') else "FAIL")]
+                for protocol, result in res.get('protocols', {}).items():
+                    rows += ["", "### " + protocol, result.get('report', {}).get('formatted', '') or str(result.get('error', ''))]
+                res['_cli_text'] = '\n'.join(rows) + '\n'
+            return res
         options = {'run': values.get('run')}
         names = {'init': ('dream_until', 'sessions', 'budget', 'hints', 'allow_post_split_memory'),
                  'questions': ('source', 'via', 'count', 'max_calls', 'dry_run'),
@@ -58,8 +64,12 @@ def dispatch(args):
         options.update({k: values[k] for k in names})
         res = {'init': ev.init_eval, 'questions': ev.seal_questions, 'run': ev.run_eval,
                 'score': ev.score_eval, 'report': ev.report_eval, 'resolve': ev.resolve_call}[op](values['repo'], **options)
-        if values.get('format') == 'markdown' and 'formatted' in res:
-            res['_cli_text'] = res['formatted'] + '\n'
+        if values.get('format') == 'markdown':
+            from memory_cli import _text_result
+            res['_cli_text'] = (res.get('formatted') or _text_result(res)) + '\n'
         return res
     except (ImportError, AttributeError, ValueError, OSError, KeyError, TypeError, TimeoutError) as exc:
-        return {'ok': False, 'exitCode': 2, 'error': str(exc)}
+        res = {'ok': False, 'exitCode': 2, 'error': str(exc)}
+        if values.get('format') == 'markdown':
+            res['_cli_text'] = '- ERROR: ' + str(exc) + '\n'
+        return res

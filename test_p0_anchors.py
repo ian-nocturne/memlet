@@ -418,7 +418,8 @@ class AnchorRegressionTests(unittest.TestCase):
         self.write('AGENTS.md', ''.join('- Never deploy flow %d before reading `docs/release.md` and getting sign-off.\n' % i for i in range(80)))
         cap = build_handover(self.root, output_format='markdown')
         self.assertLess(cap['tokenEstimate'], cap['tokenBudget'])
-        self.assertEqual(80, len(cap['pathExistsAnchors']) + cap['omitted']['pathExistsAnchors'])
+        self.assertEqual(80, len(cap['pathExistsAnchors']) + cap['omitted']['pathExistsAnchors']
+                         + cap['listCapOmitted']['pathExistsAnchors']['count'])
         self.assertGreater(cap['omitted']['pathExistsAnchors'], 0)
 
     def test_m5_legacy_skill_pin_is_unchanged_and_refreshes_when_written(self):

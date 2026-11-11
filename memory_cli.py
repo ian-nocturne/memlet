@@ -286,7 +286,7 @@ def _configure_help(parser, sub):
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     commands = dict(sub.choices)
     plugin_help = '\n'.join(('memlet ' + name if meta.get('product') else 'memlet admin ' + name) + ': ' + meta['help']
-                            for name, meta in _PLUGIN_COMMANDS.items() if name in ('dream', 'anchors', 'eval'))
+                            for name, meta in _PLUGIN_COMMANDS.items() if not meta.get('product') and name in ('anchors', 'eval'))
     for child in set(commands.values()):
         _add_global_options(child)
     admin = sub.add_parser('admin', help='Advanced and legacy commands.',
@@ -658,7 +658,7 @@ def _build_parser():
     hooks_mode.add_argument('--hooks',action='store_true',help='Opt-in: also install Memlet hooks for Claude Code (merged into .claude settings, never replacing them; all-or-nothing, with a compare-and-swap check before each write. A program that replaces the same file at that very instant cannot be excluded without a shared lock)')
     hooks_mode.add_argument('--hooks-remove',action='store_true',help='Remove only the hook entries Memlet installed')
     init_p.add_argument('--hooks-scope',choices=['local','project'],default=None,help='local (default): .claude/settings.local.json; project: shared .claude/settings.json (needs memlet on PATH)')
-    init_p.add_argument('--dream',action='store_true',help='With --hooks: Stop only snapshots sessions for an explicit dream command')
+    init_p.add_argument('--dream',action='store_true',help='With --hooks: Stop and PreCompact snapshot sessions for an explicit dream command')
     init_p.add_argument('--git-hooks',action='store_true',help='With --hooks / --hooks-remove: also the git pre-commit (warn only) and post-merge hooks')
     check_mode=aud_p.add_mutually_exclusive_group()
     check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')

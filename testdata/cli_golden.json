@@ -480,6 +480,7 @@
     "keys": [
      "actions",
      "activeConstraints",
+     "approvedLessons",
      "authorityBoundary",
      "budgetExceeded",
      "capsuleSignature",
@@ -527,6 +528,7 @@
     "keys": [
      "actions",
      "activeConstraints",
+     "approvedLessons",
      "authorityBoundary",
      "budgetExceeded",
      "capsuleSignature",

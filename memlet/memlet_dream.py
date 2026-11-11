@@ -110,7 +110,7 @@ REDACTION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 # segments and backslashes are rejected in `parse_span`.
 # Line numbers are bounded to 9 digits so every Python version (3.9 has no int-conversion limit,
 # 3.11+ does) treats an absurd span the same way: it does not parse.
-_SPAN_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*):(\d{1,9})(?:-(\d{1,9}))?$")
+_SPAN_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*):([0-9]{1,9})(?:-([0-9]{1,9}))?$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # Anchored to the start of the line so embedded timestamps in message bodies cannot forge ordering
 _LINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
@@ -1326,11 +1326,7 @@ def format_flat_memory(
             raw_sup_sp = str(sp.get("span") or "")
             safe_sup_sp = raw_sup_sp if parse_span(raw_sup_sp) else "unpinned"
             safe_sup_sha = re.sub(r"[^0-9a-f]", "", str(sp.get("sha256") or "").lower())[:12] or "none"
-            entry = (
-                f"- [{lid}] (superseded_with_active_replacement | {scope_lbl}) {title_lbl}\n"
-                f"  old_quote [SUPERSEDED — DO NOT APPLY] [{safe_sp} {safe_sha}]: {clean_q}\n"
-                f"  active_replacement_quote [ACTIVE — APPLY THIS] [{safe_sup_sp} {safe_sup_sha[:8]}]: {clean_sup}"
-            )
+            entry = render_superseded_quarantine(dict(lesson_display_fields(n), id=lid, oldLabel="SUPERSEDED — DO NOT APPLY"))
         else:
             entry = (
                 f"- [{lid}] ({category_label(cat)} | {scope_lbl}) {title_lbl}\n"
@@ -1447,6 +1443,12 @@ def recall_subgraph(
     view = graph
     if require_approval:
         view, excluded = approved_view(graph)
+        if snapshot_files is not None:
+            from .memlet_bridge import _approved_node
+            originals = {n.get("id"): n for n in graph.get("nodes", [])}
+            for node in view.get("nodes", []):
+                if not _approved_node(originals[node["id"]], snapshot_files):
+                    node["verdict"] = PENDING
     else:
         view = _quote_integrity_view(graph)  # raw mode: an edited stored quote is still never shown
     header = "# Memlet Dream Subgraph Capsule\n"
@@ -1623,6 +1625,8 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             or n.get("statusKind") == "superseded_rule"
             or n.get("category") == "superseded_directive"
             or str(n.get("verdict") or "").upper() == "ALREADY_SUPERSEDED"
+            or any(e.get("edgeType") == "SUPERSEDES" and e.get("targetPin")
+                   and e.get("toId") not in {r.get("id") for r in raw_nodes} for e in s_edges)
         ):
             return "supersedes"
         if etypes == {"GOVERNS"} or n.get("category") == "cross_session_conflict":
@@ -1802,6 +1806,10 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         safe_pp_sha = re.sub(r"[^0-9a-f]", "", str(pp.get("sha256") or "").lower())[:8] or "none"
 
         if b_kind == "supersedes":
+            projected = supersession_display_node(n, graph)
+            if projected is not n and not bound_sup_edge:
+                n = projected
+                sp = projected.get("supersededByPin")
             if isinstance(sp, dict) and sp.get("quoteText"):
                 sup_quote = _window_quote(str(sp.get("quoteText") or ""), is_replacement=True)
                 raw_sup_sp = str(sp.get("span") or "")
@@ -1841,11 +1849,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
                     elif src_node_idx in superseded_indices or (san_from not in duplicate_ids and san_from in superseded_ids):
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
-            item = (
-                f"- [{lid}] ({scope_lbl}) [SUPERSEDES: old_pin({safe_pp_sp}) replaced by replacement_pin({sup_span})] {title_lbl}\n"
-                f"  old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT] [{safe_pp_sp} {safe_pp_sha}]: {quote_one}\n"
-                f"  replacement_pin [{repl_label}] [{sup_span} {sup_sha}]: {sup_quote}"
-            )
+            item = render_superseded_quarantine(dict(lesson_display_fields(dict(n, supersededByPin=sp, statusKind="superseded_rule")), id=lid), repl_label)
             bucket = sec_supersedes
         elif b_kind == "resolves":
             item = (
@@ -2022,7 +2026,7 @@ def build_cortex_lineage_payload(
             e for e in raw_e_list
             if isinstance(e, dict) and str(e.get("edgeVerdict") or "VALID").upper() in ALLOWED_EDGE_VERDICTS
         ]
-        if not s_edges:
+        if not s_edges and node_review[idx] != APPROVED:
             continue
         node_surv_map[idx] = s_edges
         all_surv_edges.extend(s_edges)
@@ -2077,7 +2081,7 @@ def build_cortex_lineage_payload(
                 and (not sp or e.get("srcPin") == sp)
                 for e in all_surv_edges
             )
-            if not has_surv_bound_sup:
+            if not has_surv_bound_sup and node_review[idx] != APPROVED:
                 continue
         st = "superseded" if (is_declared_sup or lid in superseded_target_ids) else (
             "dead_end" if cat == "repeated_pitfall" else "active"
@@ -3244,32 +3248,151 @@ def lesson_edge_sources(node):
             for e in node.get("edges", []) if isinstance(e.get("srcPin"), dict) and parse_span(e["srcPin"].get("span", ""))]
 
 
+def superseded_lesson(node):
+    """The same quarantine gate used by typed graph recall and every lesson reader."""
+    return (node.get("statusKind") == "superseded_rule" or node.get("category") == "superseded_directive"
+            or node.get("verdict") == "ALREADY_SUPERSEDED" or isinstance(node.get("supersededByPin"), dict)
+            or any(e.get("edgeType") == "SUPERSEDES" and e.get("toId") == node.get("id") for e in node.get("edges", [])))
+
+
+def supersession_display_node(node, approved_graph):
+    """Project incoming approved SUPERSEDES edges without changing any stored node/digest."""
+    pin = node.get("primaryPin") or {}
+    incoming = [e for e in approved_graph.get("edges", []) if e.get("edgeType") == "SUPERSEDES"
+                and e.get("edgeVerdict") == "VALID" and e.get("toId") == node.get("id")
+                and (e.get("targetPin") or {}).get("sha256") == pin.get("sha256")]
+    if not incoming:
+        # An active source can carry the old target inline rather than as a separate node.
+        outgoing = [e for e in node.get("edges", []) if e.get("edgeType") == "SUPERSEDES"
+                    and isinstance(e.get("targetPin"), dict) and isinstance(e.get("srcPin"), dict)
+                    and e.get("toId") not in {n.get("id") for n in approved_graph.get("nodes", [])}]
+        if not outgoing:
+            return node
+        edge = outgoing[0]
+        return dict(node, statusKind="superseded_rule", primaryPin=edge["targetPin"], supersededByPin=edge["srcPin"],
+                    allPins=list(node.get("allPins", [])) + [edge["targetPin"]])
+    edge = incoming[0]
+    display = dict(node, statusKind="superseded_rule", supersededByPin=edge.get("srcPin"))
+    display["edges"] = list(node.get("edges", []))
+    if not any(e.get("edgeId") == edge.get("edgeId") for e in display["edges"]):
+        display["edges"].append(edge)
+    source = str(edge.get("fromId") or "")
+    if not source.endswith(":NEWER"):
+        source_node = next((n for n in approved_graph.get("nodes", []) if n.get("id") == source), None)
+        source_replaced = any(e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID"
+                              and e.get("toId") == source for e in approved_graph.get("edges", []))
+        if source_node is None or source_node.get("verdict") != "SUPPORTED" or source_replaced:
+            display["replacementLabel"] = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
+    return display
+
+
 def lesson_text(node):
-    from .memlet_bridge import safe_lesson_display
     from .vocabulary import LESSON_SEPARATOR
-    parts = lesson_lines(node)
-    if len(parts) <= 1:  # Preserve legacy single-citation display exactly.
-        text = (node.get("primaryPin") or {}).get("quoteText") or node.get("title") or ""
-        return safe_lesson_display(_LINE_PREFIX_RE.sub("", str(text), count=1).strip(), limit=LESSON_TEXT_MAX_CHARS)
-    return LESSON_SEPARATOR.join(safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(),
-                                                    limit=LESSON_TEXT_MAX_CHARS) for p in parts)
+    fields = lesson_display_fields(node)
+    if fields:
+        return LESSON_SEPARATOR.join(fields["quoteLines"])
+    from .memlet_bridge import safe_lesson_display
+    raw = (node.get("primaryPin") or {}).get("quoteText") or node.get("title") or ""
+    return safe_lesson_display(_LINE_PREFIX_RE.sub("", str(raw), count=1).strip(), limit=LESSON_TEXT_MAX_CHARS)
 
 
 def lesson_display_fields(node):
     from .memlet_bridge import safe_lesson_display
-    parts = lesson_lines(node)
-    if len(parts) <= 1:
+    # Display the replacement even in older queues whose allPins contains only the old pin.
+    # Never mutate the stored evidence or the inputs to approval/trust digests.
+    display = dict(node, allPins=list(node.get("allPins") or [node.get("primaryPin")]))
+    if superseded_lesson(node):
+        display["allPins"] += [node.get("supersededByPin")]
+        display["allPins"] += [e.get("srcPin") for e in node.get("edges", []) if e.get("edgeType") == "SUPERSEDES"]
+    parts = lesson_lines(display)
+    if not parts:
         return {}
-    return {"quoteLines": [safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(),
-                                              limit=LESSON_TEXT_MAX_CHARS) for p in parts],
-            "cites": [{k: v for k, v in p.items() if k != "quote"} for p in parts],
-            "edgeSources": lesson_edge_sources(node)}
+    fields = {"quoteLines": [safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(),
+                                               limit=LESSON_TEXT_MAX_CHARS) for p in parts],
+              "cites": [{k: v for k, v in p.items() if k != "quote"} for p in parts],
+              "edgeSources": lesson_edge_sources(node)}
+    if superseded_lesson(node):
+        replacement = node.get("supersededByPin") or next((e.get("srcPin") for e in node.get("edges", [])
+                                                         if e.get("edgeType") == "SUPERSEDES"), {})
+        parsed = parse_span(str((replacement or {}).get("span", "")))
+        fields["quarantined"] = True
+        if node.get("replacementLabel"):
+            fields["replacementLabel"] = node["replacementLabel"]
+        fields["lineRoles"] = ["current" if parsed and p["file"] == parsed[0] and parsed[1] <= p["start"] <= parsed[2]
+                               else "replaced" for p in parts]
+    return fields
+
+
+def render_superseded_quarantine(item, replacement_label=None):
+    """Shared admin/main-reader quarantine, preserving every cited line and source marker."""
+    from .memlet_bridge import _lesson_quote_block
+    spans = {role: cite.get("span", "{file}:{start}".format(**cite))
+             for role, cite in zip(item.get("lineRoles", []), item.get("cites", []))}
+    relation = "[SUPERSEDES: old_pin(" + spans.get("replaced", "unpinned") + ") replaced by replacement_pin(" + spans.get("current", "unpinned") + ")]"
+    return ("- [" + str(item["id"]) + "] " + relation + " Superseded Quarantine (`SUPERSEDES`)\n"
+            + _lesson_quote_block(dict(item, replacementLabel=replacement_label or item.get("replacementLabel", "ACTIVE — APPLY THIS"))))
 
 
 def category_label(category: Any) -> str:
     """Draft category names describe keyword extraction, never independent verification."""
     return {"verified_workaround": "workaround draft", "verified_procedure": "procedure draft"}.get(
         str(category), str(category))
+
+
+CITATION_REVIEWS_FILE = "CITATION-REVIEWS.json"
+
+
+def citation_review(item, kind, snapshot):
+    pins = _item_pins(item, kind)
+    edges = item.get("edges", []) if kind == "node" else [item]
+    for edge in edges:
+        pins += _item_pins(edge, "edge") + [edge.get("citedTargetPin")]
+    stored = {}
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        parsed = parse_span(pin.get("span", ""))
+        if not parsed:
+            continue
+        quotes = pin.get("quoteLines") or str(pin.get("quoteText", "")).splitlines()
+        for offset, number in enumerate(range(parsed[1], parsed[2] + 1)):
+            stored.setdefault((parsed[0], number), []).append(quotes[offset] if offset < len(quotes) else None)
+    rows = []
+    from .memlet_bridge import safe_lesson_display
+    for (file, number), old in sorted(stored.items()):
+        pin = resolve_pin(snapshot, "%s:%s" % (file, number))
+        raw = pin["quoteText"] if pin else None
+        rows.append({"file": file, "start": number, "end": number, "span": "%s:%s" % (file, number),
+                     "quote": safe_lesson_display(_LINE_PREFIX_RE.sub("", raw, count=1)) if raw is not None else "(unavailable)",
+                     "sha256": pin.get("sha256") if pin else None, "available": bool(pin),
+                     "changed": any(raw != previous for previous in old)})
+    content = node_approval_digest(item) if kind == "node" else edge_approval_digest(item)
+    review_digest = _canonical_digest({"content": content, "edges": [edge_approval_digest(e) for e in edges],
+                                      "current": rows})
+    return {"currentCitations": rows, "currentQuoteLines": [r["quote"] for r in rows],
+            "currentQuote": "\n".join(r["quote"] for r in rows), "reviewDigest": review_digest}
+
+
+def _citation_reviews(queue):
+    from .memlet_wiki import read_regular_text
+    path = Path(queue).with_name(CITATION_REVIEWS_FILE)
+    if path.is_symlink():
+        raise ValueError("refusing symlinked citation reviews")
+    text = read_regular_text(path, 2_000_000)
+    if path.exists() and text is None:
+        raise ValueError("citation reviews unreadable or oversized")
+    return path, json.loads(text) if text else {}
+
+
+def record_citation_reviews(queue, result):
+    reviewed = {i.get("id", i.get("edgeId")): i["reviewDigest"]
+                for i in result["pendingNodes"] + result["pendingEdges"]
+                if i.get("reviewDigest") and any(r["changed"] for r in i.get("currentCitations", []))}
+    if reviewed:
+        with queue_lock(queue):
+            path, saved = _citation_reviews(queue)
+            saved.update(reviewed)
+            _atomic_write_bytes(path, (json.dumps(saved, sort_keys=True) + "\n").encode())
 
 
 def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
@@ -3303,10 +3426,9 @@ def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
                 "claimedVerdict": n.get("claimedVerdict"),
                 "staleApproval": isinstance(n.get("approval"), dict) or bool(n.get("citationReason")),
                 "citationReason": n.get("citationReason"),
-                "quote": lesson_text(n) if len(lesson_lines(n)) > 1 else pp.get("quoteText", ""),
+                "quote": lesson_text(n),
                 **lesson_display_fields(n),
-                "currentQuote": ((resolve_pin(snapshot_files or {}, pp.get("span", "")) or {}).get("quoteText")
-                                 if snapshot_files is not None else None),
+                **citation_review(n, "node", snapshot_files or {}),
                 "categoryLabel": category_label(n.get("category")),
             })
     p_edges: List[Dict[str, Any]] = []
@@ -3327,10 +3449,14 @@ def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
                 "toId": e.get("toId"),
                 "srcSpan": sp.get("span"),
                 "targetSpan": tp.get("span") if tp else None,
+                **citation_review(e, "edge", snapshot_files or {}),
             })
     counts["pendingNodes"] = len(p_nodes)
     counts["pendingEdges"] = len(p_edges)
-    return {"pendingNodes": p_nodes, "pendingEdges": p_edges, "counts": counts, "approvalBoundary": APPROVAL_BOUNDARY}
+    result = {"pendingNodes": p_nodes, "pendingEdges": p_edges, "counts": counts, "approvalBoundary": APPROVAL_BOUNDARY}
+    if not isinstance(queue, dict):
+        record_citation_reviews(queue, result)
+    return result
 
 
 def _safe_output_path(raw: Any, label: str) -> Path:
@@ -3538,6 +3664,16 @@ def _decide_locked(
         if isinstance(n, dict):
             nodes_by_id.setdefault(str(n.get("id") or ""), []).append(n)
     edge_refs = _edge_refs(graph)
+    if refresh_citations and decision == APPROVED:
+        _path, reviews = _citation_reviews(q_path)
+        for item_id in ordered_ids:
+            item = (nodes_by_id.get(item_id) or edge_refs.get(item_id) or [None])[0]
+            kind = "node" if item_id in nodes_by_id else "edge"
+            if item is None or reviews.get(item_id) != citation_review(item, kind, snap or {})["reviewDigest"]:
+                refused.append({"id": item_id, "reason": "fresh_review_required_or_changed; run learn --pending and review every current cited line"})
+        if refused:
+            return {"ok": False, "decision": decision, "applied": [], "unchanged": [], "refused": refused,
+                    "cascadedEdges": [], "approvalBoundary": APPROVAL_BOUNDARY, "queuePath": str(q_path)}
 
     def _record(digest: str) -> Dict[str, Any]:
         rec: Dict[str, Any] = {
@@ -3569,7 +3705,7 @@ def _decide_locked(
     def refresh(item, kind):
         if not refresh_citations or decision != APPROVED:
             return
-        names = ("primaryPin", "supersededByPin") if kind == "node" else ("srcPin", "targetPin")
+        names = ("primaryPin", "supersededByPin") if kind == "node" else ("srcPin", "targetPin", "citedTargetPin")
         for key in names:
             old = item.get(key)
             new = resolve_pin(snap or {}, old.get("span", "")) if isinstance(old, dict) else None
@@ -3655,6 +3791,10 @@ def _decide_locked(
         else:
             refused.append({"id": item_id, "reason": "unknown_id"})
 
+    if refresh_citations and done:
+        latest, _ = _locate_snapshot(graph, snapshot_path)
+        if latest != snap:
+            refused.extend({"id": i, "reason": "citations_changed_during_refresh; review again"} for i in done)
     if refused and refresh_citations:
         refused.extend({"id": i, "reason": "batch_refresh_aborted"} for i in done)
         done, cascaded = [], []  # a fresh-citation batch is atomic; never persist partially refreshed refused items
