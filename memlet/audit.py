@@ -641,12 +641,14 @@ def _discover_instruction_docs(repo_root: Path) -> List[Path]:
     """Find instruction, rule, runbook, and skill markdown files in repo_root."""
     found: List[Path] = []
     seen: Set[str] = set()
-    from .memlet_wiki import contained_path_problem  # the one in-repository containment rule (no symlink component)
+    from .memlet_wiki import contained_path_problem, instruction_source_allowed  # the one in-repository containment rule (no symlink component)
 
     def _add(p: Path) -> None:
         try:
             rel = p.relative_to(repo_root).as_posix()
             if contained_path_problem(repo_root, rel) is not None or not p.is_file():
+                return
+            if not instruction_source_allowed(repo_root, rel):
                 return
             resolved = str(p.resolve())
             if resolved not in seen:

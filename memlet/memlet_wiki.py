@@ -145,6 +145,36 @@ def instruction_path_shape(rel: str) -> bool:
             and not any(d in EXCLUDED_DIRS or d == MEMLET_DIR or d in _SCRATCH_DIRS for d in dirs))
 
 
+def is_memlet_skill(text: str) -> bool:
+    """Ownership marker, not an integrity check: even an edited or older export is lesson data."""
+    lines = text.lstrip("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False
+    metadata = False
+    for line in lines[1:]:
+        if line.strip() in ("---", "..."):
+            break
+        if re.match(r"^(?:metadata|'metadata'|\"metadata\")\s*:", line):
+            metadata = True
+            if re.search(r"(?:^|[{,]\s*)['\"]?memlet-digest['\"]?\s*:", line.split(":", 1)[1]):
+                return True
+        elif line and not line[0].isspace() and not line.startswith("#"):
+            metadata = False
+        elif metadata and re.match(r"^\s+['\"]?memlet-digest['\"]?\s*:", line):
+            return True
+    return False
+
+
+def instruction_source_allowed(root: Path, rel: str, text=None) -> bool:
+    """Shared discovery gate for instruction, import, audit and direct-source readers."""
+    if Path(rel).name != "SKILL.md":
+        return True
+    if text is None:
+        data = read_regular_bytes(root / rel, _MAX_SOURCE_BYTES, prefix=True)
+        text = None if data is None else data.decode("utf-8", errors="ignore")
+    return text is None or not is_memlet_skill(text)
+
+
 def is_instruction_path(root: Path, rel: str) -> bool:
     """`discover_instruction_files(root)` membership for one path without walking the tree (for fast hooks)."""
     rel = rel.replace("\\", "/")
@@ -159,6 +189,8 @@ def is_instruction_path(root: Path, rel: str) -> bool:
         if contained_path_problem(root, rel) or not p.is_file():
             return False
     except OSError:
+        return False
+    if not instruction_source_allowed(root, rel):
         return False
     from .memlet_slim import SLIM_OUTPUTS
     if rel in SLIM_OUTPUTS:
@@ -213,7 +245,7 @@ def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> L
                 return
         except (OSError, ValueError):
             return
-        if not _is_secret_path(rel):
+        if not _is_secret_path(rel) and instruction_source_allowed(root, rel):
             found.add(rel)
 
     for rel in TOP_INSTRUCTION_FILES:
@@ -340,8 +372,8 @@ def read_regular_text(p: Path, limit: int = MAX_TEXT_READ_BYTES, *, errors: str 
     return None if data is None else data.decode("utf-8", errors=errors)
 
 
-def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> Optional[bytes]:
-    """Bytes of a regular file of at most `limit` bytes, else None (see `read_regular_text`)."""
+def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES, *, prefix=False) -> Optional[bytes]:
+    """Bytes of a regular file within `limit`, else None; opt-in prefix reads stop at the limit."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(p), flags)
@@ -349,7 +381,7 @@ def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> Optional[by
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        if not stat.S_ISREG(st.st_mode) or (st.st_size > limit and not prefix):
             return None
         chunks, total = [], 0
         while True:
@@ -359,7 +391,7 @@ def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> Optional[by
             chunks.append(b)
             total += len(b)
             if total > limit:
-                return None
+                return b"".join(chunks)[:limit] if prefix else None
     except OSError:
         return None
     finally:
@@ -1536,7 +1568,7 @@ def import_source_files(root: Path, source: str = "auto") -> List[str]:
         picked = [f for f in instruction_files if f == ".cursorrules" or f.startswith(".cursor/rules/")]
     else:
         picked = _memory_dir_files(root, _MEMORY_DIRS[source])
-    return sorted(set(picked))
+    return sorted(f for f in set(picked) if instruction_source_allowed(root, f))
 
 
 def _clean_ref_path(path: str) -> str:
@@ -1561,6 +1593,8 @@ def _line_refs(text: str) -> List[Tuple[str, Optional[str]]]:
 
 def _extract_rules(text: str, source: str) -> List[Dict[str, Any]]:
     """List items (or, in a file without lists, plain lines) outside code fences, with their section."""
+    if not instruction_source_allowed(Path("."), source, text):
+        return []
     lines = text.splitlines()
     if lines and lines[0].strip() == "---":  # `.mdc` / memory-file front matter
         for i in range(1, min(len(lines), 60)):
@@ -1605,6 +1639,8 @@ def _source_texts(root: Path, files: Iterable[str]) -> List[Tuple[str, str]]:
             continue
         text = read_regular_text(root / rel, _MAX_SOURCE_BYTES)
         if text is None:
+            continue
+        if not instruction_source_allowed(root, rel, text):
             continue
         total += len(text)
         if total > MAX_SOURCE_TOTAL_BYTES:

@@ -167,11 +167,11 @@ def strict_parse_skill(text: str) -> dict:
         if m:
             assert pending_role is None, "dangling role label before new item"
             raw_files = m.group(4)
-            if raw_files == "any file":
+            if raw_files in ("any file", v.SKILL_UNSAFE_FILES):
                 parsed_files = []
             else:
                 parsed_files = re.findall(r"`([^`]+)`", raw_files)
-                assert ", ".join(f"`{p}`" for p in parsed_files) == raw_files, f"malformed files field: {raw_files!r}"
+                assert ", ".join(f"`{p}`" for p in parsed_files) == raw_files.removesuffix(", " + v.SKILL_UNSAFE_FILES), f"malformed files field: {raw_files!r}"
             cur_item = {
                 "rels": m.group(1),
                 "id": m.group(2),
@@ -201,7 +201,7 @@ def strict_parse_skill(text: str) -> dict:
             pending_role = None
             continue
         if cur_item is not None and ln.strip():
-            if ln.startswith("(+") and ln.endswith("`memlet recall`)"):
+            if ln.startswith("Lesson(s) left out: ") and ln.endswith("`memlet recall`." ):
                 cur_item = None
                 continue
             raise AssertionError(f"unexpected line inside item: {ln[:120]!r}")
@@ -284,7 +284,7 @@ def validate_skill_spec(
         if line.startswith("#"):
             test.assertTrue(
                 line == v.SKILL_BODY_TITLE
-                or line == v.SKILL_ANY_FILE_HEADING
+                or line in (v.SKILL_ANY_FILE_HEADING, v.SKILL_UNSAFE_FILE_HEADING)
                 or (line.startswith("## `") and line.endswith("`") and "`" not in line[4:-1]),
                 f"unexpected heading in body: {line!r}",
             )
@@ -704,7 +704,9 @@ class SkillbookTests(unittest.TestCase):
         self.assertEqual("memlet-lessons", res["name"])
         # 5 original approved + DRM-x, DRM-y, DRM-z, DRM-m = 9 items; DRM-w is omitted (M3 re-verify marker)
         self.assertEqual(9, res["items"])
-        self.assertEqual(0, res["omitted"])
+        self.assertEqual(1, res["omitted"])
+        self.assertEqual(1, res["omittedReasons"]["reverify"])
+        self.assertIn("reverify: 1", res["text"].splitlines()[-1])
         self.assertEqual(["src/billing.py", "src/b.py", "src/retry.py"], res["files"])
         self.assertIn(v.SKILL_OMITTED_REVERIFY_NOTICE % 1, res["notices"])
 
@@ -852,7 +854,7 @@ class SkillbookTests(unittest.TestCase):
         self.assertLessEqual(len(sb.yaml_quote(desc)), 1024)
 
     def test_hostile_quotes_ids_and_paths_strict_roundtrip(self):
-        """Test Note 1 (exact paths in code spans, unsafe paths omitted to any file),
+        """Test Note 1 (exact paths in code spans, unsafe paths labelled separately),
         Note 2 (quotes verbatim from safe_lesson_display), Note 3 (invalid/long lesson IDs omitted),
         S2 (labels outside quote cannot be forged by cited lines), and M8 (unescaped quote in file path)."""
         fnames = [
@@ -933,6 +935,7 @@ class SkillbookTests(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual(len(hostile_quotes), res["items"])
         self.assertIn(v.SKILL_OMITTED_INVALID_ID_NOTICE % len(bad_ids), res["notices"])
+        self.assertIn("invalid-id: %d" % len(bad_ids), res["text"].splitlines()[-1])
 
         parsed = validate_skill_spec(self, res["text"], max_lines=100000, budget=10**9)
 
@@ -995,7 +998,7 @@ class SkillbookTests(unittest.TestCase):
         parsed_unsafe = validate_skill_spec(self, res_unsafe["text"], max_lines=100000, budget=10**9)
         for bad_p in ("has`backtick", "has\nnewline", "has\x07bell", "has\u202ebidi"):
             self.assertNotIn(bad_p, res_unsafe["text"])
-        any_file_ids = {it["id"] for it in parsed_unsafe["items"] if it["group"] == "any file"}
+        any_file_ids = {it["id"] for it in parsed_unsafe["items"] if it["group"] == v.SKILL_UNSAFE_FILE_HEADING[3:]}
         for k_id in unsafe_paths_map:
             self.assertIn(k_id, any_file_ids)
 
@@ -1072,7 +1075,7 @@ class SkillbookTests(unittest.TestCase):
         kept_ids_4 = {it["id"] for it in parsed_4["items"]}
         self.assertEqual({"DRM-b-att-0", "DRM-b-att-1", "DRM-b-unatt-0", "DRM-b-unatt-1"}, kept_ids_4)
         self.assertGreater(res_4["omitted"], 0)
-        self.assertEqual(v.HOOK_OMITTED % res_4["omitted"], parsed_4["body_lines"][-1])
+        self.assertEqual(sb._omission_line(res_4["omitted"], {}), parsed_4["body_lines"][-1])
 
         # Note 7: description and `files` list ONLY files that still have an item in the file (`src/f00.py`, `src/f01.py`)
         self.assertEqual(["src/f00.py", "src/f01.py"], res_4["files"])
@@ -1139,7 +1142,7 @@ class SkillbookTests(unittest.TestCase):
         orig_render_body = sb._render_body
         orig_estimate = mw.estimate_tokens
 
-        def counting_render_item(item, item_files):
+        def counting_render_item(item, item_files, unsafe=False):
             counts["item_renders"] += 1
             lid = item["id"]
             counts["per_id"][lid] = counts["per_id"].get(lid, 0) + 1
@@ -1222,7 +1225,7 @@ class SkillbookTests(unittest.TestCase):
             sb.check_skill(def_path, repo_path=self.root),
         )
 
-        # Note 6: relative --out is resolved relative to the current directory
+        # Note 6: relative --out is resolved relative to the repository root
         other_cwd = self.base / "work-cwd"
         other_cwd.mkdir()
         old_cwd = os.getcwd()
@@ -1232,8 +1235,9 @@ class SkillbookTests(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
         self.assertTrue(w_rel["ok"], w_rel)
-        self.assertTrue((other_cwd / "rel-skills/custom-skill/SKILL.md").is_file())
-        self.assertFalse((self.root / "rel-skills/custom-skill/SKILL.md").exists())
+        self.assertFalse((other_cwd / "rel-skills/custom-skill/SKILL.md").exists())
+        self.assertTrue((self.root / "rel-skills/custom-skill/SKILL.md").is_file())
+        self.assertEqual(str(self.root / "rel-skills/custom-skill/SKILL.md"), w_rel["path"])
 
         # --write with explicit --out
         w_out = sb.write_skill(self.root, out=self.out_dir, name="custom-skill")
@@ -1245,8 +1249,7 @@ class SkillbookTests(unittest.TestCase):
         real_elsewhere.mkdir()
         sym_out = self.base / "sym-out"
         sym_out.symlink_to(real_elsewhere)
-        with mock.patch.object(sb, "build_skill", side_effect=AssertionError("symlink out must be refused before build")):
-            self.assertFalse(sb.write_skill(self.root, out=sym_out)["ok"])
+        self.assertTrue(sb.write_skill(self.root, out=sym_out)["ok"])
 
         sym_sub_out = self.base / "sym-sub-out"
         sym_sub_out.mkdir()
@@ -1282,7 +1285,7 @@ class SkillbookTests(unittest.TestCase):
         )
         w_foreign = sb.write_skill(self.root, out=self.out_dir, name="foreign-skill", force=False)
         self.assertFalse(w_foreign["ok"])
-        self.assertEqual("not written by Memlet", w_foreign["reason"])
+        self.assertEqual("not written by Memlet" + v.SKILL_FORCE_NOTE, w_foreign["reason"])
         self.assertIn("# Custom", foreign_file.read_text(encoding="utf-8"))
         w_foreign_force = sb.write_skill(self.root, out=self.out_dir, name="foreign-skill", force=True)
         self.assertTrue(w_foreign_force["ok"])
@@ -1315,7 +1318,7 @@ class SkillbookTests(unittest.TestCase):
                 self.assertEqual({"ok": True, "current": False, "reason": "edited"}, chk)
                 wr = sb.write_skill(self.root, out=self.out_dir, name="custom-skill", force=False)
                 self.assertFalse(wr["ok"])
-                self.assertEqual("edited", wr["reason"])
+                self.assertEqual("edited" + v.SKILL_FORCE_NOTE, wr["reason"])
         out_path.write_text(orig_text, encoding="utf-8")
 
         # S3: A file whose digest matches but was written by another Memlet version is `stale: written by Memlet X`,

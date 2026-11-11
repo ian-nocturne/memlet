@@ -274,7 +274,7 @@ def _merge_functions() -> Tuple[Any, Any]:
     return getattr(mb, "merge_view", None), getattr(mb, "merge_blockers", None)
 
 
-def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None, *, context=None) -> Dict[str, Any]:
     """The single place this module learns about merges: `memlet_bridge.merge_view` and `merge_blockers` when this
     build has both, else "merge checks not available in this build". What `merge_view` returns is checked against the
     lessons loaded (`ids`); on any inconsistency or exception, merge checks are skipped, nothing is hidden, and the
@@ -283,7 +283,8 @@ def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None) -> Dict[str
     if not callable(view_fn) or not callable(blockers_fn):
         return _merge_none(v.TIDY_MERGE_UNAVAILABLE)
     try:
-        view = view_fn(repo_path)
+        context = {} if context is None else context
+        view = view_fn(repo_path, context=context)
     except Exception:  # noqa: BLE001 - any adapter failure is reported, never raised through the report
         return _merge_none(v.TIDY_MERGE_UNREADABLE)
     if not isinstance(view, dict) or view.get("ok") is not True:
@@ -292,7 +293,7 @@ def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None) -> Dict[str
         return _merge_none(v.TIDY_MERGE_SKIPPED)
 
     def blockers(keep, same):
-        return blockers_fn(repo_path, keep, tuple(same))
+        return blockers_fn(repo_path, keep, tuple(same), context=context)
 
     return {"available": True, "states": view["states"], "members": view["members"], "blockers": blockers,
             "notice": None}
@@ -530,7 +531,20 @@ def _sessions_after(records: List[Dict[str, Any]], when: Optional[datetime.datet
 
 
 def _sightings(root: Path, lessons: Dict[str, Dict[str, Any]], merge: Dict[str, Any], *, max_bytes: int,
-               now: datetime.datetime) -> Dict[str, Any]:
+               now: datetime.datetime, graph=None) -> Dict[str, Any]:
+    reached = {}
+    # Only this scan asks the shared reader for holding members. It supplies the same
+    # verified current/replaced projection that delivery uses, without exposing members.
+    if _holding_members(merge):
+        raw = _raw_index(graph or {})
+        with mb._lesson_path_projection(root, None) as path_context:
+            read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, include_merged=True)
+            reached = {i: list(paths) for i, paths in path_context["paths"].items()}
+        lessons = dict(lessons)
+        for item in read.get("items", []):
+            if item.get("mergedInto"):
+                lines = _line_set(item, raw)
+                lessons[item["id"]] = {"current": _current(lines)}
     wanted = {}
     for lesson_id, lesson in lessons.items():
         quotes = [md.normalised_quote(raw) for raw in lesson["current"] or []]
@@ -543,6 +557,7 @@ def _sightings(root: Path, lessons: Dict[str, Dict[str, Any]], merge: Dict[str, 
         if keep in records:
             records[keep] = records[keep] + records.get(member, [])
     scan["grouped"] = records
+    scan["reached"] = reached
     return scan
 
 
@@ -567,8 +582,8 @@ def lesson_sightings(repo_path=".", *, ids=None, max_bytes=MAX_BYTES, clock=None
     if not loaded["ok"]:
         error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
         return {"ok": False, "error": error, "complete": False, "scanned": {"files": 0, "bytes": 0}, "sightings": {}}
-    merge = merge_checks(root, loaded["nodes"])
-    scan = _sightings(root, loaded["lessons"], merge, max_bytes=max_bytes, now=_now(clock))
+    merge = merge_checks(root, loaded["nodes"], context={"graph": graph})
+    scan = _sightings(root, loaded["lessons"], merge, max_bytes=max_bytes, now=_now(clock), graph=graph)
     keep = None if ids is None else set(mb._ids(ids))
     sightings = {i: _summary(r) for i, r in scan["grouped"].items() if keep is None or i in keep}
     notices = ([why] if why else []) + scan["notices"] + ([merge["notice"]] if merge["notice"] else [])
@@ -587,7 +602,8 @@ def _instruction_rules(root: Path) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for rel, text in mw._source_texts(root, mw.discover_instruction_files(root)):
         for rule in mw._extract_rules(text, rel):
-            key = md.normalised_quote(rule["text"])
+            text = re.sub(r"\s+\(`[^`\n]+::[^`\n]+`\)\s*$", "", rule["text"])
+            key = md.normalised_quote(text)
             if key:
                 out.setdefault(key, []).append("%s:%d" % (rule["source"], rule["line"]))
     return out
@@ -770,12 +786,13 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
         return {"ok": False, "exitCode": 1, "error": error, "formatted": "- ERROR: " + error + "\n"}
     notices.extend(n for n in loaded["notices"] if n not in notices)
     lessons, nodes, reached = loaded["lessons"], loaded["nodes"], loaded["reached"]
-    merge = merge_checks(root, nodes)
+    merge_context = {"graph": graph}
+    merge = merge_checks(root, nodes, context=merge_context)
     if merge["notice"]:
         notices.append(merge["notice"])
     merge_ok = merge["available"]
     holding = _holding_members(merge)
-    scan = _sightings(root, lessons, merge, max_bytes=max_bytes, now=now)
+    scan = _sightings(root, lessons, merge, max_bytes=max_bytes, now=now, graph=graph)
     notices.extend(scan["notices"])
     scan_complete = scan["complete"]
     records = scan["grouped"]
@@ -795,7 +812,9 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
     if not similar_complete:
         notices.append(v.TIDY_SIMILAR_BOUND)
     duplicates, blockers_failed = [], False
-    for kind, keep, same in groups:
+    groups.sort(key=lambda g: (-len(g[2]), g[1]))
+    omitted["duplicates"] = max(0, len(groups) - v.TIDY_SECTION_CAP)
+    for kind, keep, same in groups[:v.TIDY_SECTION_CAP]:
         entry = {"kind": kind, "label": v.TIDY_DUPLICATE_LABELS[kind], "keep": keep, "same": same,
                  "lessons": [_lesson(lessons[i]) for i in [keep] + same]}
         if merge_ok:
@@ -803,11 +822,18 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
             checked = _checked_blockers(merge, keep, same)
             if checked is None:
                 blockers_failed = True
+                _with_command(entry, None, v.TIDY_BLOCKERS_FAILED)
             else:
                 entry.update(checked)
+                entry["blockerMessages"] = {i: [v.MERGE_REASONS.get(r, r) for r in reasons]
+                                            for i, reasons in checked["blockers"].items()}
+                if any(checked["blockers"].values()):
+                    _with_command(entry, None, "; ".join(i + ": " + ", ".join(
+                        r + " — " + v.MERGE_REASONS.get(r, r) for r in rs)
+                        for i, rs in checked["blockers"].items()))
                 lost = list(dict.fromkeys(p for paths in checked["lostFiles"].values() for p in paths))
                 wanted = list(dict.fromkeys(list(lessons[keep]["item"].get("approvalPaths") or []) + lost))
-                if lost and lessons[keep]["tier"] == APPROVED and len(wanted) <= 8:
+                if entry.get("command") and lost and lessons[keep]["tier"] == APPROVED and len(wanted) <= 8:
                     paths_cmd = cmd(["learn"], [("--paths", keep), ("--by", "NAME")] + [("--path", p) for p in wanted])
                     if paths_cmd is not None:
                         entry["pathsCommand"] = paths_cmd
@@ -897,7 +923,7 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
             unattached.append(_with_command(entry, cmd(["learn"], [("--paths", lesson_id), ("--by", "NAME"),
                                                                    ("--path", "FILE")])))
         sessions = sight[lesson_id]["sessions"]
-        if (files and current and sessions >= min_seen and not item.get("quarantined")
+        if (files and current and not matched and sessions >= min_seen and not item.get("quarantined")
                 and {"BLOCKS", "GOVERNS"} & set(item.get("edgeTypes", []))):
             promote.append(dict(_lesson(lesson), paths=files, sessions=sessions,
                                 sessionsLabel=_count(sessions, scan_complete),
@@ -914,26 +940,48 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
 
     # lapsed merges ---------------------------------------------------------------------------------------------
     lapsed = []
-    for lesson_id in sorted(merge["states"]):
+    lapsed_ids = [i for i in sorted(merge["states"]) if merge["states"][i].get("state") == "lapsed" and i in lessons]
+    omitted["lapsedMerges"] = max(0, len(lapsed_ids) - v.TIDY_SECTION_CAP)
+    for lesson_id in lapsed_ids[:v.TIDY_SECTION_CAP]:
         state = merge["states"][lesson_id]
-        if state.get("state") != "lapsed" or lesson_id not in lessons:
-            continue
         into, reason = state.get("into"), state.get("reason")
         unmerge = cmd(["learn"], [("--unmerge", lesson_id), ("--by", "NAME")])
-        again_cmd = cmd(["learn"], [("--merge", into), ("--same", lesson_id), ("--by", "NAME")]) if into else None
-        entry = dict(_lesson(lessons[lesson_id]), into=into, reason=reason,
-                     label=v.TIDY_LAPSED_LABEL % (into, reason))
+        checked = _checked_blockers(merge, into, [lesson_id]) if into and merge_ok else None
+        again_cmd = (cmd(["learn"], [("--merge", into), ("--same", lesson_id), ("--by", "NAME")])
+                     if checked is not None and not any(checked["blockers"].values()) else None)
+        message = v.MERGE_REASONS.get(reason, reason)
+        entry = dict(_lesson(lessons[lesson_id]), into=into, reason=reason, message=message,
+                     label=(v.TIDY_LAPSED_LABEL % (into, reason + " — " + message) if into else v.MERGE_INVALID_LINE))
         _with_command(entry, unmerge)
         entry["commands"] = [c for c in (unmerge, again_cmd) if c is not None]
         lapsed.append(entry)
 
+    merged_lost = []
+    # The shared context means these checks never reload the queue, snapshots or tiers.
+    for keep, members in sorted(merge["members"].items()):
+        if keep not in lessons:
+            continue
+        group_paths = scan["reached"]
+        lost_files = {i: sorted(set(group_paths.get(i, [])) - set(group_paths.get(keep, []))) for i in members}
+        lost_files = {i: paths for i, paths in lost_files.items() if paths}
+        if lost_files:
+            entry = dict(_lesson(lessons[keep]), members=members, lostFiles=lost_files,
+                         label=v.MERGE_LOST_FILES + ", ".join(sorted({p for ps in lost_files.values() for p in ps})))
+            lost = [p for ps in lost_files.values() for p in ps]
+            wanted = list(dict.fromkeys(list(lessons[keep]["item"].get("approvalPaths") or []) + lost))
+            note = v.MERGE_PATH_APPROVAL if lessons[keep]["tier"] != APPROVED else v.MERGE_PATH_LIMIT
+            repair = (cmd(["learn"], [("--paths", keep), ("--by", "NAME")] + [("--path", p) for p in wanted])
+                      if lessons[keep]["tier"] == APPROVED and len(wanted) <= 8 else None)
+            merged_lost.append(_with_command(entry, repair, note or v.TIDY_UNSAFE_ARGUMENT))
+
     result = {"ok": True, "exitCode": 0,
-              "duplicates": _capped(duplicates, omitted, "duplicates"),
+              "duplicates": duplicates,
               "saidAgain": _capped(said + again, omitted, "saidAgain"),
               "retire": _capped(retire, omitted, "retire"),
               "unattached": _capped(unattached, omitted, "unattached"),
               "promote": promote,
-              "lapsedMerges": _capped(lapsed, omitted, "lapsedMerges"),
+              "lapsedMerges": lapsed,
+              "mergedLostFiles": _capped(merged_lost, omitted, "mergedLostFiles"),
               "omitted": {s: omitted.get(s, 0) for s in v.TIDY_SECTIONS},
               "complete": complete, "notices": notices, "mergeChecks": merge_ok,
               "scanned": scan["scanned"], "work": work, "skipped": scan["skipped"]}
@@ -1033,7 +1081,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
                     lines += ["  " + q for q in _quotes(lesson)]
                 if any(e.get("blockers", {}).values()):
                     lines.append("  " + v.TIDY_BLOCKERS_LABEL + "; ".join(
-                        _code(k) + ": " + ", ".join(c) for k, c in sorted(e["blockers"].items()) if c))
+                        _code(k) + ": " + ", ".join(r + " — " + v.MERGE_REASONS.get(r, r) for r in c) for k, c in sorted(e["blockers"].items()) if c))
                 if any(e.get("lostFiles", {}).values()):
                     lines.append("  " + v.TIDY_LOST_FILES_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(_code(p) for p in ps)
