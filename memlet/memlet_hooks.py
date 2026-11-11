@@ -199,7 +199,8 @@ def default_cli_path() -> Path:
 def memlet_hook_event(hook: Any) -> Optional[str]:
     """The runtime event of a hook entry Memlet wrote, else None. Recognised forms (as written by the installer):
     `memlet admin hook <event>` and `<abs interpreter> <abs .../memory_cli.py> admin hook <event>`, optionally
-    followed by `--scope local|project` (9.2: a scope installed with --jit/--guard/--capsule) and by `|| true`."""
+    preceded by `MEMLET_HOOK_SCOPE=local|project` (9.2: a scope installed with --jit/--guard/--capsule), optionally
+    followed by `--scope local|project` (written by 9.2 development builds) and by `|| true`."""
     if not isinstance(hook, dict) or hook.get("type") != "command":
         return None
     cmd = hook.get("command")
@@ -213,6 +214,8 @@ def memlet_hook_event(hook: Any) -> Optional[str]:
         tokens = tokens[:-2]
     if len(tokens) >= 6 and tokens[-2] == "--scope" and tokens[-1] in SCOPES:
         tokens = tokens[:-2]
+    if tokens and _scope_assignment(tokens[0]) is not None:
+        tokens = tokens[1:]
     if len(tokens) < 4 or tokens[-3:-1] != ["admin", "hook"] or tokens[-1] not in RUNTIME_EVENTS:
         return None
     head = tokens[:-3]
@@ -280,10 +283,20 @@ def resolve_command(scope: str, root: Path, *, which: Callable[[str], Optional[s
                   f"{cli} outside this shell's environment. Put `memlet` on PATH and retry.")
 
 
+SCOPE_ENV = "MEMLET_HOOK_SCOPE"
+
+
+def _scope_assignment(token: str) -> Optional[str]:
+    """The scope of a leading `MEMLET_HOOK_SCOPE=<scope>` shell assignment, else None."""
+    name, sep, value = token.partition("=")
+    return value if sep and name == SCOPE_ENV and value in SCOPES else None
+
+
 def hook_command(prefix: str, event: str, scope: Optional[str] = None) -> str:
-    """`scope` only for a scope installed with --jit/--guard/--capsule: the runtime then reads that scope's flags.
-    Without it the command is byte-for-byte the 9.1.1 one."""
-    return f"{prefix} admin hook {event}" + (f" --scope {scope}" if scope else "") + NEVER_FAIL_SUFFIX
+    """`scope` only for a scope that needs its own flags (installed with --jit/--guard/--capsule): the shell sets
+    MEMLET_HOOK_SCOPE for this command, which a 9.1.1 runtime ignores (it keeps printing its 9.1.1 output). Without
+    it the command is byte-for-byte the 9.1.1 one."""
+    return (f"{SCOPE_ENV}={scope} " if scope else "") + f"{prefix} admin hook {event}" + NEVER_FAIL_SUFFIX
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1059,11 +1072,12 @@ JIT_NOTICE = ("--jit: a PreToolUse hook (Write|Edit|MultiEdit|NotebookEdit) adds
               "it does not prevent an edit.")
 GUARD_NOTICE = ("--guard: in a session that started fresh (startup or clear), the first edit of a file with an approved "
                 "BLOCKS lesson or a replaced instruction is denied once, with those lessons quoted in full; set "
-                "hooks.scopes.<scope>.guard to \"ask\" (you decide in the permission prompt) or \"off\" in "
-                ".memlet/config.json without reinstalling.")
-CAPSULE_NOTICE = ("--capsule: PreCompact asks the compaction summary to keep this session's verified memory for the "
-                  "files it touched (Write, Edit, MultiEdit and NotebookEdit), followed by its usual status text, and "
-                  "SessionStart re-delivers it after compact or resume.")
+                "hooks.scopes.<scope>.guard to exactly \"deny\", \"ask\" (you decide in the permission prompt) or "
+                "\"off\" in .memlet/config.json without reinstalling (any other value means off and is reported).")
+CAPSULE_NOTICE = ("--capsule: PreCompact prints instructions asking the compaction summary to keep this session's "
+                  "verified memory for the files it touched (Write, Edit, MultiEdit and NotebookEdit; a PreToolUse "
+                  "entry sees the last two); when 9.1.1 would have printed a status message there, its text follows "
+                  "under a fixed heading. SessionStart re-delivers the memory after compact or resume.")
 FLAG_KEYS = ("jit", "guard", "capsule")
 SCOPE_KEYS = FLAG_KEYS + ("dream",)
 
@@ -1074,53 +1088,106 @@ def _scopes(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {k: v for k, v in scopes.items() if k in SCOPES and isinstance(v, dict)} if isinstance(scopes, dict) else {}
 
 
-def _scope_values(cfg: Optional[Dict[str, Any]], scope: str, *, jit: bool, guard: bool, capsule: bool,
-                  dream: bool) -> Dict[str, Any]:
-    """`hooks.scopes.<scope>` an install with these flags records (empty: the key is removed). A `guard: "ask"` the
-    user set for this scope survives a reinstall with --guard."""
-    out: Dict[str, Any] = {}
-    if jit or guard:
-        out["jit"] = True
-    if guard:
-        prior = _scopes(cfg).get(scope, {}).get("guard")
-        if prior is None:  # read both: the flat key written before flags were per scope
-            hooks = (cfg or {}).get(CONFIG_KEY)
-            prior = hooks.get("guard") if isinstance(hooks, dict) else None
-        out["guard"] = "ask" if prior == "ask" else "deny"
-    if capsule:
-        out["capsule"] = True
-    if dream:
-        out["dream"] = True
-    return out
+GUARD_VALUES = ("deny", "ask", "off")
 
 
-def _apply_scope_flags(new_cfg: Dict[str, Any], cfg: Optional[Dict[str, Any]], scope: str,
-                       values: Dict[str, Any]) -> None:
-    """Record this scope's flags, never touching another scope's. The flat 9.1.1 `hooks.dream` stays the switch the
-    runtime reads for Stop / PreCompact: it is on while any scope (or a 9.1.1 install without a scope record) asked
-    for it. Flat `jit` / `guard` / `capsule` (written before flags were per scope) are migrated away once no other
-    installed scope can still be reading them."""
+def _explicit(*, jit: bool, guard: str, capsule: bool, dream: bool) -> Dict[str, Any]:
+    return {"jit": bool(jit), "guard": guard, "capsule": bool(capsule), "dream": bool(dream)}
+
+
+def _plain(rec: Dict[str, Any]) -> bool:
+    """A record that needs nothing beyond what a 9.1.1-shaped (unscoped) command can do."""
+    return rec.get("jit") is not True and rec.get("capsule") is not True
+
+
+def _legacy_record(hooks: Dict[str, Any]) -> Dict[str, Any]:
+    """What an installed scope without a record reads today: the flat keys (9.1.1 `dream`; `jit` / `guard` /
+    `capsule` from 9.2 development builds)."""
+    guard = hooks.get("guard")
+    return _explicit(jit=hooks.get("jit") is True, guard=guard if guard in GUARD_VALUES else "off",
+                     capsule=hooks.get("capsule") is True, dream=hooks.get("dream") is True)
+
+
+def _installed_shape(root: Path, scope: str) -> Optional[bool]:
+    """Read-only: True when the scope's installed Memlet commands select their scope (MEMLET_HOOK_SCOPE or the
+    development `--scope`), False when they are 9.1.1-shaped, None when unknown or not installed."""
+    try:
+        _path, raw, doc = _load_settings(root, SCOPES[scope])
+    except Refused:
+        return None
+    hooks = doc.get("hooks") if raw is not None else None
+    found = []
+    for arr in (hooks.values() if isinstance(hooks, dict) else []):
+        for g in arr if isinstance(arr, list) else []:
+            for h in (g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else []):
+                if memlet_hook_event(h):
+                    tokens = shlex.split(h["command"])
+                    found.append(_scope_assignment(tokens[0]) is not None or "--scope" in tokens)
+    return (any(found)) if found else None
+
+
+def _scope_plan(root: Path, cfg: Optional[Dict[str, Any]], scope: str,
+                record: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], bool]:
+    """The `hooks` keys an install (`record`) or removal (`record` None) of `scope` leaves, and whether that scope's
+    commands must select their scope. Rules: (1) every other installed scope keeps exactly what it reads today: a
+    scope without a record first gets an explicit record of the flat values it reads (migration); (2) the flat
+    `jit` / `guard` / `capsule` (9.2 development builds) stay only while another installed scope with 9.1.1-shaped
+    commands still relies on them, and then this scope selects its own explicit record; (3) the flat 9.1.1
+    `hooks.dream` is on exactly when an installed scope with 9.1.1-shaped commands asked for it; (4) when nothing
+    needs a record, the config returns to the exact 9.1.1 shape (no `scopes`). While no record, flat 9.2 key or new
+    flag is involved, the result is exactly 9.1.1's: one `hooks.dream` shared by every 9.1.1-shaped install."""
+    hooks = (cfg or {}).get(CONFIG_KEY)
+    hooks = hooks if isinstance(hooks, dict) else {}
+    inst = _installed(cfg).get("claude")
+    others = [x for x in (inst if isinstance(inst, dict) else {}) if x != scope and x in SCOPES]
+    records = {k: dict(v) for k, v in _scopes(cfg).items() if k in others}
+    dev = any(k in hooks for k in FLAG_KEYS)
+    legacy = _legacy_record(hooks)
+    if not (records or dev or (record is not None and not _plain(record))):
+        # nothing of 9.2 is in use: exactly 9.1.1 (one shared `hooks.dream`, set or cleared by this install)
+        return {"scopes": {}, "keepDev": False, "dream": bool(record and record.get("dream"))}, False
+    for x in others:
+        records.setdefault(x, dict(legacy))
+    shapes = {x: _installed_shape(root, x) for x in others}
+    keep_dev = dev and any(not _plain(records.get(x, legacy)) and shapes[x] is not True for x in others)
+    scoped = record is not None and (not _plain(record) or keep_dev)
+    if record is not None:
+        records[scope] = dict(record)
+    dreams = [records.get(x, legacy).get("dream") is True for x in others if shapes[x] is not True]
+    if record is not None and not scoped:
+        dreams.append(record.get("dream") is True)
+    if (not keep_dev and not scoped and all(_plain(r) for r in records.values())
+            and all(shapes[x] is not True for x in others)):
+        records = {}
+    return {"scopes": records, "keepDev": keep_dev, "dream": any(dreams)}, scoped
+
+
+def _apply_scope_plan(new_cfg: Dict[str, Any], plan: Dict[str, Any]) -> None:
     hooks = new_cfg.get(CONFIG_KEY)
     if not isinstance(hooks, dict):
-        if not values:
+        if not (plan["scopes"] or plan["dream"]):
             return
         hooks = new_cfg[CONFIG_KEY] = {}
-    scopes = hooks.get("scopes") if isinstance(hooks.get("scopes"), dict) else {}
-    if values:
-        scopes[scope] = dict(values)
-    else:
-        scopes.pop(scope, None)
-    if scopes:
-        hooks["scopes"] = scopes
+    if plan["scopes"]:
+        hooks["scopes"] = plan["scopes"]
     else:
         hooks.pop("scopes", None)
-    others = [k for k in _installed(cfg).get("claude", {}) if k != scope] if isinstance(
-        _installed(cfg).get("claude"), dict) else []
-    if not others:
+    if not plan["keepDev"]:
         for k in FLAG_KEYS:
             hooks.pop(k, None)
-    if any(isinstance(v, dict) and v.get("dream") is True for k, v in scopes.items() if k != scope):
+    if plan["dream"]:
         hooks["dream"] = True
+    else:
+        hooks.pop("dream", None)
+
+
+def _invalid_guards(cfg: Optional[Dict[str, Any]]) -> List[str]:
+    """Notices for every `guard` value that is not exactly "deny", "ask" or "off" (such a value means off)."""
+    hooks = (cfg or {}).get(CONFIG_KEY)
+    hooks = hooks if isinstance(hooks, dict) else {}
+    where = [("hooks.guard", hooks)] + [(f"hooks.scopes.{k}.guard", v) for k, v in sorted(_scopes(cfg).items())]
+    return [voc.HOOK_GUARD_INVALID % (key, json.dumps(rec["guard"], ensure_ascii=True)[:60])
+            for key, rec in where if "guard" in rec and rec["guard"] not in GUARD_VALUES]
 
 
 def _render(rep: Dict[str, Any]) -> str:
@@ -1212,7 +1279,6 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
     jit = bool(jit or guard) and not remove
     guard = bool(guard) and not remove
     capsule = bool(capsule) and not remove
-    scoped = jit or capsule  # these scopes' commands carry `--scope <scope>`; every other install is 9.1.1-shaped
     events = CLAUDE_EVENTS + (OPTIONAL_EVENTS if jit or capsule else ())
     for flag, on, note in (("jit", jit, JIT_NOTICE), ("guard", guard, GUARD_NOTICE), ("capsule", capsule, CAPSULE_NOTICE)):
         if on:
@@ -1231,6 +1297,17 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
         cfg, cfg_problem = _read_config(root)
         if cfg_problem:
             rep["notices"].append(cfg_problem + "; the install record is not used")
+        rep["notices"] += _invalid_guards(cfg)
+
+        def record_for(cfg_now: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if remove:
+                return None
+            hooks_now = (cfg_now or {}).get(CONFIG_KEY)
+            prior = _scopes(cfg_now).get(scope, _legacy_record(hooks_now if isinstance(hooks_now, dict) else {}))
+            return _explicit(jit=jit, guard=("ask" if prior.get("guard") == "ask" else "deny") if guard else "off",
+                             capsule=capsule, dream=bool(dream))
+
+        plan_cfg, scoped = _scope_plan(root, cfg, scope, record_for(cfg))
         cmd = None
         git_prefix = None
         if not remove:
@@ -1242,6 +1319,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
                                              cli_path=cli_path)["prefix"]
 
         def plan_all(cfg_now: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+            nonlocal plan_cfg, scoped
+            plan_cfg, scoped = _scope_plan(root, cfg_now, scope, record_for(cfg_now))
             c = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg_now,
                             events=None if remove else events, scoped=scoped)
             g = plan_git(root, git_prefix, remove=remove, cfg=cfg_now) if git_hooks else None
@@ -1251,8 +1330,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
         git_changes = gplan is not None and any(it["op"] in ("create", "update", "delete", "chmod")
                                                 for it in gplan["items"])
         probe_cfg = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
-        _apply_scope_flags(probe_cfg, cfg, scope, _scope_values(cfg, scope, jit=jit, guard=guard, capsule=capsule,
-                                                                 dream=bool(dream) and not remove))
+        _apply_scope_plan(probe_cfg, plan_cfg)
         flags_change = isinstance(cfg, dict) and probe_cfg.get(CONFIG_KEY) != cfg.get(CONFIG_KEY)
         problems = _preflight(root, cplan, gplan, init_runs=run_init is not None,
                               record_changes=(cplan["op"] != "unchanged" or git_changes or dream or bool((cfg or {}).get("hooks", {}).get("dream"))
@@ -1344,12 +1422,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             actions += apply_git(gplan, txn)
         if cfg is not None and not cfg_problem:
             new_cfg = copy.deepcopy(cfg)
-            if dream and not remove:
-                new_cfg.setdefault("hooks", {})["dream"] = True
-            else:
-                new_cfg.setdefault("hooks", {}).pop("dream", None)
-            _apply_scope_flags(new_cfg, cfg, scope, _scope_values(cfg, scope, jit=jit, guard=guard, capsule=capsule,
-                                                                  dream=bool(dream) and not remove))
+            new_cfg.setdefault("hooks", {})  # as 9.1.1 did (it set or popped `dream` here)
+            _apply_scope_plan(new_cfg, plan_cfg)
             if remove:
                 _set_record(new_cfg, "claude", scope, None)
                 if gplan is not None:
@@ -1533,16 +1607,17 @@ def find_root(payload: Dict[str, Any]) -> Optional[Path]:
 
 
 def _hook_settings(root: Path, scope: Optional[str] = None) -> Dict[str, Any]:
-    """Settings for one hook run. `scope` (from `--scope`, written only for a scope installed with 9.2 flags): the
-    flags under `hooks.scopes.<scope>`; without it (every 9.1.1-shaped command) the flat keys, where 9.1.1 configs
-    have no `jit` / `guard` / `capsule`. `dream` stays the flat 9.1.1 switch."""
+    """Settings for one hook run. `scope` (MEMLET_HOOK_SCOPE, or `--scope` from 9.2 development builds; written only
+    for a scope that needs its own flags): every flag, `dream` included, from `hooks.scopes.<scope>`; without it
+    (every 9.1.1-shaped command), or without that record, the flat keys, where 9.1.1 configs have no `jit` /
+    `guard` / `capsule`. A `guard` that is not exactly "deny", "ask" or "off" means off and is reported
+    (`guardInvalid`)."""
     cfg, _err = _read_config(root)
     raw = (cfg or {}).get(CONFIG_KEY)
     raw = raw if isinstance(raw, dict) else {}
-    flags = raw
-    if scope is not None:
-        scoped = _scopes(cfg).get(scope)
-        flags = scoped if scoped is not None else raw  # read both: flat keys from before flags were per scope
+    flags, where = raw, "hooks.guard"
+    if scope is not None and scope in _scopes(cfg):
+        flags, where = _scopes(cfg)[scope], f"hooks.scopes.{scope}.guard"
 
     def number(key: str, default: float, lo: float, hi: float) -> float:
         v = raw.get(key)
@@ -1551,12 +1626,14 @@ def _hook_settings(root: Path, scope: Optional[str] = None) -> Dict[str, Any]:
         return v
 
     guard = flags.get("guard")
+    invalid = (voc.HOOK_GUARD_INVALID % (where, json.dumps(guard, ensure_ascii=True, default=str)[:60])
+               if "guard" in flags and guard not in GUARD_VALUES else None)
     return {"tokens": int(number("sessionStartTokenBudget", DEFAULT_SESSION_TOKENS, 50, 4000)),
             "maxTranscriptBytes": int(number("maxTranscriptBytes", DEFAULT_MAX_TRANSCRIPT_BYTES, 1, 1 << 30)),
-            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0), "dream": raw.get("dream") is True,
+            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0), "dream": flags.get("dream") is True,
             # 9.2 opt-ins: recorded by `init --hooks --jit/--guard/--capsule`; anything malformed means off
             "jit": flags.get("jit") is True,
-            "guard": guard if isinstance(guard, str) and guard in ("deny", "ask") else None,
+            "guard": guard if guard in ("deny", "ask") else None, "guardInvalid": invalid,
             "capsule": flags.get("capsule") is True,
             "jitTokens": int(number("jitTokenBudget", DEFAULT_JIT_TOKENS, 50, 1000)),
             "capsuleTokens": int(number("capsuleTokenBudget", DEFAULT_CAPSULE_TOKENS, 100, 2000))}
@@ -1729,6 +1806,26 @@ def _post_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}, "systemMessage": msg}
 
 
+@contextlib.contextmanager
+def _without_own_text(mb: Any):
+    """Hook-path learning only (Stop / PreCompact): a transcript line (one visible message) that contains a fixed
+    text only Memlet's 9.2 hooks print (`vocabulary.HOOK_OWN_TEXT_MARKERS`: a denial, its tail, a JIT head, a
+    capsule heading, ...) quotes Memlet, not the person, and becomes an empty line before anything is learned or
+    snapshotted. Empty, not deleted: line numbers (pins) and the snapshot's identity stay as 9.1.1 has them, and a
+    transcript without such text is read exactly as before."""
+    real = mb._transcript_lines
+
+    def filtered(f: Path):
+        lines, stats = real(f)
+        return ["" if any(m in ln for m in voc.HOOK_OWN_TEXT_MARKERS) else ln for ln in lines], stats
+
+    mb._transcript_lines = filtered
+    try:
+        yield
+    finally:
+        mb._transcript_lines = real
+
+
 def _learn(root: Path, payload: Dict[str, Any], st: Dict[str, Any], event: str) -> Optional[Dict[str, Any]]:
     from memlet import memlet_bridge as mb
     from memlet import memlet_dream as md
@@ -1753,11 +1850,12 @@ def _learn(root: Path, payload: Dict[str, Any], st: Dict[str, Any], event: str) 
     previous = md.QUEUE_LOCK_TIMEOUT
     md.QUEUE_LOCK_TIMEOUT = min(float(previous), 3.0)  # never wait long for a concurrent `memlet learn`
     try:
-        if st.get("dream"):
-            from memlet.memlet_dreamcycle import dream_ingest
-            res = dream_ingest(root, str(p))
-        else:
-            res = mb.learn_from_transcript(root, str(p))
+        with _without_own_text(mb):
+            if st.get("dream"):
+                from memlet.memlet_dreamcycle import dream_ingest
+                res = dream_ingest(root, str(p))
+            else:
+                res = mb.learn_from_transcript(root, str(p))
     finally:
         md.QUEUE_LOCK_TIMEOUT = previous
     if not isinstance(res, dict) or not res.get("ok"):
@@ -1815,6 +1913,9 @@ ITEM_MAX_CITES = 64
 GRAPH_BUDGET = 8000             # tokens asked of `neighbors` (its own maximum); hooks trim further, whole items only
 CAPSULE_MAX_FILES = 12
 CAPSULE_RESERVE_SECONDS = 1.0   # kept back from the hook deadline so the 9.1.1 output is always printed
+PRINT_RESERVE_SECONDS = 0.1     # kept back after session bookkeeping for printing the kept 9.1.1 result
+SESSION_NOTE_GRACE = 0.5        # at most this, after a 9.1.1 SessionStart timeout, to record the session start
+REARM_FLOOR_SECONDS = 0.5       # after 9.2 work, the hook alarm leaves at least this for printing the kept result
 _DISPLAY_ORDER = ("blocks", "replaced", "governs", "resolves", "stale", "hints")
 _TRIM_RANK = {"hints": 0, "resolves": 1, "stale": 2, "governs": 3, "replaced": 4, "blocks": 4}  # lowest goes first
 _GUARD_GROUPS = ("blocks", "replaced")
@@ -1871,7 +1972,7 @@ def _neighbors(root: Path, target: str, *, tiers: Tuple[str, ...] = (TIER_APPROV
     except Exception as exc:
         _log(root, "graph", "neighbors failed: " + _where(exc))
         return None
-    checked = _checked_neighbors(res, tuple(tiers))
+    checked = _checked_neighbors(res, tuple(tiers), root)
     if checked is None:
         _log(root, "graph", "answer refused by the hook gate; nothing said")
     return checked
@@ -1889,97 +1990,134 @@ def _is_str(value: Any, limit: int = 4096) -> bool:
     return isinstance(value, str) and 0 < len(value) <= limit and "\x00" not in value
 
 
-def _admissible(item: Any, group: str, hints_on: bool) -> bool:
-    """The gate for one item of a `neighbors` answer (structure AND meaning; a graph that disagrees with these
-    rules is not acted on):
-    - blocks: an approved lesson whose relations include BLOCKS (relation BLOCKS), not a quarantined pair;
-    - replaced: an approved lesson that is a quarantined supersession pair with at least one replaced line, or a
-      rule with `why` "replaced-rule-text" and a non-empty `replacedBy`;
-    - resolves: an approved RESOLVES lesson; governs: a rule with status `active` (not replaced) or an approved
-      GOVERNS lesson; stale: a rule (any anchor state) that is not replaced;
+_RULE_WHY = ("anchor-in-file", "anchor-symbol")
+_LESSON_WHY = ("lesson-path", "lesson-cites-path")
+_SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _usable_cite(root: Optional[Path], c: Any, *, rule_source: Optional[str]) -> bool:
+    """A citation a reader can re-hash: an existing contained regular file (a lesson: under the Dream snapshot; a
+    rule: its own source file at its own line), positive integer lines with start <= end, a SHA-256 digest, and not
+    marked unverified."""
+    from memlet import memlet_bridge as mb
+    from memlet import memlet_wiki as mw
+    if not isinstance(c, dict) or not _is_str(c.get("file"), 1024):
+        return False
+    start, end, rel = c.get("start"), c.get("end"), c["file"]
+    if (isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int)
+            or not 1 <= start <= end):
+        return False
+    if not isinstance(c.get("sha256"), str) or not _SHA_RE.match(c["sha256"]) or c.get("verified") is False:
+        return False
+    if rule_source is None:
+        if not rel.startswith(mb.SNAPSHOT_REL + "/"):
+            return False
+    else:
+        path, _sep, line = rule_source.rpartition(":")
+        if rel != path or not line.isdigit() or int(line) != start:
+            return False
+    if root is None:  # a caller without a repository (diagnostics): everything but the file's existence
+        return mw._rel_parts(rel) is not None
+    return mw.contained_path_problem(root, rel) is None and (root / rel).is_file()
+
+
+def _admissible(root: Optional[Path], item: Any, group: str, hints_on: bool) -> bool:
+    """The gate for one item of a `neighbors` answer: structure AND meaning; a graph answer that disagrees with
+    these rules (or with itself) is not acted on.
+    - blocks / resolves / governs (live groups): current items only (`current` true; no replaced line role, no
+      quarantine, no replacement label, no `replacedBy`, no lesson `status`); blocks: an approved lesson whose
+      relation is BLOCKS and listed among its relations; resolves: likewise RESOLVES; governs: likewise GOVERNS, or
+      a rule with status `active`, relation GOVERNS and no unknown replacement;
+    - replaced: an approved quarantined supersession pair with SUPERSEDES among its relations and at least one
+      replaced line, or a rule (relation SUPERSEDES) with `why` "replaced-rule-text" and a non-empty `replacedBy`;
+    - stale: a rule (relation GOVERNS, any anchor state) that is not replaced;
     - hints: tier `hint` lessons, only when hints were asked for.
-    Every item needs string `id` / `kind` / `relation` / `source` / `why` (`why` from GRAPH_WHY), whole quote lines
-    (strings, at most MAX_LESSON_LINES, at most ITEM_MAX_CHARS together) and well-formed citations."""
+    Every item: string `id` / `kind` / `relation` / `source` / `why` (a value of its kind), relations from the four
+    (a rule exactly its one relation), `quoteLines` a list of whole strings with one usable citation each (see
+    `_usable_cite`), at most MAX_LESSON_LINES lines and ITEM_MAX_CHARS characters."""
     if not isinstance(item, dict):
         return False
     for key in ("id", "kind", "relation", "source", "why"):
         if not _is_str(item.get(key), 200 if key == "id" else 4096):
             return False
-    if item["why"] not in voc.GRAPH_WHY or not isinstance(item.get("text"), str):
+    quotes, cites, text = item.get("quoteLines"), item.get("cites"), item.get("text")
+    if (not isinstance(text, str) or not isinstance(quotes, list) or not quotes
+            or len(quotes) > voc.MAX_LESSON_LINES or not all(isinstance(q, str) and q for q in quotes)
+            or sum(len(q) for q in quotes) + len(text) > ITEM_MAX_CHARS):
         return False
-    quotes = _quote_lines(item)
-    if (not quotes or len(quotes) > voc.MAX_LESSON_LINES or not all(isinstance(q, str) and q for q in quotes)
-            or sum(len(q) for q in quotes) + len(item["text"]) > ITEM_MAX_CHARS):
+    if not isinstance(cites, list) or len(cites) != len(quotes) or len(cites) > ITEM_MAX_CITES:
         return False
-    cites = item.get("cites", [])
-    if not isinstance(cites, list) or len(cites) > ITEM_MAX_CITES or not all(
-            isinstance(c, dict) and _is_str(c.get("file"), 1024) and isinstance(c.get("start"), int)
-            and isinstance(c.get("end"), int) and not isinstance(c.get("start"), bool) for c in cites):
+    relations = item.get("relations")
+    if (not isinstance(relations, list) or not relations or not all(isinstance(r, str) for r in relations)
+            or not set(relations) <= set(_RELATIONS)):
         return False
-    relations = item.get("relations", [item["relation"]])
-    if not isinstance(relations, list) or not relations or not all(isinstance(r, str) for r in relations):
+    kind, tier, relation, why = item["kind"], item.get("tier"), item["relation"], item["why"]
+    roles = item.get("lineRoles")
+    live = group in ("blocks", "resolves", "governs")
+    if live and (item.get("current") is not True or item.get("quarantined") or item.get("replacementLabel")
+                 or item.get("replacedBy") or (roles is not None and (not isinstance(roles, list) or "replaced" in roles))):
         return False
-    kind, tier, relation = item["kind"], item.get("tier"), item["relation"]
     if kind == "rule":
         status, replaced_by = item.get("status"), item.get("replacedBy")
-        if tier is not None or status not in _RULE_STATES:
+        if (tier is not None or status not in _RULE_STATES or relations != [relation]
+                or not all(_usable_cite(root, c, rule_source=item["source"]) for c in cites)):
             return False
         if group == "replaced":
-            return (item["why"] == _WHY_REPLACED_RULE and isinstance(replaced_by, list) and bool(replaced_by)
-                    and all(_is_str(x, 200) for x in replaced_by))
-        if replaced_by:
+            return (relation == "SUPERSEDES" and why == _WHY_REPLACED_RULE and isinstance(replaced_by, list)
+                    and bool(replaced_by) and all(_is_str(x, 200) for x in replaced_by))
+        if replaced_by or relation != "GOVERNS" or why not in _RULE_WHY:
             return False
         if group == "governs":
-            return status == "active" and relation == "GOVERNS" and not item.get("replacementUnknown")
+            return status == "active" and item.get("replacementUnknown") is False
         return group == "stale"
-    if kind != "lesson" or not cites:
-        return False
-    if not set(relations) <= set(_RELATIONS):
+    if kind != "lesson" or "status" in item or not all(_usable_cite(root, c, rule_source=None) for c in cites):
         return False
     if group == "hints":
-        return hints_on and tier == TIER_HINT
+        return (hints_on and tier == TIER_HINT and why in _LESSON_WHY and relation == ",".join(relations)
+                and item.get("current") is not False)
     if tier != TIER_APPROVED:
         return False
     if group == "replaced":
-        roles = item.get("lineRoles")
-        return (item.get("quarantined") is True and relation == "SUPERSEDES" and isinstance(roles, list)
+        return (item.get("quarantined") is True and relation == "SUPERSEDES" and "SUPERSEDES" in relations
+                and why in _LESSON_WHY + (_WHY_REPLACED_RULE,) and isinstance(roles, list)
                 and len(roles) == len(quotes) and set(roles) <= {"replaced", "current"} and "replaced" in roles)
-    if item.get("quarantined"):
-        return False
     want = {"blocks": "BLOCKS", "resolves": "RESOLVES", "governs": "GOVERNS"}.get(group)
-    return want is not None and relation == want and want in relations
+    return want is not None and relation == want and want in relations and why in _LESSON_WHY
 
 
-def _checked_neighbors(res: Any, tiers: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
-    """The whole answer or nothing: an unknown group, an inadmissible item, a historical or failed answer, or
-    malformed bookkeeping refuses it. `guardComplete` is true only when the graph says blocks and replaced are whole."""
-    if not isinstance(res, dict) or res.get("ok") is not True or res.get("historical"):
+def _checked_neighbors(res: Any, tiers: Tuple[str, ...], root: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """The whole answer or nothing. Refused: a failed or historical answer; a missing or unknown group; any
+    inadmissible item; and bookkeeping that is missing, mistyped or inconsistent (`historical` false, `truncated`
+    a bool and true whenever a group is incomplete, `incompleteGroups` known group names, `blocksIncomplete` /
+    `replacedIncomplete` bools that agree with it, `omitted` counts only for incomplete groups). Absence is never
+    read as completeness. `guardComplete` is true only when blocks and replaced are complete."""
+    if not isinstance(res, dict) or res.get("ok") is not True or res.get("historical") is not False:
         return None
     raw = res.get("groups")
-    if not isinstance(raw, dict) or set(raw) - set(voc.GRAPH_HEADINGS):
+    if not isinstance(raw, dict) or set(raw) != set(voc.GRAPH_HEADINGS):
         return None
     hints_on = TIER_HINT in tiers
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for g in _DISPLAY_ORDER:
-        items = raw.get(g, [])
-        if not isinstance(items, list) or not all(_admissible(it, g, hints_on) for it in items):
+        items = raw[g]
+        if not isinstance(items, list) or not all(_admissible(root, it, g, hints_on) for it in items):
             return None
         groups[g] = items
-    raw_om = res.get("omitted", {})
-    if not isinstance(raw_om, dict) or set(raw_om) - set(_DISPLAY_ORDER):
+    incomplete, truncated = res.get("incompleteGroups"), res.get("truncated")
+    bi, ri, raw_om = res.get("blocksIncomplete"), res.get("replacedIncomplete"), res.get("omitted")
+    if (not isinstance(incomplete, list) or not all(isinstance(g, str) and g in raw for g in incomplete)
+            or len(set(incomplete)) != len(incomplete) or not isinstance(truncated, bool)
+            or not isinstance(bi, bool) or not isinstance(ri, bool)
+            or bi != ("blocks" in incomplete) or ri != ("replaced" in incomplete) or (incomplete and not truncated)
+            or not isinstance(raw_om, dict) or set(raw_om) - set(raw)):
         return None
     omitted: Dict[str, int] = {}
     for g, n in raw_om.items():
-        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0 or (n and g not in incomplete):
             return None
         if n and (g != "hints" or hints_on):
             omitted[g] = n
-    incomplete = res.get("incompleteGroups", [])
-    if not isinstance(incomplete, list) or not all(isinstance(g, str) for g in incomplete):
-        return None
-    complete = (res.get("blocksIncomplete") is False and res.get("replacedIncomplete") is False
-                and not set(_GUARD_GROUPS) & set(incomplete) and not any(omitted.get(g) for g in _GUARD_GROUPS))
-    return {"ok": True, "groups": groups, "omitted": omitted, "guardComplete": complete}
+    return {"ok": True, "groups": groups, "omitted": omitted, "guardComplete": not bi and not ri}
 
 
 def _guard_items(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -2295,18 +2433,77 @@ def _fits_state(state: Dict[str, Any]) -> bool:
 
 def _save_state(root: Path, rel: str, state: Dict[str, Any], *, created: bool) -> None:
     """Bounded write (see `_fits_state`); a state that cannot fit is not written (ValueError), and the caller then
-    treats any decision as unrecorded."""
+    treats any decision as unrecorded. A state that can no longer deny (corrupt, or guarding disabled) also leaves a
+    tombstone for its id. Call with the state lock held."""
     if not _fits_state(state):
         raise ValueError("session state over its size cap")
     _save_doc(root, rel, _state_bytes(state))
+    if state["recovered"] or state["guardDisabled"]:
+        _add_tombstones(root, [rel])
     if created:
         _prune_sessions(root, keep=rel)
+
+
+# Tombstones: a bounded set of salted hashes of session ids whose state Memlet pruned or stopped guarding, so a
+# later `startup` / `clear` with the same id gets a state that can never deny (an id is never re-armed). Residual:
+# only the newest TOMBSTONE_MAX ids are kept, so an id pruned more than that many prunes ago counts as new. While the
+# tombstone file is unreadable or malformed no session may deny; the next tombstone write replaces it (a new salt,
+# the earlier ids are then forgotten).
+TOMBSTONES_REL = SESSIONS_REL + "/tombstones.json"
+TOMBSTONE_SCHEMA = "memlet-hook-tombstones/v1"
+TOMBSTONE_MAX = 8192
+TOMBSTONE_MAX_BYTES = 1024 * 1024
+_HEX32_RE = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def _load_tombstones(root: Path) -> Tuple[Optional[Dict[str, Any]], str]:
+    from memlet import memlet_wiki as mw
+    p = root / TOMBSTONES_REL
+    if not os.path.lexists(str(p)):
+        return None, "absent"
+    if mw.managed_path_problem(root, TOMBSTONES_REL):
+        return None, "corrupt"
+    raw = mw.read_regular_bytes(p, TOMBSTONE_MAX_BYTES)
+    try:
+        doc = json.loads((raw or b"").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, "corrupt"
+    if (not isinstance(doc, dict) or set(doc) != {"schema", "salt", "ids"} or doc["schema"] != TOMBSTONE_SCHEMA
+            or not isinstance(doc["salt"], str) or not _HEX32_RE.match(doc["salt"]) or not isinstance(doc["ids"], list)
+            or len(doc["ids"]) > TOMBSTONE_MAX or not all(isinstance(x, str) and _HEX32_RE.match(x) for x in doc["ids"])):
+        return None, "corrupt"
+    return doc, "ok"
+
+
+def _tombstone_key(doc: Dict[str, Any], rel: str) -> str:
+    return hashlib.sha256((doc["salt"] + ":" + rel).encode("utf-8", "surrogateescape")).hexdigest()[:32]
+
+
+def _tombstoned(root: Path, rel: str) -> bool:
+    """True when `rel` may not be armed: its id is in the tombstones, or the tombstone file is unusable."""
+    doc, status = _load_tombstones(root)
+    if status == "absent":
+        return False
+    return doc is None or _tombstone_key(doc, rel) in doc["ids"]
+
+
+def _add_tombstones(root: Path, rels: List[str]) -> None:
+    doc, status = _load_tombstones(root)
+    if doc is None:
+        doc = {"schema": TOMBSTONE_SCHEMA, "salt": os.urandom(16).hex(), "ids": []}
+    keys = [_tombstone_key(doc, r) for r in rels]
+    fresh = [k for k in dict.fromkeys(keys) if k not in doc["ids"]]
+    if not fresh and status == "ok":
+        return
+    doc["ids"] = (doc["ids"] + fresh)[-TOMBSTONE_MAX:]
+    _save_doc(root, TOMBSTONES_REL, (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
 
 
 def _prune_sessions(root: Path, keep: str) -> None:
     """Delete session files older than SESSION_MAX_AGE_SECONDS, then the oldest beyond SESSION_MAX_FILES. Regular
     `s-*.json` files directly in `.memlet/sessions/` only; never follows a symlink. A deleted session is unknown
-    afterwards, and an unknown session never denies: pruning can only turn a guard off."""
+    afterwards, and an unknown session never denies; its id is tombstoned first, so a later `startup` / `clear`
+    with the same id cannot re-arm it either: pruning can only turn a guard off."""
     from memlet import memlet_wiki as mw
     d = root / SESSIONS_REL
     if mw.managed_path_problem(root, SESSIONS_REL, leaf="dir"):
@@ -2322,14 +2519,15 @@ def _prune_sessions(root: Path, keep: str) -> None:
                         found.append((entry.stat(follow_symlinks=False).st_mtime, entry.name))
     now = time.time()
     found.sort(reverse=True)
-    for i, (mtime, name) in enumerate(found):
-        rel = f"{SESSIONS_REL}/{name}"
-        if rel == keep:
-            continue
-        if now - mtime > SESSION_MAX_AGE_SECONDS or i >= SESSION_MAX_FILES:
-            if not mw.managed_path_problem(root, rel):
-                with contextlib.suppress(OSError):
-                    os.unlink(str(root / rel))
+    doomed = [f"{SESSIONS_REL}/{name}" for i, (mtime, name) in enumerate(found)
+              if f"{SESSIONS_REL}/{name}" != keep and (now - mtime > SESSION_MAX_AGE_SECONDS or i >= SESSION_MAX_FILES)
+              and not mw.managed_path_problem(root, f"{SESSIONS_REL}/{name}")]
+    if not doomed:
+        return
+    _add_tombstones(root, doomed)  # first: if this fails, nothing is pruned (a pruned id must never re-arm)
+    for rel in doomed:
+        with contextlib.suppress(OSError):
+            os.unlink(str(root / rel))
 
 
 @contextlib.contextmanager
@@ -2356,40 +2554,32 @@ def _touch(state: Dict[str, Any], rel: str) -> None:
     state["touched"].append(rel)
 
 
-def _record_touch(root: Path, payload: Dict[str, Any], event: str) -> None:
-    """The edited file joins the session's touched files (PostToolUse, and PreToolUse with --capsule alone). Never
-    changes the hook's output; any failure is logged and ignored."""
-    try:
-        rel = _repo_file(root, payload)
-        srel = _session_rel(payload.get("session_id"))
-        if rel is None or srel is None:
-            return
-        with _state_lock(root):
-            state, created = _open_state(root, srel)
-            _touch(state, rel)
-            _save_state(root, srel, state, created=created)
-    except _Deadline:
-        raise
-    except Exception as exc:  # the 9.1.1 output of this event must not depend on the state
-        _log(root, event, "session state not recorded: " + _where(exc))
+def _record_touch(root: Path, payload: Dict[str, Any]) -> None:
+    """The edited file joins the session's touched files (PostToolUse, and PreToolUse with --capsule alone). Run
+    through `_best_effort`: it never changes the hook's output."""
+    rel = _repo_file(root, payload)
+    srel = _session_rel(payload.get("session_id"))
+    if rel is None or srel is None:
+        return
+    with _state_lock(root):
+        state, created = _open_state(root, srel)
+        _touch(state, rel)
+        _save_state(root, srel, state, created=created)
 
 
-def _note_session_start(root: Path, payload: Dict[str, Any], event: str) -> None:
-    """A session first seen at SessionStart `startup` / `clear` may deny; one first seen any other way never does.
-    An existing (or unreadable) state is never re-labelled."""
-    try:
-        srel = _session_rel(payload.get("session_id"))
-        if srel is None:
+def _note_session_start(root: Path, payload: Dict[str, Any]) -> None:
+    """A session first seen at SessionStart `startup` / `clear` may deny, unless its id is tombstoned (pruned or
+    disabled before) or the tombstones are unusable; one first seen any other way never does. An existing (or
+    unreadable) state is never re-labelled. Run through `_best_effort`."""
+    srel = _session_rel(payload.get("session_id"))
+    if srel is None:
+        return
+    source = payload.get("source") if payload.get("source") in SESSION_SOURCES else ""
+    with _state_lock(root):
+        if os.path.lexists(str(root / srel)):
             return
-        source = payload.get("source") if payload.get("source") in SESSION_SOURCES else ""
-        with _state_lock(root):
-            if os.path.lexists(str(root / srel)):
-                return
-            _save_state(root, srel, _new_state(source=source, may_guard=source in ("startup", "clear")), created=True)
-    except _Deadline:
-        raise
-    except Exception as exc:
-        _log(root, event, "session state not recorded: " + _where(exc))
+        may = source in ("startup", "clear") and not _tombstoned(root, srel)
+        _save_state(root, srel, _new_state(source=source, may_guard=may), created=True)
 
 
 # -- PreToolUse -------------------------------------------------------------------------------------------------
@@ -2399,6 +2589,28 @@ def _hints_enabled(root: Path) -> bool:
     from memlet import memlet_bridge as mb
     cfg, _err = _read_config(root)
     return bool(mb.dream_settings(cfg or {})[0])
+
+
+def _guard_reason(groups: Dict[str, List[Dict[str, Any]]], guarding: List[Dict[str, Any]], mode: str,
+                  shown_path: str) -> Tuple[Optional[str], List[Tuple[str, Dict[str, Any]]]]:
+    """(reason, the guarding lessons it shows in full). The tail names what was shown in full and, when another
+    prohibition only got its pointer line, says so by id; None when no guarding lesson fits whole."""
+    gentries = [(None, g, it) for g in _GUARD_GROUPS for it in groups[g]]
+    head = (voc.GUARD_DENY_HEAD if mode == "deny" else voc.GUARD_ASK_HEAD) % shown_path
+    full_tail = voc.GUARD_DENY_TAIL if mode == "deny" else voc.GUARD_ASK_TAIL
+    tail = full_tail
+    for _attempt in range(3):  # the tail depends on what fits, and what fits on the tail
+        text, full = _render_block([head, voc.HOOK_QUOTE_NOTE], gentries, [tail], tokens=None, cap=GUARD_MAX_CHARS)
+        shown = [(gentries[i][1], gentries[i][2]) for i in full if any(gentries[i][2] is it for it in guarding)]
+        if text is None or not shown:
+            return None, []
+        pointed = [it for it in guarding if not any(it is x for _g, x in shown)]
+        want = full_tail if not pointed else (voc.GUARD_DENY_PARTIAL_TAIL if mode == "deny" else voc.GUARD_ASK_PARTIAL_TAIL) % (
+            ", ".join(_clean(it.get("id"), 60) for _g, it in shown), ", ".join(_clean(it.get("id"), 60) for it in pointed))
+        if want == tail:
+            return text, shown
+        tail = want
+    return None, []
 
 
 def _pre_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2419,7 +2631,8 @@ def _pre_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Op
         return None
     srel = _session_rel(payload.get("session_id"))
     if not st.get("jit"):
-        _record_touch(root, payload, "pre-tool-use")
+        _best_effort(root, st, "pre-tool-use", "touch record", lambda: _record_touch(root, payload),
+                     reserve=PRINT_RESERVE_SECONDS)
         return None
     hints = _hints_enabled(root)
     nb = _neighbors(root, rel, tiers=(TIER_APPROVED, TIER_HINT) if hints else (TIER_APPROVED,))
@@ -2433,14 +2646,12 @@ def _pre_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Op
     shown_path = _clean(rel, 300)
     reason: Optional[str] = None
     guarding = _guard_items(groups)
+    shown_guard: List[Tuple[str, Dict[str, Any]]] = []
     if guard_mode in ("deny", "ask") and nb and nb["guardComplete"] and guarding:
-        gentries = [(None, g, it) for g in _GUARD_GROUPS for it in groups[g]]
-        head = (voc.GUARD_DENY_HEAD if guard_mode == "deny" else voc.GUARD_ASK_HEAD) % shown_path
-        tail = voc.GUARD_DENY_TAIL if guard_mode == "deny" else voc.GUARD_ASK_TAIL
-        text, full = _render_block([head, voc.HOOK_QUOTE_NOTE], gentries, [tail], tokens=None, cap=GUARD_MAX_CHARS)
-        if text is not None and any(any(gentries[i][2] is it for it in guarding) for i in full):
-            reason = text  # at least one approved prohibition is shown whole; the others carry a pointer
-    guard_digest = _digest([(g, it) for g in _GUARD_GROUPS for it in groups.get(g) or []])
+        reason, shown_guard = _guard_reason(groups, guarding, guard_mode, shown_path)
+    # the decision covers exactly the prohibitions shown in full: a lesson only pointed to can still be delivered,
+    # once, when it later fits
+    guard_digest = _digest(shown_guard)
     shown_omitted = {g: n for g, n in omitted.items() if g in shown_names and n}
     jit_digest = _digest([(g, it) for _s, g, it in entries], shown_omitted)
     scope = _scope_of(payload)
@@ -2455,7 +2666,7 @@ def _pre_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Op
                 triple = [scope, rel, guard_digest]
                 pending = False
                 if (reason is not None and state["mayGuard"] and not state["guardDisabled"]
-                        and not state["recovered"] and triple not in state["guard"]):
+                        and not state["recovered"] and triple not in state["guard"] and not _tombstoned(root, srel)):
                     if len(state["guard"]) >= SESSION_MAX_GUARD:
                         state["guardDisabled"] = True  # at the bound: stop guarding, never forget
                     else:
@@ -2541,33 +2752,39 @@ def _capsule(root: Path, payload: Dict[str, Any], st: Dict[str, Any], head: List
     return text
 
 
-def _soft(root: Path, st: Dict[str, Any], event: str, fn: Callable[[], Optional[str]]) -> Optional[str]:
-    """Run the capsule under a soft deadline CAPSULE_RESERVE_SECONDS before the hook's own (which honours
-    `hooks.deadlineSeconds` and the time already spent); when it fires, or anything fails, return None so the
-    caller prints exactly its 9.1.1 output."""
+def _best_effort(root: Path, st: Dict[str, Any], event: str, what: str, fn: Callable[[], Any], *,
+                 reserve: float) -> Any:
+    """Run 9.2 work (session bookkeeping, the capsule) after the 9.1.1 result is computed and kept: under a soft
+    deadline `reserve` seconds before the hook's own (which honours `hooks.deadlineSeconds` and the time already
+    spent). Its lock waits, its deadline and its errors stop only this work (logged); None is returned and the
+    caller prints its kept 9.1.1 result unchanged."""
     g = st.get("_guard")
     if g is None:  # called directly (tests): no alarm to borrow
         try:
             return fn()
         except Exception as exc:
-            _log(root, event, "capsule skipped: " + _where(exc))
+            _log(root, event, f"{what} skipped: " + _where(exc))
             return None
     end = g.end
-    left = end - time.monotonic() - CAPSULE_RESERVE_SECONDS
-    if left < 0.2:
-        _log(root, event, "capsule out of time; 9.1.1 output only")
+    left = end - time.monotonic() - reserve
+    if left < 0.05:
+        _log(root, event, f"{what} out of time; 9.1.1 output only")
         return None
+    result = None
     g.arm(left)
     try:
-        return fn()
-    except _Deadline:
-        _log(root, event, "capsule stopped at its soft deadline; 9.1.1 output only")
-        return None
-    except Exception as exc:
-        _log(root, event, "capsule skipped: " + _where(exc))
-        return None
-    finally:
-        g.arm(end - time.monotonic())
+        try:
+            result = fn()
+        except _Deadline:
+            _log(root, event, f"{what} stopped at its soft deadline; 9.1.1 output only")
+        except Exception as exc:
+            _log(root, event, f"{what} skipped: " + _where(exc))
+        finally:
+            # what is left after this is printing the kept result: never less than REARM_FLOOR_SECONDS for it
+            g.arm(max(end - time.monotonic(), REARM_FLOOR_SECONDS))
+    except _Deadline:  # the soft alarm fired between the work and the re-arm
+        g.arm(REARM_FLOOR_SECONDS)
+    return result
 
 
 def _pre_compact(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any:
@@ -2577,9 +2794,9 @@ def _pre_compact(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any
     result = _learn(root, payload, st, "pre-compact")
     if not st.get("capsule"):
         return result
-    text = _soft(root, st, "pre-compact",
-                 lambda: _capsule(root, payload, st, [voc.CAPSULE_COMPACT_HEAD], cap=CAPSULE_MAX_CHARS,
-                                  event="pre-compact"))
+    text = _best_effort(root, st, "pre-compact", "capsule",
+                        lambda: _capsule(root, payload, st, [voc.CAPSULE_COMPACT_HEAD], cap=CAPSULE_MAX_CHARS,
+                                         event="pre-compact"), reserve=CAPSULE_RESERVE_SECONDS)
     if not text:
         return result
     message = (result or {}).get("systemMessage") if isinstance(result, dict) else None
@@ -2589,15 +2806,30 @@ def _pre_compact(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any
 
 
 def _session_start_event(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if st.get("jit") or st.get("capsule"):
-        _note_session_start(root, payload, "session-start")
-    out = _session_start(root, payload, st)
+    """The 9.1.1 SessionStart output first, kept; then, best effort, the session note and the capsule. If the 9.1.1
+    handover itself runs out of time (large repositories), the note still gets a short grace period so the guard
+    keeps its start record; the hook then prints nothing, exactly as 9.1.1 does on a timeout."""
+    tracking = st.get("jit") or st.get("capsule")
+    try:
+        out = _session_start(root, payload, st)
+    except _Deadline:
+        g = st.get("_guard")
+        if tracking and g is not None:
+            g.arm(min(SESSION_NOTE_GRACE, 0.25 * (st.get("deadline") or DEADLINES["session-start"])))
+            _best_effort(root, st, "session-start", "session note", lambda: _note_session_start(root, payload),
+                         reserve=0.0)
+        raise
+    if tracking:
+        _best_effort(root, st, "session-start", "session note", lambda: _note_session_start(root, payload),
+                     reserve=PRINT_RESERVE_SECONDS)
+    out = _with_guard_notice(out, st)
     source = payload.get("source")
     if not st.get("capsule") or source not in ("compact", "resume"):
         return out
     first = voc.CAPSULE_AFTER_COMPACT if source == "compact" else voc.CAPSULE_AFTER_RESUME
-    text = _soft(root, st, "session-start",
-                 lambda: _capsule(root, payload, st, [first], cap=SESSION_START_MAX_CHARS // 2, event="session-start"))
+    text = _best_effort(root, st, "session-start", "capsule",
+                        lambda: _capsule(root, payload, st, [first], cap=SESSION_START_MAX_CHARS // 2,
+                                         event="session-start"), reserve=CAPSULE_RESERVE_SECONDS)
     if not text:
         return out
     base = ((out or {}).get("hookSpecificOutput") or {}).get("additionalContext")
@@ -2612,10 +2844,21 @@ def _session_start_event(root: Path, payload: Dict[str, Any], st: Dict[str, Any]
 
 
 def _post_tool_use_event(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    out = _post_tool_use(root, payload, st)
+    out = _post_tool_use(root, payload, st)  # the 9.1.1 result, kept whatever the bookkeeping below does
     if st.get("jit") or st.get("capsule"):
-        _record_touch(root, payload, "post-tool-use")
+        _best_effort(root, st, "post-tool-use", "touch record", lambda: _record_touch(root, payload),
+                     reserve=PRINT_RESERVE_SECONDS)
     return out
+
+
+def _with_guard_notice(out: Optional[Dict[str, Any]], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """An invalid guard value is reported to the person as a status message (only when one is configured)."""
+    notice = st.get("guardInvalid")
+    if not notice:
+        return out
+    new = dict(out or {})
+    new["systemMessage"] = (new["systemMessage"] + " " + notice) if new.get("systemMessage") else notice
+    return new
 
 
 def _dispatch(event: str, root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any:
@@ -2648,9 +2891,11 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
         return 0
     scope: Optional[str] = None
     if len(argv) == 3 and argv[1] == "--scope" and argv[2] in SCOPES and event in RUNTIME_EVENTS:
-        scope = argv[2]
+        scope = argv[2]  # commands written by 9.2 development builds
     elif event not in RUNTIME_EVENTS + GIT_EVENTS or len(argv) != 1:
         return 0
+    elif event in RUNTIME_EVENTS and os.environ.get(SCOPE_ENV) in SCOPES:
+        scope = os.environ[SCOPE_ENV]
     root: Optional[Path] = None
     result: Any = None
     guard: Optional[_Guard] = None

@@ -209,8 +209,11 @@ class _Case(unittest.TestCase):
     def run_hook(self, event, payload=None, raw=None, scope="local"):
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(raw if raw is not None else json.dumps(payload))
-        argv = [event] + (["--scope", scope] if scope else [])
-        code = mh.run_hook(argv, stdin=stdin, stdout=out, stderr=err, hard_exit=False)
+        env = {k: v for k, v in os.environ.items() if k != mh.SCOPE_ENV}
+        if scope:
+            env[mh.SCOPE_ENV] = scope
+        with mock.patch.dict(os.environ, env, clear=True):
+            code = mh.run_hook([event], stdin=stdin, stdout=out, stderr=err, hard_exit=False)
         self.assertEqual(0, code)
         self.assertEqual("", err.getvalue())
         return out.getvalue()
@@ -236,8 +239,15 @@ class _Case(unittest.TestCase):
         return subprocess.run([sys.executable, "-B", str(CLI)] + list(argv), cwd=str(self.repo), input=stdin,
                               capture_output=True, text=True, env=env or dict(os.environ), timeout=120)
 
+    def scoped_env(self, scope="local", **extra):
+        env = {k: v for k, v in os.environ.items() if k != mh.SCOPE_ENV}
+        if scope:
+            env[mh.SCOPE_ENV] = scope
+        env.update(extra)
+        return env
+
     def cli_hook(self, event, payload, scope="local"):
-        r = self.cli("admin", "hook", event, *(["--scope", scope] if scope else []), stdin=json.dumps(payload))
+        r = self.cli("admin", "hook", event, stdin=json.dumps(payload), env=self.scoped_env(scope))
         self.assertEqual((0, ""), (r.returncode, r.stderr))
         return json.loads(r.stdout) if r.stdout.strip() else None
 
@@ -282,27 +292,45 @@ class _Case(unittest.TestCase):
         return ids
 
     def stub(self, groups, **extra):
-        res = {"ok": True, "target": "mod.py", "groups": groups, "omitted": {}, "historical": False,
-               "truncated": False, "incompleteGroups": [], "blocksIncomplete": False, "replacedIncomplete": False}
+        """A contract-shaped answer around `groups` (the items' citations point at a real snapshot file)."""
+        snap = self.repo / ".memlet" / "dream" / "snapshot"
+        snap.mkdir(parents=True, exist_ok=True)
+        if not (snap / "x.log").exists():
+            (snap / "x.log").write_text("".join("line %d\n" % i for i in range(1, 11)))
+        res = {"ok": True, "target": "mod.py", "groups": dict({g: [] for g in voc.GRAPH_HEADINGS}, **groups),
+               "omitted": {g: 0 for g in voc.GRAPH_HEADINGS}, "historical": False, "truncated": False,
+               "incompleteGroups": [], "blocksIncomplete": False, "replacedIncomplete": False}
         res.update(extra)
         return mock.patch.object(mh, "_graph_neighbors", return_value=lambda *a, **k: res)
 
 
+def _cite(start=2, file=".memlet/dream/snapshot/x.log"):
+    return {"file": file, "start": start, "end": start, "sha256": "a" * 64, "verified": True}
+
+
 def _lesson(**kw):
     item = {"id": "DRM-stub", "kind": "lesson", "relation": "BLOCKS", "relations": ["BLOCKS"], "tier": "approved",
-            "text": "Stub prohibition", "quoteLines": ["Stub prohibition"],
-            "cites": [{"file": ".memlet/dream/snapshot/x.log", "start": 2, "end": 2, "sha256": "a" * 64}],
-            "source": ".memlet/dream/snapshot/x.log:2", "why": "lesson-path"}
+            "text": "Stub prohibition", "quoteLines": ["Stub prohibition"], "cites": [_cite()], "current": True,
+            "source": ".memlet/dream/snapshot/x.log", "why": "lesson-path"}
     item.update(kw)
     return item
 
 
 def _rule(**kw):
     item = {"id": "rule-" + "0" * 24, "kind": "rule", "relation": "GOVERNS", "relations": ["GOVERNS"],
-            "status": "active", "text": "Stub rule", "quoteLines": ["Stub rule"], "cites": [],
-            "source": "AGENTS.md:9", "why": "anchor-symbol"}
+            "status": "active", "text": "Stub rule", "quoteLines": ["Stub rule"], "cites": [_cite(9, "AGENTS.md")],
+            "source": "AGENTS.md:9", "why": "anchor-symbol", "current": True, "replacementUnknown": False,
+            "replacedBy": []}
     item.update(kw)
     return item
+
+
+OFF = {"jit": False, "guard": "off", "capsule": False, "dream": False}
+_ZERO = {g: 0 for g in voc.GRAPH_HEADINGS}
+
+
+def _record(**kw):
+    return dict(OFF, **kw)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -315,24 +343,30 @@ class InstallerTests(_Case):
         doc = json.loads(self.settings().read_text())
         self.assertEqual(["SessionStart", "PostToolUse", "Stop", "PreCompact", "PreToolUse"], list(doc["hooks"]))
         self.assertEqual([{"matcher": "Write|Edit|MultiEdit|NotebookEdit",
-                           "hooks": [{"type": "command", "command": "memlet admin hook pre-tool-use --scope local || true",
+                           "hooks": [{"type": "command",
+                                      "command": "MEMLET_HOOK_SCOPE=local memlet admin hook pre-tool-use || true",
                                       "timeout": 10}]}], doc["hooks"]["PreToolUse"])
         for event, groups in doc["hooks"].items():
             cmd = groups[0]["hooks"][0]["command"]
-            self.assertTrue(cmd.endswith(" --scope local || true"), cmd)
+            self.assertTrue(cmd.startswith("MEMLET_HOOK_SCOPE=local memlet admin hook "), cmd)
+            self.assertNotIn("--scope", cmd)
             self.assertIsNotNone(mh.memlet_hook_event(groups[0]["hooks"][0]))
         hooks = self.config()["hooks"]
-        self.assertEqual({"local": {"jit": True}}, hooks["scopes"])
+        self.assertEqual({"local": _record(jit=True)}, hooks["scopes"])
         for k in ("jit", "guard", "capsule"):
             self.assertNotIn(k, hooks)
         self.assertTrue(rep["jit"])
         self.assertTrue(any("after the call ran" in n for n in rep["notices"]))
 
     def test_recognition_of_the_scope_suffix_is_strict(self):
-        for cmd in ("memlet admin hook stop --scope local || true", "memlet admin hook pre-tool-use --scope project"):
+        for cmd in ("memlet admin hook stop --scope local || true", "memlet admin hook pre-tool-use --scope project",
+                    "MEMLET_HOOK_SCOPE=local memlet admin hook stop || true",
+                    "MEMLET_HOOK_SCOPE=project '/usr/bin/python3' '/opt/x y/memory_cli.py' admin hook pre-compact || true"):
             self.assertIsNotNone(mh.memlet_hook_event({"type": "command", "command": cmd}), cmd)
         for cmd in ("memlet admin hook stop --scope team", "memlet admin hook --scope local",
-                    "memlet admin hook stop --scope", "memlet admin hook stop --scope local extra"):
+                    "memlet admin hook stop --scope", "memlet admin hook stop --scope local extra",
+                    "MEMLET_HOOK_SCOPE=team memlet admin hook stop", "OTHER=local memlet admin hook stop",
+                    "MEMLET_HOOK_SCOPE=local mytool admin hook stop"):
             self.assertIsNone(mh.memlet_hook_event({"type": "command", "command": cmd}), cmd)
         out = io.StringIO()
         for argv in (["pre-tool-use", "--scope", "team"], ["stop", "--scope"], ["git-pre-commit", "--scope", "local"]):
@@ -341,10 +375,10 @@ class InstallerTests(_Case):
 
     def test_guard_implies_jit_and_ask_survives_a_reinstall_of_that_scope(self):
         self.install(guard=True, capsule=True)
-        self.assertEqual({"jit": True, "guard": "deny", "capsule": True}, self.config()["hooks"]["scopes"]["local"])
+        self.assertEqual(_record(jit=True, guard="deny", capsule=True), self.config()["hooks"]["scopes"]["local"])
         self.set_hooks(guard="ask")
         self.install(guard=True)
-        self.assertEqual({"jit": True, "guard": "ask"}, self.config()["hooks"]["scopes"]["local"])
+        self.assertEqual(_record(jit=True, guard="ask"), self.config()["hooks"]["scopes"]["local"])
         self.set_hooks(guard="off")
         self.install(guard=True)
         self.assertEqual("deny", self.config()["hooks"]["scopes"]["local"]["guard"])
@@ -366,7 +400,7 @@ class InstallerTests(_Case):
         self.install(capsule=True)
         doc = json.loads(self.settings().read_text())
         self.assertIn("PreToolUse", doc["hooks"])
-        self.assertEqual({"capsule": True}, self.config()["hooks"]["scopes"]["local"])
+        self.assertEqual(_record(capsule=True), self.config()["hooks"]["scopes"]["local"])
         self.learn(BLOCK_TEXT)
         (self.repo / "nb.ipynb").write_text(json.dumps({"cells": [], "nbformat": 4, "nbformat_minor": 5}))
         self.commit()
@@ -384,26 +418,36 @@ class InstallerTests(_Case):
         rep = self.install(scope="local", remove=True)
         self.assertTrue(rep["ok"])
         self.assertEqual(project_bytes, self.settings("project").read_bytes())
-        self.assertEqual({"project": {"jit": True, "guard": "deny", "capsule": True}}, self.config()["hooks"]["scopes"])
-        self.install(scope="local")  # a plain reinstall of local
-        self.assertEqual({"project": {"jit": True, "guard": "deny", "capsule": True}}, self.config()["hooks"]["scopes"])
+        self.assertEqual({"project": _record(jit=True, guard="deny", capsule=True)}, self.config()["hooks"]["scopes"])
+        self.install(scope="local")  # a plain reinstall of local: explicitly off
+        self.assertEqual({"project": _record(jit=True, guard="deny", capsule=True), "local": OFF},
+                         self.config()["hooks"]["scopes"])
         self.learn(BLOCK_TEXT)
         self.start(scope="project")
         self.assertEqual("deny", decision(self.pre(scope="project")))  # the project entries still guard
         self.assertIsNone(self.pre(scope="local", sid="s-local"))      # local's entries do what local asked: nothing
         doc = json.loads(self.settings().read_text())
         self.assertNotIn("PreToolUse", doc["hooks"])
-        self.assertTrue(all("--scope" not in g["hooks"][0]["command"] for gs in doc["hooks"].values() for g in gs))
+        self.assertTrue(all("SCOPE" not in g["hooks"][0]["command"] for gs in doc["hooks"].values() for g in gs))
 
-    def test_dream_is_recorded_per_scope_and_the_flat_switch_follows_every_scope(self):
+    def test_dream_without_new_flags_is_the_shared_9_1_1_switch(self):
         self.install(scope="project", dream=True)
-        self.install(scope="local")
-        self.assertTrue(mh._hook_settings(self.repo)["dream"])  # project still asked for it
-        self.install(scope="project")
+        self.install(scope="local")  # 9.1.1: a reinstall without --dream clears the one shared switch
         self.assertFalse(mh._hook_settings(self.repo)["dream"])
         self.install(scope="local", dream=True)
         self.install(scope="local", remove=True)
         self.assertFalse(mh._hook_settings(self.repo)["dream"])
+        self.assertNotIn("scopes", self.config().get("hooks", {}))
+
+    def test_dream_with_new_flags_is_per_scope(self):
+        self.install(scope="local", dream=True)                    # 9.1.1-shaped, flat dream
+        self.install(scope="project", jit=True)                    # scoped, its own explicit record
+        self.assertTrue(mh._hook_settings(self.repo)["dream"])     # local (unscoped) keeps dream
+        self.assertFalse(mh._hook_settings(self.repo, "project")["dream"])
+        self.install(scope="project", jit=True, dream=True)
+        self.install(scope="local")                                 # local off: project keeps its own dream
+        self.assertFalse(mh._hook_settings(self.repo)["dream"])
+        self.assertTrue(mh._hook_settings(self.repo, "project")["dream"])
 
     def test_flat_flags_from_before_scopes_are_read_and_migrated(self):
         cfg = self.config()
@@ -413,7 +457,7 @@ class InstallerTests(_Case):
         self.assertEqual("ask", mh._hook_settings(self.repo, "local")["guard"])  # read both
         self.install(guard=True)
         hooks = self.config()["hooks"]
-        self.assertEqual({"jit": True, "guard": "ask"}, hooks["scopes"]["local"])
+        self.assertEqual(_record(jit=True, guard="ask"), hooks["scopes"]["local"])
         self.assertNotIn("jit", hooks)
         self.assertNotIn("guard", hooks)
 
@@ -434,7 +478,7 @@ class InstallerTests(_Case):
         self.install(jit=True)
         doc = json.loads(self.settings().read_text())
         doc["hooks"]["PreToolUse"].append({"matcher": "Write", "hooks": [
-            {"type": "command", "command": "memlet admin hook pre-tool-use --scope local"}]})
+            {"type": "command", "command": "MEMLET_HOOK_SCOPE=local memlet admin hook pre-tool-use"}]})
         self.settings().write_text(json.dumps(doc, indent=2) + "\n")
         rep = self.install(remove=True)
         self.assertTrue(any("PreToolUse" in x and "'Write'" in x for x in rep["claude"]["leftAlone"]), rep)
@@ -449,7 +493,7 @@ class InstallerTests(_Case):
             rep = mh.hooks_command(self.repo, jit=True, guard=True, dry_run=True)
         self.assertTrue(rep["ok"], rep)
         self.assertEqual(before, _tree(self.repo))
-        self.assertIn("admin hook pre-tool-use --scope local", rep["diff"])
+        self.assertIn("MEMLET_HOOK_SCOPE=local memlet admin hook pre-tool-use", rep["diff"])
         self.assertIn({"op": "would-update", "path": ".memlet/config.json"}, rep["actions"])
         real = mh._cas_write
 
@@ -561,7 +605,7 @@ class CompatibilityTests(_Case):
             self.assertEqual("", self.run_hook("pre-tool-use", dict(p, cwd=str(self.repo), hook_event_name="PreToolUse")))
         with mock.patch.dict(os.environ, {"MEMLET_DREAMING": "1"}):
             self.assertEqual("", self.run_hook("pre-tool-use", self.payload()))
-        r = self.cli("admin", "hook", "pre-tool-use", "--scope", "local", "extra", stdin=json.dumps(self.payload()))
+        r = self.cli("admin", "hook", "pre-tool-use", "extra", stdin=json.dumps(self.payload()), env=self.scoped_env())
         self.assertEqual((0, "", ""), (r.returncode, r.stdout, r.stderr))
         self.start()
         self.assertEqual("deny", decision(self.cli_hook("pre-tool-use", self.payload())))
@@ -900,9 +944,9 @@ class GuardTests(_Case):
     def test_parallel_processes_of_one_session_deny_exactly_once(self):
         self.start("parallel")
         payload = json.dumps(self.payload("mod.py", sid="parallel"))
-        procs = [subprocess.Popen([sys.executable, "-B", str(CLI), "admin", "hook", "pre-tool-use", "--scope", "local"],
+        procs = [subprocess.Popen([sys.executable, "-B", str(CLI), "admin", "hook", "pre-tool-use"],
                                   cwd=str(self.repo), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=dict(os.environ), text=True) for _ in range(6)]
+                                  stderr=subprocess.PIPE, env=self.scoped_env(), text=True) for _ in range(6)]
         outs = []
         for p in procs:
             o, e = p.communicate(payload, timeout=120)
@@ -917,7 +961,7 @@ class GuardTests(_Case):
 
         def call():
             out = io.StringIO()
-            mh.run_hook(["pre-tool-use", "--scope", "local"],
+            mh.run_hook(["pre-tool-use", "--scope", "local"],  # the development builds' form still works
                         stdin=io.StringIO(json.dumps(self.payload("mod.py", sid="threads"))),
                         stdout=out, stderr=io.StringIO(), hard_exit=False)
             results.append(out.getvalue())
@@ -977,10 +1021,14 @@ class GateTests(_Case):
         self.start()
 
     def test_an_admissible_stub_is_rendered_and_guards(self):
-        with self.stub({"blocks": [_lesson()], "governs": [_rule()]}, omitted={"governs": 2}):
+        with self.stub({"blocks": [_lesson()], "governs": [_rule()]}, omitted=dict(_ZERO, governs=2),
+                       incompleteGroups=["governs"], truncated=True):
             out = self.pre()
+            again = self.pre()
         self.assertEqual("deny", decision(out))
         self.assertIn("  > Stub prohibition", reason(out))
+        self.assertIn("  > Stub rule", ctx(again))
+        self.assertIn("(+2 more not shown within the budget", ctx(again))
 
     def test_each_inadmissible_shape_says_nothing_and_never_denies(self):
         bad = {
@@ -1011,6 +1059,35 @@ class GateTests(_Case):
             "hints-not-asked": {"hints": [_lesson(tier="hint")]},
             "not-a-list": {"blocks": {"x": 1}},
             "not-a-dict": {"blocks": ["text"]},
+            # K1 (Astra F2): contradictory or unusable answers
+            "supersession-without-SUPERSEDES": {"replaced": [_lesson(relation="SUPERSEDES", relations=["GOVERNS"],
+                                                                     quarantined=True, lineRoles=["replaced"])]},
+            "blocks-marked-replaced": {"blocks": [_lesson(current=False, status="replaced", lineRoles=["replaced"])]},
+            "blocks-not-current": {"blocks": [_lesson(current=False)]},
+            "blocks-without-current": {"blocks": [{k: v for k, v in _lesson().items() if k != "current"}]},
+            "blocks-replaced-role": {"blocks": [_lesson(lineRoles=["replaced"])]},
+            "blocks-quarantined": {"blocks": [_lesson(quarantined=True)]},
+            "blocks-replacement-label": {"blocks": [_lesson(replacementLabel="CURRENT")]},
+            "governs-rule-replaced-by": {"governs": [_rule(replacedBy=["DRM-x"])]},
+            "governs-rule-not-current": {"governs": [_rule(current=False)]},
+            "governs-rule-unknown-replacement": {"governs": [_rule(replacementUnknown=True)]},
+            "lesson-rule-why": {"blocks": [_lesson(why="anchor-in-file")]},
+            "rule-lesson-why": {"governs": [_rule(why="lesson-path")]},
+            "quote-string": {"blocks": [_lesson(quoteLines="not-a-list")]},
+            "quotes-without-cites": {"blocks": [_lesson(quoteLines=["a", "b"])]},
+            "cite-negative": {"blocks": [_lesson(cites=[dict(_cite(), start=-10, end=True)])]},
+            "cite-zero": {"blocks": [_lesson(cites=[dict(_cite(), start=0, end=0)])]},
+            "cite-reversed": {"blocks": [_lesson(cites=[dict(_cite(), start=3, end=2)])]},
+            "cite-no-digest": {"blocks": [_lesson(cites=[{k: v for k, v in _cite().items() if k != "sha256"}])]},
+            "cite-bad-digest": {"blocks": [_lesson(cites=[dict(_cite(), sha256="zz")])]},
+            "cite-unverified": {"blocks": [_lesson(cites=[dict(_cite(), verified=False)])]},
+            "cite-missing-file": {"blocks": [_lesson(cites=[_cite(file=".memlet/dream/snapshot/no-such-file.log")])]},
+            "cite-outside-snapshot": {"blocks": [_lesson(cites=[_cite(file="outside.log")])]},
+            "rule-cite-other-line": {"governs": [_rule(cites=[_cite(8, "AGENTS.md")])]},
+            "rule-cite-other-file": {"governs": [_rule(cites=[_cite(9, "README.md")])]},
+            "stale-rule-unknown-relation": {"stale": [_rule(status="stale", relation="ALLOWS", relations=["ALLOWS"])]},
+            "rule-relations-mismatch": {"governs": [_rule(relations=["GOVERNS", "BLOCKS"])]},
+            "hint-relation-mismatch": {"hints": [_lesson(tier="hint", relation="BLOCKS", relations=["GOVERNS"])]},
         }
         cfg = self.config()
         cfg["dream"] = {"hints": False}
@@ -1018,15 +1095,33 @@ class GateTests(_Case):
         for n, (label, groups) in enumerate(bad.items()):
             with self.subTest(label=label), self.stub(groups):
                 self.assertIsNone(self.pre(sid="s1", agent_id="g%d" % n))
-        for label, extra in (("ok-false", {"ok": False}), ("historical", {"historical": True}),
-                             ("omitted-type", {"omitted": {"blocks": "1"}}), ("omitted-group", {"omitted": {"x": 1}})):
-            with self.subTest(label=label), self.stub({"blocks": [_lesson()]}, **extra):
-                self.assertIsNone(self.pre(agent_id=label))
+        bookkeeping = [("ok-false", {"ok": False}), ("historical", {"historical": True}),
+                       ("omitted-type", {"omitted": {"blocks": "1"}}), ("omitted-group", {"omitted": {"x": 1}}),
+                       ("historical-wrong-type", {"historical": []}), ("truncated-wrong-type", {"truncated": "blocks"}),
+                       ("unknown-incomplete-group", {"incompleteGroups": ["imaginary"], "truncated": True}),
+                       ("duplicate-incomplete-group", {"incompleteGroups": ["governs", "governs"], "truncated": True}),
+                       ("incomplete-not-truncated", {"incompleteGroups": ["governs"]}),
+                       ("blocks-flag-disagrees", {"blocksIncomplete": True}),
+                       ("replaced-flag-disagrees", {"incompleteGroups": ["replaced"], "truncated": True}),
+                       ("omitted-in-complete-group", {"omitted": dict(_ZERO, governs=1)}),
+                       ("blocksIncomplete-null", {"blocksIncomplete": None})]
+        for field in ("incompleteGroups", "historical", "truncated", "blocksIncomplete", "replacedIncomplete", "omitted"):
+            bookkeeping.append(("missing-" + field, {"_drop": field}))
+        for label, extra in bookkeeping:
+            drop = extra.pop("_drop", None)
+            with self.subTest(label=label), self.stub({"blocks": [_lesson()]}, **extra) as patched:
+                if drop:
+                    answer = patched.return_value()
+                    patched.return_value = lambda *a, _answer={k: v for k, v in answer.items() if k != drop}, **k: _answer
+                self.assertIsNone(self.pre(agent_id=label))  # neither a deny nor context
+        with self.stub({"blocks": [_lesson()]}, truncated=True):  # truncated alone names no incomplete group
+            self.assertEqual("deny", decision(self.pre(agent_id="truncated-only")))
 
     def test_incomplete_blocks_or_replaced_informs_but_never_denies(self):
-        for n, extra in enumerate(({"blocksIncomplete": True}, {"replacedIncomplete": True},
-                                   {"incompleteGroups": ["blocks"]}, {"omitted": {"replaced": 1}},
-                                   {"blocksIncomplete": None})):
+        for n, extra in enumerate(({"blocksIncomplete": True, "incompleteGroups": ["blocks"], "truncated": True},
+                                   {"replacedIncomplete": True, "incompleteGroups": ["replaced"], "truncated": True},
+                                   {"omitted": dict(_ZERO, replaced=1), "incompleteGroups": ["replaced"],
+                                    "replacedIncomplete": True, "truncated": True})):
             with self.subTest(extra=extra), self.stub({"blocks": [_lesson()]}, **extra):
                 out = self.pre(agent_id="i%d" % n)
                 self.assertIsNone(decision(out))
@@ -1040,8 +1135,7 @@ class GateTests(_Case):
         self.assertIn(voc.HOOK_RULE_REPLACED + " rule at AGENTS.md:9 (by DRM-x)", ctx(out))
         pair = _lesson(relation="SUPERSEDES", relations=["SUPERSEDES"], quarantined=True,
                        quoteLines=["Old way", "New way"], lineRoles=["replaced", "current"],
-                       cites=[{"file": ".memlet/dream/snapshot/x.log", "start": 1, "end": 1},
-                              {"file": ".memlet/dream/snapshot/x.log", "start": 2, "end": 2}])
+                       cites=[_cite(1), _cite(2)])
         with self.stub({"replaced": [rule, pair]}):
             out = self.pre(agent_id="pair")
         self.assertEqual("deny", decision(out))
@@ -1243,7 +1337,7 @@ class SessionStateTests(_Case):
         target.write_text("{}")
         (d / "s-link.json").symlink_to(target)
         self.start("newest")
-        names = [n for n in self.sessions() if n != "s-link.json"]
+        names = [n for n in self.sessions() if n.startswith("s-") and n != "s-link.json"]
         self.assertLessEqual(len(names), mh.SESSION_MAX_FILES)
         self.assertIn("s-newest.json", names)
         for i in range(5):
@@ -1257,9 +1351,9 @@ class SessionStateTests(_Case):
         self.commit()
         procs = []
         for f in files:
-            p = subprocess.Popen([sys.executable, "-B", str(CLI), "admin", "hook", "pre-tool-use", "--scope", "local"],
+            p = subprocess.Popen([sys.executable, "-B", str(CLI), "admin", "hook", "pre-tool-use"],
                                  cwd=str(self.repo), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=dict(os.environ), text=True)
+                                 stderr=subprocess.PIPE, env=self.scoped_env(), text=True)
             procs.append((p, json.dumps(self.payload(f, sid="conc"))))
         for p, payload in procs:
             p.communicate(payload, timeout=120)
@@ -1429,6 +1523,326 @@ class RealGraphTests(_Case):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# K1: final fixes (each auditor reproduction is a regression test here)
+
+
+BASELINE = "b8749a0"  # Memlet 9.1.1
+
+
+def _baseline_source(rel):
+    """`rel` as Memlet 9.1.1 shipped it (from this checkout's history), or None when that history is unavailable."""
+    try:
+        r = subprocess.run(["git", "-C", str(HERE), "show", f"{BASELINE}:{rel}"], capture_output=True, text=True,
+                           timeout=60, env={k: v for k, v in os.environ.items() if not k.startswith("GIT_CEILING")})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
+def _baseline_hooks(tmp):
+    import importlib.util
+    src = _baseline_source("memlet/memlet_hooks.py")
+    if src is None:
+        return None, None
+    path = Path(tmp) / "hooks_911.py"
+    path.write_text(src)
+    spec = importlib.util.spec_from_file_location("memlet._hooks_911", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = "memlet"
+    spec.loader.exec_module(mod)
+    return mod, path
+
+
+class K1Tests(_Case):
+    # -- item 1: new bookkeeping never silences what 9.1.1 prints (Astra F1, deadlines.py) -----------------------
+    def test_a_held_state_lock_never_silences_session_start_or_post_tool_use(self):
+        self.learn(BLOCK_TEXT)
+        (self.repo / "mod.py").write_text(MOD_STALE)  # a real stale warning for both 9.1.1 outputs
+        self.set_hooks(deadlineSeconds=0.4)
+        cases = [("session-start", {"session_id": "s1", "source": "startup", "cwd": str(self.repo),
+                                    "hook_event_name": "SessionStart"}),
+                 ("post-tool-use", dict(self.payload(), hook_event_name="PostToolUse"))]
+        for event, payload in cases:
+            with self.subTest(event=event):
+                self.set_hooks(jit=None, capsule=None)
+                baseline = self.cli_hook(event, payload)
+                self.assertIn("stale", json.dumps(baseline))
+                self.set_hooks(jit=True)
+                with md.queue_lock(self.repo / mh.SESSIONS_REL / "state.lock", timeout=1):
+                    held = self.cli_hook(event, payload)  # another process holds the session-state lock
+                self.assertEqual(baseline, held)
+
+    def test_failing_bookkeeping_never_silences_the_9_1_1_output(self):
+        self.learn(BLOCK_TEXT)
+        (self.repo / "mod.py").write_text(MOD_STALE)
+        cases = [("session-start", {"session_id": "s1", "source": "startup", "cwd": str(self.repo),
+                                    "hook_event_name": "SessionStart"}, "_note_session_start"),
+                 ("post-tool-use", dict(self.payload(), hook_event_name="PostToolUse"), "_record_touch")]
+        for event, payload, name in cases:
+            with self.subTest(event=event):
+                self.set_hooks(jit=None, capsule=None)
+                baseline = self.run_hook(event, payload)
+                self.assertTrue(baseline)
+                self.set_hooks(jit=True, capsule=True)
+                for failure in (RuntimeError("injected"), TimeoutError("busy"), mh._Deadline()):
+                    with mock.patch.object(mh, name, side_effect=failure):
+                        self.assertEqual(baseline, self.run_hook(event, payload))
+
+    def test_a_9_1_1_session_start_timeout_still_records_the_session_start(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        with mock.patch.object(mh, "_session_start", side_effect=mh._Deadline()):
+            self.assertIsNone(self.start())  # nothing printed, exactly as 9.1.1 on a timeout
+        self.assertTrue(self.state()["mayGuard"])
+        self.assertEqual("deny", decision(self.pre()))
+
+    # -- item 3: a pruned session id is never re-armed (Astra F3, pruned_capacity.py / pruned_start.py) ----------
+    def test_capacity_pruning_then_clear_or_startup_with_the_same_id_never_denies_again(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        start = lambda sid, source="startup": self.cli_hook("session-start", {
+            "session_id": sid, "source": source, "cwd": str(self.repo), "hook_event_name": "SessionStart"})
+        start("victim")
+        self.assertEqual("deny", decision(self.cli_hook("pre-tool-use", self.payload(sid="victim"))))
+        victim = self.repo / mh._session_rel("victim")
+        old = time.time() - 60
+        os.utime(str(victim), (old, old))
+        for i in range(mh.SESSION_MAX_FILES):
+            self.start("other-%d" % i)  # genuine starts: normal capacity pruning removes the victim's state
+        self.assertFalse(victim.exists())
+        for source in ("clear", "startup"):
+            start("victim", source)
+            self.assertIsNone(decision(self.cli_hook("pre-tool-use", self.payload(sid="victim"))), source)
+        self.assertFalse(self.state("victim")["mayGuard"])
+
+    def test_age_pruning_then_a_fresh_start_with_the_same_id_never_denies_again(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        self.start("victim")
+        self.assertEqual("deny", decision(self.pre(sid="victim")))
+        victim = self.repo / mh._session_rel("victim")
+        old = time.time() - mh.SESSION_MAX_AGE_SECONDS - 10
+        os.utime(str(victim), (old, old))
+        self.start("someone-else")
+        self.assertFalse(victim.exists())
+        for source in ("startup", "clear", "resume", "fork", "compact"):
+            self.start("victim", source)
+            self.assertIsNone(decision(self.pre(sid="victim")), source)
+        self.start("new-id")
+        self.assertEqual("deny", decision(self.pre(sid="new-id")))  # an id never seen before still guards
+
+    def test_disabled_or_corrupt_sessions_are_tombstoned(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        self.write_state("broken", {"schema": "nope"})
+        self.pre(sid="broken")  # replaced by a recovered state: tombstoned
+        (self.repo / mh._session_rel("broken")).unlink()
+        self.start("broken", "startup")
+        self.assertIsNone(decision(self.pre(sid="broken")))
+
+    def test_unusable_tombstones_block_every_new_deny_until_rewritten(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        tomb = self.repo / mh.TOMBSTONES_REL
+        tomb.parent.mkdir(parents=True, exist_ok=True)
+        for garbage in ("not json", '{"schema": "x"}', json.dumps({"schema": mh.TOMBSTONE_SCHEMA, "salt": "0" * 32,
+                                                                   "ids": ["XYZ"]})):
+            tomb.write_text(garbage)
+            sid = "n%d" % len(garbage)
+            self.start(sid)
+            self.assertIsNone(decision(self.pre(sid=sid)))
+        with mh._state_lock(self.repo):
+            mh._add_tombstones(self.repo, [mh._session_rel("gone")])  # a write replaces the unusable file
+        self.assertEqual("ok", mh._load_tombstones(self.repo)[1])
+        self.start("after-rewrite")
+        self.assertEqual("deny", decision(self.pre(sid="after-rewrite")))
+
+    def test_tombstones_are_bounded_oldest_first(self):
+        with mock.patch.object(mh, "TOMBSTONE_MAX", 3), mh._state_lock(self.repo):
+            (self.repo / mh.SESSIONS_REL).mkdir(parents=True, exist_ok=True)
+            mh._add_tombstones(self.repo, ["a", "b", "c", "d", "e"])
+            doc = mh._load_tombstones(self.repo)[0]
+        self.assertEqual([mh._tombstone_key(doc, x) for x in ("c", "d", "e")], doc["ids"])
+
+    # -- item 4: scopes and legacy installs (Astra F4, install_probe.py; Opus F6) ----------------------------------
+    def test_a_genuine_9_1_1_dream_install_keeps_dream_when_another_scope_gets_new_flags(self):
+        old, _path = _baseline_hooks(self.tmp)
+        if old is None:
+            self.skipTest("Memlet 9.1.1 is not in this checkout's history")
+        with mock.patch.object(old, "resolve_command", return_value=dict(PORTABLE)):
+            self.assertTrue(old.hooks_command(self.repo, dream=True)["ok"])
+        local = self.settings().read_bytes()
+        before = self.config()["hooks"]
+        self.assertTrue(before["dream"])
+        self.install(scope="project", jit=True, guard=True)
+        self.assertEqual(local, self.settings().read_bytes())
+        self.assertTrue(mh._hook_settings(self.repo)["dream"])          # the 9.1.1 local entries: still dream
+        self.assertFalse(mh._hook_settings(self.repo, "project")["dream"])
+        self.assertEqual(_record(dream=True), self.config()["hooks"]["scopes"]["local"])
+        self.install(scope="project", remove=True)
+        hooks = self.config()["hooks"]
+        self.assertTrue(hooks["dream"])
+        self.assertNotIn("scopes", hooks)                                # back to the 9.1.1 shape
+        self.assertEqual(before["installed"], hooks["installed"])
+
+    def test_flat_development_flags_with_two_scopes_reinstall_one_scope_off(self):
+        self.install(scope="local")
+        self.install(scope="project")
+        cfg = self.config()
+        cfg["hooks"].update(jit=True, guard="deny", capsule=True)  # the earlier development builds' flat shape
+        self.write_config(cfg)
+        project = self.settings("project").read_bytes()
+        self.install(scope="local")  # no new flags: local is now explicitly off
+        hooks = self.config()["hooks"]
+        self.assertEqual(OFF, hooks["scopes"]["local"])
+        self.assertEqual(_record(jit=True, guard="deny", capsule=True), hooks["scopes"]["project"])
+        self.assertTrue(hooks["jit"])  # still read by the project's 9.1.1-shaped commands
+        cmds = [h["command"] for gs in json.loads(self.settings().read_text())["hooks"].values() for g in gs
+                for h in g["hooks"]]
+        self.assertTrue(all(c.startswith("MEMLET_HOOK_SCOPE=local ") for c in cmds), cmds)
+        st_local = mh._hook_settings(self.repo, "local")
+        self.assertEqual((False, None, False), (st_local["jit"], st_local["guard"], st_local["capsule"]))
+        st_project = mh._hook_settings(self.repo)  # what the project's unscoped commands read: unchanged
+        self.assertEqual((True, "deny", True), (st_project["jit"], st_project["guard"], st_project["capsule"]))
+        self.assertEqual(project, self.settings("project").read_bytes())
+
+    @unittest.skipUnless(PYTHON, "no interpreter runs outside this process's launcher environment")
+    def test_a_9_1_1_runtime_ignores_the_scope_and_prints_its_9_1_1_output(self):
+        old, path = _baseline_hooks(self.tmp)
+        if old is None:
+            self.skipTest("Memlet 9.1.1 is not in this checkout's history")
+        self.install(jit=True, guard=True, capsule=True)
+        (self.repo / "mod.py").write_text(MOD_STALE)
+        launcher = self.tmp / "bin" / "memlet"
+        launcher.parent.mkdir()
+        launcher.write_text("#!/bin/sh\nexec %s -c 'import importlib.util, sys; sys.path.insert(0, sys.argv[1]); "
+                            "s = importlib.util.spec_from_file_location(\"memlet._hooks_911\", sys.argv[2]); "
+                            "m = importlib.util.module_from_spec(s); m.__package__ = \"memlet\"; "
+                            "s.loader.exec_module(m); sys.exit(m.run_hook(sys.argv[5:]))' %s %s \"$@\"\n"
+                            % (PYTHON, str(HERE), str(path)))
+        launcher.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in mh._LAUNCHER_ENV and k != mh.SCOPE_ENV}
+        env["PATH"] = str(launcher.parent) + os.pathsep + "/usr/bin:/bin"
+        doc = json.loads(self.settings().read_text())
+        payload = json.dumps({"session_id": "s1", "source": "startup", "cwd": str(self.repo),
+                              "hook_event_name": "SessionStart"})
+
+        def run(cmd):
+            return subprocess.run(["/bin/sh", "-c", cmd], input=payload, text=True, env=env, cwd=str(self.repo),
+                                  capture_output=True, timeout=120)
+
+        installed = doc["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertTrue(installed.startswith("MEMLET_HOOK_SCOPE=local memlet admin hook session-start"))
+        with_scope = run(installed)
+        plain = run("memlet admin hook session-start || true")
+        self.assertEqual((0, ""), (with_scope.returncode, with_scope.stderr))
+        self.assertTrue(plain.stdout)
+        self.assertEqual(plain.stdout, with_scope.stdout)  # the 9.1.1 output, nothing new
+        self.assertEqual("", run("memlet admin hook session-start --scope local || true").stdout)  # why not --scope
+
+    # -- item 5: deny text and digest cover what was shown (Argon F2) ---------------------------------------------
+    def test_a_partly_shown_guard_names_what_was_shown_and_records_only_that(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        big = "Never call charge() in mod.py " + "while the ledger is open, " * 110 + "even in tests."
+        self.learn(big, name="big.jsonl")
+        ids = {i["text"]: i["id"] for i in mb.dream_items(self.repo)["items"]}
+        self.start()
+        with mock.patch.object(mh, "GUARD_MAX_CHARS", 1500):
+            out = self.pre()
+            again = self.pre()
+        r = reason(out)
+        self.assertEqual("deny", decision(out))
+        self.assertTrue(r.endswith(voc.GUARD_DENY_PARTIAL_TAIL % (ids[BLOCK_TEXT], ids[big])), r)
+        self.assertNotIn(voc.GUARD_DENY_TAIL, r)
+        self.assertIsNone(decision(again))
+        shown = [g for g in mg.neighbors(str(self.repo), "mod.py", budget=8000)["groups"]["blocks"]
+                 if g["text"] == BLOCK_TEXT]
+        self.assertEqual([["main", "mod.py", mh._digest([("blocks", shown[0])])]], self.state()["guard"])
+        full = self.pre()  # the big lesson now fits: delivered once, with the plain tail
+        self.assertEqual("deny", decision(full))
+        self.assertTrue(reason(full).endswith(voc.GUARD_DENY_TAIL))
+        self.assertIn("while the ledger is open", reason(full))
+        self.assertIsNone(decision(self.pre()))
+
+    # -- item 6: guard values and wording --------------------------------------------------------------------------
+    def test_an_invalid_guard_value_is_off_and_reported(self):
+        self.learn(BLOCK_TEXT)
+        self.set_hooks(jit=True, guard="Ask")
+        notice = voc.HOOK_GUARD_INVALID % ("hooks.scopes.local.guard", '"Ask"')
+        self.assertIn(notice, self.start()["systemMessage"])
+        self.assertIsNone(decision(self.pre()))
+        with mock.patch.object(mh, "resolve_command", return_value=dict(PORTABLE)):
+            dry = mh.hooks_command(self.repo, jit=True, dry_run=True)
+        self.assertIn(notice, dry["notices"])
+        self.assertIn(notice, self.install(jit=True)["notices"])
+        self.assertEqual("off", self.config()["hooks"]["scopes"]["local"]["guard"])
+        self.set_hooks(guard=None)
+        self.assertNotIn("systemMessage", self.start("s2") or {})
+
+    def test_cli_messages_and_the_capsule_notice(self):
+        for argv, want in ((["init", ".", "--jit"], "--jit requires --hooks"),
+                           (["init", ".", "--hooks-remove", "--guard"], "--guard requires --hooks"),
+                           (["init", ".", "--git-hooks"], "--git-hooks requires --hooks or --hooks-remove")):
+            r = self.cli(*argv)
+            self.assertEqual(2, r.returncode)
+            self.assertIn(want, r.stderr)
+            if "--git-hooks" not in argv:
+                self.assertNotIn("or --hooks-remove", r.stderr)
+        notice = next(n for n in self.install(capsule=True)["notices"] if n.startswith("--capsule"))
+        self.assertIn("when 9.1.1 would have printed a status message there", notice)
+
+    # -- item 7: Stop never learns Memlet's own words (live session DRM-e0700d901929) ------------------------------
+    def test_stop_never_learns_the_hooks_own_text(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        self.start()
+        denial = reason(self.pre())
+        self.assertTrue(denial)
+        before = {n["id"] for n in mb._load_queue(self.repo)[0]["nodes"]}
+        records = [
+            {"type": "user", "timestamp": "2026-11-11T10:00:00Z",
+             "message": {"role": "user", "content": "Please make charge() round the amount in mod.py"}},
+            {"type": "assistant", "timestamp": "2026-11-11T10:00:05Z",
+             "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Edit",
+                                                           "input": {"file_path": str(self.repo / "mod.py")}}]}},
+            {"type": "user", "timestamp": "2026-11-11T10:00:06Z",
+             "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+                                                      "content": denial}]}},
+            {"type": "assistant", "timestamp": "2026-11-11T10:00:09Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text":
+                         "The edit was stopped by a hook:\n\n" + denial + "\n\nI will not call charge() from tests."}]}},
+            {"type": "user", "timestamp": "2026-11-11T10:01:00Z",
+             "message": {"role": "user", "content": "Never deploy util.py on a Friday"}},
+        ]
+        transcript = self.tmp / "transcripts" / "live.jsonl"
+        transcript.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        self.hook("stop", {"session_id": "s1", "cwd": str(self.repo), "transcript_path": str(transcript),
+                           "hook_event_name": "Stop", "stop_hook_active": False})
+        added = [n for n in mb._load_queue(self.repo)[0]["nodes"] if n["id"] not in before]
+        texts = [mb.lesson_text(n) for n in added]
+        self.assertEqual(1, len(added), texts)
+        self.assertIn("Never deploy util.py on a Friday", texts[0])
+        snap = "".join(p.read_text() for p in (self.repo / mb.SNAPSHOT_REL).iterdir() if "live" in p.name)
+        for marker in voc.HOOK_OWN_TEXT_MARKERS:
+            self.assertNotIn(marker, snap)
+        self.assertEqual(len(records), len(snap.splitlines()))  # emptied, not removed: line numbers stay
+        self.assertIn(voc.GUARD_DENY_TAIL, voc.HOOK_OWN_TEXT_MARKERS)
+
+    # -- item 8: the surviving mutant (both guardDisabled checks removed) -----------------------------------------
+    def test_a_session_whose_guard_is_disabled_never_denies(self):
+        self.set_hooks(jit=True, guard="deny")
+        self.learn(BLOCK_TEXT)
+        self.start()
+        st = self.state()
+        st["guardDisabled"] = True
+        self.write_state("s1", st)  # valid, still mayGuard, no tombstone: only the disabled bit stops the deny
+        self.assertFalse(mh._tombstoned(self.repo, mh._session_rel("s1")))
+        self.assertIsNone(decision(self.pre()))
+        self.assertIsNone(decision(self.pre(agent_id="other")))
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # deadline and latency
 
 
@@ -1445,8 +1859,8 @@ class DeadlineTests(_Case):
             "memlet_graph.neighbors = slow\n" % str(HERE))
         self.start()
         start = time.monotonic()
-        r = self.cli("admin", "hook", "pre-tool-use", "--scope", "local", stdin=json.dumps(self.payload()),
-                     env=dict(os.environ, PYTHONPATH=str(site)))
+        r = self.cli("admin", "hook", "pre-tool-use", stdin=json.dumps(self.payload()),
+                     env=self.scoped_env(PYTHONPATH=str(site)))
         self.assertEqual((0, "", ""), (r.returncode, r.stdout, r.stderr))
         self.assertLess(time.monotonic() - start, 8)
         self.assertIn("pre-tool-use timeout", (self.repo / mh.LOG_REL).read_text())
