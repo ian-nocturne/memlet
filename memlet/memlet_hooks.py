@@ -24,12 +24,27 @@ Runtime
     session: every error, a timeout, malformed stdin or a directory without `.memlet/` ends with exit 0 and no output
     (one line goes to the size-capped `.memlet/hooks.log`, never transcript text). No network, no model call, no
     `.env` read; lessons go to the PENDING queue only (nothing is approved or promoted by a hook).
+
+9.2 opt-ins (`init --hooks --jit / --guard / --capsule`; without them every event prints what 9.1.1 printed)
+    Flags are recorded per settings scope (`hooks.scopes.<local|project>`) and that scope's commands carry
+    `--scope <scope>`. `--jit` adds PreToolUse (`Write|Edit|MultiEdit|NotebookEdit`): the verified memory attached
+    to the edited file, as `additionalContext`, which Claude Code delivers with the tool result (after the call
+    ran; it informs, it does not prevent). `--guard` (implies `--jit`) answers the first edit of a file with an
+    approved BLOCKS lesson or supersession with `deny` (`guard: "ask"`: the person decides; `"off"`: no guard), once
+    per (session, agent, file, item set), only in a session first seen at SessionStart `startup` / `clear`, and only
+    after the decision reads back from disk. `--capsule` makes PreCompact print instructions that keep the session's
+    verified memory for the files it touched, and SessionStart after `compact` / `resume` re-deliver it; when the
+    time left is short the 9.1.1 output is printed instead. Memory comes only from `memlet_graph.neighbors`, through
+    the gate `_checked_neighbors`; per-session state (ids and digests, never lesson text) is kept under
+    `.memlet/sessions/`.
 """
 
 from __future__ import annotations
 
 from .vocabulary import (HINT as TIER_HINT)
+from .vocabulary import APPROVED as TIER_APPROVED
 from .vocabulary import suggested_label
+from . import vocabulary as voc
 
 import contextlib
 import copy
@@ -62,7 +77,13 @@ CLAUDE_EVENTS: Tuple[Tuple[str, str, int, Optional[str]], ...] = (
     ("Stop", "stop", 20, None),
     ("PreCompact", "pre-compact", 20, None),
 )
-RUNTIME_EVENTS = tuple(e[1] for e in CLAUDE_EVENTS)
+# 9.2: installed only with `init --hooks --jit` (or `--guard`); removed again by a reinstall without it.
+JIT_MATCHER = "Write|Edit|MultiEdit|NotebookEdit"
+OPTIONAL_EVENTS: Tuple[Tuple[str, str, int, Optional[str]], ...] = (
+    ("PreToolUse", "pre-tool-use", 10, JIT_MATCHER),
+)
+ALL_CLAUDE_EVENTS = CLAUDE_EVENTS + OPTIONAL_EVENTS
+RUNTIME_EVENTS = tuple(e[1] for e in ALL_CLAUDE_EVENTS)
 GIT_HOOKS: Tuple[Tuple[str, str], ...] = (("pre-commit", "git-pre-commit"), ("post-merge", "git-post-merge"))
 GIT_EVENTS = tuple(g[1] for g in GIT_HOOKS)
 SCOPES = {"local": ".claude/settings.local.json", "project": ".claude/settings.json"}
@@ -75,16 +96,20 @@ NEVER_FAIL_SUFFIX = " || true"
 CONFIG_KEY = "hooks"
 
 DEFAULT_SESSION_TOKENS = 400
+DEFAULT_JIT_TOKENS = 400
+DEFAULT_CAPSULE_TOKENS = 800
 DEFAULT_MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDIN_BYTES = 16 * 1024 * 1024
 # Self-imposed deadlines, below the timeouts written into settings (10 s / 20 s) and below git's patience.
 # git-pre-commit runs while someone waits for `git commit`: well under two seconds including interpreter start-up;
 # on overrun it prints nothing and exits 0.
 DEADLINES = {"session-start": 7.0, "post-tool-use": 7.0, "stop": 16.0, "pre-compact": 16.0,
-             "git-pre-commit": 1.0, "git-post-merge": 5.0}
+             "git-pre-commit": 1.0, "git-post-merge": 5.0,
+             # PreToolUse holds the tool call while it runs: a short deadline, nothing printed on overrun
+             "pre-tool-use": 4.0}
 LOG_REL = ".memlet/hooks.log"
 LOG_CAP_BYTES = 64 * 1024
-_EVENT_NAMES = {e[1]: e[0] for e in CLAUDE_EVENTS}
+_EVENT_NAMES = {e[1]: e[0] for e in ALL_CLAUDE_EVENTS}
 _FLAG_STATES = ("stale", "compatible-unverified")
 _MAX_LISTED = 8
 
@@ -174,7 +199,7 @@ def default_cli_path() -> Path:
 def memlet_hook_event(hook: Any) -> Optional[str]:
     """The runtime event of a hook entry Memlet wrote, else None. Recognised forms (as written by the installer):
     `memlet admin hook <event>` and `<abs interpreter> <abs .../memory_cli.py> admin hook <event>`, optionally
-    followed by `|| true`."""
+    followed by `--scope local|project` (9.2: a scope installed with --jit/--guard/--capsule) and by `|| true`."""
     if not isinstance(hook, dict) or hook.get("type") != "command":
         return None
     cmd = hook.get("command")
@@ -185,6 +210,8 @@ def memlet_hook_event(hook: Any) -> Optional[str]:
     except ValueError:
         return None
     if tokens[-2:] == ["||", "true"]:
+        tokens = tokens[:-2]
+    if len(tokens) >= 6 and tokens[-2] == "--scope" and tokens[-1] in SCOPES:
         tokens = tokens[:-2]
     if len(tokens) < 4 or tokens[-3:-1] != ["admin", "hook"] or tokens[-1] not in RUNTIME_EVENTS:
         return None
@@ -253,8 +280,10 @@ def resolve_command(scope: str, root: Path, *, which: Callable[[str], Optional[s
                   f"{cli} outside this shell's environment. Put `memlet` on PATH and retry.")
 
 
-def hook_command(prefix: str, event: str) -> str:
-    return f"{prefix} admin hook {event}{NEVER_FAIL_SUFFIX}"
+def hook_command(prefix: str, event: str, scope: Optional[str] = None) -> str:
+    """`scope` only for a scope installed with --jit/--guard/--capsule: the runtime then reads that scope's flags.
+    Without it the command is byte-for-byte the 9.1.1 one."""
+    return f"{prefix} admin hook {event}" + (f" --scope {scope}" if scope else "") + NEVER_FAIL_SUFFIX
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -648,19 +677,49 @@ def _in_shape(group: Any, matcher: Optional[str]) -> bool:
 
 
 def _shape_of(event: str) -> Tuple[Optional[str], Optional[str], int]:
-    for ev, cli_event, timeout, matcher in CLAUDE_EVENTS:
+    for ev, cli_event, timeout, matcher in ALL_CLAUDE_EVENTS:
         if ev == event:
             return cli_event, matcher, timeout
     return None, None, 0
 
 
+def _drop_memlet_entries(hooks: Dict[str, Any], event: str, rec: Dict[str, Any]) -> bool:
+    """Remove Memlet's entries for `event` (inside the event's install shape) from a parsed `hooks` object; the
+    event's array goes too when Memlet emptied it and had created it. True when anything was removed."""
+    arr = hooks.get(event)
+    cli_event, matcher, _t = _shape_of(event)
+    if not isinstance(arr, list) or cli_event is None:
+        return False
+    removed = emptied_by_us = False
+    for g in list(arr):
+        if not _in_shape(g, matcher):
+            continue
+        if not any(memlet_hook_event(h) == cli_event for h in g["hooks"]):
+            continue
+        removed = True
+        g["hooks"] = [h for h in g["hooks"] if memlet_hook_event(h) != cli_event]
+        if not g["hooks"]:
+            arr[:] = [x for x in arr if x is not g]
+            emptied_by_us = True
+    created = event in (rec.get("createdEvents") or []) if rec else True
+    if not arr and emptied_by_us and created:
+        del hooks[event]
+    return removed
+
+
 def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
-                cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+                cfg: Optional[Dict[str, Any]], events: Optional[Tuple[Tuple[str, str, int, Optional[str]], ...]] = None,
+                scoped: bool = False) -> Dict[str, Any]:
     """Pure: what installing (or removing) Memlet's entries would do. Raises Refused.
 
     Memlet's entry for an event is a recognised command (`memlet_hook_event`) for that event, inside a group with
-    the event's matcher (`Write|Edit` for PostToolUse, none otherwise). A Memlet-looking command anywhere else is the
-    user's customisation: left alone on install and on removal, and listed in `leftAlone`."""
+    the event's matcher (`Write|Edit` for PostToolUse, `Write|Edit|MultiEdit|NotebookEdit` for PreToolUse, none
+    otherwise). A Memlet-looking command anywhere else is the user's customisation: left alone on install and on
+    removal, and listed in `leftAlone`. `events` (install only): the events to install, default the four 9.1.1
+    events; Memlet's entry of an optional event (PreToolUse) that is not requested is removed, so a reinstall without
+    `--jit` leaves no PreToolUse entry behind. `scoped`: write the commands with `--scope <scope>` (a scope with 9.2
+    flags), else exactly the 9.1.1 commands."""
+    events = CLAUDE_EVENTS if events is None else events
     rel = SCOPES[scope]
     path, raw, doc = _load_settings(root, rel)
     rec = _record(cfg, "claude", scope)
@@ -686,14 +745,21 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
     created_events: List[str] = []
     touched: List[str] = []
     if not remove:
-        for event, _cli, _t, _m in CLAUDE_EVENTS:
+        for event, _cli, _t, _m in events:
             if event in (hooks_val or {}) and not isinstance(hooks_val[event], list):
                 raise Refused(f"{rel}: `hooks.{event}` must be a JSON array, found "
                               f"{type(hooks_val[event]).__name__}; nothing changed")
         created_hooks_key = "hooks" not in new
         hooks = new.setdefault("hooks", {})
-        for event, cli_event, timeout, matcher in CLAUDE_EVENTS:
-            command = hook_command(prefix or "memlet", cli_event)
+        wanted = {e[0] for e in events}
+        dropped: List[str] = []
+        for event, _cli, _t, _m in OPTIONAL_EVENTS:
+            if event not in wanted and _drop_memlet_entries(hooks, event, rec):
+                touched.append(event)
+                if event not in hooks:
+                    dropped.append(event)
+        for event, cli_event, timeout, matcher in events:
+            command = hook_command(prefix or "memlet", cli_event, scope if scoped else None)
             if event not in hooks:
                 hooks[event] = []
                 created_events.append(event)
@@ -725,7 +791,7 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
             "createdFile": bool(rec.get("createdFile")) if rec else raw is None,
             "createdDir": bool(rec.get("createdDir")) if rec else not (root / ".claude").exists(),
             "createdHooksKey": bool(rec.get("createdHooksKey")) if rec else created_hooks_key,
-            "createdEvents": sorted(set(prior_events) | set(created_events)),
+            "createdEvents": sorted((set(prior_events) | set(created_events)) - set(dropped)),
             "backups": list(rec.get("backups") or []),
         }
         if rec.get("writtenSha256"):
@@ -735,26 +801,9 @@ def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
         removed_any = False
         if isinstance(hooks, dict):
             for event in list(hooks):
-                arr = hooks[event]
-                cli_event, matcher, _t = _shape_of(event)
-                if not isinstance(arr, list) or cli_event is None:
-                    continue
-                emptied_by_us = False
-                for g in list(arr):
-                    if not _in_shape(g, matcher):
-                        continue
-                    mine = [h for h in g["hooks"] if memlet_hook_event(h) == cli_event]
-                    if not mine:
-                        continue
+                if _drop_memlet_entries(hooks, event, rec):
                     removed_any = True
                     touched.append(event)
-                    g["hooks"] = [h for h in g["hooks"] if memlet_hook_event(h) != cli_event]
-                    if not g["hooks"]:
-                        arr[:] = [x for x in arr if x is not g]
-                        emptied_by_us = True
-                created = event in (rec.get("createdEvents") or []) if rec else True
-                if not arr and emptied_by_us and created:
-                    del hooks[event]
             created_key = bool(rec.get("createdHooksKey")) if rec else True
             if not hooks and removed_any and created_key:
                 del new["hooks"]
@@ -1005,6 +1054,73 @@ def apply_git(plan: Dict[str, Any], txn: Optional[_Txn] = None) -> List[Dict[str
 
 FORMAT_NOTICE = ("the merged settings keep the file's indentation, line endings and final newline, but other "
                  "whitespace inside it may be normalised; the exact previous bytes are in the backup")
+JIT_NOTICE = ("--jit: a PreToolUse hook (Write|Edit|MultiEdit|NotebookEdit) adds the verified memory attached to the "
+              "file being edited. Claude Code delivers it alongside the tool result, after the call ran: it informs, "
+              "it does not prevent an edit.")
+GUARD_NOTICE = ("--guard: in a session that started fresh (startup or clear), the first edit of a file with an approved "
+                "BLOCKS lesson or a replaced instruction is denied once, with those lessons quoted in full; set "
+                "hooks.scopes.<scope>.guard to \"ask\" (you decide in the permission prompt) or \"off\" in "
+                ".memlet/config.json without reinstalling.")
+CAPSULE_NOTICE = ("--capsule: PreCompact asks the compaction summary to keep this session's verified memory for the "
+                  "files it touched (Write, Edit, MultiEdit and NotebookEdit), followed by its usual status text, and "
+                  "SessionStart re-delivers it after compact or resume.")
+FLAG_KEYS = ("jit", "guard", "capsule")
+SCOPE_KEYS = FLAG_KEYS + ("dream",)
+
+
+def _scopes(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    hooks = (cfg or {}).get(CONFIG_KEY)
+    scopes = hooks.get("scopes") if isinstance(hooks, dict) else None
+    return {k: v for k, v in scopes.items() if k in SCOPES and isinstance(v, dict)} if isinstance(scopes, dict) else {}
+
+
+def _scope_values(cfg: Optional[Dict[str, Any]], scope: str, *, jit: bool, guard: bool, capsule: bool,
+                  dream: bool) -> Dict[str, Any]:
+    """`hooks.scopes.<scope>` an install with these flags records (empty: the key is removed). A `guard: "ask"` the
+    user set for this scope survives a reinstall with --guard."""
+    out: Dict[str, Any] = {}
+    if jit or guard:
+        out["jit"] = True
+    if guard:
+        prior = _scopes(cfg).get(scope, {}).get("guard")
+        if prior is None:  # read both: the flat key written before flags were per scope
+            hooks = (cfg or {}).get(CONFIG_KEY)
+            prior = hooks.get("guard") if isinstance(hooks, dict) else None
+        out["guard"] = "ask" if prior == "ask" else "deny"
+    if capsule:
+        out["capsule"] = True
+    if dream:
+        out["dream"] = True
+    return out
+
+
+def _apply_scope_flags(new_cfg: Dict[str, Any], cfg: Optional[Dict[str, Any]], scope: str,
+                       values: Dict[str, Any]) -> None:
+    """Record this scope's flags, never touching another scope's. The flat 9.1.1 `hooks.dream` stays the switch the
+    runtime reads for Stop / PreCompact: it is on while any scope (or a 9.1.1 install without a scope record) asked
+    for it. Flat `jit` / `guard` / `capsule` (written before flags were per scope) are migrated away once no other
+    installed scope can still be reading them."""
+    hooks = new_cfg.get(CONFIG_KEY)
+    if not isinstance(hooks, dict):
+        if not values:
+            return
+        hooks = new_cfg[CONFIG_KEY] = {}
+    scopes = hooks.get("scopes") if isinstance(hooks.get("scopes"), dict) else {}
+    if values:
+        scopes[scope] = dict(values)
+    else:
+        scopes.pop(scope, None)
+    if scopes:
+        hooks["scopes"] = scopes
+    else:
+        hooks.pop("scopes", None)
+    others = [k for k in _installed(cfg).get("claude", {}) if k != scope] if isinstance(
+        _installed(cfg).get("claude"), dict) else []
+    if not others:
+        for k in FLAG_KEYS:
+            hooks.pop(k, None)
+    if any(isinstance(v, dict) and v.get("dream") is True for k, v in scopes.items() if k != scope):
+        hooks["dream"] = True
 
 
 def _render(rep: Dict[str, Any]) -> str:
@@ -1076,11 +1192,16 @@ def _preflight(root: Path, cplan: Dict[str, Any], gplan: Optional[Dict[str, Any]
 def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                   dry_run: bool = False, which: Callable[[str], Optional[str]] = shutil.which,
                   interpreter: Optional[str] = None, cli_path: Optional[str] = None,
-                  run_init: Optional[Callable[[], Dict[str, Any]]] = None, dream: bool = False) -> Dict[str, Any]:
+                  run_init: Optional[Callable[[], Dict[str, Any]]] = None, dream: bool = False,
+                  jit: bool = False, guard: bool = False, capsule: bool = False) -> Dict[str, Any]:
     """Install or remove Memlet's hooks as one transaction. Every destination is checked before the first write;
     when a later write fails, exactly this run's writes are undone (including what `run_init`, the implicit
     `memlet init` of `init --hooks`, created), unless another program changed them meanwhile; whatever had to be
-    left is listed in `leftBehind`."""
+    left is listed in `leftBehind`.
+
+    9.2 opt-ins (install only; a removal or a reinstall of the same scope without them clears them; another scope is
+    never changed): recorded under `hooks.scopes.<scope>` (`jit`, `guard` "deny" or a "ask" already set, `capsule`,
+    `dream`). `jit` or `capsule` add the PreToolUse entry, and that scope's commands carry `--scope <scope>`."""
     from memlet import memlet_wiki as mw
     rep: Dict[str, Any] = {"ok": True, "exitCode": 0, "command": "init --hooks-remove" if remove else "init --hooks",
                            "dryRun": bool(dry_run), "remove": bool(remove), "scope": scope, "notices": []}
@@ -1088,6 +1209,15 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
     if dream:
         rep["dream"] = True
         rep["notices"].append("Stop and PreCompact only ingest; no automatic model calls. Run memlet dream explicitly.")
+    jit = bool(jit or guard) and not remove
+    guard = bool(guard) and not remove
+    capsule = bool(capsule) and not remove
+    scoped = jit or capsule  # these scopes' commands carry `--scope <scope>`; every other install is 9.1.1-shaped
+    events = CLAUDE_EVENTS + (OPTIONAL_EVENTS if jit or capsule else ())
+    for flag, on, note in (("jit", jit, JIT_NOTICE), ("guard", guard, GUARD_NOTICE), ("capsule", capsule, CAPSULE_NOTICE)):
+        if on:
+            rep[flag] = True
+            rep["notices"].append(note)
 
     def fail(code: int, error: str) -> Dict[str, Any]:
         rep.update(ok=False, exitCode=code, error=error)
@@ -1112,15 +1242,21 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
                                              cli_path=cli_path)["prefix"]
 
         def plan_all(cfg_now: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-            c = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg_now)
+            c = plan_claude(root, scope, remove=remove, prefix=cmd["prefix"] if cmd else None, cfg=cfg_now,
+                            events=None if remove else events, scoped=scoped)
             g = plan_git(root, git_prefix, remove=remove, cfg=cfg_now) if git_hooks else None
             return c, g
 
         cplan, gplan = plan_all(cfg)
         git_changes = gplan is not None and any(it["op"] in ("create", "update", "delete", "chmod")
                                                 for it in gplan["items"])
+        probe_cfg = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+        _apply_scope_flags(probe_cfg, cfg, scope, _scope_values(cfg, scope, jit=jit, guard=guard, capsule=capsule,
+                                                                 dream=bool(dream) and not remove))
+        flags_change = isinstance(cfg, dict) and probe_cfg.get(CONFIG_KEY) != cfg.get(CONFIG_KEY)
         problems = _preflight(root, cplan, gplan, init_runs=run_init is not None,
-                              record_changes=(cplan["op"] != "unchanged" or git_changes or dream or bool((cfg or {}).get("hooks", {}).get("dream")))
+                              record_changes=(cplan["op"] != "unchanged" or git_changes or dream or bool((cfg or {}).get("hooks", {}).get("dream"))
+                                              or flags_change)
                               and (cfg is not None or run_init is not None))
         if problems:
             raise Refused("cannot install safely, nothing was changed: " + "; ".join(problems))
@@ -1164,7 +1300,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
             rep["actions"] += [{"op": "would-" + it["op"] if it["op"] in ("create", "update", "delete", "chmod")
                                 else it["op"], "path": it["path"]} for it in gplan["items"]]
             changes = changes or git_changes
-        if (changes or dream or bool((cfg or {}).get("hooks", {}).get("dream"))) and cfg is not None and not cfg_problem:
+        if (changes or dream or bool((cfg or {}).get("hooks", {}).get("dream")) or flags_change) and cfg is not None \
+                and not cfg_problem:
             rep["actions"].append({"op": "would-update", "path": ".memlet/config.json"})
         rep["formatted"] = _render(rep)
         return rep
@@ -1211,6 +1348,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
                 new_cfg.setdefault("hooks", {})["dream"] = True
             else:
                 new_cfg.setdefault("hooks", {}).pop("dream", None)
+            _apply_scope_flags(new_cfg, cfg, scope, _scope_values(cfg, scope, jit=jit, guard=guard, capsule=capsule,
+                                                                  dream=bool(dream) and not remove))
             if remove:
                 _set_record(new_cfg, "claude", scope, None)
                 if gplan is not None:
@@ -1321,6 +1460,7 @@ class _Guard:
 
     def arm(self, seconds: float) -> None:
         seconds = max(0.05, seconds)
+        self.end = time.monotonic() + seconds
         if self.alarm:
             signal.setitimer(signal.ITIMER_REAL, seconds)
         if self.hard_exit:  # last resort if the work is stuck where no signal handler can run
@@ -1392,10 +1532,17 @@ def find_root(payload: Dict[str, Any]) -> Optional[Path]:
     return None
 
 
-def _hook_settings(root: Path) -> Dict[str, Any]:
+def _hook_settings(root: Path, scope: Optional[str] = None) -> Dict[str, Any]:
+    """Settings for one hook run. `scope` (from `--scope`, written only for a scope installed with 9.2 flags): the
+    flags under `hooks.scopes.<scope>`; without it (every 9.1.1-shaped command) the flat keys, where 9.1.1 configs
+    have no `jit` / `guard` / `capsule`. `dream` stays the flat 9.1.1 switch."""
     cfg, _err = _read_config(root)
     raw = (cfg or {}).get(CONFIG_KEY)
     raw = raw if isinstance(raw, dict) else {}
+    flags = raw
+    if scope is not None:
+        scoped = _scopes(cfg).get(scope)
+        flags = scoped if scoped is not None else raw  # read both: flat keys from before flags were per scope
 
     def number(key: str, default: float, lo: float, hi: float) -> float:
         v = raw.get(key)
@@ -1403,9 +1550,16 @@ def _hook_settings(root: Path) -> Dict[str, Any]:
             return default
         return v
 
+    guard = flags.get("guard")
     return {"tokens": int(number("sessionStartTokenBudget", DEFAULT_SESSION_TOKENS, 50, 4000)),
             "maxTranscriptBytes": int(number("maxTranscriptBytes", DEFAULT_MAX_TRANSCRIPT_BYTES, 1, 1 << 30)),
-            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0), "dream": raw.get("dream") is True}
+            "deadline": number("deadlineSeconds", 0.0, 0.1, 60.0), "dream": raw.get("dream") is True,
+            # 9.2 opt-ins: recorded by `init --hooks --jit/--guard/--capsule`; anything malformed means off
+            "jit": flags.get("jit") is True,
+            "guard": guard if isinstance(guard, str) and guard in ("deny", "ask") else None,
+            "capsule": flags.get("capsule") is True,
+            "jitTokens": int(number("jitTokenBudget", DEFAULT_JIT_TOKENS, 50, 1000)),
+            "capsuleTokens": int(number("capsuleTokenBudget", DEFAULT_CAPSULE_TOKENS, 100, 2000))}
 
 
 def _log(root: Optional[Path], event: str, message: str) -> None:
@@ -1644,12 +1798,836 @@ def _git_check(root: Path, event: str) -> Optional[str]:
     return line + (" — run `memlet check --changed --base ORIG_HEAD`" if flagged else "") + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# 9.2: memory at the moment of the edit (PreToolUse `--jit` / `--guard`), the compaction capsule (`--capsule`) and
+# the per-session state they share. Nothing here calls a model, launches a vendor or writes outside `.memlet/`.
+# What a hook shows comes from ONE place, `memlet_graph.neighbors` (through `_neighbors`), and passes the gate
+# `_checked_neighbors` first. Every hook output is fixed labels from `vocabulary.py` plus whole items quoted from a
+# re-hashable source (an instruction-file line or cited snapshot lines), each quoted line prefixed with `  > `.
+
+JIT_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+JIT_MAX_CHARS = 2000            # hard cap of the PreToolUse additionalContext (the token budget usually binds first)
+GUARD_MAX_CHARS = 8000          # permissionDecisionReason (Claude Code context strings: 10,000)
+CAPSULE_MAX_CHARS = 6000        # PreCompact capsule (Claude Code cuts each hook's output at 10,000 characters)
+SESSION_START_MAX_CHARS = 9000  # SessionStart additionalContext with the capsule (context strings: 10,000)
+ITEM_MAX_CHARS = 16384          # one larger item makes the whole graph answer inadmissible
+ITEM_MAX_CITES = 64
+GRAPH_BUDGET = 8000             # tokens asked of `neighbors` (its own maximum); hooks trim further, whole items only
+CAPSULE_MAX_FILES = 12
+CAPSULE_RESERVE_SECONDS = 1.0   # kept back from the hook deadline so the 9.1.1 output is always printed
+_DISPLAY_ORDER = ("blocks", "replaced", "governs", "resolves", "stale", "hints")
+_TRIM_RANK = {"hints": 0, "resolves": 1, "stale": 2, "governs": 3, "replaced": 4, "blocks": 4}  # lowest goes first
+_GUARD_GROUPS = ("blocks", "replaced")
+_RELATIONS = ("SUPERSEDES", "BLOCKS", "RESOLVES", "GOVERNS")
+_RULE_STATES = ("active", "compatible-unverified", "stale", "unpinned", "path-exists", "unanchored")
+_WHY_REPLACED_RULE = "replaced-rule-text"
+
+SESSIONS_REL = ".memlet/sessions"
+SESSION_SCHEMA = "memlet-hook-session/v2"
+SESSION_KEYS = ("schema", "createdAt", "updatedAt", "startSource", "mayGuard", "guardDisabled", "recovered",
+                "touched", "shown", "guard")
+SESSION_SOURCES = ("startup", "clear", "resume", "fork", "compact", "")
+SESSION_MAX_BYTES = 64 * 1024
+SESSION_MAX_FILES = 64                  # session files kept, newest first (by modification time)
+SESSION_MAX_AGE_SECONDS = 14 * 86400    # older session files are deleted (that only ever turns a guard off)
+SESSION_MAX_TOUCHED = 48
+SESSION_MAX_SHOWN = 256                 # JIT digests; the oldest is forgotten first (the context may then repeat)
+SESSION_MAX_GUARD = 128                 # guard decisions; never forgotten: at the bound the session stops guarding
+STATE_LOCK_TIMEOUT = 1.0
+_SID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SCOPE_RE = re.compile(r"(?:main|agent:[A-Za-z0-9][A-Za-z0-9_-]{0,127}|agent:h[0-9a-f]{24})\Z")
+
+
+class _Plain(str):
+    """Hook output printed to stdout as plain text (PreCompact instructions), not as JSON."""
+
+
+# -- the graph, and the gate in front of it ---------------------------------------------------------------------
+
+
+def _graph_neighbors() -> Optional[Callable[..., Any]]:
+    """`memlet.memlet_graph.neighbors`, or None when it cannot be imported (the hooks then say nothing)."""
+    try:
+        from memlet import memlet_graph
+    except Exception:
+        return None
+    fn = getattr(memlet_graph, "neighbors", None)
+    return fn if callable(fn) else None
+
+
+def _neighbors(root: Path, target: str, *, tiers: Tuple[str, ...] = (TIER_APPROVED,)) -> Optional[Dict[str, Any]]:
+    """The ONE call the hooks make into memory: `memlet_graph.neighbors`, then `_checked_neighbors`. None = cannot
+    decide (import or call failed, `ok` false, a historical answer, or anything the gate refuses): say nothing,
+    never deny."""
+    impl = _graph_neighbors()
+    if impl is None:
+        _log(root, "graph", "memlet_graph unavailable; nothing said")
+        return None
+    try:
+        res = impl(str(root), target, tiers=tuple(tiers), budget=GRAPH_BUDGET)
+    except _Deadline:
+        raise
+    except Exception as exc:
+        _log(root, "graph", "neighbors failed: " + _where(exc))
+        return None
+    checked = _checked_neighbors(res, tuple(tiers))
+    if checked is None:
+        _log(root, "graph", "answer refused by the hook gate; nothing said")
+    return checked
+
+
+def _quote_lines(item: Dict[str, Any]) -> List[str]:
+    q = item.get("quoteLines")
+    if isinstance(q, list):
+        return list(q)
+    t = item.get("text")
+    return [t] if isinstance(t, str) else []
+
+
+def _is_str(value: Any, limit: int = 4096) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= limit and "\x00" not in value
+
+
+def _admissible(item: Any, group: str, hints_on: bool) -> bool:
+    """The gate for one item of a `neighbors` answer (structure AND meaning; a graph that disagrees with these
+    rules is not acted on):
+    - blocks: an approved lesson whose relations include BLOCKS (relation BLOCKS), not a quarantined pair;
+    - replaced: an approved lesson that is a quarantined supersession pair with at least one replaced line, or a
+      rule with `why` "replaced-rule-text" and a non-empty `replacedBy`;
+    - resolves: an approved RESOLVES lesson; governs: a rule with status `active` (not replaced) or an approved
+      GOVERNS lesson; stale: a rule (any anchor state) that is not replaced;
+    - hints: tier `hint` lessons, only when hints were asked for.
+    Every item needs string `id` / `kind` / `relation` / `source` / `why` (`why` from GRAPH_WHY), whole quote lines
+    (strings, at most MAX_LESSON_LINES, at most ITEM_MAX_CHARS together) and well-formed citations."""
+    if not isinstance(item, dict):
+        return False
+    for key in ("id", "kind", "relation", "source", "why"):
+        if not _is_str(item.get(key), 200 if key == "id" else 4096):
+            return False
+    if item["why"] not in voc.GRAPH_WHY or not isinstance(item.get("text"), str):
+        return False
+    quotes = _quote_lines(item)
+    if (not quotes or len(quotes) > voc.MAX_LESSON_LINES or not all(isinstance(q, str) and q for q in quotes)
+            or sum(len(q) for q in quotes) + len(item["text"]) > ITEM_MAX_CHARS):
+        return False
+    cites = item.get("cites", [])
+    if not isinstance(cites, list) or len(cites) > ITEM_MAX_CITES or not all(
+            isinstance(c, dict) and _is_str(c.get("file"), 1024) and isinstance(c.get("start"), int)
+            and isinstance(c.get("end"), int) and not isinstance(c.get("start"), bool) for c in cites):
+        return False
+    relations = item.get("relations", [item["relation"]])
+    if not isinstance(relations, list) or not relations or not all(isinstance(r, str) for r in relations):
+        return False
+    kind, tier, relation = item["kind"], item.get("tier"), item["relation"]
+    if kind == "rule":
+        status, replaced_by = item.get("status"), item.get("replacedBy")
+        if tier is not None or status not in _RULE_STATES:
+            return False
+        if group == "replaced":
+            return (item["why"] == _WHY_REPLACED_RULE and isinstance(replaced_by, list) and bool(replaced_by)
+                    and all(_is_str(x, 200) for x in replaced_by))
+        if replaced_by:
+            return False
+        if group == "governs":
+            return status == "active" and relation == "GOVERNS" and not item.get("replacementUnknown")
+        return group == "stale"
+    if kind != "lesson" or not cites:
+        return False
+    if not set(relations) <= set(_RELATIONS):
+        return False
+    if group == "hints":
+        return hints_on and tier == TIER_HINT
+    if tier != TIER_APPROVED:
+        return False
+    if group == "replaced":
+        roles = item.get("lineRoles")
+        return (item.get("quarantined") is True and relation == "SUPERSEDES" and isinstance(roles, list)
+                and len(roles) == len(quotes) and set(roles) <= {"replaced", "current"} and "replaced" in roles)
+    if item.get("quarantined"):
+        return False
+    want = {"blocks": "BLOCKS", "resolves": "RESOLVES", "governs": "GOVERNS"}.get(group)
+    return want is not None and relation == want and want in relations
+
+
+def _checked_neighbors(res: Any, tiers: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    """The whole answer or nothing: an unknown group, an inadmissible item, a historical or failed answer, or
+    malformed bookkeeping refuses it. `guardComplete` is true only when the graph says blocks and replaced are whole."""
+    if not isinstance(res, dict) or res.get("ok") is not True or res.get("historical"):
+        return None
+    raw = res.get("groups")
+    if not isinstance(raw, dict) or set(raw) - set(voc.GRAPH_HEADINGS):
+        return None
+    hints_on = TIER_HINT in tiers
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for g in _DISPLAY_ORDER:
+        items = raw.get(g, [])
+        if not isinstance(items, list) or not all(_admissible(it, g, hints_on) for it in items):
+            return None
+        groups[g] = items
+    raw_om = res.get("omitted", {})
+    if not isinstance(raw_om, dict) or set(raw_om) - set(_DISPLAY_ORDER):
+        return None
+    omitted: Dict[str, int] = {}
+    for g, n in raw_om.items():
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return None
+        if n and (g != "hints" or hints_on):
+            omitted[g] = n
+    incomplete = res.get("incompleteGroups", [])
+    if not isinstance(incomplete, list) or not all(isinstance(g, str) for g in incomplete):
+        return None
+    complete = (res.get("blocksIncomplete") is False and res.get("replacedIncomplete") is False
+                and not set(_GUARD_GROUPS) & set(incomplete) and not any(omitted.get(g) for g in _GUARD_GROUPS))
+    return {"ok": True, "groups": groups, "omitted": omitted, "guardComplete": complete}
+
+
+def _guard_items(groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """What may guard: approved BLOCKS lessons and approved supersession pairs (a replaced rule is shown with them,
+    it never guards alone; rules, hints and fixes never guard)."""
+    return [it for g in _GUARD_GROUPS for it in groups.get(g) or [] if it.get("kind") == "lesson"]
+
+
+# -- rendering (fixed labels + whole quoted items) --------------------------------------------------------------
+
+
+def _cite_text(c: Dict[str, Any]) -> str:
+    a, b = c.get("start"), c.get("end")
+    return _clean(c.get("file"), 300) + f":{a}" + (f"-{b}" if b != a else "")
+
+
+def _quote(text: Any) -> str:
+    """Display sanitisation only (controls, hidden characters, comment markers, secrets); never shortened."""
+    from memlet import memlet_bridge as mb
+    from memlet.memlet_dream import mask_secrets
+    s = mb.safe_lesson_display(str(text))
+    s = re.sub(r"\s+", " ", re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", s)).strip()
+    return mask_secrets(s)
+
+
+def _item_lines(item: Dict[str, Any], group: str) -> List[str]:
+    from memlet import memlet_bridge as mb
+    quotes = _quote_lines(item)
+    roles = item.get("lineRoles") if isinstance(item.get("lineRoles"), list) else []
+    if item.get("kind") == "rule":
+        source = _clean(item.get("source"), 300)
+        if group == "stale":
+            head = f"- {_clean(item.get('status'), 30).upper()}: rule at {source}"
+        elif group == "replaced":
+            head = (f"- {voc.HOOK_RULE_REPLACED} rule at {source} (by "
+                    + ", ".join(_clean(x, 60) for x in item.get("replacedBy") or []) + ")")
+        else:
+            head = f"- {suggested_label(item)}rule at {source}"
+    else:
+        rels = [r for r in _RELATIONS if r in (item.get("relations") or [item.get("relation")])] or ["LESSON"]
+        cites = ", ".join(_cite_text(c) for c in item.get("cites") or [])
+        if group == "hints":
+            head = f"- [hint; {_clean(mb.hint_item_label(item), 120)}] lesson {_clean(item.get('id'), 60)} (cites {cites})"
+        else:
+            head = f"- [{', '.join(rels)}] lesson {_clean(item.get('id'), 60)} (approved; cites {cites})"
+    lines = [head]
+    for i, q in enumerate(quotes):
+        role = roles[i] if i < len(roles) else None
+        label = voc.HOOK_ROLE_REPLACED if role == "replaced" else voc.HOOK_ROLE_CURRENT if role == "current" else ""
+        lines.append("  > " + label + _quote(q))
+    return lines
+
+
+def _pointer(item: Dict[str, Any]) -> str:
+    cites = ", ".join(_cite_text(c) for c in item.get("cites") or [])
+    return voc.HOOK_POINTER % (_clean(item.get("id"), 60), cites)
+
+
+def _fits(text: str, tokens: Optional[int], cap: int) -> bool:
+    from memlet import memlet_wiki as mw
+    return len(text) <= cap and (tokens is None or mw.estimate_tokens(text) <= tokens)
+
+
+def _render_block(head: List[str], entries: List[Tuple[Optional[str], str, Dict[str, Any]]], tail: List[str],
+                  *, tokens: Optional[int], cap: int, omitted: int = 0) -> Tuple[Optional[str], List[int]]:
+    """(text, indices of the entries shown in full). Whole items only: over the budget, items go in `_TRIM_RANK`
+    order (hints first, prohibitions and replaced instructions last), within one rank the largest item first (so
+    as many whole items as possible remain), then the latest. A dropped approved
+    prohibition or supersession keeps one fixed pointer line (its citations and `memlet recall`) when that fits;
+    everything else left out is counted. (None, []) when not even head and tail fit."""
+    keep = list(range(len(entries)))
+    sizes = [len("\n".join(_item_lines(item, g))) for _s, g, item in entries]
+
+    def build(idx: List[int]) -> str:
+        out = list(head)
+        section = group = object()
+        for i in idx:
+            sec, g, item = entries[i]
+            if sec != section:
+                section, group = sec, object()
+                if sec:
+                    out.append(sec)
+            if g != group:
+                group = g
+                out.append(voc.HOOK_GROUP_LABELS[g])
+            out.extend(_item_lines(item, g))
+        dropped = [i for i in range(len(entries)) if i not in idx]
+        pointers = [_pointer(entries[i][2]) for i in dropped
+                    if entries[i][1] in _GUARD_GROUPS and entries[i][2].get("kind") == "lesson"]
+        left = omitted + len(dropped) - len(pointers)
+        out.extend(pointers)
+        if left > 0:
+            out.append(voc.HOOK_OMITTED % left)
+        return "\n".join(out + list(tail))
+
+    text = build(keep)
+    while not _fits(text, tokens, cap) and keep:
+        keep.remove(min(keep, key=lambda i: (_TRIM_RANK[entries[i][1]], -sizes[i], -i)))
+        text = build(keep)
+    if not _fits(text, tokens, cap):  # the pointer lines themselves did not fit: count everything instead
+        text = "\n".join(list(head) + [voc.HOOK_OMITTED % (omitted + len(entries))] + list(tail)) if entries else \
+            "\n".join(list(head) + list(tail))
+        return (text, []) if _fits(text, tokens, cap) else (None, [])
+    return text, keep
+
+
+def _entries(groups: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...], section: Optional[str] = None,
+             seen: Optional[set] = None) -> List[Tuple[Optional[str], str, Dict[str, Any]]]:
+    out = []
+    for g in _DISPLAY_ORDER:
+        if g not in names:
+            continue
+        for item in groups.get(g) or []:
+            key = (g, str(item.get("id")))
+            if seen is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append((section, g, item))
+    return out
+
+
+def _digest(items: List[Tuple[str, Dict[str, Any]]], omitted: Optional[Dict[str, int]] = None) -> str:
+    """Identity of an item set: group, id, tier/status, relations, citation hashes and a hash of the quoted lines
+    (plus how many items the graph left out). No wall-clock time, no text."""
+    rows: List[Any] = [["omitted", sorted((omitted or {}).items())]] if omitted else []
+    for g, it in items:
+        cites = sorted(str(c.get("sha256") or "") + "@" + _cite_text(c) for c in it.get("cites") or [])
+        body = json.dumps([_quote_lines(it), it.get("lineRoles"), it.get("source"), it.get("replacedBy")],
+                          sort_keys=True, default=str)
+        rows.append([g, str(it.get("id")), str(it.get("tier") or ""), str(it.get("status") or ""),
+                     sorted(str(r) for r in it.get("relations") or [it.get("relation")]), cites,
+                     hashlib.sha256(body.encode("utf-8", "surrogateescape")).hexdigest()])
+    return _sha(json.dumps(sorted(rows), sort_keys=True).encode("utf-8"))
+
+
+# -- the edited file --------------------------------------------------------------------------------------------
+
+
+def _path_char_bad(c: str) -> bool:
+    import unicodedata
+    from memlet import memlet_bridge as mb
+    return unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") or mb._hidden_character(c)
+
+
+def _repo_file(root: Path, payload: Dict[str, Any]) -> Optional[str]:
+    """The key of the file a Write/Edit/MultiEdit/NotebookEdit call names: its real repo-relative path, every
+    component spelled as the directory entry on disk (a case-insensitive file system may be handed `Mod.py` for
+    `mod.py`). The parent directory is resolved (so /tmp vs /private/tmp, `./` and symlinked ancestors give one
+    key); the leaf must be a regular file or not exist yet (a file to be created). None for: a trailing slash, `.`
+    or `..` parts, backslashes or hidden/control characters, a missing parent, a directory, a symlink, a path
+    outside the repository, inside `.git/` or `.memlet/`, or inside a nested repository or another worktree."""
+    from memlet import memlet_wiki as mw
+    ti = payload.get("tool_input")
+    tr = payload.get("tool_response")
+    fp = None
+    if isinstance(ti, dict):
+        fp = _text(ti.get("file_path")) or _text(ti.get("notebook_path"))
+    if fp is None and isinstance(tr, dict):
+        fp = _text(tr.get("filePath"))
+    if (fp is None or fp.endswith("/") or "\\" in fp or any(_path_char_bad(c) for c in fp)
+            or re.search(r"(?:^|/)\.\.(?:/|$)", fp)):  # `./` parts are the same file; `..` is refused
+        return None
+    p = Path(fp)
+    if not p.is_absolute():
+        cwd = _text(payload.get("cwd"))
+        if not (cwd and os.path.isabs(cwd) and Path(cwd).is_dir()):
+            return None
+        p = Path(cwd) / p
+    try:
+        parent = Path(os.path.realpath(str(p.parent)))
+        rel_parent = parent.relative_to(root) if parent != root else Path(".")
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not parent.is_dir():
+        return None
+    parts: List[str] = []
+    cur = root
+    wanted = [x for x in rel_parent.parts if x != "."] + [p.name]
+    for n, part in enumerate(wanted):
+        try:
+            names = os.listdir(str(cur))
+        except OSError:
+            return None
+        if part in names:
+            name = part
+        else:
+            same = [x for x in names if x.casefold() == part.casefold()]
+            if len(same) == 1 and os.path.lexists(str(cur / part)):
+                name = same[0]  # the same directory entry, named in another case
+            elif not same and n == len(wanted) - 1:
+                name = part  # a file to be created
+            else:
+                return None
+        parts.append(name)
+        cur = cur / name
+    rel = "/".join(parts)
+    if not rel or len(rel) > 1024 or parts[0] in (".git", ".memlet"):
+        return None
+    leaf = root / rel
+    if os.path.lexists(str(leaf)) and (leaf.is_symlink() or not leaf.is_file()):
+        return None
+    if mw.contained_path_problem(root, rel):
+        return None
+    for i in range(1, len(parts)):  # a `.git` below the root: a nested repository or another worktree
+        if os.path.lexists(str(root.joinpath(*parts[:i], ".git"))):
+            return None
+    return rel
+
+
+# -- per-session state ------------------------------------------------------------------------------------------
+# Deny-once, kept deliberately simple: a session may deny only when its own state says it was first seen at a
+# SessionStart `startup` or `clear`; its guard history is a set of (agent scope, file, item-set digest) that is never
+# shortened while the session can still deny; at the bound the session stops guarding (written before answering).
+# Anything unexpected in the state means "corrupt": that session never denies again. No decision depends on a clock.
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _session_rel(sid: Any) -> Optional[str]:
+    """`.memlet/sessions/s-<id>.json`: the id itself when it is a plain token, else a hash of it (never a path)."""
+    if not isinstance(sid, str) or not sid or len(sid) > 4096 or "\x00" in sid:
+        return None
+    key = sid if _SID_RE.match(sid) else "h" + hashlib.sha256(sid.encode("utf-8", "surrogateescape")).hexdigest()[:40]
+    return f"{SESSIONS_REL}/s-{key}.json"
+
+
+def _scope_of(payload: Dict[str, Any]) -> str:
+    """Whose context an item reached: the main thread, or one subagent (`agent_id`)."""
+    if payload.get("agent_id") is None:
+        return "main"
+    aid = payload.get("agent_id")
+    aid = aid if isinstance(aid, str) else json.dumps(aid, default=str)
+    return "agent:" + (aid if _SID_RE.match(aid) else
+                       "h" + hashlib.sha256(aid.encode("utf-8", "surrogateescape")).hexdigest()[:24])
+
+
+def _new_state(*, source: str = "", may_guard: bool = False, recovered: bool = False) -> Dict[str, Any]:
+    now = _now()
+    return {"schema": SESSION_SCHEMA, "createdAt": now, "updatedAt": now, "startSource": source,
+            "mayGuard": bool(may_guard) and not recovered, "guardDisabled": bool(recovered), "recovered": recovered,
+            "touched": [], "shown": [], "guard": []}
+
+
+def _triples(value: Any, limit: int) -> bool:
+    return (isinstance(value, list) and len(value) <= limit and all(
+        isinstance(t, list) and len(t) == 3 and isinstance(t[0], str) and _SCOPE_RE.match(t[0])
+        and _is_str(t[1], 1024) and isinstance(t[2], str) and _DIGEST_RE.match(t[2]) for t in value))
+
+
+def _valid_state(doc: Any) -> bool:
+    """Field by field; anything missing, extra, mistyped, out of bounds or dated in the future fails."""
+    if not isinstance(doc, dict) or set(doc) != set(SESSION_KEYS) or doc["schema"] != SESSION_SCHEMA:
+        return False
+    now = _now()
+    for k in ("createdAt", "updatedAt"):
+        v = doc[k]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > now + 1:
+            return False
+    if doc["createdAt"] > doc["updatedAt"]:
+        return False
+    if not all(isinstance(doc[k], bool) for k in ("mayGuard", "guardDisabled", "recovered")):
+        return False
+    if doc["startSource"] not in SESSION_SOURCES:
+        return False
+    if doc["mayGuard"] and (doc["startSource"] not in ("startup", "clear") or doc["recovered"]):
+        return False
+    touched = doc["touched"]
+    if (not isinstance(touched, list) or len(touched) > SESSION_MAX_TOUCHED or len(set(map(str, touched))) != len(touched)
+            or not all(_is_str(t, 1024) for t in touched)):
+        return False
+    return _triples(doc["shown"], SESSION_MAX_SHOWN) and _triples(doc["guard"], SESSION_MAX_GUARD)
+
+
+def _load_state(root: Path, rel: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """(state, 'ok' | 'absent' | 'corrupt'). A symlink, a non-regular file, an oversized or unparsable file or any
+    invalid field is 'corrupt'."""
+    from memlet import memlet_wiki as mw
+    p = root / rel
+    if not os.path.lexists(str(p)):
+        return None, "absent"
+    if mw.managed_path_problem(root, rel):
+        return None, "corrupt"
+    raw = mw.read_regular_bytes(p, SESSION_MAX_BYTES)
+    try:
+        doc = json.loads((raw or b"").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, "corrupt"
+    return (doc, "ok") if _valid_state(doc) else (None, "corrupt")
+
+
+def _state_bytes(state: Dict[str, Any]) -> bytes:
+    return (json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+
+
+def _save_doc(root: Path, rel: str, data: bytes) -> None:
+    from memlet import memlet_wiki as mw
+    mw.write_managed_bytes(root, rel, data, new_mode=0o600)
+
+
+def _fits_state(state: Dict[str, Any]) -> bool:
+    """Forget touched files and JIT digests oldest-first until the state fits SESSION_MAX_BYTES; guard decisions are
+    never forgotten. False when it still does not fit."""
+    state["updatedAt"] = max(_now(), state["createdAt"])
+    del state["touched"][:-SESSION_MAX_TOUCHED]
+    del state["shown"][:-SESSION_MAX_SHOWN]
+    while len(_state_bytes(state)) > SESSION_MAX_BYTES and (state["shown"] or len(state["touched"]) > 1):
+        del (state["shown"] if state["shown"] else state["touched"])[0]
+    return len(_state_bytes(state)) <= SESSION_MAX_BYTES
+
+
+def _save_state(root: Path, rel: str, state: Dict[str, Any], *, created: bool) -> None:
+    """Bounded write (see `_fits_state`); a state that cannot fit is not written (ValueError), and the caller then
+    treats any decision as unrecorded."""
+    if not _fits_state(state):
+        raise ValueError("session state over its size cap")
+    _save_doc(root, rel, _state_bytes(state))
+    if created:
+        _prune_sessions(root, keep=rel)
+
+
+def _prune_sessions(root: Path, keep: str) -> None:
+    """Delete session files older than SESSION_MAX_AGE_SECONDS, then the oldest beyond SESSION_MAX_FILES. Regular
+    `s-*.json` files directly in `.memlet/sessions/` only; never follows a symlink. A deleted session is unknown
+    afterwards, and an unknown session never denies: pruning can only turn a guard off."""
+    from memlet import memlet_wiki as mw
+    d = root / SESSIONS_REL
+    if mw.managed_path_problem(root, SESSIONS_REL, leaf="dir"):
+        return
+    found: List[Tuple[float, str]] = []
+    with contextlib.suppress(OSError):
+        with os.scandir(str(d)) as it:
+            for n, entry in enumerate(it):
+                if n > 10000:
+                    break
+                if entry.name.startswith("s-") and entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                    with contextlib.suppress(OSError):
+                        found.append((entry.stat(follow_symlinks=False).st_mtime, entry.name))
+    now = time.time()
+    found.sort(reverse=True)
+    for i, (mtime, name) in enumerate(found):
+        rel = f"{SESSIONS_REL}/{name}"
+        if rel == keep:
+            continue
+        if now - mtime > SESSION_MAX_AGE_SECONDS or i >= SESSION_MAX_FILES:
+            if not mw.managed_path_problem(root, rel):
+                with contextlib.suppress(OSError):
+                    os.unlink(str(root / rel))
+
+
+@contextlib.contextmanager
+def _state_lock(root: Path):
+    """One short lock for every session-state change of this repository (the per-queue lock machinery of
+    `memlet_dream.queue_lock`, on its own lock file). TimeoutError when another hook holds it too long."""
+    from memlet import memlet_dream as md
+    with md.queue_lock(root / SESSIONS_REL / "state.lock", timeout=STATE_LOCK_TIMEOUT):
+        yield
+
+
+def _open_state(root: Path, rel: str) -> Tuple[Dict[str, Any], bool]:
+    """(state, created). Missing: a new state that may not deny. Corrupt: replaced by a state that may never deny
+    (`recovered`, `guardDisabled`); the file is never repaired into one that could."""
+    state, status = _load_state(root, rel)
+    if state is not None:
+        return state, False
+    return _new_state(recovered=status == "corrupt"), True
+
+
+def _touch(state: Dict[str, Any], rel: str) -> None:
+    if rel in state["touched"]:
+        state["touched"].remove(rel)
+    state["touched"].append(rel)
+
+
+def _record_touch(root: Path, payload: Dict[str, Any], event: str) -> None:
+    """The edited file joins the session's touched files (PostToolUse, and PreToolUse with --capsule alone). Never
+    changes the hook's output; any failure is logged and ignored."""
+    try:
+        rel = _repo_file(root, payload)
+        srel = _session_rel(payload.get("session_id"))
+        if rel is None or srel is None:
+            return
+        with _state_lock(root):
+            state, created = _open_state(root, srel)
+            _touch(state, rel)
+            _save_state(root, srel, state, created=created)
+    except _Deadline:
+        raise
+    except Exception as exc:  # the 9.1.1 output of this event must not depend on the state
+        _log(root, event, "session state not recorded: " + _where(exc))
+
+
+def _note_session_start(root: Path, payload: Dict[str, Any], event: str) -> None:
+    """A session first seen at SessionStart `startup` / `clear` may deny; one first seen any other way never does.
+    An existing (or unreadable) state is never re-labelled."""
+    try:
+        srel = _session_rel(payload.get("session_id"))
+        if srel is None:
+            return
+        source = payload.get("source") if payload.get("source") in SESSION_SOURCES else ""
+        with _state_lock(root):
+            if os.path.lexists(str(root / srel)):
+                return
+            _save_state(root, srel, _new_state(source=source, may_guard=source in ("startup", "clear")), created=True)
+    except _Deadline:
+        raise
+    except Exception as exc:
+        _log(root, event, "session state not recorded: " + _where(exc))
+
+
+# -- PreToolUse -------------------------------------------------------------------------------------------------
+
+
+def _hints_enabled(root: Path) -> bool:
+    from memlet import memlet_bridge as mb
+    cfg, _err = _read_config(root)
+    return bool(mb.dream_settings(cfg or {})[0])
+
+
+def _pre_tool_use(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """`--jit`: the verified memory attached to the file an edit names, as `additionalContext` (Claude Code adds it
+    alongside the tool result, i.e. after the call ran), once per session, agent and item set. `--guard`: in a
+    session that may deny, the first attempt on a file with an approved BLOCKS lesson or supersession is answered
+    with `deny` (or `ask`) quoting those lessons in full, once, and only after the decision is on disk.
+    `--capsule` alone: the file is only recorded as touched. Plan mode: nothing."""
+    if not (st.get("jit") or st.get("capsule")):
+        return None
+    if payload.get("hook_event_name") != "PreToolUse":  # not the payload shape whose output fields we know
+        return None
+    mode = payload.get("permission_mode")
+    if mode == "plan" or payload.get("tool_name") not in JIT_TOOLS:
+        return None
+    rel = _repo_file(root, payload)
+    if rel is None:
+        return None
+    srel = _session_rel(payload.get("session_id"))
+    if not st.get("jit"):
+        _record_touch(root, payload, "pre-tool-use")
+        return None
+    hints = _hints_enabled(root)
+    nb = _neighbors(root, rel, tiers=(TIER_APPROVED, TIER_HINT) if hints else (TIER_APPROVED,))
+    groups: Dict[str, List[Dict[str, Any]]] = nb["groups"] if nb else {}
+    omitted: Dict[str, int] = nb["omitted"] if nb else {}
+    shown_names = tuple(g for g in _DISPLAY_ORDER if g != "hints" or hints)
+    entries = _entries(groups, shown_names)
+    guard_mode = st.get("guard")
+    if guard_mode == "ask" and mode in ("bypassPermissions", "dontAsk"):
+        guard_mode = "deny"  # no permission prompt would show the reason to a person
+    shown_path = _clean(rel, 300)
+    reason: Optional[str] = None
+    guarding = _guard_items(groups)
+    if guard_mode in ("deny", "ask") and nb and nb["guardComplete"] and guarding:
+        gentries = [(None, g, it) for g in _GUARD_GROUPS for it in groups[g]]
+        head = (voc.GUARD_DENY_HEAD if guard_mode == "deny" else voc.GUARD_ASK_HEAD) % shown_path
+        tail = voc.GUARD_DENY_TAIL if guard_mode == "deny" else voc.GUARD_ASK_TAIL
+        text, full = _render_block([head, voc.HOOK_QUOTE_NOTE], gentries, [tail], tokens=None, cap=GUARD_MAX_CHARS)
+        if text is not None and any(any(gentries[i][2] is it for it in guarding) for i in full):
+            reason = text  # at least one approved prohibition is shown whole; the others carry a pointer
+    guard_digest = _digest([(g, it) for g in _GUARD_GROUPS for it in groups.get(g) or []])
+    shown_omitted = {g: n for g, n in omitted.items() if g in shown_names and n}
+    jit_digest = _digest([(g, it) for _s, g, it in entries], shown_omitted)
+    scope = _scope_of(payload)
+    decision: Optional[str] = None
+    informs = bool(entries or shown_omitted)  # items, or only the count of what the graph could not include
+    show = informs
+    if srel is not None:
+        try:
+            with _state_lock(root):
+                state, created = _open_state(root, srel)
+                _touch(state, rel)
+                triple = [scope, rel, guard_digest]
+                pending = False
+                if (reason is not None and state["mayGuard"] and not state["guardDisabled"]
+                        and not state["recovered"] and triple not in state["guard"]):
+                    if len(state["guard"]) >= SESSION_MAX_GUARD:
+                        state["guardDisabled"] = True  # at the bound: stop guarding, never forget
+                    else:
+                        state["guard"].append(triple)
+                        if _fits_state(state):
+                            pending = True
+                            show = False
+                        else:  # the history would not fit: stop guarding instead of forgetting
+                            state["guard"].pop()
+                            state["guardDisabled"] = True
+                if not pending and informs:
+                    jt = [scope, rel, jit_digest]
+                    if jt in state["shown"]:
+                        show = False
+                    else:
+                        state["shown"].append(jt)
+                _save_state(root, srel, state, created=created)
+                if pending:
+                    back, status = _load_state(root, srel)  # the decision counts only once it reads back
+                    if (status == "ok" and back is not None and triple in back["guard"] and back["mayGuard"]
+                            and not back["guardDisabled"]):
+                        decision = guard_mode
+                    else:
+                        show = informs
+        except _Deadline:
+            raise
+        except Exception as exc:  # cannot record: never deny; the context is still informative
+            decision = None
+            show = informs
+            _log(root, "pre-tool-use", "session state unavailable, guard off for this call: " + _where(exc))
+    if decision is not None and reason is not None:
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                       "permissionDecisionReason": reason}}
+    if not show:
+        return None
+    text, _full = _render_block([voc.JIT_HEAD % shown_path, voc.HOOK_QUOTE_NOTE], entries, [],
+                                tokens=st.get("jitTokens") or DEFAULT_JIT_TOKENS, cap=JIT_MAX_CHARS,
+                                omitted=sum(omitted.get(g, 0) for g in shown_names))
+    if text is None:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+
+
+# -- the compaction capsule -------------------------------------------------------------------------------------
+
+
+def _remaining(st: Dict[str, Any]) -> Optional[float]:
+    g = st.get("_guard")
+    return None if g is None else g.end - time.monotonic()
+
+
+def _capsule(root: Path, payload: Dict[str, Any], st: Dict[str, Any], head: List[str], *, cap: int,
+             event: str) -> Optional[str]:
+    """This session's verified memory for the files it touched (most recent first, at most CAPSULE_MAX_FILES):
+    rules anchored in them, approved lessons attached to them, their stale-anchor warnings. Approved tier only (no
+    hints, nothing pending). None when nothing is attached, or when the remaining hook time (after
+    CAPSULE_RESERVE_SECONDS for the 9.1.1 output) runs out: the caller then prints its 9.1.1 output unchanged."""
+    srel = _session_rel(payload.get("session_id"))
+    if srel is None:
+        return None
+    state, _status = _load_state(root, srel)
+    if state is None or not state["touched"]:
+        return None
+    files = list(reversed(state["touched"]))[:CAPSULE_MAX_FILES]
+    entries: List[Tuple[Optional[str], str, Dict[str, Any]]] = []
+    omitted = 0
+    seen: set = set()
+    names = ("blocks", "replaced", "governs", "resolves", "stale")
+    for f in files:
+        left = _remaining(st)
+        if left is not None and left < CAPSULE_RESERVE_SECONDS + 0.2:
+            _log(root, event, "capsule out of time; 9.1.1 output only")
+            return None
+        nb = _neighbors(root, f, tiers=(TIER_APPROVED,))
+        if nb is None:
+            continue
+        entries += _entries(nb["groups"], names, voc.CAPSULE_FILE_HEAD % _clean(f, 300), seen)
+        omitted += sum(nb["omitted"].get(g, 0) for g in names)
+    if not entries:
+        return None
+    text, _full = _render_block(head + [voc.HOOK_QUOTE_NOTE], entries, [],
+                                tokens=st.get("capsuleTokens") or DEFAULT_CAPSULE_TOKENS, cap=cap, omitted=omitted)
+    return text
+
+
+def _soft(root: Path, st: Dict[str, Any], event: str, fn: Callable[[], Optional[str]]) -> Optional[str]:
+    """Run the capsule under a soft deadline CAPSULE_RESERVE_SECONDS before the hook's own (which honours
+    `hooks.deadlineSeconds` and the time already spent); when it fires, or anything fails, return None so the
+    caller prints exactly its 9.1.1 output."""
+    g = st.get("_guard")
+    if g is None:  # called directly (tests): no alarm to borrow
+        try:
+            return fn()
+        except Exception as exc:
+            _log(root, event, "capsule skipped: " + _where(exc))
+            return None
+    end = g.end
+    left = end - time.monotonic() - CAPSULE_RESERVE_SECONDS
+    if left < 0.2:
+        _log(root, event, "capsule out of time; 9.1.1 output only")
+        return None
+    g.arm(left)
+    try:
+        return fn()
+    except _Deadline:
+        _log(root, event, "capsule stopped at its soft deadline; 9.1.1 output only")
+        return None
+    except Exception as exc:
+        _log(root, event, "capsule skipped: " + _where(exc))
+        return None
+    finally:
+        g.arm(end - time.monotonic())
+
+
+def _pre_compact(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any:
+    """9.1.1 behaviour first (snapshot / ingest per the installed flags). With --capsule and something to keep, the
+    capsule is printed as plain text (Claude Code appends PreCompact stdout to the compaction instructions),
+    followed by the 9.1.1 status message as plain text under a fixed heading. Otherwise the 9.1.1 output."""
+    result = _learn(root, payload, st, "pre-compact")
+    if not st.get("capsule"):
+        return result
+    text = _soft(root, st, "pre-compact",
+                 lambda: _capsule(root, payload, st, [voc.CAPSULE_COMPACT_HEAD], cap=CAPSULE_MAX_CHARS,
+                                  event="pre-compact"))
+    if not text:
+        return result
+    message = (result or {}).get("systemMessage") if isinstance(result, dict) else None
+    if isinstance(message, str) and message:
+        text += "\n\n" + voc.CAPSULE_STATUS_HEAD + "\n" + message
+    return _Plain(text)
+
+
+def _session_start_event(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if st.get("jit") or st.get("capsule"):
+        _note_session_start(root, payload, "session-start")
+    out = _session_start(root, payload, st)
+    source = payload.get("source")
+    if not st.get("capsule") or source not in ("compact", "resume"):
+        return out
+    first = voc.CAPSULE_AFTER_COMPACT if source == "compact" else voc.CAPSULE_AFTER_RESUME
+    text = _soft(root, st, "session-start",
+                 lambda: _capsule(root, payload, st, [first], cap=SESSION_START_MAX_CHARS // 2, event="session-start"))
+    if not text:
+        return out
+    base = ((out or {}).get("hookSpecificOutput") or {}).get("additionalContext")
+    if isinstance(base, str) and base:
+        text = text + "\n\n" + base
+    if len(text) > SESSION_START_MAX_CHARS:
+        return out
+    new: Dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+    if out and out.get("systemMessage"):
+        new["systemMessage"] = out["systemMessage"]
+    return new
+
+
+def _post_tool_use_event(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    out = _post_tool_use(root, payload, st)
+    if st.get("jit") or st.get("capsule"):
+        _record_touch(root, payload, "post-tool-use")
+    return out
+
+
 def _dispatch(event: str, root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Any:
     if event == "session-start":
-        return _session_start(root, payload, st)
+        return _session_start_event(root, payload, st)
     if event == "post-tool-use":
-        return _post_tool_use(root, payload, st)
-    if event in ("stop", "pre-compact"):
+        return _post_tool_use_event(root, payload, st)
+    if event == "pre-tool-use":
+        return _pre_tool_use(root, payload, st)
+    if event == "pre-compact":
+        return _pre_compact(root, payload, st)
+    if event == "stop":
         return _learn(root, payload, st, event)
     return _git_check(root, event)
 
@@ -1668,7 +2646,10 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
         return 0
     if os.environ.get("MEMLET_DREAMING") == "1":
         return 0
-    if event not in RUNTIME_EVENTS + GIT_EVENTS or len(argv) != 1:
+    scope: Optional[str] = None
+    if len(argv) == 3 and argv[1] == "--scope" and argv[2] in SCOPES and event in RUNTIME_EVENTS:
+        scope = argv[2]
+    elif event not in RUNTIME_EVENTS + GIT_EVENTS or len(argv) != 1:
         return 0
     root: Optional[Path] = None
     result: Any = None
@@ -1687,9 +2668,10 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
                 if payload is None:
                     _log(root, event, "skip: empty, malformed or oversized stdin")
                 else:
-                    st = _hook_settings(root)
+                    st = _hook_settings(root, scope)
                     if st["deadline"] and st["deadline"] < DEADLINES[event]:
                         guard.arm(st["deadline"] - (time.monotonic() - guard.start))
+                    st["_guard"] = guard  # the capsule borrows the remaining time from it
                     result = _dispatch(event, root, payload, st)
     except _Deadline:
         result = None
@@ -1703,7 +2685,10 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
     if result is None:
         return 0
     with contextlib.suppress(Exception):
-        if isinstance(result, str):
+        if isinstance(result, _Plain):
+            out.write(str(result) + "\n")
+            out.flush()
+        elif isinstance(result, str):
             err.write(result)
             err.flush()
         else:

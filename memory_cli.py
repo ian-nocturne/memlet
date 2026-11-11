@@ -513,6 +513,7 @@ def _validate_modes(args, parser):
     if args.action == 'init':
         if not (args.hooks or args.hooks_remove):
             flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else []) + (['--dream'] if args.dream else [])
+            flags += ['--' + name for name in ('jit', 'guard', 'capsule') if getattr(args, name)]
             if flags:
                 parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove')
         elif args.hooks_remove and args.force:
@@ -670,6 +671,9 @@ def _build_parser():
     init_p.add_argument('--hooks-scope',choices=['local','project'],default=None,help='local (default): .claude/settings.local.json; project: shared .claude/settings.json (needs memlet on PATH)')
     init_p.add_argument('--dream',action='store_true',help='With --hooks: Stop and PreCompact snapshot sessions for an explicit dream command')
     init_p.add_argument('--git-hooks',action='store_true',help='With --hooks / --hooks-remove: also the git pre-commit (warn only) and post-merge hooks')
+    init_p.add_argument('--jit',action='store_true',help='With --hooks: also a PreToolUse hook (Write|Edit|MultiEdit|NotebookEdit) that adds the verified memory attached to the file being edited. Claude Code delivers it with the tool result, after the call ran: it informs, it does not prevent')
+    init_p.add_argument('--guard',action='store_true',help='With --hooks (implies --jit): in a session started fresh, the first edit of a file with an approved BLOCKS lesson or a replaced instruction is denied once, quoting those lessons in full; hooks.scopes.<scope>.guard "ask" asks you instead, "off" disables it')
+    init_p.add_argument('--capsule',action='store_true',help='With --hooks: PreCompact asks the compaction summary to keep the verified memory for the files this session touched (Write, Edit, MultiEdit and NotebookEdit; a PreToolUse entry is installed to see the last two), and SessionStart re-delivers it after compact or resume')
     check_mode=aud_p.add_mutually_exclusive_group()
     check_mode.add_argument('--changed',action='store_true',help='Check rules affected by changed files')
     check_mode.add_argument('--accept',action='append',default=[],metavar='ANCHOR',help='Re-pin a named path::symbol anchor (repeatable)')
@@ -733,6 +737,7 @@ def _main(args, parser):
         if args.action=='init' and (args.hooks or args.hooks_remove):
             from memlet.memlet_hooks import init_hooks_command
             res=init_hooks_command(target_repo,remove=args.hooks_remove,scope=args.hooks_scope or 'local',git_hooks=args.git_hooks,dream=args.dream,
+                                   jit=args.jit,guard=args.guard,capsule=args.capsule,
                                    dry_run=args.dry_run,force=args.force,output_format=args.format)
         elif args.action=='init':
             res=init_project(target_repo,dry_run=args.dry_run,force=args.force,output_format=args.format)
