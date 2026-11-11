@@ -49,9 +49,11 @@ class AnchorScanEquivalenceTests(unittest.TestCase):
 
 class AnchorScanLinearTimeTests(unittest.TestCase):
     def _timed(self, text):
-        start = time.perf_counter()
+        # CPU time of this process, not wall time: the bound guards against a quadratic regression and must not
+        # fail because other jobs are running on the machine.
+        start = time.process_time()
         found = list(iter_explicit_anchors(text))
-        return time.perf_counter() - start, found
+        return time.process_time() - start, found
 
     def test_long_runs_of_path_characters_are_fast(self):
         # The reviewer's shape: a rule followed by 100,000 path characters and no separator, then worse shapes.

@@ -1968,9 +1968,11 @@ class MemorySkillsLoopTests(unittest.TestCase):
         saved_model = memory.vectors._MODEL
         try:
             memory.vectors._MODEL = None
-            t0 = time.monotonic()
+            # CPU time of this process, not wall time: the bound guards against a quadratic regression and must not
+            # fail because other jobs are running on the machine.
+            t0 = time.process_time()
             mem_view = self.store.memory('task-one', 'server.py 웹 프로세스만 교체하고 실행 원장을 보존', 4000)
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            elapsed_ms = (time.process_time() - t0) * 1000.0
             self.assertTrue(mem_view['retrieval']['onnxColdBypassed'])
             self.assertIsNone(memory.vectors._MODEL)
             self.assertLess(elapsed_ms, 50.0)

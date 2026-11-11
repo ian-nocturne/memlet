@@ -1158,9 +1158,11 @@ class LinearMaskingTests(unittest.TestCase):
     def test_masking_is_linear_on_adversarial_lines(self):
         for label, text in self.ADVERSARIAL.items():
             with self.subTest(case=label):
-                start = _time.monotonic()
+                # CPU time of this process, not wall time: the bound guards against a quadratic regression and must not
+                # fail because other jobs are running on the machine.
+                start = _time.process_time()
                 md.mask_secrets(text)
-                self.assertLess(_time.monotonic() - start, 1.0, label)
+                self.assertLess(_time.process_time() - start, 1.0, label)
 
     def test_block_redaction_still_covers_every_key_shape(self):
         body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"
