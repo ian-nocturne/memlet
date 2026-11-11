@@ -1,5 +1,6 @@
 """Clean-room package vs user-data path resolution, E5 model discovery, and cross-platform backup/restore."""
 from __future__ import annotations
+import contextlib
 import hashlib
 import json
 import os
@@ -184,7 +185,7 @@ def doctor_environment(explicit_root=None, module_dir=None, *, data_root=None, d
     try:
         probe_db = active_db if active_db.is_file() else (resolved_root / ".doctor_probe.sqlite3")
         created_temp_db = not active_db.is_file()
-        with sqlite3.connect(str(probe_db), timeout=5.0) as conn:
+        with contextlib.closing(sqlite3.connect(str(probe_db), timeout=5.0)) as conn:
             jm_row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
             journal_mode = str(jm_row[0]).lower() if jm_row else "unknown"
             chk_row = conn.execute("PRAGMA integrity_check").fetchone()
@@ -245,7 +246,8 @@ def backup_data_root(
 
     db_sha = ""
     if active_src_db.is_file():
-        with sqlite3.connect(str(active_src_db)) as s_conn, sqlite3.connect(str(dst_db)) as d_conn:
+        with contextlib.closing(sqlite3.connect(str(active_src_db))) as s_conn, \
+                contextlib.closing(sqlite3.connect(str(dst_db))) as d_conn:
             s_conn.backup(d_conn)
         db_sha = hashlib.sha256(dst_db.read_bytes()).hexdigest()
 
@@ -322,9 +324,10 @@ def restore_data_root(backup_dir: Path, target_root: Path, *, target_db_path: Pa
 
     integrity_ok = True
     if b_db.is_file():
-        with sqlite3.connect(str(b_db)) as s_conn, sqlite3.connect(str(t_db)) as d_conn:
+        with contextlib.closing(sqlite3.connect(str(b_db))) as s_conn, \
+                contextlib.closing(sqlite3.connect(str(t_db))) as d_conn:
             s_conn.backup(d_conn)
-        with sqlite3.connect(str(t_db)) as check_conn:
+        with contextlib.closing(sqlite3.connect(str(t_db))) as check_conn:
             chk = check_conn.execute("PRAGMA integrity_check").fetchone()
             integrity_ok = bool(chk and chk[0] == "ok")
         if not integrity_ok:

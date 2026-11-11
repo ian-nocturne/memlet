@@ -98,31 +98,43 @@ Memlet started `claude -p` itself, with every tool off, in an empty temporary fo
 ```console
 $ memlet learn --pending
 - `DRM-57dcb2bf896f99ee` [superseded_directive]
-  > Deploys go out with `make release` from the main branch. (`<snapshot>:1-1`)
-  > From now on do not use make release; deploy only with <deploy script>, which warms the cache first. (`<snapshot>:3-3`; SUPERSEDES source)
-  tier=pending; no trusted agreement; proposers=claude/tool-free; verification=
-- `DRM-eb836c7e1511beda` [repeated_pitfall] 2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold. (cites `<snapshot>:2`)
-  tier=pending; vetoed by claude/sonnet: MISSING_CONDITION; proposers=claude/tool-free; verification=claude:MISSING_CONDITION
+  old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT] [<snapshot>:1 87a2f09b]: replaced — do not apply as current: Deploys go out with `make release` from the main branch. (`<snapshot>:1-1`)
+  replacement_pin [ACTIVE — APPLY THIS] [<snapshot>:3 621061f9]: current instruction: From now on do not use make release; deploy only with <deploy script>, which warms the cache first. (`<snapshot>:3-3`; SUPERSEDES source)
+  tier=pending; no trusted agreement; proposers=claude/tool-free; verification=none
+- `DRM-eb836c7e1511beda` [repeated_pitfall]
+  > I ran make release and the smoke test failed because the cache was cold. (`<snapshot>:2-2`; BLOCKS source)
+  tier=pending; vetoed by claude/sonnet: MISSING_CONDITION. The lesson omits a condition required by the cited evidence.; proposers=claude/tool-free; verification=claude:MISSING_CONDITION
 - `DRM-cf04d035ece3c7b4` [workaround draft]
   > I ran make release and the smoke test failed because the cache was cold. (`<snapshot>:2-2`)
   > Deployed with <deploy script> and the smoke test passed. (`<snapshot>:4-4`; RESOLVES source)
   tier=hint; two models of the same vendor agreed; proposers=claude/tool-free; verification=claude:SUPPORTED
-- `DRM-331374b872ebd5af` [repeated_pitfall] 2026-11-11T10:10:00Z [user] And the old tip about passing --skip-smoke is withdrawn, never use it. (cites `<snapshot>:5`)
+- `DRM-331374b872ebd5af` [repeated_pitfall]
+  > And the old tip about passing --skip-smoke is withdrawn, never use it. (`<snapshot>:5-5`; BLOCKS source)
   tier=hint; two models of the same vendor agreed; proposers=claude/tool-free; verification=claude:SUPPORTED
 ```
 
-After `memlet learn --approve DRM-cf04d035ece3c7b4 --by "ray"`, the approved lesson and the remaining hint come back in separate groups:
+After `memlet learn --approve DRM-57dcb2bf896f99ee DRM-cf04d035ece3c7b4 --by "ray"`, the two approved lessons and the remaining hint come back in separate groups, and the replaced instruction is quarantined next to the current one:
 
 ```console
 $ memlet recall "deploy release"
 ### Approved lessons (human-approved Dream items; transcript citations re-verified)
-- [DRM-cf04d035ece3c7b4] (workaround draft)
+- [DRM-57dcb2bf896f99ee] Superseded Quarantine (`SUPERSEDES`)
+  [REPLACED — do not apply as current] Deploys go out with `make release` from the main branch. (`<snapshot>:1-1`)
+  [CURRENT] From now on do not use make release; deploy only with <deploy script>, which warms the cache first. (`<snapshot>:3-3`) [unanchored: no_code_anchor]
+- [DRM-cf04d035ece3c7b4] [RESOLVES]
   > I ran make release and the smoke test failed because the cache was cold. (`<snapshot>:2-2`)
   > Deployed with <deploy script> and the smoke test passed. (`<snapshot>:4-4`; RESOLVES source) [unanchored: no_code_anchor]
 
 ### Unreviewed hints — not approved by a person
 Agreement basis is labelled per item; citations check out, but verify in code before relying on them. ...
-- [hint; two models of the same vendor agreed] And the old tip about passing --skip-smoke is withdrawn, never use it. — cites `<snapshot>:5-5`
+- [hint; two models of the same vendor agreed]
+  > And the old tip about passing --skip-smoke is withdrawn, never use it. (`<snapshot>:5-5`; BLOCKS source)
+
+$ memlet handover . --format markdown
+### Approved lessons (human-approved; citations re-verified in .memlet/dream/snapshot/)
+- [REPLACED — do not apply as current] Deploys go out with `make release` from the main branch. ⟶ [CURRENT] From now on do not use make release; deploy only with <deploy script>, which warms the cache first. (<snapshot>:1, <snapshot>:3)
+- [RESOLVES] I ran make release and the smoke test failed because the cache was cold. ⟶ Deployed with <deploy script> and the smoke test passed. (<snapshot>:2, <snapshot>:4)
+- Omitted for token budget: hints 1
 ```
 
 Things to notice:
@@ -130,7 +142,7 @@ Things to notice:
 - **The lesson is the transcript, not a summary.** It is line 2 (the failure) and line 4 (the fix), verbatim, joined by `RESOLVES`. The model chose the lines and the relation; it wrote none of the text.
 - **A hint is not a lesson.** The `BLOCKS` hint on line 5 passed both models, but no person has read it. Hints stay in their own group, are trimmed first when space is short, and never become active constraints. Both checkers here were Claude models, so it is labelled as same-vendor agreement, the weaker kind.
 - **The second model can disagree.** It judged the pitfall on line 2 `MISSING_CONDITION`. That veto is permanent for the hint tier; only a person can still approve it.
-- **`SUPERSEDES` always needs a person.** Line 3 replaced line 1, so the pair is cited together and checked for time order, but only `BLOCKS` and `RESOLVES` can become hints. Once approved, `memlet admin dream-recall` shows it as `old_pin [SUPERSEDED — DO NOT APPLY AS CURRENT]` next to `replacement_pin [ACTIVE — APPLY THIS]`. `GOVERNS`, the fourth relation, ties a lesson to a scope and likewise needs approval.
+- **`SUPERSEDES` always needs a person.** Line 3 replaced line 1, so the pair is cited together and checked for time order, but only `BLOCKS` and `RESOLVES` can become hints. Once approved, `recall` and `handover` show the pair as a quarantine: the old line marked `[REPLACED — do not apply as current]`, the new one `[CURRENT]`. `GOVERNS`, the fourth relation, ties a lesson to a scope and likewise needs approval.
 
 (Output shortened; `<snapshot>` stands for the stored copy of the transcript under `.memlet/dream/snapshot/`, and `<deploy script>` for a script path in the transcript, for the same reason as `<billing file>` above. Without a model, `memlet learn --transcript` proposes lessons with keyword rules instead; the queue and the approval step are the same.)
 
@@ -141,7 +153,7 @@ Things to notice:
 | 1. An address you can re-check | `init`, `check`, `check --changed` / `--accept`; stale rules set apart in `recall`, `handover`, hooks and MCP; Python symbols compared by AST, including names rebound elsewhere in the module; `admin anchors` proposes anchors for rules that only mention a function; exact TS/JS comparison with tree-sitter if a repository opts in | TS/JS is a lexical scan by default and never `active`. Anchor suggestions are proposals, not proofs of uniqueness. |
 | 2. Propose, verify, approve | `dream --via claude` with an optional second-model check; keyword `learn`; MCP hosts can submit as an untrusted proposer; trust tier (`approved`, `hint`, `pending`) computed on every read; approval only by name, never over MCP | Only the `claude` CLI can be launched, so the default two-vendor agreement cannot produce a hint today. Approvals and receipts are integrity records, not signatures. |
 | 3. Quote, never rewrite | Lesson text is always the cited lines; a model writes only a title; restructuring (`admin slim-plan`) moves lines with a preservation proof | The model-written brief (`admin brief-build`) failed its fidelity check and is hidden. |
-| 4. Four relations | Four-verb schema; `SUPERSEDES` needs both citations and forward time; no cycles; one-hop recall; lineage view in `memlet ui` | An approved `SUPERSEDES` pair is shown by `admin dream-recall` and `memlet ui`, not yet by `recall` or `handover`. Relation labels from a model are often coarse; review them. |
+| 4. Four relations | Four-verb schema; `SUPERSEDES` needs both citations and forward time; no cycles; one-hop recall; an approved pair is shown as replaced / current in `recall` and `handover`; lineage view in `memlet ui` | Relation labels from a model are often coarse; review them before approving. |
 | 5. Send little, say what was left out | `recall` (works without an index), handover budget with an `omitted` count, hints trimmed first; `admin eval` measures what each way of feeding memory is worth on your own sessions | No measured result is published. The size router (`admin rule-context --auto`) is not wired into the main commands or hooks. |
 
 **What "verified" means here.** Memlet checks that an anchored symbol still exists and has not changed since it was pinned, and that a cited line still says what it said. It does not check that a rule or a lesson is true. A model's `SUPPORTED` verdict is an opinion about the citations, not an approval.
@@ -225,6 +237,8 @@ memlet admin import . --dry-run --format markdown                      # bring e
 
 The capsule carries `repoHead`, `activeConstraints`, `lexicalConstraints` (TS/JS lexical matches), `pathExistsAnchors` and `unpinnedAnchors` (carried, clearly not verified), `quarantinedStaleAnchors`, `rejectedApproaches`, `executionProof`, `nextAction`, `checksum`, and `authorityBoundary: "read-only-context-only: execution and external side-effect approvals are NOT inherited"`. The checksum detects edits; it does not prove who wrote the capsule.
 
+Approved lessons travel in the capsule too (`approvedLessons`, after the active constraints): one line each, relation first, and a replaced instruction is marked `[REPLACED — do not apply as current]` next to `[CURRENT]`. When space is short, hints are dropped first, then approved lessons, then the rest. `omitted` counts what the token budget dropped; `listCapOmitted` counts what a per-group item cap dropped.
+
 ### 5. Lessons: propose, check, approve
 
 Two ways to propose, one queue (`.memlet/dream/APPROVAL-QUEUE.json`), one approval step.
@@ -259,10 +273,12 @@ Agreement settings in `.memlet/config.json`:
 {"dream": {"agreement": "model", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}}
 ```
 
-- `dream.agreement` defaults to `"vendor"`: the two parties must be different vendors. Only `claude` can be launched today, so with the default no hint can appear. `"model"` lets two different Claude model families agree (each model id must contain exactly one of `haiku`, `sonnet`, `opus`, `fable`, and the verifier must differ from every proposer); those hints say "two models of the same vendor agreed".
+- `dream.agreement` defaults to `"vendor"`: the two parties must be different vendors. Only `claude` can be launched today, so with the default no hint can appear. `"model"` lets two different Claude model families agree (each model id must contain exactly one of `haiku`, `sonnet`, `opus`, `fable`, `mythos`, and the verifier must differ from every proposer); those hints say "two models of the same vendor agreed".
 - A `MISSING_CONDITION`, `OUT_OF_EVIDENCE` or `WRONG_EDGE` verdict from a trusted checker vetoes the hint tier for that content permanently ("vetoed by VENDOR/MODEL: VERDICT"); a person can still approve it.
 - `dream.hints: false` hides the hint tier everywhere.
 - Lessons submitted by keyword rules or over MCP never count toward agreement.
+
+**When a run goes wrong.** A batch whose candidates were all rejected is recorded as failed, with the reasons at the top of the summary. `dream` carries on with later batches, stops after three failed batches in a row, and retries failed ones only when you run it again; `memlet dream --skip-failed BATCH_ID` marks one as done. If a cited line changes after approval, the lesson goes back to pending: `memlet learn --pending` shows every cited line, changed or not; read them, then approve again with `--refresh-citations`.
 
 **Transcripts.** Only what you typed and what the assistant finally answered is read. Tool payloads, hidden reasoning, progress narration and injected instruction files are skipped. These secret formats are redacted before anything is stored: OpenAI/Anthropic `sk-`, Stripe, GitHub, Slack, AWS access key ids, Google `AIza`, GitLab, npm, PyPI and Polar tokens, database connection URLs, URL credentials, JWTs, PEM/OpenSSH/PGP/PuTTY private-key blocks, and assignments whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH`. Other formats are not detected. Very large inputs are skipped rather than partly stored (files over 16 MiB, messages or lines over 16,384 characters), and the result lists what was skipped.
 
@@ -336,23 +352,25 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 - New anchor reason `symbol_rebound_in_module`: a Python function or class that is reassigned elsewhere in its module is now `compatible-unverified`, not `active`. Hashes are unchanged; no re-pin is needed.
 - Hints can show up in `recall`, `handover`, `check --changed`, `learn --pending`, `memlet ui` and the SessionStart count, always in their own labelled group. They can appear only after a `memlet dream` run with `dream.agreement: "model"`. `dream.hints: false` turns them off.
 - Lessons with several cited lines now show every line, in order, with the line that supplies a relation marked.
+- Approved lessons are now carried in the handover capsule (new key `approvedLessons`), and an approved replaced instruction is shown in `recall` and `handover` marked as replaced, next to the current one.
+- If you opt into `anchors.exactParsers` and pin TS/JS anchors with 9.1, keep checking that repository with 9.1 or later: 9.0 reads those pins as `compatible-unverified` with a misleading reason.
 - MCP gains `memlet_dream_next` and `memlet_dream_submit`; the 23 existing tool definitions are unchanged.
 - Upgrading from 8.x: 9.0 removed the deployment-rescue, UI-scoring, starter-bundle and operational-security commands; executables are `memlet` and `memlet-mcp`; use `MEMLET_*` environment variables; the user store is `~/.memlet-store` and an older one is used only if you point at it (`--root` or `MEMLET_HOME`). Repository data from 8.5 remains readable. The Action accepts `mode: audit` only.
 
 ## Limits, stated plainly
 
-- **One vendor.** Only the `claude` CLI can be launched, and only when it reports a claude.ai subscription login; settings that could select API-key or third-party auth are refused. `codex` and `gemini` are refused because neither CLI documents a mode with every tool off. So the default two-vendor agreement produces no hints, same-vendor hints are weaker evidence, and `admin eval score --judge` cannot be used.
+- **One vendor.** Only the `claude` CLI can be launched, and only when it reports a claude.ai subscription login; settings that could select API-key or third-party auth are refused. `codex` and `gemini` are refused because neither CLI documents a mode with every tool off. So the default two-vendor agreement produces no hints, same-vendor hints are weaker evidence, and `admin eval score --judge` cannot be used. Launching a vendor needs POSIX process groups; elsewhere it is refused before anything starts.
 - **The permission screen is a phrase list, not a proof.** It looks for English and Korean permission and bypass phrases in a hint's lines; a hint could still loosen a rule in words it does not know.
 - **Integrity, not authentication.** Approvals, accepted anchors, checksums and vendor receipts detect later edits. They do not show who acted: a process that can rewrite `.memlet` can forge them.
 - **A model's verdict is an opinion.** `SUPPORTED` means a second model found the citations sufficient. It is not approval.
 - **Anchor suggestions are proposals.** Unscanned folders and nested repositories can hold other definitions.
-- **Static only.** Python anchors are compared by AST; dynamic `getattr`, `exec`, `setattr` and monkeypatching are not evaluated. The default TS/JS scanner is lexical: JSX text with apostrophes and some regex literals read as syntax errors, getters/setters and overloads are not extracted, and `tsc` is not run.
+- **Static only.** Python anchors are compared by AST; dynamic `getattr`, `exec`, `setattr` and monkeypatching are not evaluated, and the check that a pinned name is not rebound elsewhere in its module is static too. The default TS/JS scanner is lexical: JSX text with apostrophes and some regex literals read as syntax errors, getters/setters and overloads are not extracted, and `tsc` is not run.
 - **No accuracy claim.** Recall quality and the value of lessons are not measured for this release; `admin eval` exists so you can measure them on your own sessions.
 
 ## How far it has been tested
 
-- 739 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed.
-- `memlet dream` was run against the real Claude CLI in a scratch repository, a handful of calls in total (Example 2 is one of those runs).
+- 771 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23).
+- `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design twice: see the row format and the failed-batch rule in section 5.
 - Hooks (in a headless Claude Code session) and the MCP tools (from a `codex exec` session) were last exercised in real sessions on 9.0-era code.
 - Linux, Windows, other MCP hosts and interactive sessions are untested.
 

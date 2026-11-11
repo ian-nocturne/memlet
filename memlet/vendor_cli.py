@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 VENDORS = ("claude", "codex", "gemini")
-MODEL_FAMILIES = {"claude": ("haiku", "sonnet", "opus", "fable")}
+MODEL_FAMILIES = {"claude": ("haiku", "sonnet", "opus", "fable", "mythos")}
 DEFAULT_MODELS = {"claude": "haiku", "codex": "gpt-5-mini", "gemini": "gemini-2.5-flash"}
 _PAID_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
              "ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",

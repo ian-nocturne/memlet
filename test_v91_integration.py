@@ -1331,5 +1331,18 @@ class FinalAuditIntegration(Scratch):
         self.assertNotIn('More:\n  dream',admin)
 
 
+
+class ModelFamilies(unittest.TestCase):
+    def test_every_claude_family_is_one_model_and_families_differ(self):
+        from memlet import vendor_cli as vc
+        families = vc.MODEL_FAMILIES["claude"]
+        self.assertEqual(("haiku", "sonnet", "opus", "fable", "mythos"), families)
+        for family in families:
+            self.assertTrue(vc.same_model("claude", family, "claude", "CLAUDE-" + family.upper() + "-5-2"), family)
+            for other in families:
+                if other != family:
+                    self.assertFalse(vc.same_model("claude", family, "claude", "claude-" + other + "-5-2"), (family, other))
+
+
 if __name__ == '__main__':
     unittest.main()
