@@ -215,3 +215,64 @@ RESEALED_RELATIONS = "Re-sealed relations: "
 UNTOUCHED_RELATIONS = "Relations left alone: "
 RECALL_FILES_HELP = "Select lessons and hints by the attachment rule, and rules by code anchors."
 MEMLET_ECHO_NOTICE = "Memlet echo lines or duplicate approved lesson quotes skipped: %d"
+
+
+# --- Unit N2 (9.3 tidy report) ----------------------------------------------------------------------------------
+# Fixed text of `memlet admin tidy`. Everything else it prints is quoted from the queue, the snapshot or the
+# instruction files. Read-only: none of these sentences is ever written to a file.
+TIDY_CLI_HELP = "Read-only report: lessons a person might merge, look at again, retire or promote."
+TIDY_HEAD = "## Memlet tidy report"
+TIDY_NOTHING_CHANGED = ("Nothing was changed. Every line below is a proposal: Memlet merges, retires and promotes "
+                        "nothing on its own. A person decides, by running the command shown.")
+TIDY_SECTIONS = ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges")
+TIDY_SECTION_HEADINGS = {
+    "duplicates": "Lessons that may say the same thing (merge?)",
+    "saidAgain": "Said again by a person in other sessions",
+    "retire": "Approved lessons worth a second look (retire?)",
+    "unattached": "Approved lessons that reach no file (they never arrive through hooks)",
+    "promote": "Approved lessons that may belong in an instruction file (promote?)",
+    "lapsedMerges": "Merges that no longer hold",
+}
+TIDY_SECTION_CAP = 40
+TIDY_NONE = "(none)"
+TIDY_OMITTED = "(+%d more not listed)"
+TIDY_SAME_TEXT, TIDY_SIMILAR_TEXT = "same-text", "similar-text"
+TIDY_DUPLICATE_LABELS = {TIDY_SAME_TEXT: "same wording", TIDY_SIMILAR_TEXT: "similar wording — read both"}
+TIDY_KEEP_LABEL = "suggested kept lesson"
+TIDY_BLOCKERS_LABEL = "Merge would be refused: "
+TIDY_LOST_FILES_LABEL = "Files a member reaches and the kept lesson does not: "
+TIDY_SAID_AGAIN_PENDING = "said again in %s session(s)"
+TIDY_SAID_AGAIN_REJECTED = "rejected, then said again by a person after the rejection: %s session(s) since %s"
+TIDY_AT_LEAST = "at least %d"
+TIDY_RETIRE_REASONS = ("attachment-inactive", "anchored-code-changed", "now-a-rule", "old-unseen")
+TIDY_RETIRE_LABELS = {
+    "attachment-inactive": "a file a person attached no longer passes the attachment rule",
+    "anchored-code-changed": "its anchor on the promoted Dream page is stale (the code changed)",
+    "now-a-rule": "an instruction-file rule now says the same line",
+    "old-unseen": "approved long ago and not said again since",
+}
+TIDY_UNATTACHED_LABEL = "reaches no file"
+TIDY_PROMOTE_LABEL = "said in %s session(s); a ready-to-paste block follows"
+TIDY_PROMOTE_SUGGESTION = ("Ready to paste — a suggestion, not an edit: Memlet does not write your instruction files. "
+                           "The lines are the lesson's cited lines; read and adapt before pasting.")
+TIDY_ANCHOR_SUGGESTION = "Suggested anchor (Memlet's lesson anchoring; check it before keeping it): "
+TIDY_NO_ANCHOR = "No anchor suggested: the lesson names no code symbol Memlet could resolve."
+TIDY_INSTRUCTION_FILES = "Instruction files in this repository: "
+TIDY_NO_INSTRUCTION_FILES = "No instruction file exists in this repository yet."
+TIDY_LAPSED_LABEL = "merge into %s no longer holds: %s"
+TIDY_COMMAND_LABEL = "Command: "
+TIDY_ALSO_LABEL = "Or: "
+TIDY_SCAN_LINE = "Snapshot scan: %d file(s), %d byte(s) read"
+TIDY_MERGE_UNAVAILABLE = "merge checks not available in this build"
+TIDY_MERGE_UNREADABLE = "merge records could not be read; merge checks were skipped"
+TIDY_BLOCKERS_FAILED = "merge blockers could not be computed for some groups; those groups carry no blockers"
+TIDY_INCOMPLETE = ("The snapshot scan stopped at its bound or skipped unreadable files: session counts are lower "
+                   "bounds (\"at least\") and old-unseen was not judged.")
+TIDY_SIMILAR_BOUND = "Similar-wording comparison reached its work bound; some similar groups may be missing."
+TIDY_ATTACHMENT_UNKNOWN = ("The tracked-file listing was incomplete: lessons that reach no file are not listed, "
+                           "because Memlet cannot tell.")
+TIDY_PAGE_UNTRUSTED = ("The promoted Dream page is not exactly what Memlet last wrote; its anchors were not used "
+                       "(anchored-code-changed not judged).")
+TIDY_SNAPSHOT_UNAVAILABLE = "No readable transcript snapshot directory; nothing was counted as said again."
+TIDY_PROMOTE_COMMAND_NOTE = "After pasting, re-check the instruction files"
+TIDY_INVALID_ARGUMENT = "stale-days must be an integer of at least 0 and min-seen an integer of at least 1"
