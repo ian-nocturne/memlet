@@ -27,7 +27,8 @@ from __future__ import annotations
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
 from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT, VENDOR_AGREEMENT,
                          VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS, SAME_VENDOR_REVIEW,
-                         APPROVAL_PATHS_LABEL, INACTIVE_APPROVAL_PATHS, APPROVAL_PATHS_SUFFIX)
+                         APPROVAL_PATHS_LABEL, INACTIVE_APPROVAL_PATHS, APPROVAL_PATHS_SUFFIX,
+                         LESSON_VIA_SCOPE, LESSON_VIA_PATH)
 
 import contextlib
 import copy
@@ -606,27 +607,30 @@ def lesson_path_context(repo_path="."):
 
 
 def literal_lesson_paths(root, scope, text, *, context=None):
-    """Literal whole path tokens only; Git repositories require a tracked file."""
+    """Extract whole path tokens from text; Git requires tracked files.
+
+    ``scope`` is retained for caller compatibility but never attaches a path: it
+    is only a display label and recall filter term, regardless of proposer/tier.
+    """
     context = lesson_path_context(root) if context is None else context
     root = context["root"]
-    raw = [scope.split("::", 1)[0]] + [p for p, _ in mw._line_refs(text)]
+    raw = [p for p, _ in mw._line_refs(text)]
     # Enumerate maximal path-like tokens, then strip terminal sentence punctuation.
     raw += [m.group().rstrip(".") for m in re.finditer(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*", text)]
     out = []
     punctuation = ".,;:!?)]\"'`"
     for path in raw:
         path = path.replace("\\", "/").removeprefix("./")
-        named = path == scope.split("::", 1)[0].replace("\\", "/").removeprefix("./")
-        if not named:
-            for match in re.finditer(r"(?<![\w/.-])(?:\./)?" + re.escape(path), text):
-                before = text[match.start()-1:match.start()] if match.start() else ""
-                tail = text[match.end():]
-                after = tail[:1]
-                terminal = re.match("[" + re.escape(punctuation) + "]+(?=\\s|$)", tail)
-                boundary = not tail or tail[0].isspace() or terminal is not None
-                if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
-                    named = True
-                    break
+        named = False
+        for match in re.finditer(r"(?<![\w/.-])(?:\./)?" + re.escape(path), text):
+            before = text[match.start()-1:match.start()] if match.start() else ""
+            tail = text[match.end():]
+            after = tail[:1]
+            terminal = re.match("[" + re.escape(punctuation) + "]+(?=\\s|$)", tail)
+            boundary = not tail or tail[0].isspace() or terminal is not None
+            if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
+                named = True
+                break
         if (named and len(path) <= 80 and valid_lesson_path(root, path) and path not in out
                 and (not context["is_git"] or path in context["tracked"])):
             out.append(path)
@@ -1999,8 +2003,25 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
         file_notices = normalise_lesson_files(root, files)[1]
         if file_notices:
             res.setdefault("notices", []).extend(file_notices)
-    res["approvedLessons"] = dream_items(root, files=changed)["items"]
-    res["hints"] = dream_items(root, tiers=(TIER_HINT,), files=changed)["items"]
+    # 9.1.1 scope matches are informational; they must never feed attachment,
+    # export or denial decisions. Strict 9.2 path matches take precedence.
+    from .memlet_dreamcycle import _canonical_path
+    requested = {_canonical_path(f) for f in changed}
+    attached_files = set(normalise_lesson_files(root, changed)[0])
+    def matched_lessons(tier):
+        rows = []
+        for item in dream_items(root, tiers=(tier,))["items"]:
+            scope, text = item["scope"], item["text"]
+            scope_path = _canonical_path(scope.split("::", 1)[0])
+            scope_match = any(f == scope_path or (scope.endswith(("/", "\\")) and
+                f.startswith(scope_path.rstrip("/") + "/")) or f + "::" in text or
+                "`" + f + "`" in text for f in requested)
+            path_match = bool(attached_files.intersection(item.get("paths", [])))
+            if path_match or scope_match:
+                rows.append(dict(item, via=LESSON_VIA_PATH if path_match else LESSON_VIA_SCOPE))
+        return rows
+    res["approvedLessons"] = matched_lessons(TIER_APPROVED)
+    res["hints"] = matched_lessons(TIER_HINT)
     res["hintsLabel"] = hint_label(res["hints"])
     res["staleCount"] = sum(1 for a in res["affected"] if a["status"] == "stale")
     if res["staleCount"]:
@@ -2296,13 +2317,8 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             inactive = [p for p in node.get("approvedPaths", []) if p not in attached]
             if inactive and tier == TIER_APPROVED:
                 notices.append(node["id"] + INACTIVE_APPROVAL_PATHS + ", ".join(inactive))
-            scope_path = scope.split("::", 1)[0].removeprefix("./")
-            if requested is not None:
-                matches = any(f in paths for f in requested) if tier == TIER_APPROVED else any(
-                    f == scope_path or (scope.endswith(("/", "\\")) and f.startswith(scope_path.rstrip("/") + "/"))
-                    or f + "::" in text or "`" + f + "`" in text for f in requested)
-                if not matches:
-                    continue
+            if requested is not None and not any(f in paths for f in requested):
+                continue
             cites, seen = [], set()
             for pin in evidence_pins(display_node):
                 if not isinstance(pin, dict) or pin.get("span") in seen:

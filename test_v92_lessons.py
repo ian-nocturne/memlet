@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +39,65 @@ class Lessons(Fixture):
         graph=mb._load_queue(repo)[0];graph['nodes'][0]['approvedPaths']=['renamed.py'];self.save_graph(repo,graph)
         self.assertEqual([],mb.dream_items(repo)['items'])
         self.assertEqual([],mb.lesson_paths(graph['nodes'][0],repo))
+
+    def test_scope_never_attaches_across_readers_and_human_paths(self):
+        lines = ('Never call helper() in util.py.backup from tests',
+                 'Never call helper() in util.py\u200b from tests',
+                 'Never call helper() from tests',
+                 'Never call helper() in util.py from tests')
+        for number, line in enumerate(lines):
+            with self.subTest(line=line):
+                repo,_ = self.fixture('scope'+str(number), ('single-line',))
+                (repo/'util.py').write_text('def helper(): pass\n')
+                subprocess.run(['git','-C',str(repo),'add','util.py'],check=True,capture_output=True)
+                transcript = self.base/('scope'+str(number)+'.log')
+                transcript.write_text('2026-11-11T09:00:00Z [user] '+line+'\n')
+                result = mb.learn_from_transcript(repo, transcript)
+                self.assertTrue(result['ok'],result)
+                nid = result['addedNodeIds'][0]
+                graph = mb._load_queue(repo)[0]
+                node = next(n for n in graph['nodes'] if n['id']==nid)
+                self.assertEqual('util.py' if number==3 else 'project_rules',node['scopeTag'])
+                # Model proposers may supply any label, including a truncated one.
+                node['scopeTag']='util.py'
+                self.save_graph(repo,graph)
+                self.assertEqual([],mb.literal_lesson_paths(repo,'util.py',''))
+                self.assertTrue(mb.learn_approve(repo,[nid],approver='Reviewer')['ok'])
+
+                def check(attached, human=False):
+                    node = next(n for n in mb._load_queue(repo)[0]['nodes'] if n['id']==nid)
+                    self.assertEqual(['util.py'] if human else [],mb.lesson_paths(node,repo))
+                    item = next(i for i in mb.dream_items(repo)['items'] if i['id']==nid)
+                    self.assertEqual(['util.py'] if attached else [],item.get('paths',[]))
+                    for items in (mb.dream_items(repo,files=['util.py'])['items'],
+                                  mb.unified_recall(repo,files=['util.py'])['sections']['dream']):
+                        self.assertEqual(attached,any(i['id']==nid for i in items))
+                    changed=[i for i in mb.changed_check(repo,files=['util.py'])['approvedLessons'] if i['id']==nid]
+                    self.assertEqual(1,len(changed))
+                    self.assertEqual('path' if attached else 'scope',changed[0]['via'])
+                    hand,caps,_ = self.bridge(repo)
+                    capsule = next(c for c in caps['capsules'] if c['id']==nid)
+                    self.assertEqual(['util.py'] if attached else [],capsule['paths'])
+                    # Both bridge documents use the same lesson selection.
+                    for entry in hand['activeConstraints']+hand['rejectedApproaches']:
+                        if entry['id']==nid:
+                            self.assertEqual(['util.py'] if attached else [],entry['paths'])
+
+                check(number==3)
+                if number<3:
+                    result=self.cli('learn','--paths',nid,'--by','Reviewer','--path','util.py','--repo',str(repo))
+                    self.assertEqual(0,result.returncode,result.stdout+result.stderr)
+                    check(True,human=True)
+
+    def test_scope_hint_is_informational_only(self):
+        repo,_=self.fixture('hint',('BLOCKS',))
+        rows=mb.changed_check(repo,files=['deploy.py'])['hints']
+        self.assertEqual(1,len(rows))
+        self.assertEqual('scope',rows[0]['via'])
+        self.assertNotIn('paths',rows[0])
+        self.assertEqual([],mb.dream_items(repo,tiers=('hint','pending'),files=['deploy.py'])['items'])
+        _,caps,_=self.bridge(repo)
+        self.assertFalse(any(c['id']==rows[0]['id'] for c in caps['capsules']))
 
     def test_rebuild_keeps_human_attachments(self):
         repo,nodes=self.fixture('approved',('single-line',));nid=nodes['single-line']['id']
@@ -123,7 +183,7 @@ class Lessons(Fixture):
         result=mb.learn_approve(repo,ids,approver='Reviewer',paths=['anchor.py'])
         self.assertTrue(result['ok'],result)
         self.assertIn('same paths apply to each',result['formatted'])
-        self.assertTrue(all(i['paths']==['anchor.py','deploy.py'] for i in mb.dream_items(repo)['items']))
+        self.assertTrue(all(i['paths']==['anchor.py'] for i in mb.dream_items(repo)['items']))
         graph=mb._load_queue(repo)[0];node=graph['nodes'][0]
         self.assertTrue(mb.learn_reject(repo,[node['edges'][0]['edgeId']],approver='Reviewer')['ok'])
         node=mb._load_queue(repo)[0]['nodes'][0]
@@ -189,7 +249,8 @@ class Lessons(Fixture):
         elsewhere=self.base/'nongit';elsewhere.mkdir();(elsewhere/'plain.py').write_text('regular')
         context=mb.lesson_path_context(elsewhere)
         self.assertFalse(context['is_git'])
-        self.assertEqual(['plain.py'],mb.literal_lesson_paths(elsewhere,'plain.py','',context=context))
+        self.assertEqual([],mb.literal_lesson_paths(elsewhere,'plain.py','',context=context))
+        self.assertEqual(['plain.py'],mb.literal_lesson_paths(elsewhere,'ignored','Use plain.py',context=context))
 
     def test_literal_attachments_use_raw_cited_lines(self):
         for i,hidden in enumerate(('','\u200b','\U000e0061','\x01','\t')):
@@ -217,7 +278,9 @@ class Lessons(Fixture):
                 self.assertEqual([] if hidden else ['anchor.py'],item.get('paths',[]))
                 self.assertEqual(not bool(hidden),bool(mb.dream_items(repo,files=['anchor.py'])['items']))
                 self.assertEqual(not bool(hidden),bool(mb.unified_recall(repo,files=['anchor.py'])['sections']['dream']))
-                self.assertEqual(not bool(hidden),bool(mb.changed_check(repo,files=['anchor.py'])['approvedLessons']))
+                changed=mb.changed_check(repo,files=['anchor.py'])['approvedLessons']
+                self.assertEqual(hidden in ('','\u200b','\U000e0061'),bool(changed))
+                if changed:self.assertEqual('scope' if hidden else 'path',changed[0]['via'])
                 _,caps,_=self.bridge(repo)
                 self.assertTrue(caps['capsules'])
                 self.assertEqual([] if hidden else ['anchor.py'],caps['capsules'][0]['paths'])
@@ -360,7 +423,9 @@ class ReviewRegressions(Fixture):
             with self.subTest(files=files):
                 self.assertEqual(expected,bool(mb.dream_items(repo,files=files)['items']))
                 self.assertEqual(expected,bool(mb.unified_recall(repo,files=files)['sections']['dream']))
-                self.assertEqual(expected,bool(mb.changed_check(repo,files=files)['approvedLessons']))
+                changed=mb.changed_check(repo,files=files)['approvedLessons']
+                self.assertEqual(expected or files==['DEPLOY.PY'],bool(changed))
+                if changed:self.assertEqual('path' if expected else 'scope',changed[0]['via'])
         for read in (mb.dream_items,mb.unified_recall,mb.changed_check):
             for outside in (str(self.base/'outside.py'),'../outside.py'):
                 self.assertTrue(any('outside repository' in n for n in read(repo,files=[outside])['notices']))

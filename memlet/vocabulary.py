@@ -52,3 +52,7 @@ CURRENT_MARKER = "[CURRENT]"
 APPROVAL_PATHS_LABEL = "Approval paths: "
 INACTIVE_APPROVAL_PATHS = ": inactive approval paths: "
 APPROVAL_PATHS_SUFFIX = " · paths "
+
+# changed_check provenance: scope is informational and never an attachment.
+LESSON_VIA_SCOPE = "scope"
+LESSON_VIA_PATH = "path"

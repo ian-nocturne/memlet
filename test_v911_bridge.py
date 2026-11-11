@@ -189,7 +189,7 @@ class BridgeContract(Fixture):
                         self.assertIn('memlet-approved', entry['tags'])
                         self.assertTrue(entry['cites'])
                         self.assertIn('.memlet/dream/snapshot/', entry['source'])
-                        self.assertEqual(['deploy.py'], entry['paths'])
+                        self.assertEqual([], entry['paths'])
             self.assertEqual(1, len(hand['activeConstraints']))
             self.assertEqual([], report['filesNotWritten'])
             self.assertTrue(mw.verify_handover_checksum(report))
@@ -327,8 +327,8 @@ class BridgeContract(Fixture):
         subprocess.run(['git','-C',str(self.root),'add','deploy.py','src/existing.py'],check=True,capture_output=True)
         nongit = self.base/'literal-nongit'; nongit.mkdir()
         (nongit/'deploy.py').write_text('pass\n')
-        self.assertEqual(['deploy.py'], hb._paths(nongit, 'deploy.py', 'No file named.'))
-        self.assertEqual(['deploy.py','src/existing.py'], hb._paths(self.root, 'deploy.py',
+        self.assertEqual([], hb._paths(nongit, 'deploy.py', 'No file named.'))
+        self.assertEqual(['src/existing.py'], hb._paths(self.root, 'deploy.py',
             'Use `src/existing.py` with nonexistent.py, escape.py, ../outside.py.'))
         self.assertEqual([], hb._paths(self.root, 'not-there.py', 'No file named.'))
 
@@ -751,8 +751,8 @@ class ReviewRegressions(Fixture):
         subprocess.run(['git','-C',str(self.root),'add','deploy.py','src/real.py'],check=True,capture_output=True)
         self.assertEqual([], hb._paths(self.root, 'DEPLOY.PY', 'Edit DEPLOY.PY and SRC/real.py.'))
         self.assertEqual([], hb._paths(self.root, 'src', 'No files named.'))
-        self.assertEqual(['deploy.py'], hb._paths(self.root, 'deploy.py::thing', 'No files named.'))
-        self.assertEqual(['src/real.py'], hb._paths(self.root, 'src/real.py', 'No files named.'))
+        self.assertEqual([], hb._paths(self.root, 'deploy.py::thing', 'No files named.'))
+        self.assertEqual([], hb._paths(self.root, 'src/real.py', 'No files named.'))
 
     def test_source_preserves_noncontiguous_intervals(self):
         cites = [{'file':'s.log','start':n,'end':n} for n in (1,9,10)]

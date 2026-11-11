@@ -22,6 +22,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -2586,7 +2587,12 @@ def extract_candidates_with_report(
             if not clean_body:
                 continue
             cue_body = clean_body.replace("\u2019", "'").replace("\u2018", "'")
-            scope_m = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))", clean_body)  # run starts only: linear, same first match
+            scope_m = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))(?![\w./-])", clean_body)  # run starts only: linear, same first match
+            # A display scope must not truncate a longer or hidden-character token.
+            if scope_m and any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me")
+                               for c in clean_body[max(0, scope_m.start()-1):scope_m.start()]
+                               + clean_body[scope_m.end():scope_m.end()+1]):
+                scope_m = None
             scope_tag = scope_m.group(1) if scope_m else "project_rules"
 
             if has_ts and _SUPERSEDE_CUE_RE.search(cue_body):
