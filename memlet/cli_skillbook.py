@@ -55,7 +55,13 @@ def dispatch(args) -> Dict[str, Any]:
         if getattr(args, "_repo_explicit", False) or args.repo != ".":
             token = sb._check_repo_override.set(args.repo)
         try:
-            res = dict(sb.check_skill(args.check))
+            res = dict(
+                sb.check_skill(
+                    args.check,
+                    max_lines=args.max_lines,
+                    budget=args.budget,
+                )
+            )
         finally:
             if token is not None:
                 sb._check_repo_override.reset(token)
@@ -77,7 +83,16 @@ def dispatch(args) -> Dict[str, Any]:
         return res
 
     if args.write:
-        res = dict(sb.write_skill(args.repo, out=args.out, name=args.name, force=args.force))
+        res = dict(
+            sb.write_skill(
+                args.repo,
+                out=args.out,
+                name=args.name,
+                max_lines=args.max_lines,
+                budget=args.budget,
+                force=args.force,
+            )
+        )
         if not res.get("ok"):
             res["exitCode"] = 1
         if args.format == "markdown":
