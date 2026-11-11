@@ -189,7 +189,8 @@ class _History:
         work = work or _Work()
         event_bound = min(MAX_EVENTS, MAX_NEIGHBOR_EVENTS) if work.bounded else MAX_EVENTS
         self.decisions, self.sidecars, self.conflicts = {}, {}, set()
-        self.merges = {}
+        self.merges, self.hidden_merges = {}, {}
+        previous_rows = {}
         self.notices = []
         self.originals = {}
         self.now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -249,8 +250,20 @@ class _History:
                         at = _time(row["at"])
                         if at is None:
                             continue
+                        key = (kind, ident)
+                        previous = previous_rows.get(key)
+                        if previous and _stamp(at) < _stamp(previous):
+                            self.conflicts.add(key)
+                            self.notice(v.GRAPH_ORDER_NOTICE)
+                            self.notice(v.GRAPH_ORDER_ITEM_NOTICE % mb.safe_lesson_display(str(ident), limit=160))
+                        previous_rows[key] = at
                         if kind == "node" and decision in ("merged", "unmerged"):
-                            self.merges.setdefault(ident, []).append(dict(at=at, seq=seq, decision=decision))
+                            if not isinstance(row.get("digest"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", row["digest"]):
+                                self.notice(v.GRAPH_CORRUPT_HISTORY_NOTICE)
+                                continue
+                            self.merges.setdefault(ident, []).append(dict(row, at=at))
+                            if not _before(at, self.now):
+                                self.notice(v.GRAPH_FUTURE_NOTICE)
                             continue  # merge rows never change an approval interval or digest
                         key = (kind, ident)
                         events = self.decisions.setdefault(key, [])
@@ -400,13 +413,6 @@ class _History:
                 else "VALID") if record.get("decision") == APPROVED else md.PENDING
             if kind == "node":
                 item["proposers"], item["verification"] = [], []
-        hidden = set()
-        for ident, rows in self.merges.items():
-            past = sorted((r for r in rows if _before(r["at"], as_of)), key=lambda r: (_stamp(r["at"]), r["seq"]))
-            if past and past[-1]["decision"] == "merged":
-                hidden.add(ident)
-        view["nodes"] = [n for n in view.get("nodes", []) if n.get("id") not in hidden]
-        view["edges"] = [e for e in view.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden]
         for node in view.get("nodes", []):
             node.pop("merge", None)  # present records cannot hide a lesson before its historical merged row
             restore(node, "node")
@@ -414,7 +420,52 @@ class _History:
                 restore(edge, "edge")
         for edge in view.get("edges", []):
             restore(edge, "edge")
+        nodes, duplicates = {}, set()
+        for n in view.get("nodes", []):
+            if n["id"] in nodes:
+                duplicates.add(n["id"])
+            nodes[n["id"]] = n
+        hidden = set()
+        for ident, rows in self.merges.items():
+            past = sorted((r for r in rows if _before(r["at"], as_of) and _before(r["at"], self.now)),
+                          key=lambda r: (_stamp(r["at"]), r["seq"]))
+            if not past or past[-1]["decision"] != "merged":
+                continue
+            row = past[-1]
+            member = self.originals.get(("node", ident))
+            into = self.merge_target(member, row, graph) if member else None
+            if (("node", ident) in self.conflicts or not isinstance(into, str) or into not in nodes
+                    or ident in duplicates or into in duplicates):
+                self.notice(v.MERGE_HISTORY_UNKNOWN + str(ident))
+                continue
+            decision = self.decision(nodes[into], "node", as_of).get("decision")
+            if decision == "rejected":
+                continue
+            if decision != APPROVED:
+                self.notice(v.MERGE_HISTORY_UNKNOWN + str(ident))
+                continue
+            hidden.add(ident)
+            self.hidden_merges[ident] = into
+        view["nodes"] = [n for n in view.get("nodes", []) if n.get("id") not in hidden]
+        view["edges"] = [e for e in view.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden]
         return view
+
+    def merge_target(self, member, row, graph):
+        """Recover only a target whose complete record matches the logged digest.
+
+        The ledger has no target column. After unmerge, reconstruct candidates
+        from available content and the recorded author/time; otherwise unknown.
+        """
+        rec = member.get("merge")
+        if isinstance(rec, dict) and md._canonical_digest(rec) == row["digest"]:
+            return rec.get("into")
+        for kept in graph.get("nodes", []):
+            for digest in (md.merge_approval_digest, md.node_approval_digest):
+                candidate = dict(schema=v.MERGE_SCHEMA, into=kept["id"], by=row["by"], at=row["at"],
+                                 memberDigest=digest(member), keepDigest=digest(kept))
+                if md._canonical_digest(candidate) == row["digest"]:
+                    return kept["id"]
+        return None
 
     def anchor_time(self, rule, anchor, config, pin, as_of=None):
         def matches(other):
@@ -630,7 +681,9 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
     config, error = mw.read_config(root)
     config = config or {}
     graph = history.replay(queue, as_of)
-    work.known_ids.update({n["id"]: "lesson" for n in graph.get("nodes", [])})
+    work.known_ids.update({n["id"]: "lesson" for n in queue.get("nodes", [])})
+    if ident in history.hidden_merges:
+        history.notice(v.MERGE_HISTORY_INTO % history.hidden_merges[ident])
     replacement_unknown = len(_supersession_ids(graph)) > MAX_SUPERSESSION_SLICE
     if replacement_unknown:
         # Every lesson/rule-currentness decision depends on this global set.

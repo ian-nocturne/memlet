@@ -206,6 +206,38 @@ class _OutputFormat(_ExplicitValue):
         namespace._format_explicit = True
 
 
+class _LearnParser(argparse.ArgumentParser):
+    """New learn spellings are exact-only; all old abbreviation rules survive."""
+    _merge_options = ("--merge", "--unmerge", "--same")
+
+    def _get_option_tuples(self, option_string):
+        return [entry for entry in super()._get_option_tuples(option_string)
+                if entry[1] not in self._merge_options]
+
+    def parse_known_args(self, args=None, namespace=None):
+        self._uses_merge_options = any(a.split("=", 1)[0] in self._merge_options for a in (args or []))
+        return super().parse_known_args(args, namespace)
+
+    def error(self, message):
+        if getattr(self, "_uses_merge_options", False):
+            return super().error(message)
+        # Match legacy error text and usage, including the required-mode list.
+        actions = self._actions
+        groups = [(g, g._group_actions) for g in self._action_groups + self._mutually_exclusive_groups]
+        def old(action):
+            return not any(o in self._merge_options for o in action.option_strings)
+        try:
+            self._actions = [a for a in actions if old(a)]
+            for group, entries in groups:
+                group._group_actions = [a for a in entries if old(a)]
+            message = message.replace(" --merge --unmerge", "")
+            super().error(message)
+        finally:
+            self._actions = actions
+            for group, entries in groups:
+                group._group_actions = entries
+
+
 def _reserve_legacy_prefixes(parser):
     """Reserve old unique abbreviations without expanding the visible help.
 
@@ -690,6 +722,7 @@ def _build_parser():
     for name in ('feedback','skill-manage'):
         sub.add_parser(name).add_argument('--file',required=True)
     learn=sub.add_parser('learn')
+    learn.__class__ = _LearnParser
     learn_mode=learn.add_mutually_exclusive_group(required=True)
     learn_mode.add_argument('--file',help='Existing memory-store learning request JSON')
     sub.add_parser('skill-sync')
@@ -747,7 +780,6 @@ def _build_parser():
     learn.add_argument('--repo',action=_ExplicitValue,default='.')
     learn.add_argument('--vendor',action=_ExplicitValue,default='autonomous-deterministic')
     learn.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    _reserve_legacy_prefixes(learn)
     from memlet.vocabulary import MERGE_HELP, UNMERGE_HELP, MERGE_SAME_HELP
     learn_mode.add_argument('--merge', metavar='KEEP', help=MERGE_HELP)
     learn_mode.add_argument('--unmerge', metavar='ID', nargs='+', help=UNMERGE_HELP)

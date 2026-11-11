@@ -248,3 +248,15 @@ MERGE_DONE = "## Memlet learn — %s by %s"
 MERGE_HELP = "Keep one lesson; a person says the members say the same thing"
 UNMERGE_HELP = "Show the named members separately again"
 MERGE_SAME_HELP = "Lessons that say the same thing as the kept lesson"
+
+# N1 fix round: fixed lapse and guidance labels.
+MERGE_REASONS.update({
+    "duplicate-id": "A merge touching a duplicated lesson id cannot hold.",
+    "unverified-read": "Merge state is unknown without verified lesson tiers.",
+})
+MERGE_INVALID_LINE = "invalid merge record"
+MERGE_PATH_LIMIT = "No path command: attachments are limited to 8 paths in total."
+MERGE_PATH_APPROVAL = "Paths can be attached once the kept lesson is approved."
+MERGE_HISTORY_REPAIRED = "Recorded the missing decision log row for "
+MERGE_HISTORY_UNKNOWN = "Merge state at that time is unknown: "
+MERGE_HISTORY_INTO = "Merged into %s at that time."

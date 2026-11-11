@@ -119,7 +119,7 @@ class MergeTests(fixtures.Scratch):
                 before = (self.root / mb.QUEUE_REL).read_bytes()
                 events = list(mb.decision_events(self.root))
                 read = mb.merge_blockers(self.root, keep, same)
-                self.assertFalse(read['ok'], read)
+                self.assertTrue(read['ok'], read)
                 result = mb.learn_merge(self.root, keep, same, approver='Reviewer')
                 self.assertFalse(result['ok'], result)
                 self.assertIn(reason, [r['reason'] for r in result['refused']])
@@ -184,13 +184,13 @@ class MergeTests(fixtures.Scratch):
 
     def test_lapse_approved_keep_falls_to_pending_and_recovery(self):
         # Node digest/approval stay valid; a rejected edge demotes the shared tier.
-        self.lapse('keep-not-approved', lambda g: g['nodes'][0]['edges'][0]['approval'].update(decision='rejected'))
+        self.lapse('keep-not-approved', lambda g: g['nodes'][0]['approval'].update(decision='pending'))
 
     def test_lapse_snapshot_not_just_stored_approval(self):
         self.merge()
         path = self.root / mb.SNAPSHOT_REL / 's.log'; before = path.read_bytes()
         path.write_text('\n'.join(['changed first line'] + self.lines[1:]) + '\n')
-        self.assertEqual('keep-not-approved', self.state()['reason'])
+        self.assertEqual('relation-types', self.state()['reason'])
         self.assertIn('B', [i['id'] for i in mb.dream_items(self.root)['items']])
         path.write_bytes(before)
         self.assertEqual('merged', self.state()['state'])
@@ -200,9 +200,9 @@ class MergeTests(fixtures.Scratch):
         self.assertEqual(mb.merge_view(self.root), mb.merge_view(self.root, context=mb.lesson_path_context(self.root)))
         g = self.graph(); g['nodes'][0]['edges'][0]['approval']['decision'] = 'rejected'; self.save(g)
         context = mb.lesson_path_context(self.root)
-        self.assertEqual('keep-not-approved', mb.merge_view(self.root, context=context)['states']['B']['reason'])
+        self.assertEqual('relation-types', mb.merge_view(self.root, context=context)['states']['B']['reason'])
         with mock.patch.object(mb, 'dream_tiers', side_effect=AssertionError('reuse the computed tiers')):
-            self.assertEqual('keep-not-approved', mb.merge_view(self.root, context=context)['states']['B']['reason'])
+            self.assertEqual('relation-types', mb.merge_view(self.root, context=context)['states']['B']['reason'])
 
     def test_rebuild_preserves_merge_decision_for_changed_content(self):
         self.merge()
@@ -227,7 +227,7 @@ class MergeTests(fixtures.Scratch):
         self.assertEqual(['B', 'C'], [i['id'] for i in result['mergedLessons'][0]['members']])
         self.assertEqual(1, result['counts']['pendingNodes'])
         self.assertEqual(['E-A'], [i['edgeId'] for i in result['pendingEdges']])
-        self.assertIn('  - `B` says the same as `A`', result['formatted'])
+        self.assertIn('  - `B` [pending] says the same as `A`', result['formatted'])
         self.assertEqual([], mb.dream_items(self.root)['items'])
         self.assertEqual(['A'], [i['id'] for i in mb.dream_items(self.root, tiers=('pending',))['items']])
 
@@ -384,7 +384,7 @@ class MergeTests(fixtures.Scratch):
         result = self.merge()
         self.assertEqual({'B':['other.py']}, result['lostFiles'])
         command = 'memlet learn --paths A --by Reviewer --path other.py'
-        self.assertEqual(command, result['pathCommands']['B']); self.assertIn(command, result['formatted'])
+        self.assertEqual(command, result['pathCommands']['A']); self.assertIn(command, result['formatted'])
         self.assertEqual([], mg.neighbors(self.root, 'other.py')['groups']['blocks'])
         out = self.hook_outputs('guard')
         guard = out['guard']['hookSpecificOutput']
@@ -437,12 +437,285 @@ class MergeTests(fixtures.Scratch):
                 self.assertTrue(result.failures or result.errors, reason + ' survived')
 
 
+    def test_relations_hold_after_member_approval_and_keep_edge_changes(self):
+        for mode in ('approve-member', 'reject-edge', 'drift-edge'):
+            with self.subTest(mode=mode):
+                g = copy.deepcopy(self.original)
+                a, b, c = g['nodes']
+                a['edges'][0]['edgeType'] = 'RESOLVES'
+                self.seal(a)
+                if mode == 'approve-member':
+                    b.pop('approval'); b['edges'][0].pop('approval')
+                else:
+                    lines = self.lines + ['2026-01-01T00:09:00Z [user] Never retry separate rule in src.py.']
+                    self.write(mb.SNAPSHOT_REL + '/s.log', '\n'.join(lines) + '\n')
+                    pin = md.resolve_pin({'s.log': lines}, 's.log:4')
+                    edge = copy.deepcopy(a['edges'][0])
+                    edge.update(edgeId='E-A2', edgeType='BLOCKS', srcPin=pin,
+                                srcTimestamp=md.extract_line_timestamp(pin['quoteText']))
+                    a['edges'].append(edge); self.seal(a)
+                g['edges'] = [copy.deepcopy(e) for n in g['nodes'] for e in n['edges']]; self.save(g)
+                self.merge()
+                if mode == 'approve-member':
+                    self.assertTrue(mb.learn_approve(self.root, ['B'], approver='R')['ok'])
+                elif mode == 'reject-edge':
+                    self.assertTrue(mb.learn_reject(self.root, ['E-A2'], approver='R')['ok'])
+                else:
+                    self.write(mb.SNAPSHOT_REL + '/s.log', '\n'.join(self.lines + ['changed edge line']) + '\n')
+                self.assertEqual('relation-types', self.state()['reason'])
+                self.assertEqual('approved', next(i['tier'] for i in mb.dream_items(self.root)['items'] if i['id']=='B'))
+                guard = self.hook_outputs('relations-' + mode)['guard']['hookSpecificOutput']
+                self.assertEqual('deny', guard['permissionDecision'])
+                self.assertIn('lesson B in src.py', guard['permissionDecisionReason'])
+                self.write(mb.SNAPSHOT_REL + '/s.log', '\n'.join(self.lines) + '\n')
+
+    def test_printed_paths_command_is_one_union_and_merge_survives_both_orders(self):
+        import shlex
+        self.write('third.py', 'pass\n')
+        subprocess.run(['git', '-C', str(self.root), 'add', 'third.py'], check=True, capture_output=True)
+        for ident, paths in [('A',['src.py']), ('B',['other.py']), ('C',['third.py'])]:
+            self.assertTrue(mb.learn_paths(self.root, [ident], approver='R', paths=paths)['ok'])
+        before = self.graph()
+        for order in ('merge-first', 'paths-first'):
+            self.save(copy.deepcopy(before))
+            result = self.merge(same=('B','C'))
+            self.assertEqual(['A'], list(result['pathCommands']))
+            command = result['pathCommands']['A']
+            self.assertEqual(1, result['formatted'].count('memlet learn --paths'))
+            if order == 'paths-first':
+                mb.learn_unmerge(self.root, ['B','C'], approver='R')
+            run = self.cli(*shlex.split(command)[1:], '--repo', str(self.root))
+            self.assertEqual(0, run.returncode, run.stderr + run.stdout)
+            if order == 'paths-first': self.merge(same=('B','C'))
+            self.assertEqual({'A':['B','C']}, mb.merge_view(self.root)['members'])
+            self.assertEqual(['src.py','other.py','third.py'], self.graph()['nodes'][0]['approvedPaths'])
+            self.assertEqual(['A'], [i['id'] for i in mb.dream_items(self.root, files=['third.py'])['items']])
+            # A member attachment is also outside merge identity, while approvals remain sealed.
+            self.assertTrue(mb.learn_paths(self.root, ['B'], approver='R', paths=['src.py'])['ok'])
+            self.assertEqual('merged', self.state()['state'])
+            old=json.loads(self.run_code(self.baseline(), "from memlet import memlet_bridge as b, memlet_dream as d; from pathlib import Path; import sys,json; print(json.dumps([d.approval_state(n,'node') for n in b._load_queue(Path(sys.argv[1]))[0]['nodes']]))"))
+            self.assertEqual(['approved']*3, old)
+
+    def test_path_guidance_limit_and_hint_member(self):
+        for i in range(9): self.write('file%d.py'%i, 'pass\n')
+        subprocess.run(['git','-C',str(self.root),'add','.'],check=True,capture_output=True)
+        self.assertTrue(mb.learn_paths(self.root,['A'],approver='R',paths=['file0.py'])['ok'])
+        self.assertTrue(mb.learn_paths(self.root,['B'],approver='R',paths=['file%d.py'%i for i in range(1,9)])['ok'])
+        result=self.merge()
+        self.assertEqual({},result['pathCommands']); self.assertIn('8 paths', result['formatted'])
+        # Real hint receipts, then literal-only lost reach for a hint member.
+        g=copy.deepcopy(self.original)
+        lines=[self.lines[0],self.lines[1].replace('src.py','other.py'),self.lines[2]]
+        self.write(mb.SNAPSHOT_REL+'/s.log','\n'.join(lines)+'\n')
+        b=g['nodes'][1]; pin=md.resolve_pin({'s.log':lines},'s.log:2'); b.update(primaryPin=pin,allPins=[pin])
+        b['edges'][0]['srcPin']=pin
+        for n in g['nodes']:
+            n.pop('approval',None)
+            for e in n['edges']: e.pop('approval',None)
+        b['proposers']=[dc.seal_receipt(dict(origin='vendor-cli',vendor='claude',model='haiku',isolation='tool-free',at=STAMP,runId='a'*24,digest=dc.trust_digest(b)))]
+        b['verification']=[dc.seal_receipt(dict(origin='vendor-cli',vendor='codex',model='gpt-5',isolation='tool-free',at=STAMP,runId='a'*24,digest=dc.trust_digest(b),verdict='SUPPORTED'))]
+        g['edges']=[copy.deepcopy(e) for n in g['nodes'] for e in n['edges']];self.save(g)
+        result=self.merge()
+        self.assertEqual({'B':['other.py']},result['lostFiles'])
+        self.assertEqual({},result['pathCommands']);self.assertIn('once the kept lesson is approved',result['formatted'])
+
+    def test_replacement_flags_and_rejected_member_lapse(self):
+        for field,value in [('statusKind','superseded_rule'),('category','superseded_directive'),('verdict','ALREADY_SUPERSEDED'),('supersededByPin',self.original['nodes'][2]['primaryPin'])]:
+            for index in (0,1):
+                with self.subTest(field=field,index=index):
+                    g=copy.deepcopy(self.original);g['nodes'][index][field]=value;self.seal(g['nodes'][index]);self.save(g)
+                    self.assertIn('supersedes',mb.merge_blockers(self.root,'A',['B'])['blockers']['B'])
+                    # Matching merge digests do not override a replacement's status.
+                    a,b,_=g['nodes'];b['merge']=dict(schema=v.MERGE_SCHEMA,into='A',by='R',at=STAMP,
+                        memberDigest=md.merge_approval_digest(b),keepDigest=md.merge_approval_digest(a));self.save(g)
+                    self.assertNotEqual('merged',self.state()['state'])
+        self.save(copy.deepcopy(self.original));self.merge()
+        self.assertTrue(mb.learn_reject(self.root,['B'],approver='R')['ok'])
+        self.assertEqual('member-rejected',self.state()['reason'])
+        self.assertNotIn('mergedFrom',mb.dream_items(self.root)['items'][0])
+        self.assertEqual('B',mb.learn_pending(self.root)['lapsedMerges'][0]['id'])
+
+    def test_unverified_reads_never_apply_merges_and_flat_verified_does(self):
+        self.merge();g=self.graph();nodes={n['id']:n for n in g['nodes']}
+        self.assertNotEqual('merged',mb.merge_state(nodes['B'],nodes)['state'])
+        for missing in ('A','B'):
+            snap=mb._load_snapshot(self.root)[0]
+            ns=mb._merge_nodes(g,mb.dream_tiers(g,snapshot=snap,config={}),snap)
+            ns[missing].pop('tier')
+            self.assertNotEqual('merged',mb.merge_state(ns['B'],ns)['state'])
+        with mock.patch.object(mb, '_load_snapshot', return_value=(None, 'snapshot unavailable')):
+            self.assertNotEqual('merged', self.state()['state'])
+        no_merge=copy.deepcopy(g);no_merge['nodes'][1].pop('merge')
+        self.assertEqual(md.recall_subgraph(no_merge,allow_unverified=True),md.recall_subgraph(g,allow_unverified=True))
+        snap=mb._load_snapshot(self.root)[0]
+        self.assertNotIn('[B]',md.format_flat_memory(g,snapshot_files=snap))
+        self.assertIn('[B]',md.format_flat_memory(g,allow_unverified=True))
+
+    def test_cycle_only_lapses_cycle_members(self):
+        g=self.graph();a,b,c=g['nodes']
+        for member,keep in ((a,c),(c,a),(b,a)):
+            member['merge']=dict(schema=v.MERGE_SCHEMA,into=keep['id'],by='R',at=STAMP,
+                memberDigest=md.node_approval_digest(member),keepDigest=md.node_approval_digest(keep))
+        self.save(g);states=mb.merge_view(self.root)['states']
+        self.assertEqual('merge-cycle',states['A']['reason']);self.assertEqual('merge-cycle',states['C']['reason'])
+        self.assertEqual('merged',states['B']['state'])
+
+    def test_duplicate_ids_fail_open_and_invalid_records_have_fixed_lines(self):
+        with mock.patch.object(md, '_utc_now_iso', return_value='2026-01-03T00:00:00Z'): self.merge()
+        g=self.graph();g['nodes'].append(copy.deepcopy(g['nodes'][1]));g['nodes'][-1].pop('merge')
+        # Deliberate hand edit; the DB writer correctly refuses duplicate ids.
+        (self.root/mb.QUEUE_REL).write_text(json.dumps(g))
+        self.assertEqual('duplicate-id',self.state()['reason'])
+        self.assertEqual(2,sum(i['id']=='B' for i in mb.dream_items(self.root)['items']))
+        historical=mg.build_graph(self.root, as_of='2026-01-04T00:00:00Z')
+        self.assertIn('B',[n['id'] for n in historical['nodes']])
+        for value in (None,12,[],{}):
+            g=copy.deepcopy(self.original);g['nodes'][1]['merge']={'into':value}
+            (self.root/mb.QUEUE_REL).write_text(json.dumps(g))
+            result=mb.learn_pending(self.root,_record_review=False)
+            self.assertIn('invalid merge record',result['formatted']);self.assertNotIn('`None`',result['formatted'])
+
+    def test_pending_hidden_counts_tiers_edges_and_citation_notice(self):
+        self.merge();result=mb.learn_pending(self.root,_record_review=False)
+        self.assertEqual(2,result['counts']['approvedNodes']);self.assertEqual(1,result['counts']['hiddenMergedNodes'])
+        self.assertEqual(2,result['counts']['approvedEdges']);self.assertIn('`B` [approved]',result['formatted'])
+        self.write(mb.SNAPSHOT_REL+'/s.log','\n'.join([self.lines[0],'changed member line',self.lines[2]])+'\n')
+        result=mb.learn_pending(self.root,_record_review=False)
+        member=result['mergedLessons'][0]['members'][0]
+        self.assertEqual('pending',member['tier']);self.assertFalse(member['pinsVerify'])
+        self.assertIn('`B` [pending]',result['formatted']);self.assertIn(member['citationReason'],result['formatted'])
+        self.write(mb.SNAPSHOT_REL+'/s.log','\n'.join(self.lines)+'\n')
+        g=self.graph();edge=copy.deepcopy(g['edges'][2]);edge.update(edgeId='INTO-B',toId='B');edge.pop('approval');g['edges'].append(edge);self.save(g)
+        self.assertNotIn('INTO-B',[e['edgeId'] for e in mb.learn_pending(self.root,_record_review=False)['pendingEdges']])
+
+    def test_retry_repairs_missing_decision_and_then_is_unchanged(self):
+        for operation in ('merge','unmerge'):
+            if operation=='unmerge' and self.state()['state']!='merged': self.merge()
+            fn=lambda: (mb.learn_merge(self.root,'A',['B'],approver='R') if operation=='merge' else mb.learn_unmerge(self.root,['B'],approver='R'))
+            with mock.patch.object(mb,'_decision_event_write',side_effect=OSError('injected ledger unavailable')):
+                first=fn()
+            self.assertFalse(first['ok']);self.assertEqual(['B'],first['applied'])
+            second=fn();self.assertTrue(second['ok']);self.assertEqual(['B'],second['repaired'])
+            self.assertIn('missing decision log row',second['formatted'])
+            self.assertEqual(operation+'d',mb.decision_events(self.root,'B')[-1]['decision'])
+            before=(self.root/mb.QUEUE_REL).read_bytes();events=list(mb.decision_events(self.root))
+            third=fn();self.assertEqual(['B'],third['unchanged']);self.assertEqual([],third['applied'])
+            self.assertEqual(events,mb.decision_events(self.root));self.assertEqual(before,(self.root/mb.QUEUE_REL).read_bytes())
+
+    def test_history_rejection_known_member_order_future_and_bad_digest(self):
+        with mock.patch.object(md,'_utc_now_iso',return_value='2026-01-03T00:00:00Z'): self.merge()
+        got=mg.neighbors(self.root,'B',as_of='2026-01-03T12:00:00Z')
+        self.assertTrue(got['ok'],got);self.assertIn('Merged into A at that time.',got['notices'])
+        with mock.patch.object(md,'_utc_now_iso',return_value='2026-01-04T00:00:00Z'):
+            self.assertTrue(mb.learn_reject(self.root,['A'],approver='R')['ok'])
+        graph=mg.build_graph(self.root,as_of='2026-01-05T00:00:00Z')
+        self.assertIn('B',[n['id'] for n in graph['nodes']])
+        row=mb.decision_events(self.root,'B')[-1]
+        mb._decision_event_write(self.root,[('2026-01-01T00:00:00Z','B','node','unmerged','R',row['digest'],'[]')])
+        self.assertIn(v.GRAPH_ORDER_NOTICE,mg.build_graph(self.root)['notices'])
+        mb._decision_event_write(self.root,[('2999-01-01T00:00:00Z','B','node','merged','R',row['digest'],'[]')])
+        self.assertIn(v.GRAPH_FUTURE_NOTICE,mg.build_graph(self.root)['notices'])
+        mb._decision_event_write(self.root,[('2026-01-06T00:00:00Z','C','node','merged','R','bad','[]')])
+        history=mg._History(self.root,graph=self.graph())
+        self.assertNotIn('C',history.merges);self.assertIn(v.GRAPH_CORRUPT_HISTORY_NOTICE,history.notices)
+        # A syntactically valid digest without reconstructible target remains unknown.
+        mb._decision_event_write(self.root,[('2026-01-07T00:00:00Z','C','node','merged','R','sha256:'+'a'*64,'[]')])
+        result=mg.build_graph(self.root,as_of='2026-01-08T00:00:00Z')
+        self.assertIn('C',[n['id'] for n in result['nodes']]);self.assertTrue(any('unknown' in n for n in result['notices']))
+
+    def test_surviving_reader_and_record_mutants(self):
+        self.merge()
+        page=(self.root/mb.PROMOTED_PAGE).read_text()
+        self.assertNotIn('lesson B in src.py',page)  # command itself refreshed it
+        self.assertNotIn('B',[n['id'] for n in cortex._load_dream_lineage({'path':str(self.root)})['nodes']])
+        mb.learn_unmerge(self.root,['B'],approver='R')
+        self.assertIn('lesson B in src.py',(self.root/mb.PROMOTED_PAGE).read_text())
+        # Leave the materialized page stale so its reader's own filter is exercised.
+        g=self.graph();a,b,_=g['nodes'];b['merge']=dict(schema=v.MERGE_SCHEMA,into='A',by='R',at=STAMP,
+            memberDigest=md.node_approval_digest(b),keepDigest=md.node_approval_digest(a));self.save(g)
+        self.assertNotIn('B',[n['dreamId'] for n in mb.promoted_rule_entries(self.root)[0]])
+        for field,value in [('by',''),('by',None),('at','bad'),('at',None)]:
+            changed=copy.deepcopy(g);changed['nodes'][1]['merge'][field]=value;self.save(changed)
+            self.assertEqual('invalid-record',self.state()['reason'])
+        snap=mb._load_snapshot(self.root)[0]
+        ns=mb._merge_nodes(g,mb.dream_tiers(g,snapshot=snap,config={}),snap)
+        ns['A']['verdict']=md.REJECTED
+        self.assertEqual('keep-rejected',mb.merge_state(ns['B'],ns)['reason'])
+        g['nodes'][0]['verdict']=md.REJECTED;self.save(g)
+        self.assertEqual('keep-rejected',self.state()['reason'])
+
+    def test_subset_counts_only_approved_verified_relations(self):
+        for status in ('pending','rejected'):
+            for owner in (0,1):
+                g=copy.deepcopy(self.original)
+                for n in g['nodes']:
+                    n['edges'][0]['edgeType']='RESOLVES';self.seal(n)
+                edge=copy.deepcopy(g['nodes'][owner]['edges'][0]);edge.update(edgeId='EXTRA',edgeType='BLOCKS')
+                if status=='pending':edge.pop('approval')
+                else:edge['approval']['decision']='rejected'
+                g['nodes'][owner]['edges'].append(edge)
+                if owner==0:
+                    g['nodes'][1]['edges'][0]['edgeType']='BLOCKS';self.seal(g['nodes'][1])
+                g['edges']=[copy.deepcopy(e) for n in g['nodes'] for e in n['edges']];self.save(g)
+                result=mb.merge_blockers(self.root,'A',['B'])
+                self.assertTrue(result['ok'])
+                self.assertEqual(owner==0,'relation-types' in result['blockers'].get('B',[]))
+
+    def test_context_cost_2000_lessons_40_checks_and_promoted_queue_once(self):
+        g=self.graph();source=g['nodes'][0];g['nodes']=[]
+        for index in range(2000):
+            n=copy.deepcopy(source);n['id']='N%d'%index
+            n['edges'][0].update(edgeId='E%d'%index,fromId=n['id']);self.seal(n);g['nodes'].append(n)
+        g['edges']=[n['edges'][0] for n in g['nodes']]
+        snap=mb._load_snapshot(self.root)[0]
+        context=mb.lesson_path_context(self.root)
+        context.update(graph=g,snapshot=snap,config={})
+        with mock.patch.object(mb,'merge_state',wraps=mb.merge_state) as state, mock.patch.object(mb,'dream_tiers',wraps=mb.dream_tiers) as tiers, mock.patch.object(mb,'lesson_path_context',side_effect=AssertionError('reuse passed attachment context')):
+            for _ in range(40): self.assertTrue(mb.merge_blockers(self.root,'N0',['N1'],context=context)['ok'])
+        self.assertEqual(2000,state.call_count);self.assertEqual(1,tiers.call_count)
+        self.merge()
+        with mock.patch.object(mb,'_load_queue',wraps=mb._load_queue) as load:
+            mb.promoted_rule_entries(self.root)
+        self.assertEqual(1,load.call_count)
+
+    def test_920_all_learn_prefix_results_and_error_text(self):
+        script=r'''
+import argparse,contextlib,io,json,sys
+import memory_cli
+parser=memory_cli._build_parser()
+learn=next(a for a in parser._actions if isinstance(a,argparse._SubParsersAction)).choices['learn']
+names={o for a in learn._actions for o in a.option_strings if o.startswith('--') and o not in ('--merge','--unmerge','--same')}
+prefixes=sorted({o[:i] for o in names for i in range(3,len(o)+1)})
+result={}
+for prefix in prefixes:
+    for argv in (['learn',prefix],['learn',prefix,'X'],['learn','--pending',prefix,'X'],['learn','--approve','A','--by','R',prefix,'X']):
+        err=io.StringIO()
+        with contextlib.redirect_stderr(err),contextlib.redirect_stdout(io.StringIO()):
+            try:
+                ns=vars(parser.parse_args(argv));out=['ok',{k:v for k,v in ns.items() if k not in ('merge','unmerge','same') and not callable(v)}]
+            except SystemExit as exc:out=['exit',exc.code,err.getvalue()]
+        result[' '.join(argv)]=out
+print(json.dumps(result,sort_keys=True,default=str))
+'''
+        old=json.loads(self.run_code(self.baseline(),script));new=json.loads(self.run_code(Path(__file__).parent,script))
+        for argv, result in old.items():
+            with self.subTest(argv=argv):self.assertEqual(result,new[argv])
+
+
+    def test_baseline_unavailable_skips_clearly(self):
+        with mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['git'], 128, b'', b'unknown revision')):
+            with self.assertRaisesRegex(unittest.SkipTest, '1181ec5.*export or shallow clone'):
+                self.baseline()
+
     def baseline(self):
         target = self.base / 'baseline'
         if not target.exists():
             target.mkdir()
             archive = subprocess.run(['git', 'archive', '1181ec5'], cwd=Path(__file__).parent,
-                                     capture_output=True, check=True).stdout
+                                     capture_output=True)
+            if archive.returncode:
+                self.skipTest('9.2.0 compatibility requires readable git commit 1181ec5 (not available in this export or shallow clone)')
+            archive = archive.stdout
             with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
                 # Only this trusted, pinned local commit is extracted.
                 for entry in bundle.getmembers():
