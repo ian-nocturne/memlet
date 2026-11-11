@@ -45,3 +45,10 @@ def suggested_label(item):
 LESSON_SEPARATOR = " ⟶ "
 # Schema: 3 source spans + 1 replacement + 4 edges with 2 endpoints, each at most 4 lines.
 MAX_LESSON_LINES = 48
+
+REPLACED_MARKER = "[REPLACED — do not apply as current]"
+CURRENT_MARKER = "[CURRENT]"
+
+APPROVAL_PATHS_LABEL = "Approval paths: "
+INACTIVE_APPROVAL_PATHS = ": inactive approval paths: "
+APPROVAL_PATHS_SUFFIX = " · paths "

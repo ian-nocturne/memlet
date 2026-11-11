@@ -8,6 +8,7 @@ from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING a
 import copy
 import hashlib
 import json
+import os
 import posixpath
 import re
 import time
@@ -765,7 +766,60 @@ def _verification_candidates(root, vendor, model, agreement):
     return sorted(out, key=lambda n: min(r["at"] for r in n["proposers"] if trusted_record(r, n)))
 
 
-def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=None, dry_run=False, transcript=None):
+def _fixture_directory(directory):
+    path = Path(directory).absolute()
+    if ".memlet" in path.parts:
+        raise ValueError("fixture directory must be outside .memlet")
+    for part in [path] + list(path.parents):
+        if part.is_symlink():
+            raise ValueError("refusing symlinked fixture directory")
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ValueError("fixture target must be a directory")
+    return path
+
+
+def mask_fixture_text(text):
+    text = md.mask_secrets(text)
+    text = re.sub(r"(?:/Users/|/home/)[^/\s\"'`]+", "/masked-home", text)
+    owner = os.environ.get("USER", "")
+    if len(owner) >= 3:
+        text = re.sub(r"(?<![\w])" + re.escape(owner) + r"(?![\w])", "fixture-owner", text, flags=re.I)
+    return text
+
+
+def fixture_items(nodes):
+    return [{"category": n["category"], "relations": sorted({e["edgeType"] for e in n.get("edges", [])}),
+             "spans": [p["span"] for p in md.lesson_lines(n)],
+             "quoteLines": [p["quote"] for p in md.lesson_lines(n)]} for n in nodes]
+
+
+def _save_answer(directory, vendor, model, kind, data, answer, expected):
+    if directory is None:
+        return
+    import uuid
+    from . import VERSION
+    fixture = {"schema": "memlet.dream_fixture.v1", "provenance": "recorded", "vendor": vendor,
+               "model": model, "memletVersion": VERSION, "date": md._utc_now_iso(),
+               "note": "Explicit capture; model answer and input masked before writing.",
+               "kind": kind, "input": data, "answer": answer, "expected": expected}
+    def masked(value):
+        if isinstance(value, str):
+            return mask_fixture_text(value)
+        if isinstance(value, dict):
+            return {k: masked(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [masked(v) for v in value]
+        return value
+    raw = json.dumps(masked(fixture), ensure_ascii=False, indent=2) + "\n"
+    target = _fixture_directory(directory) / (kind + "-" + uuid.uuid4().hex + ".json")
+    # Exclusive creation never follows or overwrites an existing file.
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(raw)
+
+
+def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=None, dry_run=False, transcript=None, save_fixture=None):
     started = time.monotonic()
     report = {"ok": True, "calls": 0, "batches": 0, "failedBatches": 0, "droppedOutput": 0,
               "rejectedCandidates": 0, "normalizedSpans": 0, "items": [], "errors": [], "notices": [],
@@ -773,6 +827,8 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
               "dryRun": dry_run, "prompts": [], "callLog": [], "trustBoundary": TRUST_BOUNDARY}
     try:
         root, config = _repo(repo)
+        if save_fixture is not None:
+            _fixture_directory(save_fixture)
         vendors = list(dict.fromkeys(via))
         if not vendors or any(v not in vc.VENDORS for v in vendors) or verify_with not in (None,) + vc.VENDORS:
             raise ValueError("unknown vendor")
@@ -861,9 +917,11 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     if not isinstance(verdict, dict) or set(verdict) != {"verdict"} or verdict["verdict"] not in VERDICTS:
                         raise ValueError("invalid verdict")
                 except ValueError:
+                    _save_answer(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": None})
                     report["droppedOutput"] += 1
                     report["notices"].append(nid + ": dropped verifier verdict from " + verify_with + "/" + verifier_model + ": invalid or failed output")
                     continue
+                _save_answer(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": verdict["verdict"]})
                 with md.queue_lock(root / mb.QUEUE_REL):
                     graph, _ = mb._load_queue(root)
                     target = next((n for n in (graph or {}).get("nodes", []) if n["id"] == nid), None)
@@ -943,6 +1001,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             if not isinstance(cands, list) or len(cands) > MAX_CANDIDATES:
                                 raise ValueError("expected bounded candidate array")
                         except ValueError as exc:
+                            _save_answer(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], {"failed": True, "items": [], "rejectionCodes": []})
                             report["droppedOutput"] += 1
                             report["failedBatches"] += 1
                             report["errors"].append(str(exc))
@@ -955,6 +1014,10 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             success = False
                             break
                         submitted = _submit(root, run_id, batch["batchId"], cands, v, result, batch, complete=False)
+                        if save_fixture is not None:
+                            graph, _ = mb._load_queue(root)
+                            captured = [n for n in (graph or {}).get("nodes", []) if n["id"] in submitted["itemIds"]]
+                            _save_answer(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], {"failed": not submitted["ok"], "items": fixture_items(captured), "rejectionCodes": [r["reasonCode"] for r in submitted[TIER_REJECTED]]})
                         report["items"].extend(submitted["itemIds"])
                         _keep_rejections(report, submitted[TIER_REJECTED])
                         report["normalizedSpans"] += submitted["normalizedSpans"]

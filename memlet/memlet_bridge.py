@@ -26,7 +26,8 @@ from __future__ import annotations
 
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
 from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT, VENDOR_AGREEMENT,
-                         VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS, SAME_VENDOR_REVIEW)
+                         VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS, SAME_VENDOR_REVIEW,
+                         APPROVAL_PATHS_LABEL, INACTIVE_APPROVAL_PATHS, APPROVAL_PATHS_SUFFIX)
 
 import contextlib
 import copy
@@ -34,6 +35,8 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import time
 import unicodedata
 import sqlite3
 import subprocess
@@ -335,7 +338,8 @@ def _merge(old: Optional[Dict[str, Any]], built: Dict[str, Any], snap: Dict[str,
         nid = str(n.get("id"))
         new_ids.add(nid)
         o = old_by_id.get(nid)
-        if o is not None and md.node_approval_digest(o) == md.node_approval_digest(n) and _intact(o):
+        candidate = dict(n, approvedPaths=o["approvedPaths"]) if o is not None and "approvedPaths" in o else n
+        if o is not None and md.node_approval_digest(o) == md.node_approval_digest(candidate) and _intact(o):
             out_nodes.append(o)
         else:
             out_nodes.append(n)
@@ -536,6 +540,170 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
     return res
 
 
+def valid_lesson_path(root, path):
+    """Exact, contained regular file; an attachment names a location, not content identity.
+
+    Recreating a removed file at that location reactivates it, just like a file anchor.
+    No normalization is allowed for a human approval.
+    """
+    root = Path(root)
+    if (not isinstance(path, str) or not path or len(path) > 240
+            or any(c in path for c in "\\*?[]`<>") or unsafe_contributed_string(path) or path.startswith("/")
+            or any(p in ("", ".", "..", ".git", ".memlet") for p in path.split("/"))
+            or mw._is_secret_path(path) or mw.contained_path_problem(root, path)):
+        return False
+    cursor = root
+    try:
+        for part in path.split("/"):
+            if part not in {p.name for p in cursor.iterdir()}:
+                return False
+            cursor = cursor / part
+            if cursor != root / path and (cursor / ".git").exists():
+                return False
+        return cursor.is_file()
+    except OSError:
+        return False
+
+
+def lesson_path_context(repo_path="."):
+    """One bounded tracked-file lookup per projection; lazy citation context for human paths.
+
+    An invalid/unreadable git work tree fails closed for automatic attachments.
+    """
+    root = mw._resolve_root(repo_path)
+    is_git = any((p / ".git").exists() for p in [root] + list(root.parents))
+    tracked = set()
+    if is_git:
+        process = None
+        selector = selectors.DefaultSelector()
+        try:
+            process = subprocess.Popen(["git", "ls-files", "-z", "--cached", "--"], cwd=str(root),
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            selector.register(process.stdout, selectors.EVENT_READ)
+            data = bytearray()
+            deadline = time.monotonic() + .5
+            complete = False
+            while time.monotonic() < deadline and len(data) <= 4 * 1024 * 1024:
+                if not selector.select(max(0, deadline - time.monotonic())):
+                    break
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    complete = True
+                    break
+                data.extend(chunk)
+            if complete and len(data) <= 4 * 1024 * 1024 and process.wait(timeout=.1) == 0:
+                tracked = set(data.decode("utf-8", "surrogateescape").split("\0"))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            selector.close()
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                process.stdout.close()
+    return {"root": root, "is_git": is_git, "tracked": tracked, "loaded": False, "trust": {}}
+
+
+def literal_lesson_paths(root, scope, text, *, context=None):
+    """Literal whole path tokens only; Git repositories require a tracked file."""
+    context = lesson_path_context(root) if context is None else context
+    root = context["root"]
+    raw = [scope.split("::", 1)[0]] + [p for p, _ in mw._line_refs(text)]
+    raw += re.findall(r"(?<![\w/.-])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+(?![\w/.-])", text)
+    out = []
+    for path in raw:
+        path = path.replace("\\", "/").removeprefix("./")
+        named = path == scope.split("::", 1)[0].replace("\\", "/").removeprefix("./")
+        if not named:
+            for match in re.finditer(r"(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])", text):
+                before = text[match.start() - 1:match.start()] if match.start() else ""
+                after = text[match.end():match.end() + 1]
+                if not any(_hidden_character(c) or unicodedata.category(c) == "Cc" for c in before + after):
+                    named = True
+                    break
+        if (named and len(path) <= 80 and valid_lesson_path(root, path) and path not in out
+                and (not context["is_git"] or path in context["tracked"])):
+            out.append(path)
+    return out[:8]
+
+
+def _lesson_literal_paths(node, root, context):
+    """Match original hashed lines, never a sanitised display projection.
+
+    Own citations were approved with the node; only approved-valid edges may add
+    further evidence. Each line is matched separately so joins cannot invent tokens.
+    """
+    scope = node.get("scopeTag") or ""
+    pins = list(md._item_pins(node, "node"))
+    for edge in node.get("edges", []):
+        if md.approval_state(edge, "edge") == TIER_APPROVED and edge.get("edgeVerdict") == "VALID":
+            pins += md._item_pins(edge, "edge")
+            if edge.get("citedTargetPin") is not None:
+                pins.append(edge["citedTargetPin"])
+    paths = literal_lesson_paths(root, scope, "", context=context)
+    seen = set()
+    for pin in pins:
+        if (not isinstance(pin, dict) or pin.get("span") in seen
+                or md._verify_pin_dict(pin, context["snapshot"] or {}, "path")):
+            continue
+        seen.add(pin["span"])
+        for line in str(pin.get("quoteText", "")).split("\n"):
+            for path in literal_lesson_paths(root, scope, line, context=context):
+                if path not in paths:
+                    paths.append(path)
+    return paths[:8]
+
+
+def lesson_paths(node, repo_path=".", *, context=None):
+    """Human-attached locations: approved tier, exact existing file; tracking is optional."""
+    if not node.get("approvedPaths") or md.approval_state(node, "node") != TIER_APPROVED:
+        return []
+    context = lesson_path_context(repo_path) if context is None else context
+    if not context["loaded"]:
+        snapshot, _ = _load_snapshot(context["root"])
+        config, _ = _load_config(context["root"])
+        graph, _ = _load_queue(context["root"])
+        context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config))
+    state = context["trust"].get(node["id"])
+    if state is None:
+        state = item_trust(node, snapshot=context["snapshot"], config=context["config"])
+        context["trust"][node["id"]] = state
+    if state["tier"] != TIER_APPROVED:
+        return []
+    return [p for p in node.get("approvedPaths", []) if valid_lesson_path(context["root"], p)]
+
+
+def _decision_event_write(root, events):
+    unique = {}
+    for event in events:
+        unique.setdefault((event[1], event[2]), event)
+    events = list(unique.values())
+    # Advisory history only: integrity, not authentication; no tier reads this table.
+    conn = mw.connect_managed_sqlite(Path(root), ".memlet/ledger.sqlite3")
+    try:
+        with conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS dream_decision_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, item_id TEXT, kind TEXT, decision TEXT, by TEXT, digest TEXT, paths TEXT)")
+            conn.executemany("INSERT INTO dream_decision_events (at,item_id,kind,decision,by,digest,paths) VALUES (?,?,?,?,?,?,?)", events)
+    finally:
+        conn.close()
+
+
+def decision_events(repo_path=".", item_id=None):
+    """Bounded advisory history in stable sequence order; absent/unreadable means unknown."""
+    try:
+        root = mw._resolve_root(repo_path)
+        conn = mw.connect_managed_sqlite(root, ".memlet/ledger.sqlite3", readonly=True)
+        try:
+            query = "SELECT seq,at,item_id,kind,decision,by,digest,paths FROM dream_decision_events"
+            rows = conn.execute(query + (" WHERE item_id=?" if item_id is not None else "") + " ORDER BY seq LIMIT 4096", (item_id,) if item_id is not None else ()).fetchall()
+            return [dict(zip(("seq","at","item_id","kind","decision","by","digest","paths"), (*r[:7], json.loads(r[7])))) for r in rows]
+        finally:
+            conn.close()
+    except (OSError, ValueError, sqlite3.Error):
+        return []
+
+
 def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
     """Nodes and edges of `.memlet/dream/APPROVAL-QUEUE.json` with no valid human decision (stale approvals included)."""
     try:
@@ -575,6 +743,8 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
         item.update(proposers=_display_records((node or {}).get("proposers", [])),
                     verification=_display_records((node or {}).get("verification", [])))
         item.update(_lesson_fields(node))
+        if (node or {}).get("approvedPaths"):
+            item["approvalPaths"] = node["approvedPaths"]
         if item.get("quoteLines"):
             item["quote"] = lesson_text(node)
         item["pinsVerify"] = bool(snap is not None and node is not None and _node_edges_verify(node, snap) is None)
@@ -591,9 +761,11 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
         flag = (" — " + str(item["citationReason"]) if item.get("citationReason") else
                 "" if item["pinsVerify"] else " — citation does NOT verify: snapshot unavailable")
         if item.get("quoteLines"):
-            lines.append(f"- `{item['id']}` [{item['categoryLabel']}]{flag}\n" + _lesson_quote_block(item))
+            lines.append(f"- `{item['id']}` [{item['categoryLabel']}]{flag}\n" + (_pending_quotes(item)))
         else:
             lines.append(f"- `{item['id']}` [{item['categoryLabel']}] {item['quote']} (cites `{SNAPSHOT_REL}/{item['span']}`){flag}")
+            if item.get("approvalPaths"):
+                lines.append("  " + APPROVAL_PATHS_LABEL + ", ".join(item["approvalPaths"]))
         lines.append("  tier=" + item["tier"] + "; " + item["agreementLabel"] + "; proposers=" + ", ".join(str(r.get("vendor")) + "/" + str(r.get("isolation", "none")) for r in item["proposers"] if isinstance(r, dict))
                      + "; verification=" + (", ".join(str(r.get("vendor")) + ":" + str(r.get("verdict")) for r in item["verification"] if isinstance(r, dict)) or "none"))
         if item.get("citationReason") and item.get("currentQuote"):
@@ -617,7 +789,7 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
             "notices": [], "formatted": "\n".join(lines) + "\n"}
 
 
-def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, reconsider=False, refresh_citations=False) -> Dict[str, Any]:
+def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, reconsider=False, refresh_citations=False, paths=None) -> Dict[str, Any]:
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
@@ -643,7 +815,7 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
                 if not snap.is_dir():
                     return _fail("no transcript snapshot (.memlet/dream/snapshot/) to verify pins against", 1)
                 res = md.approve_queue_items(q, wanted, who, snapshot_path=str(snap), db_path=str(root / DB_REL),
-                                             reconsider=reconsider, refresh_citations=refresh_citations)
+                                             reconsider=reconsider, refresh_citations=refresh_citations, paths=paths)
             else:
                 res = md.reject_queue_items(q, wanted, who, reason=reason, db_path=str(root / DB_REL))
             promotion = promote_approved(root)
@@ -654,7 +826,9 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
            "unchanged": res.get("unchanged", []), "refused": res.get("refused", []),
            "cascadedEdges": res.get("cascadedEdges", []), "approvalBoundary": res.get("approvalBoundary"),
            "promotion": {k: promotion.get(k) for k in ("ok", "page", "promoted", "removed", "op", "error")}}
-    errors = []
+    errors = list(res.get("eventErrors", []))
+    if paths is not None:
+        out["paths"] = list(paths)
     if res.get("refused"):
         errors.append("refused: " + ", ".join(f"{r['id']} ({r['reason']})" for r in res["refused"]))
     if not promotion.get("ok"):
@@ -670,14 +844,31 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
                      f"{len(promotion.get('removed') or [])} removed ({promotion.get('op')})")
     else:
         lines.append(f"- Promotion NOT done: {promotion.get('error')}")
+    if paths is not None:
+        lines.append("- The same paths apply to each requested lesson: " + ", ".join(paths))
     out["formatted"] = "\n".join(lines) + "\n"
     return out
 
 
-def learn_approve(repo_path=".", ids=(), *, approver="", reconsider=False, refresh_citations=False) -> Dict[str, Any]:
+def learn_approve(repo_path=".", ids=(), *, approver="", reconsider=False, refresh_citations=False, paths=None) -> Dict[str, Any]:
     """The only path out of PENDING: `memlet_dream.approve_queue_items` with the snapshot and DB passed explicitly
     (pins re-verified, approval bound to a content digest), then `promote_approved`."""
-    return _decide(repo_path, ids, approver, md.APPROVED, reconsider=reconsider, refresh_citations=refresh_citations)
+    return _decide(repo_path, ids, approver, md.APPROVED, reconsider=reconsider, refresh_citations=refresh_citations, paths=paths)
+
+
+def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
+    """Replace attachments by a fresh approval; only a currently approved lesson qualifies."""
+    try:
+        root = mw._resolve_root(repo_path)
+        if _symlinked(root, (QUEUE_REL, SNAPSHOT_REL)):
+            return _fail("refusing symlinked Dream data", 2)
+        with md.queue_lock(root / QUEUE_REL):
+            approved = {i["id"] for i in dream_items(root)["items"]}
+            if not paths or not _ids(ids) or any(i not in approved for i in _ids(ids)):
+                return _fail("--paths requires an already approved lesson and --path FILE", 2)
+            return learn_approve(root, ids, approver=approver, reconsider=True, paths=paths)
+    except (OSError, ValueError) as exc:
+        return _fail(str(exc), 2)
 
 
 def learn_reject(repo_path=".", ids=(), *, approver="", reason="") -> Dict[str, Any]:
@@ -850,6 +1041,21 @@ def _lesson_fields(node):
     return fields
 
 
+def _pending_quotes(item):
+    from .vocabulary import REPLACED_MARKER, CURRENT_MARKER
+    if not any(r in ("replaced", "current") for r in item.get("lineRoles", [])):
+        text = _lesson_quote_block(item)
+        return text + ("\n  " + APPROVAL_PATHS_LABEL + ", ".join(item["approvalPaths"]) if item.get("approvalPaths") else "")
+    lines = []
+    for i, (quote, cite) in enumerate(zip(item.get("quoteLines", []), item.get("cites", []))):
+        role = (item.get("lineRoles") or [None] * len(item["quoteLines"]))[i]
+        marker = REPLACED_MARKER if role == "replaced" else CURRENT_MARKER if role == "current" else ">"
+        lines.append("  " + marker + " " + quote + " (`{file}:{start}-{end}`)".format(**cite))
+    if item.get("approvalPaths"):
+        lines.append("  " + APPROVAL_PATHS_LABEL + ", ".join(item["approvalPaths"]))
+    return "\n".join(lines)
+
+
 def _lesson_quote_block(item):
     """Multi-line readers: one quoted line per citation, with relation source labels."""
     lines = []
@@ -941,6 +1147,8 @@ def _render_rule(node: Dict[str, Any], anchor: Optional[Tuple[str, Dict[str, Any
     text = lesson_text(node)
     meta = (f"dream {node.get('id')} · {md.category_label(node.get('category'))} · scope {_defuse(node.get('scopeTag'), 48)}"
             f" · cites {_defuse(SNAPSHOT_REL + '/' + str(pp.get('span') or ''), 120)}")
+    if node.get("approvedPaths"):
+        meta += APPROVAL_PATHS_SUFFIX + ", ".join(node["approvedPaths"])
     body = f"{text} (`{anchor[0]}`) — {meta}" if anchor else f"{text} — {meta}"
     lines = [f"- {body}"]
     if anchor:
@@ -997,7 +1205,7 @@ def _promote_locked(root: Path) -> Dict[str, Any]:
             body = "Replaced instruction " + nid + " (do not apply as current)"
             replaced_lines += ["- " + body,
                 f"  <!-- memlet:dream id={nid} digest={md.node_approval_digest(n)} text={_sha(body)[:16]} -->",
-                md.render_superseded_quarantine(projected[nid])]
+                md.render_superseded_quarantine(projected[nid]) + (APPROVAL_PATHS_SUFFIX + ", ".join(n["approvedPaths"]) if n.get("approvedPaths") else "")]
             rules_out.append({"id": nid, "category": n.get("category"), "scope": n.get("scopeTag"),
                               "anchor": None, "section": "replaced", "text": body})
             continue
@@ -1294,7 +1502,7 @@ def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str
 
 
 def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=None,
-                   include=("rules", "dream", "memory")) -> Dict[str, Any]:
+                   include=("rules", "dream", "memory"), files=None) -> Dict[str, Any]:
     """One budgeted response from three stores (no model call). The budget is split evenly across the sections that
     have candidates; whatever a section leaves unused flows to the others. `tokenEstimate <= tokenBudget` always."""
     try:
@@ -1332,6 +1540,9 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
     if "dream" in wanted:
         cands["dream"], sources["dream"], extra = _dream_items(root, query)
         notices += extra
+        if files is not None:
+            selected = {it["id"] for it in dream_items(root, files=files)["items"]}
+            cands["dream"] = [it for it in cands["dream"] if it["id"] in selected]
         stale_dream = [it for it in cands["dream"] if it["anchorStatus"] == "stale"]
         cands["staleRules"].extend(stale_dream)
         cands["dream"] = [it for it in cands["dream"] if it["anchorStatus"] != "stale"]
@@ -1976,6 +2187,8 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
         approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
                                    if e.get("fromId") in live_ids or e.get("toId") in live_ids]
         projection = md.supersession_projection(approved_graph)
+        path_context = lesson_path_context(root)
+        path_context.update(loaded=True, snapshot=snapshot, config=config, trust=trust)
         items, notices = [], dream_settings(config)[2]
         query_terms = md._query_terms(str(query))
         requested = {_canonical_path(f) for f in files} if files is not None else None
@@ -2000,10 +2213,18 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             scope = safe_lesson_display(node.get("scopeTag") or "")
             if query_terms and not query_terms & md._query_terms(text + " " + scope):
                 continue
+            attached = lesson_paths(node, root, context=path_context) if tier == TIER_APPROVED else []
+            paths = list(dict.fromkeys(attached + _lesson_literal_paths(node, root, path_context))) if tier == TIER_APPROVED else []
+            inactive = [p for p in node.get("approvedPaths", []) if p not in attached]
+            if inactive and tier == TIER_APPROVED:
+                notices.append(node["id"] + INACTIVE_APPROVAL_PATHS + ", ".join(inactive))
             scope_path = _canonical_path(scope.split("::", 1)[0])
-            if requested is not None and not any(f == scope_path or (scope.endswith(("/", "\\")) and f.startswith(scope_path.rstrip("/") + "/"))
-                                                 or f + "::" in text or "`" + f + "`" in text for f in requested):
-                continue
+            if requested is not None:
+                matches = any(f in paths for f in requested) if tier == TIER_APPROVED else any(
+                    f == scope_path or (scope.endswith(("/", "\\")) and f.startswith(scope_path.rstrip("/") + "/"))
+                    or f + "::" in text or "`" + f + "`" in text for f in requested)
+                if not matches:
+                    continue
             cites, seen = [], set()
             for pin in evidence_pins(node):
                 if not isinstance(pin, dict) or pin.get("span") in seen:
@@ -2022,6 +2243,10 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                   "edgeTypes": sorted({e["edgeType"] for e in display_node.get("edges", [])}), "text": text,
                   "cites": cites, "scope": scope, "proposers": _display_records(node.get("proposers", [])),
                   "verification": _display_records(node.get("verification", []))}
+            if paths:
+                it["paths"] = paths
+            if node.get("approvedPaths"):
+                it["approvalPaths"] = node["approvedPaths"]
             fields = _lesson_fields(display_node)
             if fields:
                 # Display hashes are per-line projections of stored pins, never fresh trust baselines.

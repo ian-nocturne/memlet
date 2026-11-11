@@ -1,0 +1,70 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "reconstructed",
+  "vendor": "claude",
+  "model": "haiku",
+  "memletVersion": "9.1.0",
+  "date": "2026-11-11",
+  "note": "Reconstructed from v91-live2/repo/.memlet/dream/APPROVAL-QUEUE.json primaryPin/allPins/edges/title/scopeTag and snapshot; envelopes reconstructed, not recorded answer bytes.",
+  "kind": "propose",
+  "input": "{\"id\": \"session2.log-631d66fac8.log:1\", \"text\": \"2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.\"}\n{\"id\": \"session2.log-631d66fac8.log:2\", \"text\": \"2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold.\"}\n{\"id\": \"session2.log-631d66fac8.log:3\", \"text\": \"2026-11-11T10:06:00Z [user] From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first.\"}\n{\"id\": \"session2.log-631d66fac8.log:4\", \"text\": \"2026-11-11T10:09:00Z [assistant] Deployed with scripts/deploy.sh and the smoke test passed.\"}\n{\"id\": \"session2.log-631d66fac8.log:5\", \"text\": \"2026-11-11T10:10:00Z [user] And the old tip about passing --skip-smoke is withdrawn, never use it.\"}",
+  "expected": {
+    "failed": false,
+    "items": [
+      {
+        "category": "superseded_directive",
+        "relations": [
+          "SUPERSEDES"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:1",
+          "session2.log-631d66fac8.log:3"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:00:00Z [user] Deploys go out with `make release` from the main branch.",
+          "2026-11-11T10:06:00Z [user] From now on do not use make release; deploy only with scripts/deploy.sh, which warms the cache first."
+        ]
+      },
+      {
+        "category": "repeated_pitfall",
+        "relations": [
+          "BLOCKS"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:2"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold."
+        ]
+      },
+      {
+        "category": "verified_workaround",
+        "relations": [
+          "RESOLVES"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:2",
+          "session2.log-631d66fac8.log:4"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:05:00Z [assistant] I ran make release and the smoke test failed because the cache was cold.",
+          "2026-11-11T10:09:00Z [assistant] Deployed with scripts/deploy.sh and the smoke test passed."
+        ]
+      },
+      {
+        "category": "repeated_pitfall",
+        "relations": [
+          "BLOCKS"
+        ],
+        "spans": [
+          "session2.log-631d66fac8.log:5"
+        ],
+        "quoteLines": [
+          "2026-11-11T10:10:00Z [user] And the old tip about passing --skip-smoke is withdrawn, never use it."
+        ]
+      }
+    ],
+    "rejectionCodes": []
+  },
+  "answer": "```json\n{\"items\": [{\"category\": \"superseded_directive\", \"title\": \"Deploy only via scripts/deploy.sh, not make release\", \"scope_tag\": \"deploy\", \"src_spans\": [\"session2.log-631d66fac8.log:1\", \"session2.log-631d66fac8.log:3\"], \"edges\": [{\"edge_type\": \"SUPERSEDES\", \"target\": \"old[session2.log-631d66fac8.log:1] -> active[session2.log-631d66fac8.log:3]\", \"src_span\": \"session2.log-631d66fac8.log:3\", \"target_span\": \"session2.log-631d66fac8.log:1\"}], \"superseded_by_src\": \"session2.log-631d66fac8.log:3\"}, {\"category\": \"repeated_pitfall\", \"title\": \"make release smoke test fails on cold cache\", \"scope_tag\": \"deploy\", \"src_spans\": [\"session2.log-631d66fac8.log:2\"], \"edges\": [{\"edge_type\": \"BLOCKS\", \"target\": \"make release from main\", \"src_span\": \"session2.log-631d66fac8.log:2\"}]}, {\"category\": \"verified_workaround\", \"title\": \"scripts/deploy.sh warms cache; smoke test passed\", \"scope_tag\": \"deploy\", \"src_spans\": [\"session2.log-631d66fac8.log:2\", \"session2.log-631d66fac8.log:4\"], \"edges\": [{\"edge_type\": \"RESOLVES\", \"target\": \"cold cache smoke test failure\", \"src_span\": \"session2.log-631d66fac8.log:4\", \"target_span\": \"session2.log-631d66fac8.log:2\"}]}, {\"category\": \"repeated_pitfall\", \"title\": \"Never pass --skip-smoke; that tip is withdrawn\", \"scope_tag\": \"deploy\", \"src_spans\": [\"session2.log-631d66fac8.log:5\"], \"edges\": [{\"edge_type\": \"BLOCKS\", \"target\": \"--skip-smoke flag usage\", \"src_span\": \"session2.log-631d66fac8.log:5\"}]}]}\n```"
+}

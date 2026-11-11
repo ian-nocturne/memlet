@@ -323,6 +323,11 @@ class BridgeContract(Fixture):
         self.write('deploy.py', 'pass\n')
         self.write('src/existing.py', 'pass\n')
         (self.root/'escape.py').symlink_to(self.base/'outside.py')
+        self.assertEqual([], hb._paths(self.root, 'deploy.py', 'Use `src/existing.py`.'))
+        subprocess.run(['git','-C',str(self.root),'add','deploy.py','src/existing.py'],check=True,capture_output=True)
+        nongit = self.base/'literal-nongit'; nongit.mkdir()
+        (nongit/'deploy.py').write_text('pass\n')
+        self.assertEqual(['deploy.py'], hb._paths(nongit, 'deploy.py', 'No file named.'))
         self.assertEqual(['deploy.py','src/existing.py'], hb._paths(self.root, 'deploy.py',
             'Use `src/existing.py` with nonexistent.py, escape.py, ../outside.py.'))
         self.assertEqual([], hb._paths(self.root, 'not-there.py', 'No file named.'))
@@ -742,6 +747,8 @@ class ReviewRegressions(Fixture):
 
     def test_exact_case_directory_entry_and_scope_file(self):
         self.write('deploy.py', 'pass\n'); self.write('src/real.py','pass\n')
+        self.assertEqual([], hb._paths(self.root, 'deploy.py::thing', 'Use `src/real.py`.'))
+        subprocess.run(['git','-C',str(self.root),'add','deploy.py','src/real.py'],check=True,capture_output=True)
         self.assertEqual([], hb._paths(self.root, 'DEPLOY.PY', 'Edit DEPLOY.PY and SRC/real.py.'))
         self.assertEqual([], hb._paths(self.root, 'src', 'No files named.'))
         self.assertEqual(['deploy.py'], hb._paths(self.root, 'deploy.py::thing', 'No files named.'))
