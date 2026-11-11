@@ -371,7 +371,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 
 - 771 unit tests pass on Python 3.9 and 3.13 on macOS, and again with the optional tree-sitter parser installed (core 0.23 and 0.24, grammars 0.23).
 - `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design twice: see the row format and the failed-batch rule in section 5.
-- Hooks (in a headless Claude Code session) and the MCP tools (from a `codex exec` session) were last exercised in real sessions on 9.0-era code.
+- On 9.1 code, hooks installed with `--hooks --dream` ran in one headless Claude Code session (the checked rules arrived at session start, and the session was snapshotted at Stop without a model call), and six MCP tools, including `memlet_dream_next` and `memlet_dream_submit`, were called from one `codex exec` session; the submitted lesson stayed pending as an untrusted `host` proposal. The PostToolUse and PreCompact hooks were last exercised in a real session on 9.0-era code.
 - Linux, Windows, other MCP hosts and interactive sessions are untested.
 
 ---
