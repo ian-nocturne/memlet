@@ -22,6 +22,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -2103,6 +2104,7 @@ def build_cortex_lineage_payload(
             "status": st,
             "isSuperseded": st == "superseded",
             "inRecallCapsule": bool(is_approved and ((not has_recall_info) or (lid in included_set))),
+            **({"approvalPaths": n["approvedPaths"]} if n.get("approvedPaths") else {}),
             "reviewState": APPROVED if is_approved else REVIEW_PENDING,
             "vendorOrigins": [safe_truncate_masked(str(v), 48) for v in raw_vendors],
             "srcSpan": safe_truncate_masked(str(pp.get("span") or ""), 64),
@@ -2585,7 +2587,12 @@ def extract_candidates_with_report(
             if not clean_body:
                 continue
             cue_body = clean_body.replace("\u2019", "'").replace("\u2018", "'")
-            scope_m = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))", clean_body)  # run starts only: linear, same first match
+            scope_m = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:py|md|json|ts|tsx|js))(?![\w./-])", clean_body)  # run starts only: linear, same first match
+            # A display scope must not truncate a longer or hidden-character token.
+            if scope_m and any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me")
+                               for c in clean_body[max(0, scope_m.start()-1):scope_m.start()]
+                               + clean_body[scope_m.end():scope_m.end()+1]):
+                scope_m = None
             scope_tag = scope_m.group(1) if scope_m else "project_rules"
 
             if has_ts and _SUPERSEDE_CUE_RE.search(cue_body):
@@ -2878,6 +2885,7 @@ def node_approval_digest(node: Dict[str, Any]) -> str:
     identity (file, line range, hash) of every pin (`primaryPin`, `allPins`, `supersededByPin`)."""
     all_pins = node.get("allPins") if isinstance(node.get("allPins"), list) else []
     return _canonical_digest({
+        **({"paths": node["approvedPaths"]} if "approvedPaths" in node else {}),
         "kind": "node",
         "id": node.get("id"),
         "title": node.get("title"),
@@ -2926,6 +2934,8 @@ def approval_state(item: Any, kind: str) -> str:
     if not isinstance(by, str) or not by.strip() or not _valid_utc_stamp(rec.get("at")):
         return REVIEW_PENDING
     expected = node_approval_digest(item) if kind == "node" else edge_approval_digest(item)
+    if kind == "node" and rec.get("paths", []) != item.get("approvedPaths", []):
+        return REVIEW_PENDING
     if rec.get("digest") != expected:
         return REVIEW_PENDING
     return APPROVED
@@ -3655,6 +3665,7 @@ def _decide_queue_items(
     reason: str = "",
     reconsider: bool = False,
     refresh_citations: bool = False,
+    paths=None,
 ) -> Dict[str, Any]:
     if decision not in (APPROVED, REJECTED_DECISION):
         raise ValueError(f"Unknown decision: {decision}")
@@ -3667,7 +3678,7 @@ def _decide_queue_items(
         raise ValueError(f"Refusing symlinked Dream queue: {queue_path}")
     # one lock from load to commit: a concurrent writer can never start from the graph this call is replacing
     with queue_lock(queue_path):
-        return _decide_locked(queue_path, ids, decision, who, snapshot_path, db_path, cascade_edges, reason, reconsider, refresh_citations)
+        return _decide_locked(queue_path, ids, decision, who, snapshot_path, db_path, cascade_edges, reason, reconsider, refresh_citations, paths)
 
 
 def _decide_locked(
@@ -3681,9 +3692,20 @@ def _decide_locked(
     reason: str,
     reconsider: bool = False,
     refresh_citations: bool = False,
+    paths=None,
 ) -> Dict[str, Any]:
     q_path, graph = _load_queue(queue_path)
+    if paths is not None:
+        from .memlet_bridge import valid_lesson_path
+        if q_path.name != "APPROVAL-QUEUE.json" or q_path.parent.name != "dream" or q_path.parent.parent.name != ".memlet":
+            raise ValueError("paths require a queue at <root>/.memlet/dream/APPROVAL-QUEUE.json")
+        root = q_path.parent.parent.parent
+        if (not isinstance(paths, (list, tuple)) or len(paths) > 8
+                or any(not isinstance(p, str) for p in paths) or len(set(paths)) != len(paths)
+                or any(not valid_lesson_path(root, p) for p in paths)):
+            raise ValueError("paths require at most 8 distinct exact, non-secret regular files inside this repository")
     prior_sha = graph_sha256(graph)
+    events = []
     db_target = _resolve_approval_db(q_path, graph, db_path)
 
     ordered_ids: List[str] = []
@@ -3754,6 +3776,8 @@ def _decide_locked(
         return None
 
     def _apply_edge(eid: str) -> None:
+        was_approved = _edge_state(edge_refs.get(eid, [])) == APPROVED
+        events.append((at, eid, "edge", "citations-refreshed" if refresh_citations else "reconsidered" if reconsider else "revoked" if was_approved and decision == REJECTED_DECISION else decision, who, edge_approval_digest(edge_refs[eid][0]) if decision == APPROVED else "", "[]"))
         for ref in edge_refs.get(eid, []):
             ref["edgeVerdict"] = "VALID" if decision == APPROVED else REJECTED
             ref["approval"] = _record(edge_approval_digest(ref))
@@ -3779,6 +3803,14 @@ def _decide_locked(
                 continue
             n = nodes_by_id[item_id][0]
             cur = approval_state(n, "node")
+            had_record = isinstance(n.get("approval"), dict)
+            path_change = paths is not None and list(paths) != n.get("approvedPaths", [])
+            if path_change and isinstance(n.get("approval"), dict) and not reconsider:
+                refused.append({"id": item_id, "reason": "paths_changed_requires_reconsider"})
+                continue
+            was_approved = cur == APPROVED
+            if reconsider and cur == APPROVED:
+                cur = REVIEW_PENDING
             if cur == REJECTED_DECISION and decision == APPROVED and not reconsider:
                 refused.append({"id": item_id, "reason": "already_rejected"})
                 continue
@@ -3814,6 +3846,8 @@ def _decide_locked(
             if err:
                 refused.append({"id": item_id, "reason": f"pin_does_not_verify:{err}"})
                 continue
+            if paths is not None:
+                n["approvedPaths"] = list(paths)
             if decision == APPROVED:
                 n["verdict"] = "ALREADY_SUPERSEDED" if n.get("statusKind") == "superseded_rule" else "SUPPORTED"
                 n["edgeVerdict"] = "VALID"
@@ -3822,6 +3856,10 @@ def _decide_locked(
                 n["verdict"] = REJECTED
                 n["edgeVerdict"] = REJECTED
             n["approval"] = _record(node_approval_digest(n))
+            if "approvedPaths" in n:
+                n["approval"]["paths"] = n["approvedPaths"]
+            event_kind = "paths-changed" if path_change and had_record else "citations-refreshed" if refresh_citations else "reconsidered" if reconsider else "revoked" if was_approved and decision == REJECTED_DECISION else decision
+            events.append((at, item_id, "node", event_kind, who, n["approval"]["digest"] if decision == APPROVED else "", json.dumps(n.get("approvedPaths", []))))
             for eid in owned:
                 _apply_edge(eid)
                 cascaded.append(eid)
@@ -3863,8 +3901,16 @@ def _decide_locked(
             replaces_sha=prior_sha,
         )
 
+    event_errors = []
+    if done and events and q_path.parent.name == "dream" and q_path.parent.parent.name == ".memlet":
+        try:
+            from .memlet_bridge import _decision_event_write
+            _decision_event_write(q_path.parent.parent.parent, events)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            event_errors.append("decision recorded; missing dream_decision_events: " + str(exc))
     return {
-        "ok": not refused,
+        **({"eventErrors": event_errors} if event_errors else {}),
+        "ok": not refused and not event_errors,
         "decision": decision,
         "decidedBy": who,
         "decidedAt": at,
@@ -3888,6 +3934,7 @@ def approve_queue_items(
     cascade_edges: bool = True,
     reconsider: bool = False,
     refresh_citations: bool = False,
+    paths=None,
 ) -> Dict[str, Any]:
     """Approve nodes and/or edges of a Dream queue by id (human decision).
 
@@ -3901,7 +3948,7 @@ def approve_queue_items(
     inside the queue's own directory. Boundary: integrity check, not a signature (`APPROVAL_BOUNDARY`).
     """
     return _decide_queue_items(queue_path, ids, APPROVED, approver, snapshot_path, db_path, cascade_edges,
-                               reconsider=reconsider, refresh_citations=refresh_citations)
+                               reconsider=reconsider, refresh_citations=refresh_citations, paths=paths)
 
 
 def reject_queue_items(

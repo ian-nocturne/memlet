@@ -118,18 +118,9 @@ def _exact_file(root, path):
         return False
 
 
-def _paths(root, scope, text):
-    # No repository walk and no guessed paths: literal paths named by scope or
-    # cited text only, with containment and a regular-file existence check.
-    raw = [scope.split("::", 1)[0]] + [p for p, _ in mw._line_refs(text)]
-    raw += re.findall(r"(?<![\w/])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+", text)
-    paths = []
-    for path in raw:
-        path = path.replace("\\", "/").removeprefix("./")
-        if (path and len(path) <= 80 and not mw.contained_path_problem(root, path)
-                and _exact_file(root, path) and path not in paths):
-            paths.append(path)
-    return paths[:8]
+def _paths(root, scope, text, *, context=None):
+    from .memlet_bridge import literal_lesson_paths
+    return literal_lesson_paths(root, scope, text, context=context)
 
 
 def _rule_text(root, rule, cache):
@@ -289,7 +280,7 @@ def build(root, rules, anchors, approved, head, updated_at):
                       "reason": BRIDGE_REPLACED_REASON,
                       "source": source, "cites": cite_fields, "tags": tags}, {"approach": 110, "source": 120})
             elif relations:
-                admit(caps, "capsules", {"id": ident, "paths": _paths(root, lesson.get("scope", ""), text),
+                admit(caps, "capsules", {"id": ident, "paths": lesson.get("paths", []),
                       "tags": tags, "summary": text, "source": source, "cites": cite_fields,
                       "updated_at": updated_at}, {"summary": SUMMARY_CHARS})
 

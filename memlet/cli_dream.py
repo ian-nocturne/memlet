@@ -14,6 +14,7 @@ def register(sub):
     parser.add_argument("--via", help="Comma-separated proposer vendors (claude,codex,gemini)")
     parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help="Verifier model: dream.models.verifier.<vendor>; distinct families can check within one vendor; dream.agreement=model is needed only for same-vendor hints")
     parser.add_argument("--transcript")
+    parser.add_argument("--save-fixture", metavar="DIR", help="Explicitly save masked model answers outside .memlet (never overwrite)")
     parser.add_argument("--max-batches", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--status", action="store_true")
@@ -101,7 +102,8 @@ def dispatch(args):
     elif not args.via:
         result = {"ok": False, "exitCode": 2, "error": "Choose --via VENDOR explicitly, or --status"}
     else:
-        result = dream_run(args.repo, via=tuple(v.strip() for v in args.via.split(",")), verify_with=args.verify_with,
+        options = {"save_fixture": args.save_fixture} if args.save_fixture is not None else {}
+        result = dream_run(args.repo, **options, via=tuple(v.strip() for v in args.via.split(",")), verify_with=args.verify_with,
                            max_batches=args.max_batches, dry_run=args.dry_run, transcript=args.transcript)
     result["command"] = "dream"
     result.setdefault("exitCode", 0 if result["ok"] else 2)

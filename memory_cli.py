@@ -402,8 +402,12 @@ def _route_new(args):
             return _bridge_call('learn_from_transcript', args.repo, args.transcript, vendor=args.vendor)
         if args.pending:
             return _bridge_call('learn_pending', args.repo)
+        if args.paths:
+            return _bridge_call('learn_paths', args.repo, ids=args.paths, approver=args.by, paths=args.path)
         if args.approve:
             options = {}
+            if args.path is not None:
+                options["paths"] = args.path
             if args.reconsider:
                 options['reconsider'] = True
             if args.refresh_citations:
@@ -493,12 +497,18 @@ def _validate_modes(args, parser):
         reject('unified recall (use recall --query for store filters)', flags)
     if args.action == 'learn':
         mode = ('--file' if args.file is not None else '--transcript' if args.transcript is not None
-                else '--pending' if args.pending else '--approve' if args.approve else '--reject')
+                else '--pending' if args.pending else '--approve' if args.approve or args.paths else '--reject')
         allowed = {'--file': (), '--transcript': ('repo', 'vendor'), '--pending': ('repo',),
                    '--approve': ('repo', 'by'), '--reject': ('repo', 'by', 'reason')}[mode]
         flags = ['--' + name for name in ('repo', 'vendor', 'by', 'reason') if given(name) and name not in allowed]
         reject('learn ' + mode, flags + (store_flags if mode != '--file' else []))
-        if (args.approve or args.reject) and not args.by.strip():
+        if (args.reconsider or args.refresh_citations) and not args.approve:
+            parser.error("--reconsider and --refresh-citations require --approve")
+        if args.path is not None and not (args.approve or args.paths):
+            parser.error("--path requires --approve or --paths")
+        if args.paths and not args.path:
+            parser.error("--paths requires --path FILE")
+        if (args.approve or args.reject or args.paths) and not args.by.strip():
             parser.error('learn --approve/--reject requires --by NAME')
     if args.action == 'init':
         if not (args.hooks or args.hooks_remove):
@@ -688,6 +698,8 @@ def _build_parser():
     learn_mode.add_argument('--transcript',metavar='PATH',help='Add transcript lessons to the PENDING queue')
     learn_mode.add_argument('--pending',action='store_true',help='List lessons awaiting review')
     learn_mode.add_argument('--approve',nargs='+',metavar='ID',help='Approve lessons as a human reviewer')
+    learn_mode.add_argument('--paths', metavar='ID', nargs='+', help='Re-approve a lesson with new file attachments')
+    learn.add_argument('--path', action='append', metavar='FILE', help='Exact repository file; applies to each approved lesson (max 8)')
     learn_mode.add_argument('--reject',nargs='+',metavar='ID',help='Reject lessons as a human reviewer')
     learn.add_argument('--by',action=_ExplicitValue,default='',help='Name of the human reviewer (required for decisions)')
     learn.add_argument('--reconsider',action='store_true',help='Fresh approval of a previously rejected lesson')
