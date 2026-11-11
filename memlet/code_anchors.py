@@ -1112,8 +1112,12 @@ def extract_file_symbol_signatures(file_path):
     return res
 
 
+_PYTHON_BINDING_CACHE = {}  # <= 32 contents, keyed only by SHA-256 of freshly read bytes
+_PYTHON_BINDING_PARSE_COUNT = 0
+
+
 def python_symbol_rebound(file_path, symbol):
-    """Fresh module binding scan, independent of the stat-keyed symbol hash caches.
+    """Content-addressed module binding scan, independent of stat-keyed caches.
 
     Hashes still describe a definition, not subsequent bindings. An overload stub
     is not an implementation: as before, one implementation after typing-style
@@ -1123,15 +1127,37 @@ def python_symbol_rebound(file_path, symbol):
     try:
         if p.is_symlink() or p.stat().st_size > 2 * 1024 * 1024:
             return True
-        tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+        content = p.read_bytes()
+        if len(content) > 2 * 1024 * 1024:
+            return True
+        digest = hashlib.sha256(content).digest()
+        cached = _PYTHON_BINDING_CACHE.get(digest)
+        if cached is None:
+            cached = _python_binding_analysis(content.decode("utf-8", errors="ignore"))
+            if len(_PYTHON_BINDING_CACHE) >= 32:
+                _PYTHON_BINDING_CACHE.pop(next(iter(_PYTHON_BINDING_CACHE)))
+            _PYTHON_BINDING_CACHE[digest] = cached
+        definitions, bindings = cached
+        qualified = definitions.get(symbol, set())
+        if not qualified:
+            return False
+        return (any(bindings.get(q, 0) > 1 for q in qualified)
+                or symbol not in qualified and bindings.get(symbol, 0) > 0)
     except (OSError, SyntaxError, ValueError, RecursionError):
         return True  # never affirm a cached definition when the fresh scan failed
+
+
+def _python_binding_analysis(content):
+    global _PYTHON_BINDING_PARSE_COUNT
+    _PYTHON_BINDING_PARSE_COUNT += 1
+    tree = ast.parse(content)
     definitions = _collect_scoped_ast_nodes(tree.body)
-    qualified = {q for q, short, _, _ in definitions if q == symbol}
-    if not qualified:
-        qualified = {q for q, short, _, _ in definitions if short == symbol}
-    if not qualified:
-        return False
+    qualified = {q for q, _, _, _ in definitions}
+    # Include exact qualified names and the aliases accepted by the old scan.
+    names = {q: {q} for q in qualified}
+    for q, short, _, _ in definitions:
+        if short not in qualified:
+            names.setdefault(short, set()).add(q)
     bindings = {}
 
     def overload_stub(node):
@@ -1252,8 +1278,7 @@ def python_symbol_rebound(file_path, symbol):
         visit_GeneratorExp = visit_ListComp
 
     Bindings().visit(tree)
-    return (any(bindings.get(q, 0) > 1 for q in qualified)
-            or symbol not in qualified and bindings.get(symbol, 0) > 0)
+    return names, bindings
 
 
 def previous_python_symbol_hashes(file_path) -> List[Dict[str, str]]:

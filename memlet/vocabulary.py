@@ -56,3 +56,76 @@ APPROVAL_PATHS_SUFFIX = " · paths "
 # changed_check provenance: scope is informational and never an attachment.
 LESSON_VIA_SCOPE = "scope"
 LESSON_VIA_PATH = "path"
+# 9.2 graph
+GRAPH_WHY = ("anchor-in-file", "anchor-symbol", "lesson-path", "lesson-cites-path", "replaced-rule-text",
+             "target-item", "supersession-connected")
+GRAPH_HEADINGS = {
+    "governs": "Governs this code",
+    "blocks": "Approved dead ends — do not repeat",
+    "resolves": "Approved fixes",
+    "replaced": "Replaced instructions — do not apply as current",
+    "stale": "Anchors not verified against code — do not apply as governing",
+    "hints": HINT_LABEL,
+}
+GRAPH_TIME_NOTICE = (
+    "Times come only from retained pin pinnedAt fields, accepted-anchor ledger events, "
+    "Dream approval records and decision events. 9.1.1 writes no pin timestamp or rule creation time; "
+    "anchor_snapshots.updated_at is the latest observation, not the first stale observation. "
+    "Hint receipts are dated but activation of the agreement policy is not, so hint start times are unknown. "
+    "Unknown times are null. Historical queries exclude unknown-since evidence and re-check current source bytes; "
+    "overwritten pins, deleted sidecar payloads and changed citation contents cannot be reconstructed. "
+    "Historical anchors must still be active now; undated present drift is not projected into the past."
+)
+GRAPH_HISTORY_NOTICE = (
+    "Past views come from a local, unauthenticated log: digests check content integrity, not authentication. "
+    "Historical results must never be used by hooks. Historical hints are omitted: the repository does not retain changes to the hint agreement policy. "
+    "Without decision events, only the retained approval can be dated; overwritten decisions cannot be reconstructed."
+)
+GRAPH_OMITTED = "Omitted for budget: "
+
+GRAPH_WORK_NOTICE = "Neighborhood work limit reached; incompleteGroups names every group that may omit evidence."
+GRAPH_SUPERSESSION_NOTICE = ("Supersession work bound reached: lesson projection and rule currentness were skipped; "
+                             "code anchor classification remains available, without governing authority.")
+GRAPH_EVENTS_NOTICE = "Decision event bound reached: event history was skipped; current queue records remain available."
+GRAPH_ANCHOR_EVENTS_NOTICE = "Anchor event bound reached: accepted-anchor history was skipped; current code classification remains available."
+GRAPH_FILES_NOTICE = "Tracked-file index unavailable or over bound: literal lesson path attachment was skipped; explicit human paths and code anchors remain available."
+GRAPH_CORRUPT_HISTORY_NOTICE = "Unreadable local history was skipped; current queue records remain available."
+GRAPH_ORDER_NOTICE = "Decision sequence and timestamp order disagree: the affected item's past before its current record is unknown."
+GRAPH_FUTURE_NOTICE = "Future-dated decision or anchor records were ignored in the present view."
+GRAPH_CONFIG_NOTICE = "Graph configuration could not be read; unavailable configuration evidence was skipped."
+GRAPH_RULE_BOUND_NOTICE = "Rule input bounds reached; inspect the source for omitted rules."
+GRAPH_RULE_EXCLUSION_NOTICE = ("Rules with hidden characters, secret-like text, invalid source digests or excessive size/references "
+                               "were excluded. Existing text readers may show neutralised text; this graph refuses to attach those bytes to code.")
+GRAPH_REPLACED_MARKER = "[REPLACED — do not apply as current] "
+GRAPH_STATUS_LABELS = {status: "[" + status + "] " for status in
+                       BRIDGE_RULE_STATES + ("unverified", "missing-symbol", "deleted-file")}
+GRAPH_STATS_LINE = "- %s: %s"
+GRAPH_STATS_UNATTACHED = "Lessons attached to no file"
+GRAPH_STATS_UNANCHORED = "Rules with no anchor"
+GRAPH_UNAVAILABLE = "Graph unavailable: repository evidence is unsafe, unreadable or exceeds its input bound."
+GRAPH_INVALID_TIME = "invalid as_of timestamp"
+GRAPH_UNSAFE_DREAM = "unsafe Dream input"
+GRAPH_QUEUE_BOUND = "Dream graph exceeds graph work bound"
+GRAPH_EVIDENCE_ERROR = "Dream evidence could not be verified"
+GRAPH_INVALID_TIERS = "tiers must contain only approved and hint"
+GRAPH_INVALID_BUDGET = "budget must be a non-negative integer"
+GRAPH_TARGET_REQUIRED = "target is required"
+GRAPH_INVALID_SYMBOL = "invalid symbol target"
+GRAPH_INVALID_TARGET = "target is outside the repository, unsafe, or differs from the exact on-disk spelling"
+GRAPH_UNKNOWN_ID = "unknown rule or lesson id"
+GRAPH_UNKNOWN_FILE = "unknown file target"
+GRAPH_REFUSALS = (GRAPH_INVALID_TIME, GRAPH_UNSAFE_DREAM, GRAPH_QUEUE_BOUND, GRAPH_EVIDENCE_ERROR,
+                  GRAPH_INVALID_TIERS, GRAPH_INVALID_BUDGET, GRAPH_TARGET_REQUIRED, GRAPH_INVALID_SYMBOL,
+                  GRAPH_INVALID_TARGET, GRAPH_UNKNOWN_ID, GRAPH_UNKNOWN_FILE)
+GRAPH_CLI_HELP = "Inspect the typed, time-aware memory attached to code."
+GRAPH_CLI_SHOW_HELP = "Rules and lessons attached to a file, symbol or memory id."
+GRAPH_CLI_STATS_HELP = "Node, relation and unattached memory counts."
+GRAPH_CLI_TIERS_HELP = "approved or approved,hint"
+
+GRAPH_RELATION_MARKER = "[%s] "
+GRAPH_HINT_MARKER = "[hint; %s] "
+GRAPH_CURRENT_MARKER = "[CURRENT] "
+GRAPH_REPLACED_BY_MARKER = "[REPLACED — do not apply as current; replaced by %s] "
+GRAPH_INCOMPLETE_MARKER = "Incomplete groups: "
+
+GRAPH_ORDER_ITEM_NOTICE = "Decision order conflict for %s: history before the current queue record is unknown; the current record remains authoritative from its timestamp onward."
