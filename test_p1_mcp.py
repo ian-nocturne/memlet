@@ -608,7 +608,7 @@ class MemletMCPTests(unittest.TestCase):
                           'memlet_dream_next', 'memlet_dream_submit'},
                          {t['name'] for t in result[19:]})
         self.assertEqual(25, len(result))
-        self.assertEqual('9.1.1', SERVER_VERSION)
+        self.assertEqual('9.2.0', SERVER_VERSION)
         self.assertIn('Approval is CLI-only', result[22]['description'])
 
     def test_check_edit_and_rename_stale(self):

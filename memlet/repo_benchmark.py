@@ -1,4 +1,4 @@
-"""Independent Multi-Epoch Repository Evolution Benchmark Suite (4 Baselines x 4 Ablations) for Memlet v9.1.1.
+"""Independent Multi-Epoch Repository Evolution Benchmark Suite (4 Baselines x 4 Ablations) for Memlet v9.2.0.
 
 Evaluates agent memory and procedural skill engines across 4 realistic repository evolution epochs:
 - Epoch 1 (v1_baseline): Initial codebase with verified procedural skills and pitfall cases + directive turn trap.
@@ -914,7 +914,7 @@ def run_repo_evolution_benchmark(work_dir: Optional[str | Path] = None) -> Dict[
 
         return {
             "ok": True,
-            "benchmarkVersion": "9.1.1",
+            "benchmarkVersion": "9.2.0",
             "epochsEvaluated": 4,
             "turnsPerSystem": memlet_res["totalTurns"],
             "systemsEvaluated": len(systems),
