@@ -45,3 +45,28 @@ def suggested_label(item):
 LESSON_SEPARATOR = " ⟶ "
 # Schema: 3 source spans + 1 replacement + 4 edges with 2 endpoints, each at most 4 lines.
 MAX_LESSON_LINES = 48
+
+# 9.2 graph
+GRAPH_WHY = ("anchor-in-file", "anchor-symbol", "lesson-path", "lesson-cites-path", "replaced-rule-text")
+GRAPH_HEADINGS = {
+    "governs": "Governs this code",
+    "blocks": "Approved dead ends — do not repeat",
+    "resolves": "Approved fixes",
+    "replaced": "Replaced instructions — do not apply as current",
+    "stale": "Anchors requiring re-verification — do not apply as governing",
+    "hints": HINT_LABEL,
+}
+GRAPH_TIME_NOTICE = (
+    "Times come only from retained pin pinnedAt fields, accepted-anchor ledger events, "
+    "Dream approval records and decision events. 9.1.1 writes no pin timestamp or rule creation time; "
+    "anchor_snapshots.updated_at is the latest observation, not the first stale observation. "
+    "Hint receipts are dated but activation of the agreement policy is not, so hint start times are unknown. "
+    "Unknown times are null. Historical queries exclude unknown-since evidence and re-check current source bytes; "
+    "overwritten pins, deleted sidecar payloads and changed citation contents cannot be reconstructed. "
+    "Historical anchors must still be active now; undated present drift is not projected into the past."
+)
+GRAPH_HISTORY_NOTICE = (
+    "Historical hints are omitted: the repository does not retain changes to the hint agreement policy. "
+    "Without decision events, only the retained approval can be dated; overwritten decisions cannot be reconstructed."
+)
+GRAPH_OMITTED = "Omitted for budget: "

@@ -17,7 +17,7 @@ import importlib
 import importlib.util
 from typing import Any, Dict, List, Optional
 
-PLUGIN_MODULES = ("memlet.cli_dream", "memlet.cli_anchors", "memlet.cli_eval")
+PLUGIN_MODULES = ("memlet.cli_dream", "memlet.cli_anchors", "memlet.cli_eval", "memlet.cli_graph")
 
 
 class _Format(argparse.Action):
