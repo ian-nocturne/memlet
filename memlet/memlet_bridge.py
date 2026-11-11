@@ -610,16 +610,21 @@ def literal_lesson_paths(root, scope, text, *, context=None):
     context = lesson_path_context(root) if context is None else context
     root = context["root"]
     raw = [scope.split("::", 1)[0]] + [p for p, _ in mw._line_refs(text)]
-    raw += re.findall(r"(?<![\w/.-])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+(?![\w/.-])", text)
+    # Enumerate maximal path-like tokens, then strip terminal sentence punctuation.
+    raw += [m.group().rstrip(".") for m in re.finditer(r"(?<![\w/.-])(?:\./)?[\w.-]+(?:/[\w.-]+)*", text)]
     out = []
+    punctuation = ".,;:!?)]\"'`"
     for path in raw:
         path = path.replace("\\", "/").removeprefix("./")
         named = path == scope.split("::", 1)[0].replace("\\", "/").removeprefix("./")
         if not named:
-            for match in re.finditer(r"(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])", text):
-                before = text[match.start() - 1:match.start()] if match.start() else ""
-                after = text[match.end():match.end() + 1]
-                if not any(_hidden_character(c) or unicodedata.category(c) == "Cc" for c in before + after):
+            for match in re.finditer(r"(?<![\w/.-])(?:\./)?" + re.escape(path), text):
+                before = text[match.start()-1:match.start()] if match.start() else ""
+                tail = text[match.end():]
+                after = tail[:1]
+                terminal = re.match("[" + re.escape(punctuation) + "]+(?=\\s|$)", tail)
+                boundary = not tail or tail[0].isspace() or terminal is not None
+                if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
                     named = True
                     break
         if (named and len(path) <= 80 and valid_lesson_path(root, path) and path not in out
@@ -635,19 +640,28 @@ def _lesson_literal_paths(node, root, context):
     further evidence. Each line is matched separately so joins cannot invent tokens.
     """
     scope = node.get("scopeTag") or ""
-    pins = list(md._item_pins(node, "node"))
+    fields = md.lesson_display_fields(node)
+    roles = fields.get("lineRoles", ["current"] * len(fields.get("cites", [])))
+    paths = []
+    evidence = list(zip(fields.get("cites", []), roles))
+    replaced = {c["span"] for c, role in evidence if role == "replaced"}
     for edge in node.get("edges", []):
         if md.approval_state(edge, "edge") == TIER_APPROVED and edge.get("edgeVerdict") == "VALID":
-            pins += md._item_pins(edge, "edge")
-            if edge.get("citedTargetPin") is not None:
-                pins.append(edge["citedTargetPin"])
-    paths = literal_lesson_paths(root, scope, "", context=context)
-    seen = set()
-    for pin in pins:
-        if (not isinstance(pin, dict) or pin.get("span") in seen
-                or md._verify_pin_dict(pin, context["snapshot"] or {}, "path")):
+            for pin in md._item_pins(edge, "edge") + [edge.get("citedTargetPin")]:
+                if not isinstance(pin, dict) or md._verify_pin_dict(pin, context["snapshot"] or {}, "path"):
+                    continue
+                parsed = md.parse_span(pin.get("span", ""))
+                if parsed:
+                    for number in range(parsed[1], parsed[2] + 1):
+                        span = "%s:%d" % (parsed[0], number)
+                        if span not in replaced:
+                            evidence.append((md.resolve_pin(context["snapshot"], span), "current"))
+    for cite, role in evidence:
+        if role != "current":
             continue
-        seen.add(pin["span"])
+        pin = md.resolve_pin(context["snapshot"] or {}, cite["span"])
+        if not pin or pin.get("sha256") != cite.get("sha256"):
+            continue
         for line in str(pin.get("quoteText", "")).split("\n"):
             for path in literal_lesson_paths(root, scope, line, context=context):
                 if path not in paths:
@@ -664,10 +678,11 @@ def lesson_paths(node, repo_path=".", *, context=None):
         snapshot, _ = _load_snapshot(context["root"])
         config, _ = _load_config(context["root"])
         graph, _ = _load_queue(context["root"])
-        context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config))
+        context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config),
+                       trust=dream_tiers(graph or {}, snapshot=snapshot, config=config))
     state = context["trust"].get(node["id"])
     if state is None:
-        state = item_trust(node, snapshot=context["snapshot"], config=context["config"])
+        state = {"tier": TIER_PENDING}
         context["trust"][node["id"]] = state
     if state["tier"] != TIER_APPROVED:
         return []
@@ -689,6 +704,14 @@ def _decision_event_write(root, events):
         conn.close()
 
 
+class DecisionEvents(list):
+    """List-compatible advisory rows with read diagnostics."""
+    def __init__(self, rows=(), *, skipped=0, truncated=False):
+        super().__init__(rows)
+        self.skipped = skipped
+        self.truncated = truncated
+
+
 def decision_events(repo_path=".", item_id=None):
     """Bounded advisory history in stable sequence order; absent/unreadable means unknown."""
     try:
@@ -696,8 +719,17 @@ def decision_events(repo_path=".", item_id=None):
         conn = mw.connect_managed_sqlite(root, ".memlet/ledger.sqlite3", readonly=True)
         try:
             query = "SELECT seq,at,item_id,kind,decision,by,digest,paths FROM dream_decision_events"
-            rows = conn.execute(query + (" WHERE item_id=?" if item_id is not None else "") + " ORDER BY seq LIMIT 4096", (item_id,) if item_id is not None else ()).fetchall()
-            return [dict(zip(("seq","at","item_id","kind","decision","by","digest","paths"), (*r[:7], json.loads(r[7])))) for r in rows]
+            rows = conn.execute(query + (" WHERE item_id=?" if item_id is not None else "") + " ORDER BY seq DESC LIMIT 4097", (item_id,) if item_id is not None else ()).fetchall()
+            result = DecisionEvents(truncated=len(rows) > 4096)
+            for r in reversed(rows[:4096]):
+                try:
+                    paths = json.loads(r[7])
+                    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
+                        raise ValueError("invalid paths")
+                    result.append(dict(zip(("seq","at","item_id","kind","decision","by","digest","paths"), (*r[:7], paths))))
+                except (ValueError, TypeError):
+                    result.skipped += 1
+            return result
         finally:
             conn.close()
     except (OSError, ValueError, sqlite3.Error):
@@ -727,6 +759,7 @@ def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
     by_id = {str(n.get("id")): n for n in graph.get("nodes") or [] if isinstance(n, dict)}
     config, _ = _load_config(root)
     trust = dream_tiers(graph, snapshot=snap, config=config)
+    res["pendingNodes"] = [i for i in res["pendingNodes"] if trust.get(i["id"], {}).get("tier") != TIER_APPROVED]
     pending_ids = {i["id"] for i in res["pendingNodes"]}
     for node in graph.get("nodes", []):
         if (node["id"] not in pending_ids and md.approval_state(node, "node") == TIER_APPROVED
@@ -866,7 +899,10 @@ def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
             approved = {i["id"] for i in dream_items(root)["items"]}
             if not paths or not _ids(ids) or any(i not in approved for i in _ids(ids)):
                 return _fail("--paths requires an already approved lesson and --path FILE", 2)
-            return learn_approve(root, ids, approver=approver, reconsider=True, paths=paths)
+            graph, _ = _load_queue(root)
+            selected = [n for n in graph["nodes"] if n["id"] in _ids(ids)]
+            changed = any(n.get("approvedPaths", []) != list(paths) for n in selected)
+            return learn_approve(root, ids, approver=approver, reconsider=changed, paths=paths)
     except (OSError, ValueError) as exc:
         return _fail(str(exc), 2)
 
@@ -1027,7 +1063,7 @@ def _approved_lessons(root: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     # One tier gate for every consumer; do not reimplement edge approval here.
     result = dream_items(root)
     permitted = {it["id"] for it in result["items"]}
-    return [n for n in graph.get("nodes", []) if n.get("id") in permitted], result["notices"]
+    return [_approved_projection(n, snap) for n in graph.get("nodes", []) if n.get("id") in permitted], result["notices"]
 
 
 def lesson_text(node: Dict[str, Any]) -> str:
@@ -1368,12 +1404,22 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         return [], {"available": False, "reason": "no transcript snapshot to verify Dream pins; nothing returned"}, []
     try:
         _q, graph = md._load_queue(q)
-        res = md.run_dream_recall(str(q), snapshot_path=str(snap), query_text=query, budget_tokens=100000)
+        shared = dream_items(root, query=query)
+        shared_ids = {i["id"] for i in shared["items"]}
+        mixed = any(n.get("id") in shared_ids and any(md.approval_state(e, "edge") != TIER_APPROVED for e in n.get("edges", [])) for n in graph.get("nodes", []))
+        if mixed:
+            res = {"ok": True, "includedNodeIds": sorted(shared_ids), "pinVerification": "verified", "unverifiableItems": []}
+        else:
+            res = md.run_dream_recall(str(q), snapshot_path=str(snap), query_text=query, budget_tokens=100000)
     except (OSError, ValueError) as exc:
         return [], {"available": False, "reason": f"Dream snapshot or queue does not verify; nothing returned ({exc})"[:300]}, []
     if not res.get("ok"):
         return [], {"available": False, "reason": str(res.get("error") or "Dream recall failed")}, []
-    view, stats = md.approved_view(md.citation_review_view(graph, md.load_snapshot(snap)))
+    read_graph = graph
+    if mixed:
+        read_graph = copy.deepcopy(graph)
+        read_graph["nodes"] = [_approved_projection(n, md.load_snapshot(snap)) if n.get("id") in shared_ids else n for n in graph["nodes"]]
+    view, stats = md.approved_view(md.citation_review_view(read_graph, md.load_snapshot(snap)))
     by_id = {md.sanitize_node_id(n.get("id"), ""): n for n in view.get("nodes") or [] if isinstance(n, dict)}
     items = []
     for nid in res.get("includedNodeIds") or []:
@@ -1390,6 +1436,11 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         if items[-1].get("quoteLines"):
             items[-1]["text"] = f"- [{nid}] ({md.category_label(n.get('category'))}) {label}\n" + _lesson_quote_block(items[-1])
     states = {it["id"]: it for it in dream_items(root)["items"]}
+    present = {i["id"] for i in items}
+    for nid, state in states.items():
+        if nid not in present and any(md.approval_state(e, "edge") != TIER_APPROVED for e in by_id.get(nid, {}).get("edges", [])):
+            cite = state["cites"][0]
+            items.append(dict(state, source=SNAPSHOT_REL + "/" + cite["span"], quote=state["text"]))
     permitted = set(states)
     items = [it for it in items if it["id"] in permitted]
     for item in items:
@@ -1541,7 +1592,9 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         cands["dream"], sources["dream"], extra = _dream_items(root, query)
         notices += extra
         if files is not None:
-            selected = {it["id"] for it in dream_items(root, files=files)["items"]}
+            selection = dream_items(root, files=files)
+            notices.extend(n for n in selection["notices"] if n.startswith("outside repository"))
+            selected = {it["id"] for it in selection["items"]}
             cands["dream"] = [it for it in cands["dream"] if it["id"] in selected]
         stale_dream = [it for it in cands["dream"] if it["anchorStatus"] == "stale"]
         cands["staleRules"].extend(stale_dream)
@@ -1775,28 +1828,39 @@ def _git_z(root: Path, args: List[str]) -> Tuple[Optional[List[str]], str]:
     return [t for t in r.stdout.decode("utf-8", "surrogateescape").split("\0")], ""
 
 
+def normalise_lesson_files(root, files):
+    """Exact spelling; resolve absolute ancestors without changing the leaf spelling."""
+    root = Path(root).resolve()
+    out, notices = [], []
+    for raw in ([files] if isinstance(files, str) else files):
+        text = str(raw).replace("\\", "/")
+        p = Path(text)
+        if p.is_absolute():
+            try:
+                text = (p.parent.resolve() / p.name).relative_to(root).as_posix()
+            except ValueError:
+                notices.append("outside repository file ignored: " + str(raw))
+                continue
+        text = text.removeprefix("./")
+        if ".." in text.split("/"):
+            notices.append("outside repository or traversal file ignored: " + str(raw))
+            continue
+        try:
+            (root / text).parent.resolve().relative_to(root)
+        except ValueError:
+            notices.append("outside repository file ignored: " + str(raw))
+            continue
+        if text and text not in out:
+            out.append(text)
+    return out, notices
+
+
 def _changed_files(root: Path, base: Optional[str], files: Optional[Iterable[str]]) -> Tuple[Optional[List[str]], Optional[str]]:
     """`files` as given (absolute paths inside the repo made relative), else `git diff --name-status -z <base or HEAD>`
     plus untracked files. NUL-delimited, so names are taken literally; both ends of a rename or copy and every deleted
     path count as changed (a rule citing the old path must be re-checked)."""
     if files is not None:
-        if isinstance(files, str):
-            files = [files]
-        out: List[str] = []
-        for raw in files:
-            s = str(raw).strip()
-            if not s:
-                continue
-            p = Path(s)
-            if p.is_absolute():
-                try:
-                    s = p.resolve().relative_to(root).as_posix()
-                except ValueError:
-                    continue  # outside the repository: no rule here can reference it
-            s = mw._clean_ref_path(s.replace("\\", "/"))
-            if s and s not in out:
-                out.append(s)
-        return out, None
+        return normalise_lesson_files(root, files)[0], None
     ref = base or "HEAD"
     if ref.startswith("-"):
         return None, f"invalid base ref: {ref}"
@@ -1931,6 +1995,10 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                 rows = a.get("rules") or [{"rule": "pinned anchor (including committed changes)",
                                            "source": ", ".join(a["sources"]) or mw.CONFIG_PATH}]
                 res["affected"].extend(dict(row, anchor=a["anchor"], status=a["status"], reason=a["reason"]) for row in rows)
+    if files is not None:
+        file_notices = normalise_lesson_files(root, files)[1]
+        if file_notices:
+            res.setdefault("notices", []).extend(file_notices)
     res["approvedLessons"] = dream_items(root, files=changed)["items"]
     res["hints"] = dream_items(root, tiers=(TIER_HINT,), files=changed)["items"]
     res["hintsLabel"] = hint_label(res["hints"])
@@ -2046,10 +2114,10 @@ def _approved_node(node, snapshot):
     n = view["nodes"][0]
     edges = n.get("edges", [])
     return (n.get("verdict") in ("SUPPORTED", "ALREADY_SUPERSEDED")
-            and any(e.get("edgeVerdict") == "VALID" for e in edges)
+            and bool(_approved_projection(n, snapshot)["edges"])
             and (not md.superseded_lesson(n) or any(e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID" for e in edges))
             and not any(e.get("edgeVerdict") == md.REJECTED for e in edges)
-            and not _node_edges_verify(node, snapshot))
+            and not _node_edges_verify(_approved_projection(node, snapshot), snapshot))
 
 
 def _compute_tier(node, *, snapshot, config):
@@ -2061,7 +2129,7 @@ def _compute_tier(node, *, snapshot, config):
     if decision == TIER_REJECTED or node.get("verdict") == md.REJECTED:
         return TIER_REJECTED
     try:
-        if not isinstance(snapshot, dict) or _node_edges_verify(node, snapshot):
+        if not isinstance(snapshot, dict) or _node_edges_verify(_approved_projection(node, snapshot) if decision == TIER_APPROVED else node, snapshot):
             return TIER_PENDING
         edges = node.get("edges", [])
         if any(md.approval_state(e, "edge") == TIER_REJECTED or e.get("edgeVerdict") == md.REJECTED for e in edges):
@@ -2125,6 +2193,12 @@ def item_tier(node, *, snapshot, config):
     return item_trust(node, snapshot=snapshot, config=config)["tier"]
 
 
+def _approved_projection(node, snapshot):
+    return dict(node, edges=[e for e in node.get("edges", [])
+                if md.approval_state(e, "edge") == TIER_APPROVED and e.get("edgeVerdict") == "VALID"
+                and md._verify_item_pins(e, "edge", snapshot or {}) is None])
+
+
 def dream_tiers(graph, *, snapshot, config):
     config = tier_config(graph, config)
     approved_graph = md.approved_view(graph or {})[0]
@@ -2133,7 +2207,7 @@ def dream_tiers(graph, *, snapshot, config):
         if not isinstance(node, dict):
             continue
         state = item_trust(node, snapshot=snapshot, config=config)
-        display_node = md._supersession_pair(node, approved_graph)
+        display_node = md._supersession_pair(_approved_projection(node, snapshot), approved_graph)
         if state["tier"] == TIER_APPROVED and _node_edges_verify(display_node, snapshot or {}):
             state["tier"] = TIER_PENDING
         result[str(node["id"])] = state
@@ -2186,12 +2260,16 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
         live_ids = {n["id"] for n in approved_graph["nodes"]}
         approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
                                    if e.get("fromId") in live_ids or e.get("toId") in live_ids]
+        approved_graph["nodes"] = [_approved_projection(n, snapshot) for n in approved_graph["nodes"]]
         projection = md.supersession_projection(approved_graph)
         path_context = lesson_path_context(root)
         path_context.update(loaded=True, snapshot=snapshot, config=config, trust=trust)
         items, notices = [], dream_settings(config)[2]
         query_terms = md._query_terms(str(query))
-        requested = {_canonical_path(f) for f in files} if files is not None else None
+        requested = None
+        if files is not None:
+            requested, file_notices = normalise_lesson_files(root, files)
+            notices.extend(file_notices)
         for node in graph.get("nodes", []):
             if not isinstance(node, dict):
                 continue
@@ -2208,17 +2286,17 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             counts[tier] += 1
             if tier not in tiers:
                 continue
-            display_node = md.supersession_display_node(node, approved_graph, projection)
+            display_node = md.supersession_display_node(_approved_projection(node, snapshot) if tier == TIER_APPROVED else node, approved_graph, projection)
             text = lesson_text(display_node)
             scope = safe_lesson_display(node.get("scopeTag") or "")
             if query_terms and not query_terms & md._query_terms(text + " " + scope):
                 continue
             attached = lesson_paths(node, root, context=path_context) if tier == TIER_APPROVED else []
-            paths = list(dict.fromkeys(attached + _lesson_literal_paths(node, root, path_context))) if tier == TIER_APPROVED else []
+            paths = list(dict.fromkeys(attached + _lesson_literal_paths(display_node, root, path_context))) if tier == TIER_APPROVED else []
             inactive = [p for p in node.get("approvedPaths", []) if p not in attached]
             if inactive and tier == TIER_APPROVED:
                 notices.append(node["id"] + INACTIVE_APPROVAL_PATHS + ", ".join(inactive))
-            scope_path = _canonical_path(scope.split("::", 1)[0])
+            scope_path = scope.split("::", 1)[0].removeprefix("./")
             if requested is not None:
                 matches = any(f in paths for f in requested) if tier == TIER_APPROVED else any(
                     f == scope_path or (scope.endswith(("/", "\\")) and f.startswith(scope_path.rstrip("/") + "/"))
@@ -2226,7 +2304,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                 if not matches:
                     continue
             cites, seen = [], set()
-            for pin in evidence_pins(node):
+            for pin in evidence_pins(display_node):
                 if not isinstance(pin, dict) or pin.get("span") in seen:
                     continue
                 parsed = md.parse_span(str(pin.get("span", "")))
@@ -2250,7 +2328,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             fields = _lesson_fields(display_node)
             if fields:
                 # Display hashes are per-line projections of stored pins, never fresh trust baselines.
-                pins_verify = snapshot is not None and _node_edges_verify(node, snapshot) is None
+                pins_verify = snapshot is not None and _node_edges_verify(display_node, snapshot) is None
                 fields["cites"] = [dict(c, verified=bool(pins_verify and
                     (md.resolve_pin(snapshot, c["span"]) or {}).get("sha256") == c["sha256"])) for c in fields["cites"]]
                 it.update(fields)

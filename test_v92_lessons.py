@@ -348,3 +348,142 @@ class Corpus(Fixture):
         saved=json.loads(next(target.glob('*.json')).read_text())
         self.assertEqual(['unpinnable_citation'],saved['expected']['rejectionCodes'])
         self.assertEqual(saved['expected'],self.replay(saved,'rejected-replay'))
+
+class ReviewRegressions(Fixture):
+    def test_exact_case_and_shared_file_normalisation(self):
+        repo,nodes=self.fixture('pending',('single-line',))
+        (repo/'MyFile.py').write_text('x')
+        nid=nodes['single-line']['id']
+        self.assertTrue(mb.learn_approve(repo,[nid],approver='Reviewer',paths=['MyFile.py'])['ok'])
+        alias=self.base/'alias';alias.symlink_to(repo,target_is_directory=True)
+        for files,expected in [('MyFile.py',True),([str(repo/'MyFile.py')],True),([str(alias/'MyFile.py')],True),(['myfile.py'],False),(['DEPLOY.PY'],False)]:
+            with self.subTest(files=files):
+                self.assertEqual(expected,bool(mb.dream_items(repo,files=files)['items']))
+                self.assertEqual(expected,bool(mb.unified_recall(repo,files=files)['sections']['dream']))
+                self.assertEqual(expected,bool(mb.changed_check(repo,files=files)['approvedLessons']))
+        for read in (mb.dream_items,mb.unified_recall,mb.changed_check):
+            for outside in (str(self.base/'outside.py'),'../outside.py'):
+                self.assertTrue(any('outside repository' in n for n in read(repo,files=[outside])['notices']))
+
+    def test_raw_token_boundaries_and_dot_prefix(self):
+        repo,_=self.fixture('pending',('single-line',))
+        context=mb.lesson_path_context(repo)
+        for suffix in ('', '.', ',', ';', ':', '!', '?', ')', ']', '"', "'", '`'):
+            for prefix in ('','./'):
+                for tail in ('',' next'):
+                    self.assertEqual(['deploy.py'],mb.literal_lesson_paths(repo,'','Edit '+prefix+'deploy.py'+suffix+tail,context=context))
+        for text in ('deploy.py.bak','deploy.pyc','a/deploy.py/b','xdeploy.py','deploy.py.next'):
+            self.assertEqual([],mb.literal_lesson_paths(repo,'','Edit '+text,context=context))
+        for char in ('\x01','\t','\u200b','\U000e0061','\u0301','\ufe0f','\u20dd'):
+            for text in (char+'deploy.py','deploy.py'+char):
+                self.assertEqual([],mb.literal_lesson_paths(repo,'','Edit '+text,context=context))
+
+    def test_independent_digest_and_record_path_tampering(self):
+        repo,nodes=self.fixture('pending',('single-line',));nid=nodes['single-line']['id']
+        self.assertTrue(mb.learn_approve(repo,[nid],approver='Reviewer',paths=['anchor.py'])['ok'])
+        original=mb._load_queue(repo)[0]
+        for both in (False,True):
+            graph=copy.deepcopy(original);n=graph['nodes'][0]
+            n['approval']['paths']=['deploy.py']
+            if both:n['approvedPaths']=['deploy.py']
+            self.save_graph(repo,graph)
+            self.assertEqual('pending',md.approval_state(n,'node'))
+            self.assertEqual([],mb.lesson_paths(n,repo))
+            self.assertEqual([],mb.dream_items(repo)['items'])
+
+    def test_paths_idempotent_multiselect_and_unused_flags(self):
+        repo,nodes=self.fixture('pending',('single-line','BLOCKS'));ids=[n['id'] for n in nodes.values()]
+        self.assertTrue(mb.learn_approve(repo,ids,approver='Reviewer',paths=['anchor.py'])['ok'])
+        before=list(mb.decision_events(repo))
+        result=mb.learn_paths(repo,ids,approver='Reviewer',paths=['anchor.py'])
+        self.assertTrue(result['ok'],result);self.assertEqual([],result['applied'])
+        self.assertEqual(set(ids),set(result['unchanged']));self.assertEqual(before,mb.decision_events(repo))
+        result=self.cli('learn','--paths',*ids,'--by','Reviewer','--path','deploy.py','--repo',str(repo))
+        self.assertEqual(0,result.returncode,result.stdout+result.stderr)
+        for mode in (['--pending'],['--reject',ids[0],'--by','Reviewer'],['--paths',ids[0],'--by','Reviewer','--path','deploy.py'],['--file','unused'],['--transcript','unused']):
+            for flag in ('--reconsider','--refresh-citations'):
+                self.assertEqual(2,self.cli('learn',*mode,flag).returncode)
+
+    def test_custom_queue_refuses_paths(self):
+        repo,nodes=self.fixture('pending',('single-line',));queue=repo/'custom.json'
+        queue.write_bytes((repo/mb.QUEUE_REL).read_bytes())
+        with self.assertRaisesRegex(ValueError,'paths require a queue at'):
+            md.approve_queue_items(queue,[nodes['single-line']['id']],'Reviewer',snapshot_path=str(repo/mb.SNAPSHOT_REL),paths=['anchor.py'])
+
+    def test_events_skip_bad_rows_and_newest_cap(self):
+        repo,nodes=self.fixture('pending',('single-line',))
+        self.assertTrue(mb.learn_approve(repo,[nodes['single-line']['id']],approver='Reviewer')['ok'])
+        conn=sqlite3.connect(str(repo/'.memlet/ledger.sqlite3'))
+        conn.executemany('INSERT INTO dream_decision_events(at,item_id,kind,decision,by,digest,paths) VALUES (?,?,?,?,?,?,?)', [('now','id','node','approved','Reviewer','digest','[]')]*4100)
+        conn.execute("UPDATE dream_decision_events SET paths='invalid' WHERE seq=4101");conn.commit();conn.close()
+        events=mb.decision_events(repo)
+        self.assertTrue(events.truncated);self.assertEqual(1,events.skipped)
+        self.assertEqual(4095,len(events));self.assertEqual(7,events[0]['seq']);self.assertEqual(4102,events[-1]['seq'])
+
+    def test_mixed_edge_reader_agreement_table(self):
+        repo,nodes=self.fixture('approved',('BLOCKS',));graph=mb._load_queue(repo)[0];node=graph['nodes'][0]
+        for kind in ('SUPERSEDES','RESOLVES','GOVERNS'):
+            edge=copy.deepcopy(node['edges'][0]);edge.pop('approval',None)
+            edge.update(edgeId=edge['edgeId']+kind,edgeType=kind,toId='inline-target',edgeVerdict='PENDING')
+            node['edges'].append(edge);graph['edges'].append(copy.deepcopy(edge))
+        self.save_graph(repo,graph)
+        item=mb.dream_items(repo)['items'][0]
+        self.assertEqual(['BLOCKS'],item['edgeTypes']);self.assertFalse(item.get('quarantined'))
+        hand,caps,report=self.bridge(repo)
+        readers={'dream':mb.dream_items(repo)['items'],'recall':mb.unified_recall(repo)['sections']['dream'],'changed':mb.changed_check(repo,files=['deploy.py'])['approvedLessons'],'handover':report['approvedLessons']}
+        for name,items in readers.items():
+            with self.subTest(reader=name):
+                self.assertEqual([node['id']],[i['id'] for i in items]);self.assertEqual(['BLOCKS'],items[0]['edgeTypes'])
+                self.assertFalse(items[0].get('quarantined'))
+        self.assertNotIn(node['id'],[i['id'] for i in mb.learn_pending(repo)['pendingNodes']])
+        self.assertIn(node['id'],(repo/mb.PROMOTED_PAGE).read_text())
+        self.assertNotIn('memlet-supersedes',json.dumps(caps));self.assertNotIn('memlet-resolves',json.dumps(caps));self.assertNotIn('memlet-governs',json.dumps(caps))
+
+class CaptureFailures(Corpus):
+    def test_capture_failure_never_changes_batch(self):
+        fixture=json.loads((CORPUS/'well-formed.json').read_text())
+        for i,error in enumerate((OSError('unwritable'),FileExistsError('existing'),ValueError('masking'))):
+            repo=self.setup_input(fixture,'failure'+str(i))
+            def fail(*args):
+                states=list((repo/dc.RUNS_REL).glob('*.json'))
+                self.assertTrue(states)
+                self.assertTrue(any(json.loads(p.read_text()).get('completed') for p in states))
+                raise error
+            with mock.patch.object(dc,'_save_answer',side_effect=fail):
+                report=dc.dream_run(repo,runner=lambda *a,**kw:fixture['answer'],save_fixture=self.base/'answers')
+            self.assertTrue(report['ok'],report);self.assertEqual(0,report['exitCode']);self.assertTrue(report['items'])
+            self.assertTrue(any('fixture capture failed' in n for n in report['notices']))
+
+class SupersessionRegressions(Fixture):
+    def test_replaced_only_paths_never_attach_current(self):
+        repo,nodes=self.fixture('pending',('SUPERSEDES',));graph=mb._load_queue(repo)[0];node=graph['nodes'][0]
+        file=md.parse_span(node['primaryPin']['span'])[0];path=repo/mb.SNAPSHOT_REL/file
+        path.write_text('2026-11-11T10:00:00Z [user] Deploy with anchor.py.\n2026-11-11T10:01:00Z [user] From now on use deploy.py.\n')
+        snapshot,_=mb._load_snapshot(repo)
+        node['scopeTag']='general deployment'
+        for item in [node]+node['edges']+graph['edges']:
+            for key in ('primaryPin','supersededByPin','srcPin','targetPin','citedTargetPin'):
+                if isinstance(item.get(key),dict):item[key]=md.resolve_pin(snapshot,item[key]['span'])
+            if 'allPins' in item:item['allPins']=[md.resolve_pin(snapshot,p['span']) for p in item['allPins']]
+        self.save_graph(repo,graph)
+        self.assertTrue(mb.learn_approve(repo,[node['id']],approver='Reviewer')['ok'])
+        self.assertEqual(['deploy.py'],mb.dream_items(repo)['items'][0]['paths'])
+        for read,key in ((mb.dream_items,'items'),(mb.changed_check,'approvedLessons')):
+            self.assertEqual([],read(repo,files=['anchor.py'])[key])
+        self.assertEqual([],mb.unified_recall(repo,files=['anchor.py'])['sections']['dream'])
+        hand,caps,_=self.bridge(repo)
+        self.assertEqual(['deploy.py'],caps['capsules'][0]['paths'])
+
+    def test_incoming_stale_supersession_demotes_standalone_paths(self):
+        repo,nodes=self.fixture('approved',('BLOCKS','single-line'));graph=mb._load_queue(repo)[0]
+        old,new=graph['nodes'];edge=new['edges'][0]
+        edge.update(edgeType='SUPERSEDES',toId=old['id'],targetPin=copy.deepcopy(old['primaryPin']))
+        graph['edges']=[copy.deepcopy(e) for n in graph['nodes'] for e in n['edges']]
+        self.save_graph(repo,graph)
+        self.assertTrue(mb.learn_approve(repo,[old['id'],new['id']],approver='Reviewer',reconsider=True,paths=['anchor.py'])['ok'])
+        graph=mb._load_queue(repo)[0];old,new=graph['nodes']
+        file,line,_=md.parse_span(new['primaryPin']['span']);path=repo/mb.SNAPSHOT_REL/file
+        lines=path.read_text().splitlines();lines[line-1]+=' changed';path.write_text('\n'.join(lines)+'\n')
+        self.assertEqual([],mb.dream_items(repo)['items'])
+        self.assertEqual([],mb.lesson_paths(old,repo))
+        self.assertEqual([],mb.lesson_paths(old,repo,context=mb.lesson_path_context(repo)))

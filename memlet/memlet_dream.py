@@ -3691,6 +3691,8 @@ def _decide_locked(
     q_path, graph = _load_queue(queue_path)
     if paths is not None:
         from .memlet_bridge import valid_lesson_path
+        if q_path.name != "APPROVAL-QUEUE.json" or q_path.parent.name != "dream" or q_path.parent.parent.name != ".memlet":
+            raise ValueError("paths require a queue at <root>/.memlet/dream/APPROVAL-QUEUE.json")
         root = q_path.parent.parent.parent
         if (not isinstance(paths, (list, tuple)) or len(paths) > 8
                 or any(not isinstance(p, str) for p in paths) or len(set(paths)) != len(paths)

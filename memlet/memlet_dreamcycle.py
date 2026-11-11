@@ -825,10 +825,12 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
               "rejectedCandidates": 0, "normalizedSpans": 0, "items": [], "errors": [], "notices": [],
               "limits": {"batches": max_batches, "calls": MAX_CALLS, "wallSeconds": MAX_WALL_SECONDS},
               "dryRun": dry_run, "prompts": [], "callLog": [], "trustBoundary": TRUST_BOUNDARY}
+    captures = []
+    def capture(*args):
+        if args[0] is not None:
+            captures.append(args)
     try:
         root, config = _repo(repo)
-        if save_fixture is not None:
-            _fixture_directory(save_fixture)
         vendors = list(dict.fromkeys(via))
         if not vendors or any(v not in vc.VENDORS for v in vendors) or verify_with not in (None,) + vc.VENDORS:
             raise ValueError("unknown vendor")
@@ -917,11 +919,11 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     if not isinstance(verdict, dict) or set(verdict) != {"verdict"} or verdict["verdict"] not in VERDICTS:
                         raise ValueError("invalid verdict")
                 except ValueError:
-                    _save_answer(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": None})
+                    capture(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": None})
                     report["droppedOutput"] += 1
                     report["notices"].append(nid + ": dropped verifier verdict from " + verify_with + "/" + verifier_model + ": invalid or failed output")
                     continue
-                _save_answer(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": verdict["verdict"]})
+                capture(save_fixture, verify_with, verifier_model, "verify", data, result["text"], {"verdict": verdict["verdict"]})
                 with md.queue_lock(root / mb.QUEUE_REL):
                     graph, _ = mb._load_queue(root)
                     target = next((n for n in (graph or {}).get("nodes", []) if n["id"] == nid), None)
@@ -1001,7 +1003,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             if not isinstance(cands, list) or len(cands) > MAX_CANDIDATES:
                                 raise ValueError("expected bounded candidate array")
                         except ValueError as exc:
-                            _save_answer(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], {"failed": True, "items": [], "rejectionCodes": []})
+                            capture(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], {"failed": True, "items": [], "rejectionCodes": []})
                             report["droppedOutput"] += 1
                             report["failedBatches"] += 1
                             report["errors"].append(str(exc))
@@ -1015,9 +1017,11 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                             break
                         submitted = _submit(root, run_id, batch["batchId"], cands, v, result, batch, complete=False)
                         if save_fixture is not None:
-                            graph, _ = mb._load_queue(root)
-                            captured = [n for n in (graph or {}).get("nodes", []) if n["id"] in submitted["itemIds"]]
-                            _save_answer(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], {"failed": not submitted["ok"], "items": fixture_items(captured), "rejectionCodes": [r["reasonCode"] for r in submitted[TIER_REJECTED]]})
+                            def expected_capture(submitted=submitted):
+                                graph, _ = mb._load_queue(root)
+                                captured = [n for n in (graph or {}).get("nodes", []) if n["id"] in submitted["itemIds"]]
+                                return {"failed": not submitted["ok"], "items": fixture_items(captured), "rejectionCodes": [r["reasonCode"] for r in submitted[TIER_REJECTED]]}
+                            capture(save_fixture, v, models.get(v, vc.DEFAULT_MODELS[v]), "propose", batch["stdinText"], result["text"], expected_capture)
                         report["items"].extend(submitted["itemIds"])
                         _keep_rejections(report, submitted[TIER_REJECTED])
                         report["normalizedSpans"] += submitted["normalizedSpans"]
@@ -1059,6 +1063,12 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     _write(root, state_rel, state)
     except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
         report["errors"].append(str(exc))
+    for args in captures:
+        try:
+            expected = args[-1]() if callable(args[-1]) else args[-1]
+            _save_answer(*args[:-1], expected)
+        except Exception as exc:
+            report["notices"].append("fixture capture failed: " + str(exc))
     report["wallSeconds"] = round(time.monotonic() - started, 3)
     report["ok"] = not report["errors"]
     report["exitCode"] = 0 if report["ok"] else 2
