@@ -281,7 +281,8 @@ class GraphTests(fixtures.Scratch):
         print('I5 differential E3 path tables:', compared)
 
     def assert_reader_agreement(self, repo, target):
-        approved = {i['id']: i for i in mb.dream_items(repo)['items']}
+        with mb._lesson_path_projection(repo, None) as context:
+            approved = {i['id']: dict(i, paths=context['paths'].get(i['id'], [])) for i in mb.dream_items(repo)['items']}
         built = graph.build_graph(repo)
         self.assertTrue(built['ok'], built)
         projected = {i['id']: i for i in built['nodes'] if i.get('recordType') == 'item' and i['tier'] == 'approved'}
@@ -429,7 +430,9 @@ class GraphTests(fixtures.Scratch):
         table = []
         for state in ('approved', 'hint', 'pending', 'rejected', 'edge-rejected', 'vetoed'):
             repo, nodes = self.fixture(state)
-            read = mb.dream_items(repo, tiers=('approved', 'hint'))['items']
+            with mb._lesson_path_projection(repo, None) as context:
+                read = mb.dream_items(repo, tiers=('approved', 'hint'))['items']
+                attachments = dict(context['paths'])
             built = graph.build_graph(repo)
             self.assertTrue(built['ok'], built)
             projected = {n['id']: n for n in built['nodes'] if n.get('recordType') == 'item'}
@@ -458,8 +461,8 @@ class GraphTests(fixtures.Scratch):
                     self.assertEqual(original['cites'], projected[node['id']]['cites'])
                     if original['tier'] == 'approved':
                         capsule = next(i for i in capsules if i['id'] == node['id'])
-                        self.assertEqual(original.get('paths', []), capsule['paths'])
-                        self.assertEqual(original.get('paths', []), projected[node['id']]['paths'])
+                        self.assertEqual(attachments.get(original['id'], []), capsule['paths'])
+                        self.assertEqual(attachments.get(original['id'], []), projected[node['id']]['paths'])
                     else:
                         self.assertNotIn('paths', original)  # E3 hints are display only.
             old = routlet_hand['rejectedApproaches']
@@ -1238,7 +1241,7 @@ class GraphTests(fixtures.Scratch):
             node['allPins'].append(pin(2)); self.seal(node)
             return [node], []
         self.queue_fixture(['Never use the cold cache.', 'deploy.py requires review.'], build)
-        self.assertEqual(['deploy.py'], mb.dream_items(self.root)['items'][0]['paths'])
+        self.assertEqual(['deploy.py'], mb.dream_items(self.root, files=['deploy.py'])['items'][0]['paths'])
         self.assertEqual(['DRM-line-start'], [i['id'] for i in self.result(target='deploy.py')['groups']['blocks']])
         self.assert_reader_agreement(self.root, 'deploy.py')
 
@@ -1843,6 +1846,65 @@ class GraphTests(fixtures.Scratch):
         print('E1 long cited line %d bytes: %.3fs token scan' % (len(text), elapsed))
 
 
+
+    def test_final_managed_dream_pages_are_not_rules_and_every_id_is_queryable(self):
+        repo, _ = self.fixture('approved', ('BLOCKS', 'GOVERNS', 'SUPERSEDES'))
+        built = graph.build_graph(repo)
+        self.assertTrue(built['ok'], built)
+        self.assertEqual(1, built['counts']['nodes']['rule'])
+        self.assertFalse(any(n.get('path') == mb.PROMOTED_PAGE and n['kind'] == 'rule' for n in built['nodes']))
+        for node in built['nodes']:
+            with self.subTest(kind=node['kind'], id=node['id']):
+                response = graph.neighbors(repo, node['id'], budget=8000)
+                self.assertTrue(response['ok'], response)
+        result = self.cli('admin', 'graph', 'stats', '--repo', str(repo))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, json.loads(result.stdout)['counts']['nodes']['rule'])
+
+    def test_final_historical_markdown_and_empty_history_are_explicit(self):
+        from memlet import vocabulary as v
+        self.time_fixture()
+        for cutoff, empty in [('2025-01-01T00:00:00Z', True), ('2026-01-03T00:00:00Z', False)]:
+            result = self.cli('admin', 'graph', 'show', 'deploy.py', '--repo', str(self.root),
+                              '--as-of', cutoff, '--format', 'markdown', '--budget', '8000')
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue(result.stdout.startswith(v.GRAPH_HISTORICAL_HEAD % cutoff), result.stdout)
+            self.assertIn(v.GRAPH_HISTORY_NOTICE, result.stdout)
+            self.assertNotIn('9.1.1', result.stdout)
+            if empty:
+                self.assertIn(v.GRAPH_HISTORICAL_EMPTY % cutoff, result.stdout)
+            else:
+                self.assertIn('Never edit deploy.py', result.stdout)
+
+    def test_final_current_only_quarantined_lesson_does_not_poison_blocks(self):
+        from memlet import memlet_hooks as hooks, vocabulary as v
+        self.write('deploy.py', 'x = 1\n')
+        self.write('AGENTS.md', '# Rules\n')
+        mw.init_project(self.root)
+        self.tracked('deploy.py', 'AGENTS.md')
+        lines = ['2026-01-01T00:00:00Z [user] Never edit deploy.py by hand.',
+                 '2026-01-02T00:00:00Z [user] Edit deploy.py only via gen_v1.',
+                 '2026-01-03T00:00:00Z [user] Edit deploy.py only via gen_v2.',
+                 '2026-01-04T00:00:00Z [user] Never commit deploy.py with debug flags on.']
+        def build(pin):
+            nodes = [self.queue_node('DRM-' + name, pin(i+1), 'general') for i, name in enumerate(('X', 'S', 'T', 'Z'))]
+            for n, target, to in ((nodes[1], pin(1), 'DRM-X'), (nodes[2], pin(2), 'DRM-S')):
+                n.update(category='superseded_directive', statusKind='active_lesson')
+                edge = dict(edgeId='E-' + n['id'], edgeType='SUPERSEDES', fromId=n['id'], toId=to,
+                            targetLabel='fixture', srcPin=n['primaryPin'], targetPin=target, edgeVerdict='VALID')
+                n['edges'] = [self.seal(edge, 'edge')]
+                self.seal(n)
+            return nodes, []
+        self.queue_fixture(lines, build)
+        read = {i['id']: i for i in mb.dream_items(self.root)['items']}
+        self.assertTrue(read['DRM-T']['quarantined'])
+        self.assertEqual(['current'], read['DRM-T']['lineRoles'])
+        result = graph.neighbors(self.root, 'deploy.py', budget=8000)
+        self.assertTrue(result['ok'], result)
+        self.assertIn('DRM-Z', [i['id'] for i in result['groups']['blocks']])
+        self.assertNotIn('DRM-T', [i['id'] for i in result['groups']['replaced']])
+        self.assertIn(v.GRAPH_CURRENT_ONLY_NOTICE, result['notices'])
+        self.assertIsNotNone(hooks._checked_neighbors(result, ('approved',)))
 
 if __name__ == '__main__':
     unittest.main()

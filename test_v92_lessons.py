@@ -68,7 +68,7 @@ class Lessons(Fixture):
                     node = next(n for n in mb._load_queue(repo)[0]['nodes'] if n['id']==nid)
                     self.assertEqual(['util.py'] if human else [],mb.lesson_paths(node,repo))
                     item = next(i for i in mb.dream_items(repo)['items'] if i['id']==nid)
-                    self.assertEqual(['util.py'] if attached else [],item.get('paths',[]))
+                    self.assertEqual(['util.py'] if human else [],item.get('paths',[]))
                     for items in (mb.dream_items(repo,files=['util.py'])['items'],
                                   mb.unified_recall(repo,files=['util.py'])['sections']['dream']):
                         self.assertEqual(attached,any(i['id']==nid for i in items))
@@ -275,7 +275,7 @@ class Lessons(Fixture):
                 result=mb.learn_approve(repo,[node['id']],approver='Reviewer')
                 self.assertTrue(result['ok'],result)
                 item=mb.dream_items(repo)['items'][0]
-                self.assertEqual([] if hidden else ['anchor.py'],item.get('paths',[]))
+                self.assertNotIn('paths', item)  # literal attachment does not alter default legacy bytes
                 self.assertEqual(not bool(hidden),bool(mb.dream_items(repo,files=['anchor.py'])['items']))
                 self.assertEqual(not bool(hidden),bool(mb.unified_recall(repo,files=['anchor.py'])['sections']['dream']))
                 changed=mb.changed_check(repo,files=['anchor.py'])['approvedLessons']
@@ -303,7 +303,7 @@ class Lessons(Fixture):
         item=mb.dream_items(repo)['items'][0]
         self.assertEqual('approved',item['tier']);self.assertEqual([],item.get('paths',[]))
         self.assertTrue(mb.learn_approve(repo,[extra['edgeId']],approver='Reviewer')['ok'])
-        self.assertEqual(['anchor.py'],mb.dream_items(repo)['items'][0]['paths'])
+        self.assertEqual(['anchor.py'],mb.dream_items(repo, files=['anchor.py', 'deploy.py'])['items'][0]['paths'])
 
     def test_explicit_and_cascaded_decisions_log_each_item_once(self):
         repo,nodes=self.fixture('approved',('single-line',))
@@ -426,7 +426,7 @@ class ReviewRegressions(Fixture):
                 changed=mb.changed_check(repo,files=files)['approvedLessons']
                 self.assertEqual(expected or files==['DEPLOY.PY'],bool(changed))
                 if changed:self.assertEqual('path' if expected else 'scope',changed[0]['via'])
-        for read in (mb.dream_items,mb.unified_recall,mb.changed_check):
+        for read in (mb.dream_items,mb.unified_recall):
             for outside in (str(self.base/'outside.py'),'../outside.py'):
                 self.assertTrue(any('outside repository' in n for n in read(repo,files=[outside])['notices']))
 
@@ -532,7 +532,7 @@ class SupersessionRegressions(Fixture):
             if 'allPins' in item:item['allPins']=[md.resolve_pin(snapshot,p['span']) for p in item['allPins']]
         self.save_graph(repo,graph)
         self.assertTrue(mb.learn_approve(repo,[node['id']],approver='Reviewer')['ok'])
-        self.assertEqual(['deploy.py'],mb.dream_items(repo)['items'][0]['paths'])
+        self.assertEqual(['deploy.py'],mb.dream_items(repo, files=['anchor.py', 'deploy.py'])['items'][0]['paths'])
         for read,key in ((mb.dream_items,'items'),(mb.changed_check,'approvedLessons')):
             self.assertEqual([],read(repo,files=['anchor.py'])[key])
         self.assertEqual([],mb.unified_recall(repo,files=['anchor.py'])['sections']['dream'])
@@ -546,9 +546,255 @@ class SupersessionRegressions(Fixture):
         graph['edges']=[copy.deepcopy(e) for n in graph['nodes'] for e in n['edges']]
         self.save_graph(repo,graph)
         self.assertTrue(mb.learn_approve(repo,[old['id'],new['id']],approver='Reviewer',reconsider=True,paths=['anchor.py'])['ok'])
+        self.assertTrue(mb.learn_approve(repo,[edge['edgeId']],approver='Reviewer')['ok'])
         graph=mb._load_queue(repo)[0];old,new=graph['nodes']
         file,line,_=md.parse_span(new['primaryPin']['span']);path=repo/mb.SNAPSHOT_REL/file
         lines=path.read_text().splitlines();lines[line-1]+=' changed';path.write_text('\n'.join(lines)+'\n')
         self.assertEqual([],mb.dream_items(repo)['items'])
         self.assertEqual([],mb.lesson_paths(old,repo))
         self.assertEqual([],mb.lesson_paths(old,repo,context=mb.lesson_path_context(repo)))
+
+class FinalReaderFixes(Fixture):
+    """Final-audit reproductions; all inputs live in the fixture sandbox."""
+    def keyword_repo(self, texts, *, approve=True):
+        self.write('AGENTS.md', '# Rules\n- Always keep `anchor.py::guard` enabled.\n')
+        self.write('anchor.py', 'def guard():\n    return True\n')
+        self.write('deploy.py', '# root\n')
+        self.write('src/deploy.py', '# nested\n')
+        self.assertTrue(mw.init_project(self.root)['ok'])
+        subprocess.run(['git', '-C', str(self.root), 'add', 'AGENTS.md', 'anchor.py', 'deploy.py', 'src/deploy.py'],
+                       check=True, capture_output=True)
+        source = self.base / 'stream.jsonl'
+        source.write_text('\n'.join(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': t}})
+                                    for t in texts) + '\n')
+        learned = mb.learn_from_transcript(self.root, source)
+        self.assertTrue(learned['ok'], learned)
+        if approve:
+            self.assertTrue(mb.learn_approve(self.root, learned['addedNodeIds'], approver='Reviewer')['ok'])
+        return learned['addedNodeIds']
+
+    def mixed_edges(self):
+        repo, _ = self.fixture('approved', ('BLOCKS',))
+        data = mb._load_queue(repo)[0]
+        node = data['nodes'][0]
+        for relation in ('GOVERNS', 'RESOLVES'):
+            edge = copy.deepcopy(node['edges'][0])
+            edge.update(edgeId='PENDING-' + relation, edgeType=relation, toId='INLINE-' + relation, edgeVerdict='PENDING')
+            edge.pop('approval', None)
+            node['edges'].append(edge)
+            data['edges'].append(copy.deepcopy(edge))
+        self.save_graph(repo, data)
+        return repo, node['id'], node['edges'][0]['edgeId']
+
+    def test_paths_reseal_only_reviewed_relations_cli_and_log(self):
+        repo, nid, approved_edge = self.mixed_edges()
+        result = self.cli('learn', '--paths', nid, '--by', 'Reviewer', '--path', 'anchor.py', '--repo', str(repo))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual([approved_edge], record['resealedEdges'])
+        self.assertEqual([{'id': 'PENDING-GOVERNS', 'state': 'pending'},
+                          {'id': 'PENDING-RESOLVES', 'state': 'pending'}], record['untouchedEdges'])
+        edges = mb._load_queue(repo)[0]['nodes'][0]['edges']
+        self.assertEqual(['approved', 'pending', 'pending'], [md.approval_state(e, 'edge') for e in edges])
+        self.assertEqual(['BLOCKS'], mb.dream_items(repo)['items'][0]['edgeTypes'])
+        decisions = {e['item_id']: e['decision'] for e in mb.decision_events(repo)}
+        self.assertEqual('reconsidered', decisions[approved_edge])
+        self.assertEqual('left-pending', decisions['PENDING-GOVERNS'])
+        self.assertIn('Re-sealed relations:', record['formatted'])
+        self.assertIn('PENDING-RESOLVES (pending)', record['formatted'])
+
+    def test_reconsider_cannot_overturn_rejected_relation_911_noop(self):
+        repo, nid, approved_edge = self.mixed_edges()
+        self.assertTrue(mb.learn_reject(repo, ['PENDING-RESOLVES'], approver='Reviewer')['ok'])
+        before = (repo / mb.QUEUE_REL).read_bytes()
+        result = mb.learn_approve(repo, [nid], approver='Reviewer', reconsider=True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([nid], result['unchanged'])
+        self.assertEqual([], result['cascadedEdges'])
+        self.assertEqual(before, (repo / mb.QUEUE_REL).read_bytes())
+        self.assertEqual('pending', mb.dream_items(repo, tiers=('pending',))['items'][0]['tier'])
+        self.assertIn({'id': 'PENDING-RESOLVES', 'state': 'rejected'}, result['untouchedEdges'])
+        self.assertEqual('left-rejected', mb.decision_events(repo, 'PENDING-RESOLVES')[-1]['decision'])
+        resealed = mb.learn_approve(repo, [nid], approver='Reviewer', reconsider=True, paths=['anchor.py'])
+        self.assertEqual([approved_edge], resealed['resealedEdges'])
+        self.assertEqual(['approved', 'pending', 'rejected'],
+                         [md.approval_state(e, 'edge') for e in mb._load_queue(repo)[0]['nodes'][0]['edges']])
+        self.assertEqual([], mb.dream_items(repo)['items'])
+
+    def test_explicit_relation_review_in_reseal_batch_is_logged_as_a_decision(self):
+        repo, nid, approved_edge = self.mixed_edges()
+        result = mb.learn_approve(repo, [nid, 'PENDING-GOVERNS'], approver='Reviewer', reconsider=True)
+        self.assertTrue(result['ok'], result)
+        self.assertNotIn('PENDING-GOVERNS', [e['id'] for e in result['untouchedEdges']])
+        self.assertEqual('reconsidered', mb.decision_events(repo, 'PENDING-GOVERNS')[-1]['decision'])
+        self.assertEqual(['BLOCKS', 'GOVERNS'], mb.dream_items(repo)['items'][0]['edgeTypes'])
+
+    def test_reconsider_only_reseals_current_approved_edges(self):
+        repo, nid, approved_edge = self.mixed_edges()
+        result = mb.learn_approve(repo, [nid], approver='Reviewer', reconsider=True)
+        self.assertEqual([approved_edge], result['cascadedEdges'])
+        self.assertEqual(['approved', 'pending', 'pending'],
+                         [md.approval_state(e, 'edge') for e in mb._load_queue(repo)[0]['nodes'][0]['edges']])
+
+    def test_leading_punctuation_table_all_attachment_consumers(self):
+        from memlet import memlet_graph as mg
+        bad = ['src\\deploy.py', 'C:\\x\\deploy.py', 'pkg:deploy.py', 'a/deploy.py', '~deploy.py', '%deploy.py',
+               '@deploy.py', '+deploy.py', '=deploy.py', '-deploy.py', '.deploy.py', '?deploy.py',
+               '\u200bdeploy.py', '\u034fdeploy.py']
+        good = ['deploy.py', '"deploy.py"', "'deploy.py'", '`deploy.py`', '(deploy.py)', '[deploy.py]',
+                '{deploy.py ', '<deploy.py ', './deploy.py', 'src/deploy.py']
+        self.assertNotIn('deploy.py', mb._lesson_path_candidates('Never edit \x01deploy.py by hand.'))
+        ids = self.keyword_repo(['Never edit ' + p + ' by hand.' for p in bad + good])
+        self.assertEqual(len(bad + good), len(ids))
+        expected = {nid: [] if i < len(bad) else ['src/deploy.py'] if i == len(bad + good)-1 else ['deploy.py']
+                    for i, nid in enumerate(ids)}
+        default = mb.dream_items(self.root)
+        self.assertTrue(all('paths' not in i for i in default['items']))
+        by_id = {i['id']: i for i in mb.dream_items(self.root, files=['deploy.py', 'src/deploy.py'])['items']}
+        for nid, paths in expected.items():
+            self.assertEqual(paths, by_id.get(nid, {}).get('paths', []), nid)
+        for path in ('deploy.py', 'src/deploy.py'):
+            with mock.patch.object(mg, '_monotonic', return_value=0):
+                neighbors = mg.neighbors(self.root, path, budget=8000)
+            self.assertTrue(neighbors['ok'], neighbors)
+            self.assertEqual({nid for nid, paths in expected.items() if path in paths},
+                             {i['id'] for i in neighbors['groups']['blocks']})
+        _, caps, _ = self.bridge(self.root)
+        self.assertEqual(expected, {i['id']: i['paths'] for i in caps['capsules']})
+
+    def test_rule_file_normalisation_cli_mcp_and_lesson_exactness(self):
+        ids = self.keyword_repo(['Never edit anchor.py by hand.'])
+        (self.root / 'alias.py').symlink_to('anchor.py')
+        for path in ('anchor.py', ' anchor.py', 'anchor.py\n', '././anchor.py', str(self.root / 'alias.py')):
+            with self.subTest(path=path):
+                result = mb.changed_check(self.root, files=[path])
+                self.assertIn('anchor.py::guard', [i['anchor'] for i in result['affected']])
+                rpc = self.rpc('memlet_check', files=[path])['structuredContent']
+                self.assertIn('anchor.py::guard', [i['anchor'] for i in rpc['affected']])
+                if path != 'anchor.py':
+                    self.assertEqual([], mb.dream_items(self.root, files=[path])['items'])
+
+    def test_attachment_unavailable_is_visible_everywhere_and_human_paths_survive(self):
+        from memlet.vocabulary import ATTACHMENT_INCOMPLETE
+        ids = self.keyword_repo(['Never edit deploy.py by hand.'])
+        self.assertTrue(mb.learn_paths(self.root, ids, approver='Reviewer', paths=['anchor.py'])['ok'])
+        # Size exhaustion is deterministic and exercises the real git reader.
+        with mock.patch.object(mb, 'LITERAL_FILES_MAX_BYTES', 1):
+            reads = [mb.dream_items(self.root), mb.unified_recall(self.root, files=['anchor.py'], budget=8000),
+                     mb.changed_check(self.root, files=['anchor.py']), mw.build_handover(self.root, budget=8000, output_format='markdown')]
+            for result in reads:
+                self.assertTrue(result['attachmentIncomplete'], result)
+                self.assertEqual(ATTACHMENT_INCOMPLETE, result['attachmentReason'])
+            self.assertEqual(['anchor.py'], reads[0]['items'][0]['paths'])
+            self.assertEqual(ids, [i['id'] for i in reads[1]['sections']['dream']])
+            self.assertTrue(mw.verify_handover_checksum(reads[-1]))
+            self.assertIn(ATTACHMENT_INCOMPLETE, reads[-1]['formatted'])
+            hand, caps, _ = self.bridge(self.root)
+            for doc in (hand, caps):
+                self.assertTrue(doc['attachmentIncomplete'])
+                self.assertEqual(1, doc['omitted']['literalAttachments'])
+                self.assertTrue(hb.verify(doc))
+            self.assertEqual(['anchor.py'], caps['capsules'][0]['paths'])
+        with mock.patch.object(mb, 'LITERAL_FILES_MAX_BYTES', 1):
+            tiny = mb.unified_recall(self.root, files=['anchor.py'], budget=10)
+            self.assertTrue(tiny['attachmentIncomplete'])
+            self.assertLessEqual(tiny['tokenEstimate'], tiny['tokenBudget'])
+        self.assertNotIn('attachmentIncomplete', mw.build_handover(self.root, budget=8000))
+        with mock.patch.object(mb.subprocess, 'Popen', side_effect=OSError('git unavailable')):
+            self.assertTrue(mb.dream_items(self.root)['attachmentIncomplete'])
+        ctx = mb.lesson_path_context(self.root, remaining=0)
+        self.assertTrue(ctx['attachmentIncomplete'])
+
+    def test_recall_files_cli_selects_lessons_and_anchored_rules(self):
+        ids = self.keyword_repo(['Never edit deploy.py by hand.', 'Never edit anchor.py by hand.'])
+        result = self.cli('recall', 'Never', '--files', 'deploy.py', '--repo', str(self.root), '--budget', '8000')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual([ids[0]], [i['id'] for i in parsed['sections']['dream']])
+        self.assertFalse(parsed['sections']['rules'])
+        help_text = self.cli('recall', '--help').stdout
+        self.assertIn('attachment rule', help_text)
+        import memory_cli
+        legacy = memory_cli._build_parser().parse_args(['recall', '--f'])
+        self.assertTrue(legacy.federated)
+        self.assertIsNone(legacy.files)
+        conflict = self.cli('recall', 'Never', '--files', 'deploy.py', '--at', '2000-01-01')
+        self.assertEqual(2, conflict.returncode)
+        self.assertIn('--at', conflict.stderr)
+
+    def test_live_transcript_echo_and_duplicate_quote_are_counted(self):
+        quote = 'Never call refund() in billing.py without the retry wrapper; it double-charges on timeouts.'
+        ids = self.keyword_repo([quote])
+        # Same visible assistant-message shape and relevant prose as the live
+        # stream fixture; no host paths or provider execution are involved.
+        live = {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text':
+            '1. **Denial:** Yes. The first Edit call was denied by a Memlet PreToolUse hook. '
+            'The reason, quoted from the start: "Memlet stopped the first edit of `billing.py` in this session; '
+            'the call did not run. A person approved the lessons below for this file." '
+            'The cited approved lesson (DRM-ba4128230195) says: "' + quote + '"'}]}}
+        source = self.base / 'echo.jsonl'
+        duplicate = {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': quote}]}}
+        source.write_text(json.dumps(live) + '\n' + json.dumps(duplicate) + '\n')
+        lines, stats = md.read_jsonl_transcript(source)
+        self.assertEqual('', lines[0])
+        self.assertEqual(1, stats['skippedMemletEcho'])
+        learned = mb.learn_from_transcript(self.root, source)
+        self.assertTrue(learned['ok'], learned)
+        self.assertEqual([], learned['addedNodeIds'])
+        self.assertEqual(2, learned['skippedMemletEcho'])
+        self.assertIn('skipped: 2', learned['formatted'])
+        ingested = dc.dream_ingest(self.root, source)
+        self.assertEqual(1, ingested['skippedMemletEcho'])
+        self.assertEqual(ids, [n['id'] for n in mb._load_queue(self.root)[0]['nodes']])
+
+    def test_masked_duplicate_echo_skips_only_the_same_whole_sentence(self):
+        from memlet.vocabulary import MEMLET_ECHO_NOTICE
+        secrets = ['sk_' + 'live_abcdefghijklmnopqrstuvwx', 'ghp_abcdefghijklmnopqrstuvwx']
+        sentence = 'Never share billing credential %s with customers.'
+        first_ids = self.keyword_repo([sentence % secrets[0]])
+        source = self.base / 'masked-echo.jsonl'
+        source.write_text(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': sentence % secrets[1]}}) + '\n')
+        learned = mb.learn_from_transcript(self.root, source)
+        self.assertTrue(learned['ok'], learned)
+        self.assertEqual([], learned['addedNodeIds'])
+        self.assertGreaterEqual(learned['skippedMemletEcho'], 1)
+        self.assertIn(MEMLET_ECHO_NOTICE % learned['skippedMemletEcho'], learned['notices'])
+        self.assertEqual(first_ids, [n['id'] for n in mb._load_queue(self.root)[0]['nodes']])
+        # A single-word difference remains new evidence, even after masking.
+        other = self.base / 'masked-distinct.jsonl'
+        other.write_text(json.dumps({'type': 'user', 'message': {'role': 'user',
+                         'content': (sentence % secrets[1]).replace('customers', 'clients')}}) + '\n')
+        distinct = mb.learn_from_transcript(self.root, other)
+        self.assertTrue(distinct['ok'], distinct)
+        self.assertEqual(1, len(distinct['addedNodeIds']))
+        recalled = json.dumps(mb.unified_recall(self.root, 'billing credential', budget=8000))
+        for secret in secrets:
+            self.assertNotIn(secret, recalled)
+            for path in (self.root / '.memlet').rglob('*'):
+                if path.is_file():
+                    self.assertNotIn(secret.encode(), path.read_bytes(), str(path))
+
+    def test_all_fixed_hook_framing_is_excluded_without_shifting_pins(self):
+        from memlet import vocabulary as v
+        templates = [v.GUARD_DENY_HEAD, v.GUARD_DENY_TAIL, v.GUARD_ASK_HEAD, v.GUARD_ASK_TAIL,
+                     v.JIT_HEAD, v.HOOK_QUOTE_NOTE, v.HINT_LABEL] + list(v.HOOK_GROUP_LABELS.values())
+        # One definition for the library readers and the hooks (lead integration of K1 and K2): every fixed hook
+        # text is excluded, including the partial tails and pointers. `### For `x`` alone is a heading a person can
+        # write, so it is kept.
+        templates += [s for k, s in vars(v).items()
+                      if k.startswith('CAPSULE_') and isinstance(s, str) and k != 'CAPSULE_FILE_HEAD']
+        templates += [v.GUARD_DENY_PARTIAL_TAIL, v.GUARD_ASK_PARTIAL_TAIL, v.HOOK_POINTER, v.HOOK_OMITTED,
+                      v.HOOK_RULE_REPLACED]
+        source = self.base / 'framing.jsonl'
+        texts = ['Never follow ' + t.replace('%s', 'deploy.py').replace('%d', '1') for t in templates]
+        texts.append('Never follow ' + v.CAPSULE_FILE_HEAD % 'deploy.py')
+        texts.append('Never remove the independent test.')
+        source.write_text('\n'.join(json.dumps({'type':'assistant', 'message':{'role':'assistant', 'content':t}})
+                                    for t in texts) + '\n')
+        lines, stats = md.read_jsonl_transcript(source)
+        self.assertEqual([''] * len(templates), lines[:-2])
+        self.assertIn('### For `deploy.py`', lines[-2])
+        self.assertIn('independent test', lines[-1])
+        self.assertEqual(len(templates), stats['skippedMemletEcho'])
+        for text in texts[:len(templates)]:
+            self.assertTrue(md.memlet_echo(text), text)

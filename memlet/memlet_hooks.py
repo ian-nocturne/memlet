@@ -1813,11 +1813,12 @@ def _without_own_text(mb: Any):
     capsule heading, ...) quotes Memlet, not the person, and becomes an empty line before anything is learned or
     snapshotted. Empty, not deleted: line numbers (pins) and the snapshot's identity stay as 9.1.1 has them, and a
     transcript without such text is read exactly as before."""
+    from memlet import memlet_dream as md
     real = mb._transcript_lines
 
-    def filtered(f: Path):
+    def filtered(f: Path):  # the readers already blank these lines; this keeps the hook path safe on its own
         lines, stats = real(f)
-        return ["" if any(m in ln for m in voc.HOOK_OWN_TEXT_MARKERS) else ln for ln in lines], stats
+        return ["" if md.memlet_echo(ln) else ln for ln in lines], stats
 
     mb._transcript_lines = filtered
     try:

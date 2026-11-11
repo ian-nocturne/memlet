@@ -383,8 +383,10 @@ def _route_new(args):
         if args.repin_legacy_ts:
             from memlet.memlet_wiki import repin_legacy_ts_anchors
             return repin_legacy_ts_anchors(repo, dry_run=args.dry_run)
-    if args.action == 'recall' and (args.unified or args.positional_query is not None):
+    if args.action == 'recall' and (args.unified or args.positional_query is not None or args.files is not None):
         kwargs = {'budget': args.budget}
+        if args.files is not None:
+            kwargs['files'] = args.files
         if args.standalone or args.task:
             store = _open_store(args)
             task = args.task or _standalone_task_id()
@@ -489,7 +491,7 @@ def _validate_modes(args, parser):
     store_flags = ['--' + name for name in ('root', 'task', 'session') if given('_global_' + name)]
     if args.standalone:
         store_flags.append('--standalone')
-    if args.action == 'recall' and (args.unified or args.positional_query is not None):
+    if args.action == 'recall' and (args.unified or args.positional_query is not None or args.files is not None):
         flags = ['--query'] if args.positional_query is not None and given('query') else []
         flags += ['--' + name.replace('_', '-') for name in ('at', 'known_at', 'before', 'after')
                   if getattr(args, name) is not None]
@@ -549,7 +551,7 @@ def main():
             setattr(args, name, getattr(args, '_global_' + name))
     _validate_modes(args, parser)
     if args.action == 'recall' and args.budget is None:
-        args.budget = 1200 if args.unified or args.positional_query is not None else 6000
+        args.budget = 1200 if args.unified or args.positional_query is not None or args.files is not None else 6000
     human = args.action in _product_commands()
     if human and not getattr(args, '_format_explicit', False) and sys.stdout.isatty():
         args.format = 'markdown'
@@ -697,6 +699,8 @@ def _build_parser():
                 p.add_argument('--reason',default='')
     hand_p.add_argument('--verify',metavar='FILE',help='Verify a JSON or Markdown capsule checksum')
     recall.add_argument('positional_query',nargs='?',help='Recall across repository rules and approved lessons')
+    from memlet.vocabulary import RECALL_FILES_HELP
+    recall.add_argument('--files', nargs='+', default=None, metavar='FILE', help=RECALL_FILES_HELP)
     recall.add_argument('--unified',action='store_true',help='Recall across repository sources')
     recall.add_argument('--repo',default='.',help='Repository for unified recall')
     recall.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])

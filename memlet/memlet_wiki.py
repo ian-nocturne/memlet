@@ -2137,7 +2137,7 @@ def estimate_tokens(text: str) -> int:
 def _signed_fields(capsule: Dict[str, Any]) -> Tuple[str, ...]:
     # digest fields join the signature only in digest mode, so the default capsule's signature is unchanged
     extra = {"digest": DIGEST_SIGNED_FIELDS, "brief": BRIEF_SIGNED_FIELDS, "index": INDEX_SIGNED_FIELDS}.get(capsule.get("mode"), ())
-    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints", "approvedLessons", "listCapOmitted", "replacedRuleNotices") if k in capsule)
+    observations = tuple(k for k in ("pathExistsAnchors", "unpinnedAnchors", "lexicalConstraints", "hints", "approvedLessons", "listCapOmitted", "replacedRuleNotices", "attachmentIncomplete", "attachmentReason") if k in capsule)
     return HANDOVER_SIGNED_FIELDS + extra + observations
 
 
@@ -2267,6 +2267,9 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
                          ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
     if not c["activeConstraints"]:
         lines.append("- (none)")
+    if c.get("attachmentIncomplete"):
+        from .vocabulary import ATTACHMENT_INCOMPLETE
+        lines.append("- " + ATTACHMENT_INCOMPLETE)
     if c.get("replacedRuleNotices"):
         lines.extend("- " + notice for notice in c["replacedRuleNotices"])
     if c.get("approvedLessons"):
@@ -2634,8 +2637,9 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     }
     _mark_suggested_items(lists, constraints, by_key)
     from memlet.memlet_bridge import dream_items, render_capsule_lesson, _load_queue
-    lesson_items = (dream_items(root, tiers=("approved", TIER_HINT)).get("items", [])
-                    if _lesson_items is None else _lesson_items)
+    lesson_read = dream_items(root, tiers=("approved", TIER_HINT)) if _lesson_items is None else {"items": _lesson_items}
+    lesson_items = lesson_read.get("items", [])
+    attachment = {k: lesson_read[k] for k in ("attachmentIncomplete", "attachmentReason") if k in lesson_read}
     # Metadata only: eligibility remains exclusively the verified tier provider's decision.
     try:
         graph = _load_queue(root)[0] or {}
@@ -2751,6 +2755,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     while True:
         capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
                    "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
+        capsule.update(attachment)
         if replacement_notices:
             capsule["replacedRuleNotices"] = replacement_notices
         if any(capped.values()):

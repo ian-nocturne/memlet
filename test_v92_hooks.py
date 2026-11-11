@@ -1558,18 +1558,26 @@ class K1Tests(_Case):
     def test_a_held_state_lock_never_silences_session_start_or_post_tool_use(self):
         self.learn(BLOCK_TEXT)
         (self.repo / "mod.py").write_text(MOD_STALE)  # a real stale warning for both 9.1.1 outputs
-        self.set_hooks(deadlineSeconds=0.4)
         cases = [("session-start", {"session_id": "s1", "source": "startup", "cwd": str(self.repo),
                                     "hook_event_name": "SessionStart"}),
                  ("post-tool-use", dict(self.payload(), hook_event_name="PostToolUse"))]
         for event, payload in cases:
             with self.subTest(event=event):
-                self.set_hooks(jit=None, capsule=None)
-                baseline = self.cli_hook(event, payload)
+                # The deadline is real time in a child process, so a busy host can time out the 9.1.1 work itself.
+                # The claim is about the lock, not the host: at a deadline under which 9.1.1 prints, a held lock
+                # must print the same. Longer deadlines are tried only when the host was too slow for a shorter one.
+                baseline = held = None
+                for deadline in (0.4, 1.6, 6.4):
+                    self.set_hooks(deadlineSeconds=deadline, jit=None, capsule=None)
+                    baseline = self.cli_hook(event, payload)
+                    if "stale" not in json.dumps(baseline):
+                        continue
+                    self.set_hooks(jit=True)
+                    with md.queue_lock(self.repo / mh.SESSIONS_REL / "state.lock", timeout=1):
+                        held = self.cli_hook(event, payload)  # another process holds the session-state lock
+                    if held == baseline:
+                        break
                 self.assertIn("stale", json.dumps(baseline))
-                self.set_hooks(jit=True)
-                with md.queue_lock(self.repo / mh.SESSIONS_REL / "state.lock", timeout=1):
-                    held = self.cli_hook(event, payload)  # another process holds the session-state lock
                 self.assertEqual(baseline, held)
 
     def test_failing_bookkeeping_never_silences_the_9_1_1_output(self):

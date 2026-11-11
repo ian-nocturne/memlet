@@ -104,7 +104,7 @@ GRAPH_HEADINGS = {
 }
 GRAPH_TIME_NOTICE = (
     "Times come only from retained pin pinnedAt fields, accepted-anchor ledger events, "
-    "Dream approval records and decision events. 9.1.1 writes no pin timestamp or rule creation time; "
+    "Dream approval records and decision events. Pin timestamps and rule creation times may not have been recorded; "
     "anchor_snapshots.updated_at is the latest observation, not the first stale observation. "
     "Hint receipts are dated but activation of the agreement policy is not, so hint start times are unknown. "
     "Unknown times are null. Historical queries exclude unknown-since evidence and re-check current source bytes; "
@@ -195,9 +195,23 @@ def _literal_pieces(*templates):
 
 
 # Text only Memlet's own hooks print. A transcript line (one visible message) containing any of these quotes a
-# hook's output, not something the person said: hook-path learning (Stop / PreCompact) drops such lines before
-# learning or ingesting. Library transcript readers should drop them too (same constant).
+# hook's output, not something the person said. This is the single definition: the transcript readers
+# (`memlet_dream.memlet_echo`, used by `learn --transcript`, `dream` ingest and the Stop / PreCompact hooks) blank
+# such lines before anything is learned. `CAPSULE_FILE_HEAD` ("### For `x`") is left out on purpose: a person can
+# write that heading themselves.
 HOOK_OWN_TEXT_MARKERS = _literal_pieces(
     JIT_HEAD, GUARD_DENY_HEAD, GUARD_DENY_TAIL, GUARD_ASK_HEAD, GUARD_ASK_TAIL, GUARD_DENY_PARTIAL_TAIL,
     GUARD_ASK_PARTIAL_TAIL, HOOK_QUOTE_NOTE, HOOK_POINTER, HOOK_OMITTED, HOOK_RULE_REPLACED, CAPSULE_COMPACT_HEAD,
-    CAPSULE_AFTER_COMPACT, CAPSULE_AFTER_RESUME, CAPSULE_STATUS_HEAD, *HOOK_GROUP_LABELS.values())
+    CAPSULE_AFTER_COMPACT, CAPSULE_AFTER_RESUME, CAPSULE_STATUS_HEAD, *HOOK_GROUP_LABELS.values(), HINT_LABEL)
+
+
+# --- Unit K2 (9.2 readers, final fixes) -------------------------------------------------------------------------
+# K2: reader completeness, history and relation resealing.
+ATTACHMENT_INCOMPLETE = "Literal lesson attachment is unavailable: the tracked-file listing could not be read within its time or size bound; person-attached paths remain available."
+GRAPH_HISTORICAL_HEAD = "Historical memory view — as of %s"
+GRAPH_HISTORICAL_EMPTY = "nothing recorded as of %s"
+GRAPH_CURRENT_ONLY_NOTICE = "A quarantined lesson has only current lines and no current approved relation; it was omitted from the neighborhood."
+RESEALED_RELATIONS = "Re-sealed relations: "
+UNTOUCHED_RELATIONS = "Relations left alone: "
+RECALL_FILES_HELP = "Select lessons and hints by the attachment rule, and rules by code anchors."
+MEMLET_ECHO_NOTICE = "Memlet echo lines or duplicate approved lesson quotes skipped: %d"

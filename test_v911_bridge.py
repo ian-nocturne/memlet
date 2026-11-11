@@ -895,3 +895,22 @@ class ReviewRegressions(Fixture):
         self.assertEqual([],hand['activeConstraints'])
         self.assertEqual(2,hand['omitted']['compatibleUnverifiedRules'])
         self.assertTrue(report['reverifyBeforeUse'])
+
+class FinalAttachmentCompatibility(Fixture):
+    def test_default_paths_shape_and_conditional_attachment_signature(self):
+        repo, nodes = self.fixture('approved', ('BLOCKS',))
+        # Unfiltered legacy rows never grow an automatic path key.
+        self.assertNotIn('paths', mb.dream_items(repo)['items'][0])
+        normal = mw.build_handover(repo, budget=8000, output_format='markdown')
+        self.assertNotIn('attachmentIncomplete', normal)
+        self.assertNotIn('attachmentReason', normal['signedFields'])
+        self.assertTrue(mw.verify_handover_checksum(normal))
+        with mock.patch.object(mb, 'LITERAL_FILES_MAX_BYTES', 0):
+            incomplete = mw.build_handover(repo, budget=8000, output_format='markdown')
+        self.assertTrue(incomplete['attachmentIncomplete'])
+        self.assertIn('attachmentReason', incomplete['signedFields'])
+        self.assertTrue(mw.verify_handover_checksum(incomplete))
+        tampered = copy.deepcopy(incomplete)
+        tampered['attachmentReason'] = 'Everything attached successfully'
+        self.assertFalse(mw.verify_handover_checksum(tampered))
+        self.assertEqual(normal, mw.build_handover(repo, budget=8000, output_format='markdown'))

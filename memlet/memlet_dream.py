@@ -2307,6 +2307,14 @@ def _jsonl_record_to_line(obj: Any, prefer_response_items: bool = False) -> Opti
     return f"{ts} [{role}] {body}" if ts else f"[{role}] {body}"
 
 
+def memlet_echo(text):
+    """True when a visible transcript line quotes text only Memlet's own hooks print (a denial, JIT context, a
+    capsule, a group label): that is Memlet's output, not transcript evidence. One definition for every reader:
+    `vocabulary.HOOK_OWN_TEXT_MARKERS`."""
+    from . import vocabulary as v
+    return any(marker in text for marker in v.HOOK_OWN_TEXT_MARKERS)
+
+
 def read_jsonl_transcript(path: Any, *, max_line_chars: Optional[int] = None,
                           max_text_chars: Optional[int] = None) -> Tuple[List[str], Dict[str, int]]:
     """Read a Claude Code / Codex CLI `.jsonl` session transcript into pin-addressable lines.
@@ -2374,6 +2382,10 @@ def read_jsonl_transcript(path: Any, *, max_line_chars: Optional[int] = None,
                 stats["malformedLines"] += 1
                 lines.append("")
                 continue
+            if memlet_echo(line):
+                stats["skippedMemletEcho"] = stats.get("skippedMemletEcho", 0) + 1
+                lines.append("")
+                continue
             stats["messages"] += 1
             lines.append(line)
             continue
@@ -2432,6 +2444,8 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
         report["jsonlMessages"] += st["messages"]
         report["jsonlMalformedLines"] += st["malformedLines"]
         report["jsonlNonMessageLines"] += st["nonMessageLines"]
+        if st.get("skippedMemletEcho"):
+            report["skippedMemletEcho"] = report.get("skippedMemletEcho", 0) + st["skippedMemletEcho"]
 
     if p.is_dir():
         out: Dict[str, List[str]] = {}
@@ -3735,6 +3749,7 @@ def _decide_locked(
     unchanged: List[str] = []
     refused: List[Dict[str, str]] = []
     cascaded: List[str] = []
+    resealed, left_alone = [], []
     at = _utc_now_iso()
     clean_reason = safe_truncate_masked(str(reason or ""), 200)
     nodes_by_id: Dict[str, List[Dict[str, Any]]] = {}
@@ -3809,7 +3824,14 @@ def _decide_locked(
                 refused.append({"id": item_id, "reason": "paths_changed_requires_reconsider"})
                 continue
             was_approved = cur == APPROVED
-            if reconsider and cur == APPROVED:
+            prior_edges = {str(e.get("edgeId")): _edge_state(edge_refs.get(str(e.get("edgeId")), [e]))
+                           for e in n.get("edges", []) if isinstance(e, dict) and e.get("edgeId")}
+            # An approved node with a rejected relation remains unchanged under
+            # the legacy reconsider command. Changing paths may reseal approved
+            # relations, but cannot overturn that person's rejection.
+            legacy_unchanged = (was_approved and REJECTED_DECISION in prior_edges.values()
+                                and not path_change and not refresh_citations)
+            if reconsider and was_approved and not legacy_unchanged:
                 cur = REVIEW_PENDING
             if cur == REJECTED_DECISION and decision == APPROVED and not reconsider:
                 refused.append({"id": item_id, "reason": "already_rejected"})
@@ -3818,6 +3840,8 @@ def _decide_locked(
                 refresh(n, "node")
                 cur = REVIEW_PENDING
                 for e in n.get("edges", []):
+                    if was_approved and prior_edges.get(str(e.get("edgeId"))) != APPROVED:
+                        continue
                     for ref in edge_refs.get(str(e.get("edgeId")), [e]):
                         refresh(ref, "edge")
             if cur == decision:
@@ -3829,13 +3853,19 @@ def _decide_locked(
                     refused.append({"id": item_id, "reason": "pin_does_not_verify:" + err})
                 else:
                     unchanged.append(item_id)
+                    if was_approved and reconsider and decision == APPROVED:
+                        for eid, state in prior_edges.items():
+                            left_alone.append({"id": eid, "state": state})
+                            events.append((at, eid, "edge", "left-" + state, who, "", "[]"))
                 continue
             if cur != REVIEW_PENDING and decision != REJECTED_DECISION and not reconsider:
                 refused.append({"id": item_id, "reason": f"already_{cur}"})
                 continue
             owned = [
                 str(e.get("edgeId")) for e in (n.get("edges") or [])
-                if isinstance(e, dict) and e.get("edgeId") and (decision == REJECTED_DECISION or reconsider or _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == REVIEW_PENDING)
+                if isinstance(e, dict) and e.get("edgeId") and (decision == REJECTED_DECISION or
+                    (prior_edges.get(str(e.get("edgeId"))) == APPROVED if was_approved else
+                     reconsider or _edge_state(edge_refs.get(str(e.get("edgeId")), [e])) == REVIEW_PENDING))
             ] if cascade_edges else []
             err = _verify_item_pins(n, "node", snap or {}) if decision == APPROVED else None
             if not err:
@@ -3863,6 +3893,13 @@ def _decide_locked(
             for eid in owned:
                 _apply_edge(eid)
                 cascaded.append(eid)
+                if was_approved and decision == APPROVED:
+                    resealed.append(eid)
+            if was_approved and decision == APPROVED:
+                for eid, state in prior_edges.items():
+                    if eid not in owned:
+                        left_alone.append({"id": eid, "state": state})
+                        events.append((at, eid, "edge", "left-" + state, who, "", "[]"))
             done.append(item_id)
         elif item_id in edge_refs:
             cur = _edge_state(edge_refs[item_id])
@@ -3901,8 +3938,13 @@ def _decide_locked(
             replaces_sha=prior_sha,
         )
 
+    # A relation explicitly selected later in this batch was reviewed after
+    # the node's reseal. Its actual decision replaces the earlier observation.
+    left_alone = [e for e in left_alone if e["id"] not in done and e["id"] not in cascaded]
+    untouched_ids = {e["id"] for e in left_alone}
+    events = [event for event in events if not event[3].startswith("left-") or event[1] in untouched_ids]
     event_errors = []
-    if done and events and q_path.parent.name == "dream" and q_path.parent.parent.name == ".memlet":
+    if events and q_path.parent.name == "dream" and q_path.parent.parent.name == ".memlet":
         try:
             from .memlet_bridge import _decision_event_write
             _decision_event_write(q_path.parent.parent.parent, events)
@@ -3920,6 +3962,7 @@ def _decide_locked(
         "unchanged": unchanged,
         "refused": refused,
         "cascadedEdges": cascaded,
+        **({"resealedEdges": resealed, "untouchedEdges": left_alone} if resealed or left_alone else {}),
         "dbPath": str(db_target) if (db_target and done) else None,
         "approvalBoundary": APPROVAL_BOUNDARY,
     }

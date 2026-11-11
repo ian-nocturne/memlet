@@ -252,9 +252,14 @@ def dream_ingest(repo, transcript_path, *, dry_run=False):
                 stored.append({"snapshotFile": fid, "op": op, "lines": len(lines)})
             if not dry_run:
                 _write(root, STATE_REL, sessions)
+        echo = skipped.get("skippedMemletEcho", 0)
+        extra = {}
+        if echo:
+            from .vocabulary import MEMLET_ECHO_NOTICE
+            extra = {"skippedMemletEcho": echo, "notices": [MEMLET_ECHO_NOTICE % echo]}
         if dry_run:
-            return {"ok": True, "snapshot": preview, "snapshotFiles": stored, "skipped": skipped}
-        return {"ok": True, "snapshotFiles": stored, "skipped": skipped, "waiting":
+            return {"ok": True, "snapshot": preview, "snapshotFiles": stored, "skipped": skipped, **extra}
+        return {"ok": True, "snapshotFiles": stored, "skipped": skipped, **extra, "waiting":
                 sum(s.get("ingested") is True and s["lines"] > s["dreamed"] for s in sessions["sessions"].values())}
     except (OSError, ValueError, TypeError) as exc:
         return mb._fail(str(exc), 2)
