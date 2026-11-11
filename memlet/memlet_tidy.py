@@ -267,13 +267,19 @@ def _valid_view(view: Any, ids: Set[str]) -> bool:
     return not (seen & set(members))  # a kept lesson is never itself a holding member
 
 
+def _merge_functions() -> Tuple[Any, Any]:
+    """The two merge reads this module may call (`memlet_bridge.merge_view`, `merge_blockers`), or None for one a
+    build does not have. The only lookup; tests replace this function, never the bridge's own functions, which the
+    bridge itself calls."""
+    return getattr(mb, "merge_view", None), getattr(mb, "merge_blockers", None)
+
+
 def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """The single place this module learns about merges: `memlet_bridge.merge_view` and `merge_blockers` when this
     build has both, else "merge checks not available in this build". What `merge_view` returns is checked against the
     lessons loaded (`ids`); on any inconsistency or exception, merge checks are skipped, nothing is hidden, and the
     notice says so. Returns {available, states, members, blockers: callable or None, notice}."""
-    view_fn = getattr(mb, "merge_view", None)
-    blockers_fn = getattr(mb, "merge_blockers", None)
+    view_fn, blockers_fn = _merge_functions()
     if not callable(view_fn) or not callable(blockers_fn):
         return _merge_none(v.TIDY_MERGE_UNAVAILABLE)
     try:

@@ -32,21 +32,15 @@ def at(text):
 
 @contextlib.contextmanager
 def merge_absent():
-    """This build may or may not carry unit N1's merge functions; force the absent case."""
-    saved = {name: getattr(mb, name) for name in ('merge_view', 'merge_blockers') if hasattr(mb, name)}
-    for name in saved:
-        delattr(mb, name)
-    try:
+    """A build without unit N1's merge functions, as the tidy adapter sees it. Only the adapter's lookup is replaced:
+    the bridge keeps its own functions, which its readers call."""
+    with mock.patch.object(mt, '_merge_functions', return_value=(None, None)):
         yield
-    finally:
-        for name, fn in saved.items():
-            setattr(mb, name, fn)
 
 
 @contextlib.contextmanager
 def merge_stub(view, blockers):
-    with mock.patch.object(mb, 'merge_view', view, create=True), \
-            mock.patch.object(mb, 'merge_blockers', blockers, create=True):
+    with mock.patch.object(mt, '_merge_functions', return_value=(view, blockers)):
         yield
 
 
@@ -119,7 +113,8 @@ class Base(unittest.TestCase):
                    GIT_CEILING_DIRECTORIES=str(self.base), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                    MEMLET_LOCK_DIR=str(self.base / 'locks'), MEMLET_DREAMING='0',
                    MEMLET_HOME=str(self.base / 'unused'), MEMLET_TRANSCRIPT_DIRS=str(self.base))
-        for key in ('PYTHONHOME', 'PYTHONEXECUTABLE', '__PYVENV_LAUNCHER__', 'CODEX_THREAD_ID', 'MEMLET_PARENT_SESSION_ID'):
+        # Interpreter variables (PYTHONHOME and friends) stay: some launchers need them to start a child Python.
+        for key in ('CODEX_THREAD_ID', 'MEMLET_PARENT_SESSION_ID'):
             env.pop(key, None)
         patch = mock.patch.dict(os.environ, env, clear=True)
         patch.start()
