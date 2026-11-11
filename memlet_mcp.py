@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone MCP Server (JSON-RPC 2.0 over stdio) for Memlet v9.1.0.
+"""Standalone MCP Server (JSON-RPC 2.0 over stdio) for Memlet v9.1.1.
 
 Can be plugged into Claude Code, Codex, Cursor, Windsurf, or any MCP-compatible IDE/agent in 1 minute
 without requiring an external web server.

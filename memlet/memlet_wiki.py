@@ -54,7 +54,7 @@ from .audit import (BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED
 from .code_anchors import (NEW_PIN, PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_symbol_fingerprints, extract_file_symbol_hashes,
                            extract_file_symbol_signatures, previous_python_symbol_hashes)
 
-MEMLET_VERSION = "9.1.0"
+MEMLET_VERSION = "9.1.1"
 CONFIG_SCHEMA_VERSION = 1
 MEMLET_DIR = ".memlet"
 WIKI_DIR = ".memlet/wiki"
@@ -2158,6 +2158,9 @@ def verify_handover_checksum(capsule: Dict[str, Any]) -> bool:
     """
     if not isinstance(capsule, dict):
         return False
+    if capsule.get("schema_version") == "memlet.handover_bridge.v1":
+        from .handover_bridge import verify
+        return verify(capsule)
     if capsule.get("mode") not in (None,) + HANDOVER_MODES:
         return False
     expected = capsule.get("checksum", capsule.get("capsuleSignature"))
@@ -2529,6 +2532,26 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
 
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
                    output_format: str = "json", write: bool = False, budget=None, mode=None, _lesson_items=None) -> Dict[str, Any]:
+    options = dict(next_step=next_step, rejected=rejected, output_format=output_format,
+                   budget=budget, mode=mode, _lesson_items=_lesson_items)
+    if not write:
+        return _build_handover(repo_path, **options)
+    root = _resolve_root(repo_path)
+    try:
+        # Build and replace all projections under the same re-entrant write lock.
+        with memlet_write_lock(root):
+            return _build_handover(root, write=True, **options)
+    except (OSError, ValueError) as exc:
+        from .handover_bridge import HANDOVER_FILE, CAPSULES_FILE
+        report = _build_handover(root, **options)
+        paths = [HANDOVER_PAGE, HANDOVER_FILE, CAPSULES_FILE]
+        report.update(ok=False, exitCode=2, written=False, filesWritten=[], filesNotWritten=paths,
+                      error=str(exc) + "; written: none; not written: " + ", ".join(paths))
+        return report
+
+
+def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_format="json", write=False,
+                    budget=None, mode=None, _lesson_items=None):
     """`memlet handover`: deterministic, checksummed (<500 token) Memlet handover capsule.
 
     Only rules whose anchors are all `active` are carried as constraints; `stale` anchors are quarantined
@@ -2692,6 +2715,10 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
                 for f in ("anchors", "pathNotFound"):
                     if isinstance(a.get(f), list):
                         a[f] = [_mask(x) if isinstance(x, str) else x for x in a[f]]
+    # Preserve the capsule's rule order (including digest ranking) in the bridge,
+    # before token trimming. Compatible rules follow the active constraints.
+    bridge_order = {item["source"]: i for i, item in enumerate(lists["activeConstraints"])} if write else {}
+    bridge_rules = sorted(constraints, key=lambda r: bridge_order.get(f"{r['source']}:{r['line']}", len(bridge_order))) if write else []
     capped = {k: max(0, len(v) - caps[k]) for k, v in lists.items()}
     omitted = {k: 0 for k in lists}
     lists = {k: v[:caps[k]] for k, v in lists.items()}
@@ -2757,28 +2784,47 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
 
     actions: List[Dict[str, str]] = []
     write_refused: Optional[str] = None
+    files_written, files_not_written = [], []
     if write:
+        from . import handover_bridge as hb
+        write_paths = [HANDOVER_PAGE, hb.HANDOVER_FILE, hb.CAPSULES_FILE]
+        files_not_written = list(write_paths)
         page = "# Memlet Handover\n\n" + markdown
-        problem = first_managed_problem(root, (MEMLET_DIR, WIKI_DIR, HANDOVER_PAGE) + _LEDGER_FILES)
+        problem = first_managed_problem(root, (MEMLET_DIR, WIKI_DIR) + tuple(write_paths) + _LEDGER_FILES)
         if problem:  # nothing is written through a symlinked / non-regular component; the capsule is still returned
-            actions += [{"op": "kept", "path": HANDOVER_PAGE}, {"op": "kept", "path": LEDGER_PATH}]
+            actions += [{"op": "kept", "path": p} for p in write_paths + [LEDGER_PATH]]
             write_refused = problem
         else:
             write_refused = None
             ledger = root / LEDGER_PATH
             try:
                 with memlet_write_lock(root):
-                    op = _write_generated_page(root, HANDOVER_PAGE, page, dry_run=False)
-                    actions.append({"op": op, "path": HANDOVER_PAGE})
-                    existed = ledger.is_file()
                     now = _utc_now()
+                    # Use the same classified rules and approved lesson order,
+                    # before the Markdown token budget trims either group.
+                    bridges = hb.build(root, bridge_rules, anchors, approved, head, now)
+                    # Explicit --write replaces all three even when bytes match;
+                    # the generic page helper can skip unchanged/unsafe targets.
+                    existed = (root / HANDOVER_PAGE).is_file()
+                    write_managed_text(root, HANDOVER_PAGE, page)
+                    op = "update" if existed else "create"
+                    actions.append({"op": op, "path": HANDOVER_PAGE})
+                    files_written.append(HANDOVER_PAGE)
+                    files_not_written.remove(HANDOVER_PAGE)
+                    for rel, text in bridges.items():
+                        existed = (root / rel).is_file()
+                        hb.write(root, rel, text)
+                        actions.append({"op": "update" if existed else "create", "path": rel})
+                        files_written.append(rel)
+                        files_not_written.remove(rel)
+                    existed = ledger.is_file()
                     with contextlib.closing(connect_managed_sqlite(root, LEDGER_PATH)) as conn:
                         with conn:
                             _ledger_ready(conn)
                             _sync_snapshots(conn, [a for a in anchors if a["symbol"]], now)
                             _record_page(conn, HANDOVER_PAGE, _page_body_sha256(page), "handover", now)
                     actions.append({"op": "update" if existed else "create", "path": LEDGER_PATH})
-            except UnsafePathError as exc:
+            except (OSError, ValueError) as exc:
                 write_refused = str(exc)
 
     over = tokens >= token_budget
@@ -2801,9 +2847,12 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
     }
     if budget_source != "default":  # additive only when a budget was chosen: the default report stays byte-identical
         report["tokenBudgetSource"] = budget_source
-    if refused_write:  # additive, only when `--write` was refused: nothing was written
+    if write:
+        report.update(filesWritten=files_written, filesNotWritten=files_not_written)
+    if refused_write:
         report["written"] = False
-        report["error"] = f"{write_refused}; HANDOVER.md and the ledger were not written"
+        report["error"] = (str(write_refused) + "; written: " + (", ".join(files_written) or "none")
+                           + "; not written: " + (", ".join(files_not_written) or "none"))
     if (output_format or "json").lower() == "markdown":
         report["formatted"] = markdown
     return report

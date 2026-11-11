@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
 from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT, VENDOR_AGREEMENT,
-                         VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS)
+                         VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS, SAME_VENDOR_REVIEW)
 
 import contextlib
 import copy
@@ -1871,6 +1871,13 @@ def item_trust(node, *, snapshot, config):
               for r in (node or {}).get("verification", [])
               if trusted_record(r, node) and r.get("verdict") != "SUPPORTED"]
     label = "; ".join(vetoes) if vetoes else (hint_item_label({"agreementBasis": basis}) if basis else "no trusted agreement")
+    if tier == TIER_PENDING and not vetoes and dream_settings(config)[1] == "vendor":
+        from memlet.vendor_cli import same_model
+        proposers = [r for r in (node or {}).get("proposers", []) if trusted_record(r, node)]
+        if any(r.get("verdict") == "SUPPORTED" and trusted_record(r, node)
+               and any(p["vendor"] == r["vendor"] and not same_model(p["vendor"], p["model"], r["vendor"], r["model"])
+                       for p in proposers) for r in (node or {}).get("verification", [])):
+            label = SAME_VENDOR_REVIEW
     return {"tier": tier, "agreementBasis": basis, "agreementLabel": label}
 
 
@@ -1948,7 +1955,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
                 notices.append(node["id"] + ": pending; approval has no live approved-valid edge, a rejected edge, or stale citations")
             if tier == TIER_PENDING and md.lesson_quote_digest(node) in config["_dreamRejectedQuoteHashes"]:
                 notices.append(node["id"] + ": pending; " + ("primary quote matches" if len(md.lesson_lines(node)) == 1 else "full cited quote set matches") + " a rejected item; explicit human approval is required")
-            if item_state["agreementLabel"].startswith(VETO_PREFIX):
+            if tier in tiers and item_state["agreementLabel"].startswith(VETO_PREFIX):
                 notices.append(node["id"] + ": " + item_state["agreementLabel"])
             counts[tier] += 1
             if tier not in tiers:

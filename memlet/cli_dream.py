@@ -12,7 +12,7 @@ def register(sub):
     parser = sub.add_parser("dream", help=COMMANDS["dream"]["help"], epilog=TRUST_BOUNDARY)
     parser.add_argument("repo", nargs="?", default=".")
     parser.add_argument("--via", help="Comma-separated proposer vendors (claude,codex,gemini)")
-    parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help="Verifier model: dream.models.verifier.<vendor>; same vendor needs dream.agreement=model and distinct models")
+    parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help="Verifier model: dream.models.verifier.<vendor>; distinct families can check within one vendor; dream.agreement=model is needed only for same-vendor hints")
     parser.add_argument("--transcript")
     parser.add_argument("--max-batches", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
@@ -59,6 +59,8 @@ def _markdown(result):
         text += "- Failed batches: %s\n" % result.get("failedBatches", 0)
         for run in result.get("runs", []):
             text += "- [%s] %s: %s completed; %s failed\n" % (run["lane"], run["runId"], run["completedBatches"], run["failedBatches"])
+        for item in result.get("items", []):
+            text += "- %s: tier=%s; %s\n" % (item["id"], item["tier"], item["agreementLabel"])
     else:
         text = "## Dream %s\n\n" % ("preview" if result.get("dryRun") else "run")
         text += rejections + "- Batches: %s; calls: %s; failed batches: %s\n" % (
@@ -76,6 +78,8 @@ def _markdown(result):
             text += "- Batch %s: completed-with-rejections at %s\n" % (entry["batchId"], entry["at"])
     if result.get("droppedOutput"):
         text += "- Dropped output: %s\n" % result["droppedOutput"]
+    if result.get("verificationSummary"):
+        text += "- " + result["verificationSummary"] + "\n"
     if not rejections:
         text += "- Rejected candidates: 0\n"
     text += "\n" + result.get("trustBoundary", "") + "\n"

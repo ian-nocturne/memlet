@@ -30,7 +30,7 @@ MAX_HOST_RUN_FILES = 64
 MAX_HOST_RUN_BYTES = 4 * 1024 * 1024
 MAX_REJECTION_RECORDS = 100
 MAX_REJECTION_BYTES = 32768
-from .vocabulary import HINT_HELP
+from .vocabulary import HINT_HELP, VERIFICATION_SUMMARY, VENDOR_REVIEW_SUMMARY
 TRUST_BOUNDARY = ("Vendor launch receipts are local digest integrity records, not signatures: a writer of .memlet "
                   "can forge them and human approval records. MCP and model output cannot create launch receipts. " + HINT_HELP)
 HOST_STATE_REL = RUNS_REL + "/host-sessions.json"
@@ -724,8 +724,7 @@ def _verification_candidates(root, vendor, model, agreement):
         if mb._node_edges_verify(node, snapshot or {}):
             continue
         proposers = [r for r in node.get("proposers", []) if trusted_record(r, node)]
-        if not any((not vc.same_model(r["vendor"], r["model"], vendor, model) if agreement == "model"
-                    else r["vendor"] != vendor) for r in proposers):
+        if not any(not vc.same_model(r["vendor"], r["model"], vendor, model) for r in proposers):
             continue
         if any(trusted_record(r, node) and r["vendor"] == vendor
                and vc.same_model(vendor, r["model"], vendor, model) for r in node.get("verification", [])):
@@ -736,7 +735,11 @@ def _verification_candidates(root, vendor, model, agreement):
         supported = _receipt(vendor, hypothetical, "a" * 24, {"model": model})
         supported["verdict"] = "SUPPORTED"
         hypothetical.setdefault("verification", []).append(seal_receipt(supported))
-        if mb.item_tier(hypothetical, snapshot=snapshot, config=config) != TIER_HINT:
+        # Selection tests whether a second model can help review this content.
+        # The repository's actual agreement setting still controls every read.
+        review_config = copy.deepcopy(config)
+        review_config.setdefault("dream", {})["agreement"] = "model"
+        if mb.item_tier(hypothetical, snapshot=snapshot, config=review_config) != TIER_HINT:
             continue
         out.append(node)
     # Stable queue order resolves ties (timestamps have second precision).
@@ -772,9 +775,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     key = "dream.models.verifier." + vendor if index >= len(vendors) else "dream.models." + vendor
                     raise ValueError(key + " must contain exactly one known family token under dream.agreement=model; accepted families: "
                                      + ", ".join(vc.MODEL_FAMILIES[vendor]))
-        if verify_with in vendors and agreement == "vendor":
-            raise ValueError("same-vendor verification requires dream.agreement=model and a distinct dream.models.verifier model")
-        if verify_with and agreement == "model" and any(vc.same_model(v, m, verify_with, verifier_model) for v, m in chosen[:-1]):
+        if verify_with and any(vc.same_model(v, m, verify_with, verifier_model) for v, m in chosen[:-1]):
             raise ValueError("dream.models.verifier must differ from every proposer model under dream.agreement=model")
         if runner is None:
             for vendor in dict.fromkeys(v for v, _ in chosen):
@@ -821,7 +822,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
             report["callLog"].append(dict(kind=kind, **identity, **{k: result[k] for k in ("vendor", "model", "isolation", "ok")}))
             return result
 
-        attempted = set()
+        attempted, checked = set(), set()
         def verify_pending():
             for node in _verification_candidates(root, verify_with, verifier_model, agreement):
                 nid = node["id"]
@@ -859,6 +860,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     target.setdefault("verification", []).append(rec)
                     md._commit_queue_and_db(root / mb.QUEUE_REL, json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
                                            root / mb.DB_REL, graph, replaces_sha=previous)
+                    checked.add(nid)
 
         if dry_run:
             snapshot = preview if preview is not None else (mb._load_snapshot(root)[0] or {})
@@ -956,6 +958,14 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
                     if verify_with:
                         verify_pending()
                 report["items"] = list(dict.fromkeys(report["items"]))
+                if verify_with:
+                    states = mb.dream_items(root, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING))["items"]
+                    hints = sum(i["id"] in checked and i["tier"] == TIER_HINT for i in states)
+                    pending = sum(i["id"] in checked and i["tier"] == TIER_PENDING for i in states)
+                    report["checkedItems"] = len(checked)
+                    report["verificationSummary"] = VERIFICATION_SUMMARY % (len(checked), hints, pending)
+                    if agreement == "vendor" and verify_with in vendors:
+                        report["verificationSummary"] += " " + VENDOR_REVIEW_SUMMARY
                 report["ok"] = not report["errors"]
                 report["wallSeconds"] = round(time.monotonic() - started, 3)
                 with md.queue_lock(root / mb.QUEUE_REL):
