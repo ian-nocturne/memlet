@@ -178,7 +178,7 @@ def _attached(root, node, item, context):
     """Approved paths are the reader's result; hint paths are display-only."""
     if item["tier"] == APPROVED:
         human = set(mb.lesson_paths(node, root, context=context))
-        return {p: GRAPH_WHY[2] if p in human else GRAPH_WHY[3] for p in item.get("paths", [])}
+        return {p: GRAPH_WHY[2] if p in human else GRAPH_WHY[3] for p in context["paths"].get(item["id"], [])}
     # The shared reader retains legacy unfiltered hint bytes, and exposes its
     # literal selection through the call-local context for display here only.
     return {p: GRAPH_WHY[3] for p in context.get("hintPaths", {}).get(item["id"], [])}
@@ -239,6 +239,9 @@ class _History:
                             self.decisions, self.conflicts = {}, set()
                             self.notice(v.GRAPH_EVENTS_NOTICE)
                             break
+                        # An observation of an untouched relation is not a new decision.
+                        if row["decision"] in ("left-pending", "left-rejected", "left-approved"):
+                            continue
                         seq, ident, kind = row["seq"], row["item_id"], row["kind"]
                         decision = {"reconsidered": APPROVED, "paths-changed": APPROVED,
                                     "citations-refreshed": APPROVED, "revoked": "rejected"}.get(row["decision"], row["decision"])
@@ -436,17 +439,12 @@ def _sources(root, lesson_items):
     if len(sources) < len(source_files):
         truncated = True
     for rel, text in mw.trusted_wiki_pages(root):
+        if rel == mb.PROMOTED_PAGE or mw._is_generated_page(rel, text):
+            continue
         for anchor in mw._extract_anchors(text, rel):
             if anchor["pin"]:
                 pins.setdefault(anchor["path"] + "::" + anchor["symbol"], anchor["pin"])
-        if rel == mb.PROMOTED_PAGE:
-            # Only the exact lines whose owning lesson survives the shared
-            # trust/supersession reader are rules. No model-written page prose.
-            live = {i["id"] for i in lesson_items if i["tier"] == APPROVED and not i.get("quarantined")}
-            parsed = {r["line"]: r for r in mb._parse_promoted(text) if r["id"] in live}
-            body = "\n".join(line if n in parsed else "" for n, line in enumerate(text.splitlines(), 1))
-            sources.append((rel, body))
-        elif not mw._is_generated_page(rel, text):
+        if rel != mb.PROMOTED_PAGE and not mw._is_generated_page(rel, text):
             sources.append((rel, text))
     for rel, text in sources:
         texts[rel] = text.splitlines()
@@ -921,7 +919,18 @@ def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=
             raise ValueError(v.GRAPH_TARGET_REQUIRED)
         ident, queue = None, None
         if "::" not in target and "/" not in target and md._ID_RE.fullmatch(target) and not (root / target).exists():
-            if re.fullmatch(r"rule-[a-f0-9]{24}", target):
+            if re.fullmatch(r"(?:file|symbol|line)-[a-f0-9]{24}", target):
+                full_nodes, _, _, _, _ = _project(root, at, queue=queue, work=work)
+                found = full_nodes.get(target)
+                if found is None:
+                    raise ValueError(v.GRAPH_UNKNOWN_ID)
+                if found["kind"] in ("file", "symbol"):
+                    target_path = found["anchor"] if found["kind"] == "symbol" else found["path"]
+                    return neighbors(repo_path, target_path, tiers=tiers, budget=budget, as_of=as_of,
+                                     _clock=_clock, _counters=_counters)
+                return neighbors(repo_path, found["lessonId"], tiers=tiers, budget=budget, as_of=as_of,
+                                 _clock=_clock, _counters=_counters)
+            elif re.fullmatch(r"rule-[a-f0-9]{24}", target):
                 ident = target
             else:
                 queue = _queue(root, work)
@@ -939,7 +948,7 @@ def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=
         nodes, edges, attachments, notices, truncated = _project(root, at, path=path, symbol=symbol, ident=ident, queue=queue, work=work)
         if ident is not None:
             if ident not in nodes:
-                if not work.incomplete or ident not in work.known_ids:
+                if ident not in work.known_ids or (at is None and not work.incomplete):
                     raise ValueError(v.GRAPH_UNKNOWN_ID)
                 resolved = dict(kind=work.known_ids[ident], id=ident)
             else:
@@ -1010,7 +1019,7 @@ def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=
                 relations = node.get("edgeTypes", [])
                 if node["tier"] == HINT:
                     include(node, ",".join(relations), why, "hints", targets=node.get("paths", []))
-                elif node.get("quarantined"):
+                elif "replaced" in node.get("lineRoles", []):
                     include(node, "SUPERSEDES", why, "replaced", targets=node.get("paths", []))
                 else:
                     # One approved item appears once, with all its approved
@@ -1018,13 +1027,19 @@ def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=
                     relation = next((r for r in ("BLOCKS", "GOVERNS", "RESOLVES") if r in relations), None)
                     if relation:
                         group = {"GOVERNS": "governs", "BLOCKS": "blocks", "RESOLVES": "resolves"}[relation]
-                        include(node, relation, why, group, targets=node.get("paths", []))
+                        current = dict(node, quarantined=False, current=True)
+                        include(current, relation, why, group, targets=node.get("paths", []))
+                    elif node.get("quarantined"):
+                        notices.append(v.GRAPH_CURRENT_ONLY_NOTICE)
         for group in groups:
             groups[group].sort(key=lambda i: (i["id"], i["relation"]))
         omitted, formatted = _trim(groups, min(budget, 8000), work.incomplete)
         # Output budgeting is a second source of incomplete groups, independent
         # of scan limits. In particular partial blocks/replaced are never whole.
         incomplete = work.incomplete | {g for g, count in omitted.items() if count}
+        if at is not None:
+            body = formatted or v.GRAPH_HISTORICAL_EMPTY % at + "\n"
+            formatted = v.GRAPH_HISTORICAL_HEAD % at + "\n" + body + "\n" + "\n".join(notices) + "\n"
         return dict(ok=True, target=target, resolved=resolved, groups=groups, omitted=omitted,
                     historical=at is not None, truncated=bool(truncated or incomplete), incompleteGroups=sorted(incomplete),
                     blocksIncomplete="blocks" in incomplete, replacedIncomplete="replaced" in incomplete,

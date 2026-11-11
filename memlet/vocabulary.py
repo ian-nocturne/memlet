@@ -170,3 +170,14 @@ GRAPH_REPLACED_BY_MARKER = "[REPLACED — do not apply as current; replaced by %
 GRAPH_INCOMPLETE_MARKER = "Incomplete groups: "
 
 GRAPH_ORDER_ITEM_NOTICE = "Decision order conflict for %s: history before the current queue record is unknown; the current record remains authoritative from its timestamp onward."
+
+# K2: reader completeness, history and relation resealing.
+ATTACHMENT_INCOMPLETE = "Literal lesson attachment is unavailable: the tracked-file listing could not be read within its time or size bound; person-attached paths remain available."
+GRAPH_TIME_NOTICE = GRAPH_TIME_NOTICE.replace("9.1.1 writes no pin timestamp or rule creation time; ", "Pin timestamps and rule creation times may not have been recorded; ")
+GRAPH_HISTORICAL_HEAD = "Historical memory view — as of %s"
+GRAPH_HISTORICAL_EMPTY = "nothing recorded as of %s"
+GRAPH_CURRENT_ONLY_NOTICE = "A quarantined lesson has only current lines and no current approved relation; it was omitted from the neighborhood."
+RESEALED_RELATIONS = "Re-sealed relations: "
+UNTOUCHED_RELATIONS = "Relations left alone: "
+RECALL_FILES_HELP = "Select lessons and hints by the attachment rule, and rules by code anchors."
+MEMLET_ECHO_NOTICE = "Memlet echo lines or duplicate approved lesson quotes skipped: %d"

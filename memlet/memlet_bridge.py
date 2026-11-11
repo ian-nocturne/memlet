@@ -231,6 +231,11 @@ def _transcript_lines(f: Path) -> Tuple[List[str], Dict[str, int]]:
         stats = {"overlongLines": sum(1 for ln in lines if len(ln) > TRANSCRIPT_MAX_TEXT_CHARS)}
         if stats["overlongLines"]:
             lines = ["" if len(ln) > TRANSCRIPT_MAX_TEXT_CHARS else ln for ln in lines]
+    if f.suffix != ".jsonl":
+        for i, line in enumerate(lines):
+            if md.memlet_echo(line):
+                lines[i] = ""
+                stats["skippedMemletEcho"] = stats.get("skippedMemletEcho", 0) + 1
     return [md.mask_secrets(_SPLITLINES_CHARS_RE.sub(" ", ln)) for ln in lines], stats
 
 
@@ -465,12 +470,13 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
     snap_dir.mkdir(parents=True, exist_ok=True)
     stored, reader = [], {"messages": 0, "malformedLines": 0, "nonMessageLines": 0, "overlongLines": 0,
                           "overlongMessages": 0}
-    work, over_work = 0, 0
+    work, over_work, echo_count = 0, 0, 0
     for f in files:
         if work >= TRANSCRIPT_MAX_WORK_CHARS:
             over_work += 1
             continue
         lines, st = _transcript_lines(f)
+        echo_count += st.get("skippedMemletEcho", 0)
         size = sum(len(ln) for ln in lines)
         if work + size > TRANSCRIPT_MAX_WORK_CHARS:
             over_work += 1  # never stored partially
@@ -482,6 +488,23 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
         stored.append({"transcript": str(f), "snapshotFile": f"{SNAPSHOT_REL}/{fid}", "op": op})
     snap = md.load_snapshot(snap_dir)
     cands, cap = _stable_candidates(snap)
+    if old:
+        config, _ = _load_config(root)
+        trust = dream_tiers(old, snapshot=snap, config=config)
+        approved_quotes = {md._LINE_PREFIX_RE.sub("", line["quote"], count=1).strip()
+                           for node in old.get("nodes", []) if trust.get(node["id"], {}).get("tier") == TIER_APPROVED
+                           for line in md.lesson_lines(node)}
+        old_ids = {n["id"] for n in old.get("nodes", [])}
+        kept = []
+        for candidate in cands:
+            spans = candidate.get("src_spans", [])
+            pins = [md.resolve_pin(snap, span) for span in spans]
+            quote = "\n".join(md._LINE_PREFIX_RE.sub("", p["quoteText"], count=1).strip() for p in pins if p)
+            if candidate["lesson_id"] not in old_ids and quote in approved_quotes:
+                echo_count += 1
+            else:
+                kept.append(candidate)
+        cands = kept
     with tempfile.TemporaryDirectory(prefix="memlet-learn-") as tmp:
         cpath = Path(tmp) / "candidates.json"
         cpath.write_text(json.dumps(cands, ensure_ascii=False), encoding="utf-8")
@@ -520,6 +543,10 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
                     "droppedCandidates": len(receipt.get("dropped") or []),
                     "truncatedFiles": cap["truncatedFiles"], "omittedCandidates": cap["omittedCandidates"],
                     "replacedChanged": info["replacedChanged"], "droppedUnverifiable": info["droppedUnverifiable"]})
+    if echo_count:
+        from .vocabulary import MEMLET_ECHO_NOTICE
+        skipped["skippedMemletEcho"] = echo_count
+        notices.append(MEMLET_ECHO_NOTICE % echo_count)
     bounded = {k: skipped.get(k, 0) for k in ("overSizeFiles", "overTotalSizeFiles", "overWorkCapFiles",
                                               "overlongLines", "overlongMessages") if skipped.get(k)}
     if bounded:
@@ -531,6 +558,7 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
         "addedNodeIds": info["added"], "pendingCount": pending["counts"]["pendingNodes"],
         "pendingEdgeCount": pending["counts"]["pendingEdges"], "transcriptMessages": reader["messages"],
         "skipped": skipped, "notices": notices, "approvalRequired": True,
+        **({"skippedMemletEcho": echo_count} if echo_count else {}),
     }
     lines = ["## Memlet learn (PENDING: nothing is approved)", "",
              f"- Queue: `{QUEUE_REL}` · {len(info['added'])} new item(s) · {res['pendingCount']} pending",
@@ -551,7 +579,7 @@ class _LessonPathContext(dict):
     def __init__(self, root, work=None):
         super().__init__(root=root, loaded=False, trust={}, is_git=False, tracked=set(),
                          initialized=False, directories=work.directories if work else {},
-                         valid={}, literal={}, work=work)
+                         valid={}, literal={}, paths={}, work=work)
 
     def update(self, *args, **kwargs):
         values = dict(*args, **kwargs)
@@ -626,7 +654,51 @@ def _valid_lesson_path(root, path, context):
         return False
 
 
-def lesson_path_context(repo_path="."):
+LITERAL_FILES_MAX_BYTES = 64 * 1024 * 1024
+LITERAL_FILES_TIMEOUT = 5.0
+
+
+def attachment_metadata(context):
+    if context.get("attachmentIncomplete"):
+        from .vocabulary import ATTACHMENT_INCOMPLETE
+        return {"attachmentIncomplete": True, "attachmentReason": ATTACHMENT_INCOMPLETE}
+    return {}
+
+
+def _attachment_result(result, context):
+    metadata = attachment_metadata(context)
+    if metadata:
+        result.update(metadata)
+        notice = metadata["attachmentReason"]
+        notices = result.setdefault("notices", [])
+        if notice not in notices:
+            notices.append(notice)
+    return result
+
+
+def _attachment_reader(fn):
+    # Nested readers reuse a single listing without leaking across calls.
+    import functools
+    @functools.wraps(fn)
+    def read(repo_path=".", *args, **kwargs):
+        try:
+            root = mw._resolve_root(repo_path)
+        except ValueError:
+            return fn(repo_path, *args, **kwargs)
+        active = _lesson_path_active.get()
+        if active is not None and active["root"] == root:
+            return fn(repo_path, *args, **kwargs)
+        with _lesson_path_projection(root, None) as context:
+            result = fn(repo_path, *args, **kwargs)
+            if context.get("attachmentIncomplete"):
+                _attachment_result(result, context)
+                if "formatted" in result and "tokenBudget" not in result:
+                    result["formatted"] += "\n" + result["attachmentReason"] + "\n"
+            return result
+    return read
+
+
+def lesson_path_context(repo_path=".", *, remaining=None):
     """One bounded tracked-file lookup and one set of evidence reads per projection.
 
     An invalid/unreadable git work tree fails closed for automatic attachments.
@@ -640,6 +712,7 @@ def lesson_path_context(repo_path="."):
     context["initialized"] = True
     is_git = any((p / ".git").exists() for p in [root] + list(root.parents))
     context["is_git"] = is_git
+    complete = not is_git
     if is_git and _lesson_path_available(context):
         process = None
         selector = selectors.DefaultSelector()
@@ -652,8 +725,11 @@ def lesson_path_context(repo_path="."):
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             selector.register(process.stdout, selectors.EVENT_READ)
             data = bytearray()
-            deadline = time.monotonic() + .5
-            while time.monotonic() < deadline and len(data) <= 4 * 1024 * 1024 and _lesson_path_available(context):
+            allowance = LITERAL_FILES_TIMEOUT if remaining is None else min(LITERAL_FILES_TIMEOUT, max(0, remaining))
+            if work and work.bounded:
+                allowance = min(allowance, max(0, work.deadline - work.clock()))
+            deadline = time.monotonic() + allowance
+            while time.monotonic() < deadline and len(data) <= LITERAL_FILES_MAX_BYTES and _lesson_path_available(context):
                 remaining = max(0, deadline - time.monotonic())
                 if work and work.bounded:
                     remaining = min(remaining, max(0, work.deadline - work.clock()))
@@ -664,7 +740,7 @@ def lesson_path_context(repo_path="."):
                     complete = True
                     break
                 data.extend(chunk)
-            complete = complete and len(data) <= 4 * 1024 * 1024 and process.wait(timeout=.1) == 0
+            complete = complete and len(data) <= LITERAL_FILES_MAX_BYTES and process.wait(timeout=max(.001, deadline - time.monotonic())) == 0
             if complete:
                 context["tracked"] = set(data.decode("utf-8", "surrogateescape").split("\0"))
         except (OSError, subprocess.SubprocessError):
@@ -676,9 +752,11 @@ def lesson_path_context(repo_path="."):
                     process.kill()
                 process.wait()
                 process.stdout.close()
-        if not complete and work:
+    if not complete:
+        context["attachmentIncomplete"] = True
+        if context.get("work"):
             from .vocabulary import GRAPH_FILES_NOTICE
-            work.skip(GRAPH_FILES_NOTICE)
+            context["work"].skip(GRAPH_FILES_NOTICE)
     return context
 
 
@@ -694,7 +772,8 @@ def _lesson_path_tokens(text):
         end = match.start() + len(path)
         before = text[match.start()-1:match.start()] if match.start() else ""
         after = text[end:end+1]
-        boundary = end == len(text) or text[end].isspace() or _lesson_punctuation.match(text, end)
+        leading = not before or before.isspace() or before in "\"'`([{<"
+        boundary = leading and (end == len(text) or text[end].isspace() or _lesson_punctuation.match(text, end))
         if boundary and not any(unicodedata.category(c) in ("Cc", "Cf", "Mn", "Me") for c in before + after):
             named.add(path.removeprefix("./"))
     return raw, named
@@ -976,6 +1055,9 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
            "unchanged": res.get("unchanged", []), "refused": res.get("refused", []),
            "cascadedEdges": res.get("cascadedEdges", []), "approvalBoundary": res.get("approvalBoundary"),
            "promotion": {k: promotion.get(k) for k in ("ok", "page", "promoted", "removed", "op", "error")}}
+    for key in ("resealedEdges", "untouchedEdges"):
+        if key in res:
+            out[key] = res[key]
     errors = list(res.get("eventErrors", []))
     if paths is not None:
         out["paths"] = list(paths)
@@ -988,6 +1070,11 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
     lines = [f"## Memlet learn — {decision} by {who}", ""]
     lines += [f"- {decision}: `{i}`" for i in out["applied"]]
     lines += [f"- unchanged: `{i}`" for i in out["unchanged"]]
+    if "resealedEdges" in out or "untouchedEdges" in out:
+        from .vocabulary import RESEALED_RELATIONS, UNTOUCHED_RELATIONS
+        lines.append("- " + RESEALED_RELATIONS + (", ".join(out.get("resealedEdges", [])) or "none"))
+        lines.append("- " + UNTOUCHED_RELATIONS + (", ".join(
+            e["id"] + " (" + e["state"] + ")" for e in out.get("untouchedEdges", [])) or "none"))
     lines += [f"- REFUSED `{r['id']}`: {r['reason']}" for r in out["refused"]]
     if promotion.get("ok"):
         lines.append(f"- Promoted page `{PROMOTED_PAGE}`: {len(promotion.get('promoted') or [])} rule(s), "
@@ -1669,6 +1756,7 @@ def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str
     return "\n".join(lines) + "\n"
 
 
+@_attachment_reader
 def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=None,
                    include=("rules", "dream", "memory"), files=None) -> Dict[str, Any]:
     """One budgeted response from three stores (no model call). The budget is split evenly across the sections that
@@ -1701,6 +1789,12 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
             sources["rules"], sources["safety"] = srcs["rules"], srcs["safety"]
             cands["staleRules"], sources["staleRules"] = got["staleRules"], srcs["staleRules"]
             rules_mode = srcs["rules"]["mode"]
+            if files is not None:
+                wanted_files = set(_changed_files(root, None, files)[0])
+                for section in ("rules", "safety", "staleRules"):
+                    cands[section] = [i for i in cands[section] if any(
+                        (a if isinstance(a, str) else a.get("anchor", "")).split("::", 1)[0] in wanted_files
+                        for a in i.get("anchors", []))]
             notices += extra
         except (OSError, ValueError) as exc:
             sources["rules"] = {"available": False, "reason": f"rule recall failed: {exc}"}
@@ -1737,6 +1831,9 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
     failures = sources["dream"].get("unverifiableItems", [])
     verification_notice = "\n- ".join([n for n in [md.citation_failure_notice(failures)] if n]
                                        + [n for n in notices if n.startswith("Rule ") and "is replaced by lesson" in n])
+    attachment = attachment_metadata(_lesson_path_active.get() or {})
+    if attachment:
+        verification_notice = "\n- ".join(filter(None, (verification_notice, attachment["attachmentReason"])))
     fixed_heading = _render_recall({}, None, rules_mode, verification_notice)
     unavailable = [f"{s} ({sources[s]['reason']})" for s in wanted if not sources[s]["available"]]
     footer = ("- Not consulted: " + "; ".join(unavailable)) if unavailable else None
@@ -1977,7 +2074,23 @@ def _changed_files(root: Path, base: Optional[str], files: Optional[Iterable[str
     plus untracked files. NUL-delimited, so names are taken literally; both ends of a rename or copy and every deleted
     path count as changed (a rule citing the old path must be re-checked)."""
     if files is not None:
-        return normalise_lesson_files(root, files)[0], None
+        if isinstance(files, str):
+            files = [files]
+        out: List[str] = []
+        for raw in files:
+            s = str(raw).strip()
+            if not s:
+                continue
+            p = Path(s)
+            if p.is_absolute():
+                try:
+                    s = p.resolve().relative_to(root).as_posix()
+                except ValueError:
+                    continue  # outside the repository: no rule here can reference it
+            s = mw._clean_ref_path(s.replace("\\", "/"))
+            if s and s not in out:
+                out.append(s)
+        return out, None
     ref = base or "HEAD"
     if ref.startswith("-"):
         return None, f"invalid base ref: {ref}"
@@ -2038,6 +2151,7 @@ def _cheap_rule_sources(root: Path, cfg: Optional[Dict[str, Any]], changed: Iter
     return sorted(found)
 
 
+@_attachment_reader
 def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
     """Fast hook check: classify only the anchors / referenced paths of rules that touch the changed files (`files`,
     else `git diff --name-status <base or HEAD>` with both rename ends, plus untracked files). Memlet's own generated
@@ -2112,15 +2226,12 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                 rows = a.get("rules") or [{"rule": "pinned anchor (including committed changes)",
                                            "source": ", ".join(a["sources"]) or mw.CONFIG_PATH}]
                 res["affected"].extend(dict(row, anchor=a["anchor"], status=a["status"], reason=a["reason"]) for row in rows)
-    if files is not None:
-        file_notices = normalise_lesson_files(root, files)[1]
-        if file_notices:
-            res.setdefault("notices", []).extend(file_notices)
     # 9.1.1 scope matches are informational; they must never feed attachment,
     # export or denial decisions. Strict 9.2 path matches take precedence.
     from .memlet_dreamcycle import _canonical_path
     requested = {_canonical_path(f) for f in changed}
-    attached_files = set(normalise_lesson_files(root, changed)[0])
+    attached_files = set(normalise_lesson_files(root, files if files is not None else changed)[0])
+    path_context = lesson_path_context(root)
     def matched_lessons(tier):
         rows = []
         for item in dream_items(root, tiers=(tier,))["items"]:
@@ -2129,7 +2240,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
             scope_match = any(f == scope_path or (scope.endswith(("/", "\\")) and
                 f.startswith(scope_path.rstrip("/") + "/")) or f + "::" in text or
                 "`" + f + "`" in text for f in requested)
-            path_match = bool(attached_files.intersection(item.get("paths", [])))
+            path_match = bool(attached_files.intersection(path_context["paths"].get(item["id"], [])))
             if path_match or scope_match:
                 rows.append(dict(item, via=LESSON_VIA_PATH if path_match else LESSON_VIA_SCOPE))
         return rows
@@ -2433,11 +2544,12 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             attached = lesson_paths(node, root, context=path_context) if tier == TIER_APPROVED else []
             literal = _lesson_literal_paths(display_node, root, path_context) if tier in (TIER_APPROVED, TIER_HINT) else []
             selected_paths = list(dict.fromkeys(attached + literal))
+            path_context["paths"][node["id"]] = selected_paths
             if tier == TIER_HINT:
                 path_context.setdefault("hintPaths", {})[node["id"]] = literal
             # Preserve no-files hint bytes while sharing the same selection
             # with recall and graph; human attachments remain approved-only.
-            paths = selected_paths if tier == TIER_APPROVED or requested is not None else []
+            paths = selected_paths if node.get("approvedPaths") or requested is not None else []
             inactive = [p for p in node.get("approvedPaths", []) if p not in attached]
             if inactive and tier == TIER_APPROVED:
                 notices.append(node["id"] + INACTIVE_APPROVAL_PATHS + ", ".join(inactive))
@@ -2478,6 +2590,6 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             notices.append(snap_why)
         if cfg_why:
             notices.append(cfg_why)
-        return {"ok": True, "items": items, "counts": counts, "notices": notices}
+        return _attachment_result({"ok": True, "items": items, "counts": counts, "notices": notices}, path_context)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         return {"ok": False, "items": [], "counts": counts, "notices": [str(exc)]}

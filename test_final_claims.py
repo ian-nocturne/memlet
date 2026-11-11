@@ -252,7 +252,7 @@ class ClaimsCase(unittest.TestCase):
         for i, secret in enumerate(secrets):
             with self.subTest(secret_family=i):
                 path = self.repo / ('secret%d.log' % i)
-                path.write_text('[user] RULE: Never share billing credential ' + secret + ' with customers.\n')
+                path.write_text('[user] RULE: Never share billing credential family%d ' % i + secret + ' with customers.\n')
                 result = mb.learn_from_transcript(self.repo, path)
                 self.assertTrue(result['ok'], result)
                 self.approve([n['id'] for n in mb.learn_pending(self.repo)['pendingNodes']])

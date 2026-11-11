@@ -228,6 +228,15 @@ def build(root, rules, anchors, approved, head, updated_at):
               "status": "stale", "reason": anchor["reason"], "tags": tags},
               {"anchor": 80, "path": 80, "reason": 90})
 
+    from . import memlet_bridge as mb
+    with mb._lesson_path_projection(root, None) as path_context:
+        mb.dream_items(root)
+        attached = dict(path_context["paths"])
+        metadata = mb.attachment_metadata(path_context)
+    if metadata:
+        for document in (hand, caps):
+            document.update(metadata)
+            document["omitted"]["literalAttachments"] = len(approved)
     rejected_seen_cites, rejected_seen_texts = set(), set()
     for lesson in approved:
         if lesson.get("tier") != APPROVED:
@@ -280,7 +289,7 @@ def build(root, rules, anchors, approved, head, updated_at):
                       "reason": BRIDGE_REPLACED_REASON,
                       "source": source, "cites": cite_fields, "tags": tags}, {"approach": 110, "source": 120})
             elif relations:
-                admit(caps, "capsules", {"id": ident, "paths": lesson.get("paths", []),
+                admit(caps, "capsules", {"id": ident, "paths": attached.get(lesson["id"], lesson.get("paths", [])),
                       "tags": tags, "summary": text, "source": source, "cites": cite_fields,
                       "updated_at": updated_at}, {"summary": SUMMARY_CHARS})
 
