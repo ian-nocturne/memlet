@@ -14,7 +14,7 @@ from unittest import mock
 
 import memory_cli
 import test_v93_tidy as tidy_tests
-from memlet import memlet_bridge as mb, memlet_tidy as mt
+from memlet import memlet_bridge as mb, memlet_skillbook as sb, memlet_tidy as mt
 
 REAL_MERGE_FUNCTIONS = mt._merge_functions  # captured before any test replaces the adapter's lookup
 LINE = tidy_tests.LINE
@@ -115,6 +115,21 @@ class TidyAndMergeTogether(tidy_tests.Base):
             argv = shlex.split(command)
             self.assertEqual('memlet', argv[0])
             memory_cli._build_parser().parse_args([a.replace('NAME', 'Ray') for a in argv[1:]])  # accepted by the real parser
+
+    def test_the_skill_file_leaves_out_a_merged_member_and_brings_it_back_when_the_merge_lapses(self):
+        repo, first, second, third = self.fixture()
+        self.assertTrue(mb.learn_approve(repo, [first, second, third], approver='Ray')['ok'])
+        both = sb.build_skill(repo)
+        self.assertTrue(both['ok'], both)
+        for ident in (first, second, third):
+            self.assertIn('lesson %s ' % ident, both['text'])
+        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Ray')['ok'])
+        merged = sb.build_skill(repo)
+        self.assertIn('lesson %s ' % first, merged['text'])
+        self.assertNotIn(second, merged['text'])  # not as an item, a label or a citation
+        self.assertEqual(both['items'] - 1, merged['items'])
+        self.assertTrue(mb.learn_unmerge(repo, [second], approver='Ray')['ok'])
+        self.assertEqual(both['text'], sb.build_skill(repo)['text'])  # same state, same bytes
 
     def test_tidy_stays_read_only_with_merges_present(self):
         repo, first, second, third = self.fixture()

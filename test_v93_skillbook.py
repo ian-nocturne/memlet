@@ -1748,18 +1748,28 @@ sys.stdout.write(json.dumps(payload, sort_keys=True, ensure_ascii=False))
         help93 = d93["admin_diff"]["admin_help"]["stdout"]
         self.assertNotIn("skillbook", help92)
         self.assertIn("skillbook", help93)
-        self.assertEqual(
-            help92,
-            help93.replace(" anchors graph skillbook\n", " anchors graph\n").replace(
-                f"    skillbook           {v.SKILL_CLI_HELP}\n", ""
-            ),
-        )
+        # The other 9.3 plug-in command (`tidy`, unit N2) is listed too once the units are merged; both are new
+        # commands, and nothing else in the help may differ.
+        def without_new_commands(text):
+            lines = []
+            for line in text.splitlines(True):
+                if line.lstrip().startswith(("skillbook ", "tidy ")) or line.startswith("memlet admin tidy:") \
+                        or line.startswith("memlet admin skillbook:"):
+                    continue
+                if " anchors graph" in line:
+                    line = line.replace(" tidy", "").replace(" skillbook", "")
+                lines.append(line)
+            return "".join(lines)
+
+        self.assertEqual(help92, without_new_commands(help93))
 
         bogus92 = d92["admin_diff"]["admin_bogus"]["stderr"]
         bogus93 = d93["admin_diff"]["admin_bogus"]["stderr"]
         self.assertNotIn("skillbook", bogus92)
         self.assertIn("skillbook", bogus93)
-        self.assertEqual(bogus92, bogus93.replace(", 'skillbook'", "").replace(", skillbook", ""))
+        for name in ("skillbook", "tidy"):
+            bogus93 = bogus93.replace(", '%s'" % name, "").replace(", %s" % name, "")
+        self.assertEqual(bogus92, bogus93)
 
 
 if __name__ == "__main__":
