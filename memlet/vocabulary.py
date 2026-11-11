@@ -227,7 +227,8 @@ TIDY_NOTHING_CHANGED = ("Nothing was changed. Every line below is a proposal: Me
 TIDY_SECTIONS = ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges")
 TIDY_SECTION_HEADINGS = {
     "duplicates": "Lessons that may say the same thing (merge?)",
-    "saidAgain": "Said again by a person in other sessions",
+    "saidAgain": ("Said again by a person in other sessions (pending lessons and unreviewed hints; rejected lessons "
+                  "said again after their rejection)"),
     "retire": "Approved lessons worth a second look (retire?)",
     "unattached": "Approved lessons that reach no file (they never arrive through hooks)",
     "promote": "Approved lessons that may belong in an instruction file (promote?)",
@@ -251,28 +252,46 @@ TIDY_RETIRE_LABELS = {
     "now-a-rule": "an instruction-file rule now says the same line",
     "old-unseen": "approved long ago and not said again since",
 }
+TIDY_NOT_CHECKED = "not checked"
 TIDY_UNATTACHED_LABEL = "reaches no file"
 TIDY_PROMOTE_LABEL = "said in %s session(s); a ready-to-paste block follows"
 TIDY_PROMOTE_SUGGESTION = ("Ready to paste — a suggestion, not an edit: Memlet does not write your instruction files. "
-                           "The lines are the lesson's cited lines; read and adapt before pasting.")
+                           "The lines are the lesson's complete current cited lines; read and adapt before pasting.")
+TIDY_BLOCK_ESCAPED = ("Escaped for display: characters that could hide text or act as markup were replaced, so these "
+                      "bytes differ from the cited source; copy from the cited source if you need it exactly.")
+TIDY_BLOCK_TOO_LONG = ("No block: the lesson's current cited text is longer than %d characters, and Memlet never "
+                       "cuts a rule; read it in the cited source.")
+TIDY_BLOCK_UNAVAILABLE = "No block: a current cited line could not be read in full; read it in the cited source."
 TIDY_ANCHOR_SUGGESTION = "Suggested anchor (Memlet's lesson anchoring; check it before keeping it): "
 TIDY_NO_ANCHOR = "No anchor suggested: the lesson names no code symbol Memlet could resolve."
+TIDY_ANCHOR_NOT_CHECKED = ("No anchor suggested: the promoted Dream page could not be checked against the ledger "
+                           "(not checked).")
 TIDY_INSTRUCTION_FILES = "Instruction files in this repository: "
 TIDY_NO_INSTRUCTION_FILES = "No instruction file exists in this repository yet."
 TIDY_LAPSED_LABEL = "merge into %s no longer holds: %s"
 TIDY_COMMAND_LABEL = "Command: "
 TIDY_ALSO_LABEL = "Or: "
+TIDY_NO_COMMAND_LABEL = "No command: "
+TIDY_UNSAFE_ARGUMENT = ("an id or path here cannot be passed safely to the memlet argument parser (several values "
+                        "where one starts with \"-\", or a NUL character)")
+TIDY_MERGE_COMMAND_UNAVAILABLE = "merge is not available in this build"
 TIDY_SCAN_LINE = "Snapshot scan: %d file(s), %d byte(s) read"
 TIDY_MERGE_UNAVAILABLE = "merge checks not available in this build"
 TIDY_MERGE_UNREADABLE = "merge records could not be read; merge checks were skipped"
+TIDY_MERGE_SKIPPED = ("merge records were inconsistent or a merge function failed; merge checks were skipped and "
+                      "every affected lesson is shown")
 TIDY_BLOCKERS_FAILED = "merge blockers could not be computed for some groups; those groups carry no blockers"
-TIDY_INCOMPLETE = ("The snapshot scan stopped at its bound or skipped unreadable files: session counts are lower "
-                   "bounds (\"at least\") and old-unseen was not judged.")
+TIDY_INCOMPLETE = ("Some snapshot evidence was not considered (a bound was reached, or a file, entry or line could not "
+                   "be read): session counts are lower bounds (\"at least\") and old-unseen was not judged.")
 TIDY_SIMILAR_BOUND = "Similar-wording comparison reached its work bound; some similar groups may be missing."
 TIDY_ATTACHMENT_UNKNOWN = ("The tracked-file listing was incomplete: lessons that reach no file are not listed, "
                            "because Memlet cannot tell.")
 TIDY_PAGE_UNTRUSTED = ("The promoted Dream page is not exactly what Memlet last wrote; its anchors were not used "
-                       "(anchored-code-changed not judged).")
+                       "(anchored-code-changed: not checked).")
+TIDY_LEDGER_SIDE_EFFECTS = ("The ledger could not be read without side effects (write-ahead log or journal present); "
+                            "it was not opened, so the promoted Dream page's anchors were not checked.")
 TIDY_SNAPSHOT_UNAVAILABLE = "No readable transcript snapshot directory; nothing was counted as said again."
+TIDY_SCAN_UNSUPPORTED = ("This platform cannot open snapshot files relative to a directory descriptor; the snapshot "
+                         "scan was skipped.")
 TIDY_PROMOTE_COMMAND_NOTE = "After pasting, re-check the instruction files"
-TIDY_INVALID_ARGUMENT = "stale-days must be an integer of at least 0 and min-seen an integer of at least 1"
+TIDY_INVALID_ARGUMENT = ("stale-days must be an integer from 0 to 999999999 and min-seen an integer of at least 1")

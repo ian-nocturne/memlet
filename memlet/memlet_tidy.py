@@ -1,21 +1,28 @@
 """Memlet 9.3 tidy report: lessons a person might merge, look at again, retire or promote. Strictly read-only.
 
-Nothing here writes: no queue, ledger, page, cache or table is created or changed, and no model is called. Tiers come
-from the one reader every other reader uses (`memlet_bridge.dream_items`); merge state comes only from
+Nothing here writes: no queue, ledger, page, cache, table or SQLite side file is created or changed, and no model is
+called. Tiers and line roles (current / replaced) come from the one reader every other reader uses
+(`memlet_bridge.dream_items` and `memlet_dream.lesson_display_fields`); merge state comes only from
 `memlet_bridge.merge_view` / `merge_blockers` through `merge_checks`, the single adapter, which says so when this
-build has no merge support. Sightings ("said again") are computed at read time from the stored snapshots under
-`.memlet/dream/snapshot/`: every file is opened at most once per call, and the work is counted, not timed.
+build has no merge support or when what it returns does not fit the lessons loaded.
+
+Sightings ("said again") are computed at read time from the stored snapshots, which Memlet stores flat in
+`.memlet/dream/snapshot/`. The scan opens that directory through no-follow directory descriptors, opens each file at
+most once relative to it, and counts its work; anything it could not consider makes the result incomplete. The tier
+read inside the shared reader is separate, has its own existing bounds, and is not part of the scan's counters.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
 import re
 import shlex
+import sqlite3
 import stat
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import memlet_bridge as mb
 from . import memlet_dream as md
@@ -23,18 +30,23 @@ from . import memlet_wiki as mw
 from . import vocabulary as v
 from .vocabulary import APPROVED, HINT, PENDING, REJECTED
 
-MAX_BYTES = 64 * 1024 * 1024          # snapshot bytes read per call
-MAX_FILES = md.SNAPSHOT_MAX_FILES      # snapshot files read per call
-MAX_LINE_BYTES = 64 * 1024            # a longer physical line is skipped (a cited line is at most 16,384 characters)
+MAX_BYTES = 64 * 1024 * 1024          # snapshot bytes read per scan
+MAX_FILES = md.SNAPSHOT_MAX_FILES      # snapshot directory entries listed (and files opened) per scan
+MAX_LINE_BYTES = 64 * 1024            # a longer physical line is not considered (a cited line is at most 16,384 chars)
 MAX_WHERE = 8
+MAX_MATCH_WORK = 2_000_000            # (quote, lesson) hand-overs from per-session quote summaries to lessons
 MIN_SIMILAR_WORDS = 5
 SIMILAR_JACCARD = 0.8
 MAX_SIMILAR_WORK = 2_000_000          # posting-list visits for the similar-wording comparison
+MAX_BLOCK_CHARS = 12_000              # a longer promote block is omitted whole, never cut
+MAX_STALE_DAYS = 999_999_999          # the largest day count `datetime.timedelta` can represent
 
 _USER_LINE_RE = re.compile(r"^\s*(?:\d{4}-\d{2}-\d{2}[T ][^\s]+\s*)?\[user\]")
 # `<stem>-<10 hex>.log` (a transcript's snapshot) and `<stem>-<10 hex>-<10 hex>.log` (the same transcript rewritten).
 _SESSION_SUFFIX_RE = re.compile(r"(?:-[0-9a-f]{10}){1,2}\.log$")
 _WORD_RE = re.compile(r"\w+")
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_FAR = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -61,45 +73,46 @@ def _line_time(line: str, now: datetime.datetime) -> Optional[datetime.datetime]
 
 
 def session_key(file_id: str) -> str:
-    """One session per transcript: a snapshot base name without its trailing `-<10 hex>.log` (and the second hash a
-    rewritten transcript adds), so a rewritten transcript is never counted twice. Undercounts rather than overstates."""
-    head, _, name = file_id.rpartition("/")
-    base = _SESSION_SUFFIX_RE.sub("", name)
-    if not base or base == name:
-        return file_id
-    return (head + "/" if head else "") + base
+    """A session is identified by its stored file name: the snapshot name without its trailing `-<10 hex>.log` (and
+    the second hash a rewritten transcript adds). So a rewritten transcript counts once; a copy stored under another
+    name counts again, and different transcripts with the same file name count once."""
+    base = _SESSION_SUFFIX_RE.sub("", file_id)
+    return base if base and base != file_id else file_id
 
 
-def _q(value: Any) -> str:
-    return shlex.quote(str(value))
+def command(words: Sequence[str], options: Sequence[Tuple[str, Any]] = (), *, repo: Optional[str] = None
+            ) -> Optional[str]:
+    """A POSIX-shell command line that runs only `memlet` and that the memlet argument parser binds as intended.
 
-
-def command(*argv: Any, repo: Optional[str] = None) -> str:
-    """A POSIX-shell command line that runs only `memlet`, every argument quoted as one word."""
-    parts = ["memlet"] + [_q(a) for a in argv]
+    Every option value is passed as `--option=value`, so a value starting with `-` is never read as an option. An
+    option that takes several values (`--same A B`) cannot use that form; when one of them starts with `-`, or any
+    value holds a NUL character, no command is returned (None)."""
+    argv = ["memlet"] + list(words)
+    for flag, value in options:
+        if value is True:
+            argv.append(flag)
+        elif isinstance(value, (list, tuple)):
+            values = [str(x) for x in value]
+            if len(values) == 1:
+                argv.append(flag + "=" + values[0])
+            elif not values or any(x.startswith("-") for x in values):
+                return None
+            else:
+                argv += [flag] + values
+        else:
+            argv.append(flag + "=" + str(value))
     if repo is not None:
-        parts += ["--repo", _q(repo)]
-    return " ".join(parts)
+        argv.append("--repo=" + repo)
+    if any("\x00" in a for a in argv):
+        return None
+    return " ".join(shlex.quote(a) for a in argv)
 
 
-def _current_lines(node: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """(span, raw cited line) of the lesson as stored now, without replaced lines of a supersession."""
-    display = dict(node, allPins=list(node.get("allPins") or [node.get("primaryPin")]))
-    if md.superseded_lesson(node):
-        display["allPins"] += [node.get("supersededByPin")]
-        display["allPins"] += [e.get("srcPin") for e in node.get("edges", [])
-                               if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES"]
-    raw = {p["span"]: p["quote"] for p in md.lesson_lines(display)}
-    fields = md.lesson_display_fields(node)
-    roles = fields.get("lineRoles", ["current"] * len(fields.get("cites", [])))
-    return [(c["span"], raw[c["span"]]) for c, role in zip(fields.get("cites", []), roles)
-            if role != "replaced" and c["span"] in raw]
-
-
-def _node_time(node: Dict[str, Any]) -> Optional[datetime.datetime]:
-    times = [md.parse_iso_dt(md.extract_line_timestamp(p["quote"])) for p in md.lesson_lines(node)]
-    times = [t for t in times if t is not None]
-    return min(times) if times else None
+def _with_command(entry: Dict[str, Any], cmd: Optional[str], note: str = v.TIDY_UNSAFE_ARGUMENT) -> Dict[str, Any]:
+    entry["command"] = cmd
+    if cmd is None:
+        entry["commandNote"] = note
+    return entry
 
 
 def _decision_time(node: Dict[str, Any]) -> Optional[datetime.datetime]:
@@ -107,28 +120,170 @@ def _decision_time(node: Dict[str, Any]) -> Optional[datetime.datetime]:
     return md.parse_iso_dt(record.get("at")) if md._valid_utc_stamp(record.get("at")) else None
 
 
+def _strip(raw: str) -> str:
+    return md._LINE_PREFIX_RE.sub("", raw, count=1).strip()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# lessons through the shared reader
+
+
+def _raw_index(graph: Dict[str, Any]) -> Dict[Tuple[str, str], str]:
+    """{(span, sha256): raw cited line} from every stored pin, so a line the reader projects (also from another
+    lesson's pin) can be matched in full. A lookup by hash only; it decides no role and no supersession."""
+    out: Dict[Tuple[str, str], str] = {}
+
+    def add(pin):
+        if not isinstance(pin, dict):
+            return
+        parsed = md.parse_span(str(pin.get("span", "")))
+        if not parsed:
+            return
+        quotes = pin.get("quoteLines") or str(pin.get("quoteText", "")).split("\n")
+        for number, quote in zip(range(parsed[1], parsed[2] + 1), quotes):
+            if isinstance(quote, str):
+                out.setdefault(("%s:%d" % (parsed[0], number), md.sha256_hex(quote)), quote)
+
+    def edge_pins(edge):
+        if isinstance(edge, dict):
+            for key in ("srcPin", "targetPin", "citedTargetPin"):
+                add(edge.get(key))
+
+    for node in graph.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        for pin in [node.get("primaryPin"), node.get("supersededByPin")] + list(node.get("allPins") or []):
+            add(pin)
+        for edge in node.get("edges", []) or []:
+            edge_pins(edge)
+    for edge in graph.get("edges", []) or []:
+        edge_pins(edge)
+    return out
+
+
+def _line_set(fields: Dict[str, Any], raw: Dict[Tuple[str, str], str]) -> List[Dict[str, Any]]:
+    """[{role, raw, quote, cite}] in the reader's order, with the reader's roles (`current` when it gives none)."""
+    cites = fields.get("cites", [])
+    roles = fields.get("lineRoles") or ["current"] * len(cites)
+    quotes = fields.get("quoteLines") or []
+    out = []
+    for i, cite in enumerate(cites):
+        out.append({"role": roles[i] if i < len(roles) else "current",
+                    "raw": raw.get((cite.get("span"), cite.get("sha256"))),
+                    "quote": quotes[i] if i < len(quotes) else "", "cite": cite})
+    return out
+
+
+def _current(lines: List[Dict[str, Any]]) -> Optional[List[str]]:
+    """Raw current lines, or None when one of them cannot be read in full."""
+    current = [ln for ln in lines if ln["role"] != "replaced"]
+    if any(ln["raw"] is None for ln in current):
+        return None
+    return [ln["raw"] for ln in current]
+
+
+def _load_lessons(root: Path, graph: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = {n["id"]: n for n in graph.get("nodes", []) if isinstance(n, dict) and isinstance(n.get("id"), str)}
+    with mb._lesson_path_projection(root, None) as context:
+        read = (mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph) if nodes
+                else {"ok": True, "items": [], "notices": []})
+        reached = {k: list(p) for k, p in context["paths"].items()}
+        attachment_complete = not context.get("attachmentIncomplete")
+    raw = _raw_index(graph)
+    lessons: Dict[str, Dict[str, Any]] = {}
+    for item in read.get("items", []):
+        lines = _line_set(item, raw)
+        lessons[item["id"]] = {"id": item["id"], "tier": item["tier"], "item": item, "lines": lines,
+                               "current": _current(lines), "node": nodes.get(item["id"], {})}
+    for lesson_id, node in nodes.items():
+        if lesson_id in lessons or mb.item_tier(node, snapshot=None, config={}) != REJECTED:
+            continue
+        if md.approval_state(node, "node") != REJECTED:
+            continue  # a model's REJECTED verdict alone has no rejection time
+        fields = mb._lesson_fields(node)
+        lines = _line_set(fields, raw)
+        item = {"id": lesson_id, "tier": REJECTED,
+                "edgeTypes": sorted({e.get("edgeType") for e in node.get("edges", [])
+                                     if isinstance(e, dict) and e.get("edgeType")}),
+                **fields}
+        lessons[lesson_id] = {"id": lesson_id, "tier": REJECTED, "item": item, "lines": lines,
+                              "current": _current(lines), "node": node}
+    return {"ok": read["ok"], "notices": list(read.get("notices", [])), "lessons": lessons, "nodes": nodes,
+            "reached": reached, "attachmentComplete": attachment_complete}
+
+
+def _lesson(lesson: Dict[str, Any]) -> Dict[str, Any]:
+    item = lesson["item"]
+    out = {"id": lesson["id"], "tier": lesson["tier"], "edgeTypes": list(item.get("edgeTypes", [])),
+           "quoteLines": [ln["quote"] for ln in lesson["lines"]] or [item.get("text", "")],
+           "cites": [{"file": ln["cite"]["file"], "start": ln["cite"]["start"], "end": ln["cite"]["end"]}
+                     for ln in lesson["lines"]]}
+    if any(ln["role"] != "current" for ln in lesson["lines"]) or item.get("quarantined"):
+        out["lineRoles"] = [ln["role"] for ln in lesson["lines"]]
+    return out
+
+
+def _earliest(lesson: Dict[str, Any]) -> Optional[datetime.datetime]:
+    times = [md.parse_iso_dt(md.extract_line_timestamp(raw)) for raw in lesson["current"] or []]
+    times = [t for t in times if t is not None]
+    return min(times) if times else None
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # merge awareness: the one adapter
 
 
-def merge_checks(repo_path=".") -> Dict[str, Any]:
-    """The single place this module learns about merges. Uses `memlet_bridge.merge_view` and
-    `memlet_bridge.merge_blockers` when this build has both; otherwise reports that merge checks are not available.
+def _merge_none(notice: Optional[str]) -> Dict[str, Any]:
+    return {"available": False, "states": {}, "members": {}, "blockers": None, "notice": notice}
 
-    Returns {available, states: {id: {state, into, reason}}, members: {kept id: [member ids]}, blockers: callable or
-    None, notice: str or None}. Nothing here decides whether a merge holds."""
+
+def _valid_view(view: Any, ids: Set[str]) -> bool:
+    """Shapes and ids only; whether a merge holds is `merge_view`'s answer, never decided here."""
+    if not isinstance(view, dict) or view.get("ok") is not True:
+        return False
+    states, members = view.get("states"), view.get("members")
+    if not isinstance(states, dict) or not isinstance(members, dict):
+        return False
+    for lesson_id, state in states.items():
+        if (lesson_id not in ids or not isinstance(state, dict)
+                or state.get("state") not in ("none", "merged", "lapsed")
+                or not (state.get("into") is None or isinstance(state.get("into"), str))
+                or not (state.get("reason") is None or isinstance(state.get("reason"), str))):
+            return False
+        if state["state"] == "merged" and (state.get("into") not in ids or state["into"] == lesson_id
+                                           or lesson_id not in (members.get(state["into"]) or [])):
+            return False
+    seen: Set[str] = set()
+    for keep, listed in members.items():
+        if keep not in ids or not isinstance(listed, list):
+            return False
+        for member in listed:
+            if not isinstance(member, str) or member not in ids or member == keep or member in seen:
+                return False
+            seen.add(member)
+            state = states.get(member)
+            if state is not None and (state.get("state") != "merged" or state.get("into") != keep):
+                return False
+    return not (seen & set(members))  # a kept lesson is never itself a holding member
+
+
+def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    """The single place this module learns about merges: `memlet_bridge.merge_view` and `merge_blockers` when this
+    build has both, else "merge checks not available in this build". What `merge_view` returns is checked against the
+    lessons loaded (`ids`); on any inconsistency or exception, merge checks are skipped, nothing is hidden, and the
+    notice says so. Returns {available, states, members, blockers: callable or None, notice}."""
     view_fn = getattr(mb, "merge_view", None)
     blockers_fn = getattr(mb, "merge_blockers", None)
-    none = {"available": False, "states": {}, "members": {}, "blockers": None}
     if not callable(view_fn) or not callable(blockers_fn):
-        return dict(none, notice=v.TIDY_MERGE_UNAVAILABLE)
+        return _merge_none(v.TIDY_MERGE_UNAVAILABLE)
     try:
         view = view_fn(repo_path)
-    except (OSError, ValueError, TypeError, KeyError):
-        view = None
-    if (not isinstance(view, dict) or not view.get("ok") or not isinstance(view.get("states"), dict)
-            or not isinstance(view.get("members"), dict)):
-        return dict(none, notice=v.TIDY_MERGE_UNREADABLE)
+    except Exception:  # noqa: BLE001 - any adapter failure is reported, never raised through the report
+        return _merge_none(v.TIDY_MERGE_UNREADABLE)
+    if not isinstance(view, dict) or view.get("ok") is not True:
+        return _merge_none(v.TIDY_MERGE_UNREADABLE)
+    if ids is not None and not _valid_view(view, set(ids)):
+        return _merge_none(v.TIDY_MERGE_SKIPPED)
 
     def blockers(keep, same):
         return blockers_fn(repo_path, keep, tuple(same))
@@ -137,78 +292,119 @@ def merge_checks(repo_path=".") -> Dict[str, Any]:
             "notice": None}
 
 
-def _holding_members(merge: Dict[str, Any]) -> Dict[str, str]:
-    """{member id: kept id} for merges that hold, as `merge_view` reports them."""
+def _checked_blockers(merge: Dict[str, Any], keep: str, same: List[str]) -> Optional[Dict[str, Any]]:
+    """`merge_blockers` output when it could be computed (ok true, shapes valid), else None. A merge that would be
+    refused is non-empty `blockers` with ok true."""
+    try:
+        checked = merge["blockers"](keep, same)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(checked, dict) or checked.get("ok") is not True:
+        return None
     out = {}
-    for keep, members in merge["members"].items():
-        for member in members or ():
-            out[str(member)] = str(keep)
+    for key in ("blockers", "lostFiles"):
+        value = checked.get(key) or {}
+        if (not isinstance(value, dict) or any(k not in same for k in value)
+                or any(not isinstance(x, list) or any(not isinstance(y, str) for y in x) for x in value.values())):
+            return None
+        out[key] = {k: list(x) for k, x in value.items()}
     return out
 
 
+def _holding_members(merge: Dict[str, Any]) -> Dict[str, str]:
+    return {str(m): str(keep) for keep, members in merge["members"].items() for m in members or ()}
+
+
 # ---------------------------------------------------------------------------------------------------------------
-# sightings
+# the sightings scan
 
 
 class _Work(dict):
     def __init__(self):
-        super().__init__(filesListed=0, filesOpened=0, bytesRead=0, linesRead=0, linesCompared=0)
+        super().__init__(entriesListed=0, filesOpened=0, bytesRead=0, linesRead=0, linesCompared=0, matchWork=0)
 
 
-def _snapshot_files(root: Path, work: _Work, skipped: Dict[str, int]) -> List[Tuple[str, Path]]:
-    """(file id, path) of every `.log` file under the snapshot directory, sorted; symlinks never followed."""
-    base = root / mb.SNAPSHOT_REL
-    out: List[Tuple[str, Path]] = []
-    stack = [("", base)]
-    while stack:
-        prefix, folder = stack.pop()
-        try:
-            with os.scandir(str(folder)) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except OSError:
-            skipped["unreadable"] += 1
-            continue
-        for entry in entries:
-            rel = prefix + entry.name
+def _skipped() -> Dict[str, int]:
+    return {"symlinks": 0, "directories": 0, "unsupported": 0, "unreadable": 0, "hugeLines": 0,
+            "invalidUtf8Lines": 0, "overBudget": 0, "overFileCount": 0, "overMatchWork": 0}
+
+
+def _dir_fd_supported() -> bool:
+    return (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+            and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"))
+
+
+@contextlib.contextmanager
+def _snapshot_dir(root: Path):
+    """A descriptor of `.memlet/dream/snapshot`, each component opened with O_NOFOLLOW relative to its parent.
+    Yields (fd or None, state) with state "ok", "missing" or "refused"."""
+    fds: List[int] = []
+    try:
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+        fds.append(fd)
+        for part in mb.SNAPSHOT_REL.split("/"):
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            fds.append(fd)
+        state = "ok"
+    except FileNotFoundError:
+        state = "missing"
+    except OSError:
+        state = "refused"
+    try:
+        yield (fds[-1] if state == "ok" else None), state
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _list(dir_fd: int, work: _Work, skipped: Dict[str, int]) -> Tuple[List[str], bool]:
+    """Names of regular `.log` files, at most MAX_FILES entries listed; (names, every entry considered)."""
+    names, complete = [], True
+    with os.scandir(dir_fd) as it:
+        for entry in it:
+            if work["entriesListed"] >= MAX_FILES:
+                skipped["overFileCount"] += 1
+                return sorted(names), False
+            work["entriesListed"] += 1
             try:
                 if entry.is_symlink():
                     skipped["symlinks"] += 1
+                    complete = False
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    stack.append((rel + "/", Path(entry.path)))
+                    skipped["directories"] += 1  # snapshots are stored flat: never descended
+                    complete = False
                     continue
-                if not entry.is_file(follow_symlinks=False):
-                    skipped["unsupported"] += 1
-                    continue
+                regular = entry.is_file(follow_symlinks=False)
             except OSError:
                 skipped["unreadable"] += 1
+                complete = False
                 continue
-            if not entry.name.endswith(".log") or not md._is_safe_file_id(rel):
-                skipped["unsupported"] += 1
+            if not regular or not entry.name.endswith(".log") or not md._is_safe_file_id(entry.name):
+                skipped["unsupported"] += 1  # includes `.jsonl`, which this scan does not parse
+                complete = False
                 continue
-            work["filesListed"] += 1
-            out.append((rel, Path(entry.path)))
-    out.sort()
-    return out
+            names.append(entry.name)
+    return sorted(names), complete
 
 
-def _read_file(path: Path, remaining: int, work: _Work, skipped: Dict[str, int]) -> Tuple[Optional[bytes], bool]:
-    """(bytes or None, over budget). One open per file; a symlink, FIFO or device is never followed or read."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _read(dir_fd: int, name: str, remaining: int, work: _Work, skipped: Dict[str, int]) -> Optional[bytes]:
+    """One open per file, relative to the snapshot directory, never following a symlink or blocking on a FIFO."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW
     try:
-        fd = os.open(str(path), flags)
+        fd = os.open(name, flags, dir_fd=dir_fd)
     except OSError:
         skipped["unreadable"] += 1
-        return None, False
+        return None
     work["filesOpened"] += 1
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             skipped["unsupported"] += 1
-            return None, False
+            return None
         if st.st_size > remaining:
             skipped["overBudget"] += 1
-            return None, True
+            return None
         chunks, total = [], 0
         while total <= remaining:
             chunk = os.read(fd, min(1 << 20, remaining + 1 - total))
@@ -219,83 +415,97 @@ def _read_file(path: Path, remaining: int, work: _Work, skipped: Dict[str, int])
         work["bytesRead"] += total
         if total > remaining:
             skipped["overBudget"] += 1
-            return None, True
-        return b"".join(chunks), False
+            return None
+        return b"".join(chunks)
     except OSError:
         skipped["unreadable"] += 1
-        return None, False
+        return None
     finally:
         os.close(fd)
 
 
-def _scan(root: Path, wanted: Dict[str, List[str]], *, max_bytes: int, now: datetime.datetime
-          ) -> Dict[str, Any]:
-    """Records of complete sightings per lesson: [{session, file, line, early, late}], one per snapshot file."""
-    work = _Work()
-    skipped = {"symlinks": 0, "unreadable": 0, "unsupported": 0, "hugeLines": 0, "invalidUtf8Lines": 0,
-               "overBudget": 0, "overFileCount": 0}
+def _scan(root: Path, wanted: Dict[str, List[str]], *, max_bytes: int, now: datetime.datetime) -> Dict[str, Any]:
+    """Per lesson, one record per snapshot file in which every wanted quote was said by the user:
+    [{session, file, line, early, late}]. Matches are summarised per quote and file first (first line, earliest and
+    latest time); only the summaries are handed to the lessons that want them (counted in `matchWork`)."""
+    work, skipped = _Work(), _skipped()
     records: Dict[str, List[Dict[str, Any]]] = {i: [] for i in wanted}
-    complete, notices = True, []
     scanned = {"files": 0, "bytes": 0}
-    need: Dict[str, List[Tuple[str, int]]] = {}
-    for lesson_id, lines in wanted.items():
-        for index, text in enumerate(lines):
-            need.setdefault(text, []).append((lesson_id, index))
-    problem = mb._symlinked(root, (mb.SNAPSHOT_REL,))
-    if problem or not (root / mb.SNAPSHOT_REL).is_dir():
-        notices.append(v.TIDY_SNAPSHOT_UNAVAILABLE)
-        return {"records": records, "complete": not (root / mb.SNAPSHOT_REL).exists(), "work": work,
-                "skipped": skipped, "scanned": scanned, "notices": notices}
-    files = _snapshot_files(root, work, skipped)
-    if len(files) > MAX_FILES:
-        skipped["overFileCount"] = len(files) - MAX_FILES
-        files, complete = files[:MAX_FILES], False
-    budget = max(0, int(max_bytes))
-    for file_id, path in files:
-        data, over = _read_file(path, budget - work["bytesRead"], work, skipped)
-        if data is None:
-            complete = False
-            continue
-        scanned["files"] += 1
-        scanned["bytes"] += len(data)
-        if not need:
-            continue
-        found: Dict[str, Dict[int, List[Tuple[int, Optional[datetime.datetime]]]]] = {}
-        raw_lines = data.split(b"\n")
-        if raw_lines and raw_lines[-1] == b"":
-            raw_lines.pop()
-        for number, raw in enumerate(raw_lines, start=1):
-            work["linesRead"] += 1
-            if len(raw) > MAX_LINE_BYTES:
-                skipped["hugeLines"] += 1
+    need: Dict[str, List[str]] = {}
+    required: Dict[str, Tuple[str, ...]] = {}
+    for lesson_id, quotes in wanted.items():
+        required[lesson_id] = tuple(dict.fromkeys(quotes))
+        for quote in required[lesson_id]:
+            need.setdefault(quote, []).append(lesson_id)
+    out = {"records": records, "complete": True, "work": work, "skipped": skipped, "scanned": scanned, "notices": []}
+    if not _dir_fd_supported():
+        out.update(complete=False, notices=[v.TIDY_SCAN_UNSUPPORTED])
+        return out
+    with _snapshot_dir(root) as (dir_fd, state):
+        if state != "ok":
+            out["notices"].append(v.TIDY_SNAPSHOT_UNAVAILABLE)
+            out["complete"] = state == "missing"
+            return out
+        names, complete = _list(dir_fd, work, skipped)
+        budget = max(0, int(max_bytes))
+        for name in names:
+            data = _read(dir_fd, name, budget - work["bytesRead"], work, skipped)
+            if data is None:
+                complete = False
                 continue
-            try:
-                line = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                skipped["invalidUtf8Lines"] += 1
-                continue
-            if not _USER_LINE_RE.match(line):
-                continue
-            work["linesCompared"] += 1
-            hits = need.get(md.normalised_quote(line))
-            if not hits:
-                continue
-            when = _line_time(line, now)
-            for lesson_id, index in hits:
-                found.setdefault(lesson_id, {}).setdefault(index, []).append((number, when))
-        for lesson_id, by_index in found.items():
-            if len(by_index) != len(wanted[lesson_id]):
-                continue  # every cited line must be said in this one session
-            first_line = min(n for n, _ in by_index[0])
-            per_line = [[t for _, t in by_index[i] if t is not None] for i in range(len(wanted[lesson_id]))]
-            early = late = None
-            if all(per_line):
-                early = max(min(ts) for ts in per_line)
-                late = min(max(ts) for ts in per_line)
-            records[lesson_id].append({"session": session_key(file_id), "file": file_id, "line": first_line,
-                                       "early": early, "late": late})
-    return {"records": records, "complete": complete, "work": work, "skipped": skipped, "scanned": scanned,
-            "notices": notices}
+            scanned["files"] += 1
+            scanned["bytes"] += len(data)
+            summary: Dict[str, List[Any]] = {}  # quote -> [first line, earliest time, latest time]
+            raw_lines = data.split(b"\n")
+            if raw_lines and raw_lines[-1] == b"":
+                raw_lines.pop()
+            for number, raw in enumerate(raw_lines, start=1):
+                work["linesRead"] += 1
+                if len(raw) > MAX_LINE_BYTES:
+                    skipped["hugeLines"] += 1
+                    complete = False
+                    continue
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped["invalidUtf8Lines"] += 1
+                    complete = False
+                    continue
+                if not need or not _USER_LINE_RE.match(line):
+                    continue
+                work["linesCompared"] += 1
+                quote = md.normalised_quote(line)
+                if quote not in need:
+                    continue
+                when = _line_time(line, now)
+                seen = summary.get(quote)
+                if seen is None:
+                    summary[quote] = [number, when, when]
+                elif when is not None:
+                    seen[1] = when if seen[1] is None else min(seen[1], when)
+                    seen[2] = when if seen[2] is None else max(seen[2], when)
+            handed: Set[str] = set()
+            for quote in summary:
+                work["matchWork"] += len(need[quote])
+                if work["matchWork"] > MAX_MATCH_WORK:
+                    skipped["overMatchWork"] += 1
+                    out["complete"] = False
+                    return out
+                for lesson_id in need[quote]:
+                    if lesson_id in handed:
+                        continue
+                    handed.add(lesson_id)
+                    parts = [summary.get(q) for q in required[lesson_id]]
+                    if any(p is None for p in parts):
+                        continue  # every cited line must be said in this one session
+                    early = late = None
+                    if all(p[1] is not None for p in parts):
+                        early = max(p[1] for p in parts)
+                        late = min(p[2] for p in parts)
+                    records[lesson_id].append({"session": session_key(name), "file": name, "line": parts[0][0],
+                                               "early": early, "late": late})
+    out["complete"] = complete
+    return out
 
 
 def _summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -313,16 +523,15 @@ def _sessions_after(records: List[Dict[str, Any]], when: Optional[datetime.datet
     return len({r["session"] for r in records if r["late"] is not None and r["late"] > when})
 
 
-def _sightings(root: Path, graph: Dict[str, Any], merge: Dict[str, Any], *, max_bytes: int,
+def _sightings(root: Path, lessons: Dict[str, Dict[str, Any]], merge: Dict[str, Any], *, max_bytes: int,
                now: datetime.datetime) -> Dict[str, Any]:
-    nodes = [n for n in (graph or {}).get("nodes", []) if isinstance(n, dict) and isinstance(n.get("id"), str)]
     wanted = {}
-    for node in nodes:
-        lines = [md.normalised_quote(raw) for _, raw in _current_lines(node)]
-        if lines and all(lines):
-            wanted[node["id"]] = lines
+    for lesson_id, lesson in lessons.items():
+        quotes = [md.normalised_quote(raw) for raw in lesson["current"] or []]
+        if quotes and all(quotes):
+            wanted[lesson_id] = quotes
     scan = _scan(root, wanted, max_bytes=max_bytes, now=now)
-    records = {n["id"]: list(scan["records"].get(n["id"], [])) for n in nodes}
+    records = {i: list(scan["records"].get(i, [])) for i in lessons}
     # A holding merge: the kept lesson counts distinct sessions across the whole group.
     for member, keep in _holding_members(merge).items():
         if keep in records:
@@ -331,40 +540,40 @@ def _sightings(root: Path, graph: Dict[str, Any], merge: Dict[str, Any], *, max_
     return scan
 
 
+def _load(repo_path) -> Tuple[Path, Dict[str, Any], str]:
+    root = mw._resolve_root(repo_path)
+    problem = mb._symlinked(root, (mb.QUEUE_REL, mb.SNAPSHOT_REL, mw.CONFIG_PATH))
+    if problem:
+        raise ValueError(mb._refusing(problem))
+    graph, why = mb._load_queue(root)
+    return root, graph or {"nodes": [], "edges": []}, why
+
+
 def lesson_sightings(repo_path=".", *, ids=None, max_bytes=MAX_BYTES, clock=None) -> Dict[str, Any]:
-    """{ok, complete, scanned: {files, bytes}, sightings: {id: {sessions, first, last, where}}} plus `work` (counters:
-    files listed and opened, bytes read, lines read and compared) and `skipped`. Read-only."""
+    """{ok, complete, scanned: {files, bytes}, sightings: {id: {sessions, first, last, where}}} plus `work` (entries
+    listed, files opened, bytes read, lines read and compared, match work), `skipped` and `notices`. Read-only."""
     try:
-        root = mw._resolve_root(repo_path)
-        graph, why = mb._load_queue(root)
+        root, graph, why = _load(repo_path)
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": str(exc), "complete": False, "scanned": {"files": 0, "bytes": 0},
                 "sightings": {}}
-    now = _now(clock)
-    merge = merge_checks(root)
-    scan = _sightings(root, graph or {}, merge, max_bytes=max_bytes, now=now)
+    loaded = _load_lessons(root, graph)
+    if not loaded["ok"]:
+        error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
+        return {"ok": False, "error": error, "complete": False, "scanned": {"files": 0, "bytes": 0}, "sightings": {}}
+    merge = merge_checks(root, loaded["nodes"])
+    scan = _sightings(root, loaded["lessons"], merge, max_bytes=max_bytes, now=_now(clock))
     keep = None if ids is None else set(mb._ids(ids))
     sightings = {i: _summary(r) for i, r in scan["grouped"].items() if keep is None or i in keep}
     notices = ([why] if why else []) + scan["notices"] + ([merge["notice"]] if merge["notice"] else [])
+    if not scan["complete"]:
+        notices.append(v.TIDY_INCOMPLETE)
     return {"ok": True, "complete": scan["complete"], "scanned": scan["scanned"], "sightings": sightings,
             "work": dict(scan["work"]), "skipped": scan["skipped"], "notices": notices}
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# the report
-
-
-def _cites(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [{"file": c["file"], "start": c["start"], "end": c["end"]} for c in fields.get("cites", [])]
-
-
-def _lesson(item: Dict[str, Any]) -> Dict[str, Any]:
-    return {"id": item["id"], "tier": item["tier"], "edgeTypes": list(item.get("edgeTypes", [])),
-            "quoteLines": list(item.get("quoteLines") or [item.get("text", "")]), "cites": _cites(item)}
-
-
-def _count(value: int, complete: bool) -> Any:
-    return value if complete else v.TIDY_AT_LEAST % value
+# instruction rules, the promoted page and its ledger
 
 
 def _instruction_rules(root: Path) -> Dict[str, List[str]]:
@@ -378,16 +587,68 @@ def _instruction_rules(root: Path) -> Dict[str, List[str]]:
     return out
 
 
-def _promoted_anchors(root: Path) -> Tuple[Dict[str, Tuple[str, Dict[str, Any]]], bool]:
-    """({lesson id: (path::symbol, pin)} from the promoted page, page trusted). Same rule as promotion's sticky anchors:
-    only a page that is exactly what Memlet last wrote."""
+def _ledger_rows(root: Path) -> Tuple[Optional[List[Tuple[Any, ...]]], str]:
+    """The promoted page's ledger events, read without any side effect, else (None, why).
+
+    SQLite may create or touch `-wal` / `-shm` files even for a read-only connection, so the ledger is opened only
+    when its header says rollback-journal mode and no `-wal`, `-shm` or `-journal` file exists, and then with
+    `mode=ro&immutable=1`. why: "ok", "absent" (no ledger: the page is not Memlet's) or "side-effects"."""
+    if mb._symlinked(root, mw._LEDGER_FILES):
+        return None, "absent"
+    ledger = root / mw.LEDGER_PATH
+    if any(os.path.lexists(str(ledger) + suffix) for suffix in ("-wal", "-shm", "-journal")):
+        return None, "side-effects"
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(ledger), flags)
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "side-effects"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "side-effects"
+        header = os.read(fd, 100)
+    except OSError:
+        return None, "side-effects"
+    finally:
+        os.close(fd)
+    if len(header) < 100 or not header.startswith(_SQLITE_MAGIC) or header[18] != 1 or header[19] != 1:
+        return None, "side-effects"  # WAL mode (2), another format, or not a database: never opened
+    try:
+        with contextlib.closing(sqlite3.connect(ledger.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
+            rows = conn.execute("SELECT id, content_sha256, event_type FROM wiki_events WHERE page=? ORDER BY id",
+                                (mb.PROMOTED_PAGE,)).fetchall()
+    except sqlite3.Error:
+        return None, "side-effects"
+    return rows, "ok"
+
+
+def _promoted_anchors(root: Path) -> Tuple[Dict[str, Tuple[str, Dict[str, Any]]], Dict[str, str], str]:
+    """(trusted {id: (path::symbol, pin)}, {id: path::symbol} on the page whatever its trust, state).
+
+    The page counts only when it is exactly what Memlet last wrote, per the ledger: the rule the shared readers apply
+    (`memlet_bridge._page_edit_problem(for_reader=True)`), evaluated here on a side-effect-free ledger read.
+    state: "trusted", "none" (no page), "untrusted" or "side-effects"."""
     page = root / mb.PROMOTED_PAGE
     if mb._symlinked(root, (mb.PROMOTED_PAGE,)) or not page.is_file():
-        return {}, True
+        return {}, {}, "none"
     text = mw.read_regular_text(page, mw.MAX_WIKI_PAGE_BYTES, errors="replace")
-    if text is None or mb._page_edit_problem(root, text, for_reader=True):
-        return {}, False
-    return {r["id"]: (r["pins"][0]["key"], r["pins"][0]["pin"]) for r in mb._parse_promoted(text) if r["pins"]}, True
+    if text is None:
+        return {}, {}, "untrusted"
+    pinned = {r["id"]: (r["pins"][0]["key"], r["pins"][0]["pin"]) for r in mb._parse_promoted(text) if r["pins"]}
+    listed = {k: a[0] for k, a in pinned.items()}
+    if mb._PAGE_META not in text:
+        return {}, listed, "untrusted"
+    rows, why = _ledger_rows(root)
+    if why == "side-effects":
+        return {}, listed, "side-effects"
+    if not rows or not any(r[2] == "dream_promote" for r in rows):
+        return {}, listed, "untrusted"
+    last = rows[-1]
+    if last[2] not in mb._MEMLET_PAGE_EVENTS or last[1] != mw._page_body_sha256(text):
+        return {}, listed, "untrusted"
+    return pinned, listed, "trusted"
 
 
 def _anchor_stale(root: Path, key: str, pin: Dict[str, Any]) -> Optional[str]:
@@ -398,44 +659,80 @@ def _anchor_stale(root: Path, key: str, pin: Dict[str, Any]) -> Optional[str]:
     return entry["reason"] if entry["status"] == "stale" else None
 
 
-def _similar_groups(texts: Dict[str, List[str]]) -> Tuple[List[List[str]], bool]:
-    """Components of distinct normalised quotes whose word sets have Jaccard >= 0.8 (both >= 5 words)."""
-    keys = sorted(texts)
+# ---------------------------------------------------------------------------------------------------------------
+# duplicates
+
+
+def _similar_pairs(keys: List[str], work: Dict[str, int]) -> Tuple[Dict[str, Set[str]], bool]:
+    """{quote: quotes whose word sets have Jaccard >= 0.8 with it (both >= 5 distinct words)}; (pairs, complete).
+    Every posting visit is counted in `work["similarityWork"]` and checked against MAX_SIMILAR_WORK."""
     words = {k: frozenset(_WORD_RE.findall(k)) for k in keys}
     eligible = [k for k in keys if len(words[k]) >= MIN_SIMILAR_WORDS]
-    parent = {k: k for k in keys}
-
-    def find(k):
-        while parent[k] != k:
-            parent[k] = parent[parent[k]]
-            k = parent[k]
-        return k
-
     postings: Dict[str, List[int]] = {}
     for i, k in enumerate(eligible):
         for w in words[k]:
             postings.setdefault(w, []).append(i)
-    work, complete = 0, True
+    pairs: Dict[str, Set[str]] = {k: set() for k in keys}
     for i, k in enumerate(eligible):
         overlap: Dict[int, int] = {}
         for w in words[k]:
             for j in postings[w]:
-                work += 1
+                if work["similarityWork"] >= MAX_SIMILAR_WORK:
+                    return pairs, False
+                work["similarityWork"] += 1
                 if j > i:
                     overlap[j] = overlap.get(j, 0) + 1
-            if work > MAX_SIMILAR_WORK:
-                complete = False
-                break
         for j, inter in overlap.items():
             other = eligible[j]
             if inter / (len(words[k]) + len(words[other]) - inter) >= SIMILAR_JACCARD:
-                parent[find(other)] = find(k)
-        if not complete:
-            break
-    groups: Dict[str, List[str]] = {}
-    for k in keys:
-        groups.setdefault(find(k), []).append(k)
-    return list(groups.values()), complete
+                pairs[k].add(other)
+                pairs[other].add(k)
+    return pairs, True
+
+
+def _similar_groups(texts: Dict[str, List[str]]) -> Tuple[List[List[str]], bool]:
+    """Groups of quotes, each formed around its first quote (in `texts` order) with only quotes similar to that one;
+    used by tests and by `_duplicates`, which passes quotes in kept-lesson order."""
+    work = {"similarityWork": 0}
+    pairs, complete = _similar_pairs(list(texts), work)
+    groups, taken = [], set()
+    for k in texts:
+        if k in taken:
+            continue
+        group = [k] + [o for o in texts if o not in taken and o != k and o in pairs[k]]
+        taken.update(group)
+        groups.append(group)
+    return groups, complete
+
+
+def _duplicates(lessons: Dict[str, Dict[str, Any]], visible: List[str], work: Dict[str, int]
+                ) -> Tuple[List[Tuple[str, str, List[str]]], bool]:
+    """[(kind, keep, members)] where every member says the same as, or reaches Jaccard 0.8 against, its kept lesson.
+    Kept lessons are chosen in the contract's order: approved first, then the earliest line time, then the id."""
+    order = sorted(visible, key=lambda i: (lessons[i]["tier"] != APPROVED, _earliest(lessons[i]) or _FAR, i))
+    key = {i: "\n".join(md.normalised_quote(raw) for raw in lessons[i]["current"]) for i in order}
+    order = [i for i in order if key[i].strip()]
+    pairs, complete = _similar_pairs(list(dict.fromkeys(key[i] for i in order)), work)
+    out, taken = [], set()
+    for keep in order:
+        if keep in taken:
+            continue
+        taken.add(keep)
+        members = [i for i in order if i not in taken and (key[i] == key[keep] or key[i] in pairs[key[keep]])]
+        if not members:
+            continue
+        taken.update(members)
+        kind = v.TIDY_SAME_TEXT if all(key[i] == key[keep] for i in members) else v.TIDY_SIMILAR_TEXT
+        out.append((kind, keep, members))
+    return out, complete
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# the report
+
+
+def _count(value: int, complete: bool) -> Any:
+    return value if complete else v.TIDY_AT_LEAST % value
 
 
 def _capped(entries: List[Dict[str, Any]], omitted: Dict[str, int], section: str) -> List[Dict[str, Any]]:
@@ -443,135 +740,122 @@ def _capped(entries: List[Dict[str, Any]], omitted: Dict[str, int], section: str
     return entries[:v.TIDY_SECTION_CAP]
 
 
+def _invalid(stale_days, min_seen) -> bool:
+    return (type(stale_days) is not int or not 0 <= stale_days <= MAX_STALE_DAYS
+            or type(min_seen) is not int or min_seen < 1)
+
+
 def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_bytes=MAX_BYTES) -> Dict[str, Any]:
     """{ok, duplicates, saidAgain, retire, unattached, promote, lapsedMerges, omitted, complete, notices, formatted}
-    plus `scanned`, `work` and `skipped` of the snapshot scan. Writes nothing; proposes only."""
-    if (type(stale_days) is not int or stale_days < 0 or type(min_seen) is not int or min_seen < 1):
+    plus `mergeChecks`, `scanned`, `work` and `skipped`. Writes nothing; proposes only."""
+    if _invalid(stale_days, min_seen):
         return {"ok": False, "exitCode": 2, "error": v.TIDY_INVALID_ARGUMENT,
                 "formatted": "- ERROR: " + v.TIDY_INVALID_ARGUMENT + "\n"}
     repo_arg = None if str(repo_path) == "." else str(repo_path)
     try:
-        root = mw._resolve_root(repo_path)
-        problem = mb._symlinked(root, (mb.QUEUE_REL, mb.SNAPSHOT_REL, mw.CONFIG_PATH))
-        if problem:
-            raise ValueError(mb._refusing(problem))
-        graph, why = mb._load_queue(root)
+        root, graph, why = _load(repo_path)
     except (OSError, ValueError) as exc:
         return {"ok": False, "exitCode": 2, "error": str(exc), "formatted": "- ERROR: " + str(exc) + "\n"}
     now = _now(clock)
     notices: List[str] = [why] if why else []
-    graph = graph or {"nodes": [], "edges": []}
-    merge = merge_checks(root)
+    loaded = _load_lessons(root, graph)
+    if not loaded["ok"]:
+        error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
+        return {"ok": False, "exitCode": 1, "error": error, "formatted": "- ERROR: " + error + "\n"}
+    notices.extend(n for n in loaded["notices"] if n not in notices)
+    lessons, nodes, reached = loaded["lessons"], loaded["nodes"], loaded["reached"]
+    merge = merge_checks(root, nodes)
     if merge["notice"]:
         notices.append(merge["notice"])
-    with mb._lesson_path_projection(root, None) as context:
-        read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph) if graph["nodes"] else \
-            {"ok": True, "items": [], "notices": []}
-        reached = dict(context["paths"])
-        attachment_complete = not context.get("attachmentIncomplete")
-    if not read["ok"]:
-        error = "; ".join(read.get("notices", [])) or v.GRAPH_EVIDENCE_ERROR
-        return {"ok": False, "exitCode": 1, "error": error, "formatted": "- ERROR: " + error + "\n"}
-    notices.extend(n for n in read.get("notices", []) if n not in notices)
-    items = {i["id"]: i for i in read["items"]}
-    nodes = {n["id"]: n for n in graph["nodes"] if isinstance(n, dict) and isinstance(n.get("id"), str)}
-    rejected = {i: n for i, n in nodes.items() if i not in items
-                and mb.item_tier(n, snapshot=None, config={}) == REJECTED
-                and md.approval_state(n, "node") == REJECTED}
+    merge_ok = merge["available"]
     holding = _holding_members(merge)
-    scan = _sightings(root, graph, merge, max_bytes=max_bytes, now=now)
+    scan = _sightings(root, lessons, merge, max_bytes=max_bytes, now=now)
     notices.extend(scan["notices"])
-    complete = scan["complete"]
-    if not complete:
-        notices.append(v.TIDY_INCOMPLETE)
+    scan_complete = scan["complete"]
     records = scan["grouped"]
     sight = {i: _summary(r) for i, r in records.items()}
-    visible = {i: it for i, it in items.items() if i not in holding}
+    visible = [i for i, l in lessons.items() if l["tier"] != REJECTED and i not in holding]
+    work = dict(scan["work"], similarityWork=0)
     omitted: Dict[str, int] = {}
 
+    def cmd(words, options):
+        return command(words, options, repo=repo_arg)
+
     # duplicates ------------------------------------------------------------------------------------------------
-    by_text: Dict[str, List[str]] = {}
-    for lesson_id in visible:
-        text = "\n".join(md.normalised_quote(p["quote"]) for p in md.lesson_lines(nodes[lesson_id]))
-        if text.strip():
-            by_text.setdefault(text, []).append(lesson_id)
-    components, similar_complete = _similar_groups(by_text)
+    groups, similar_complete = _duplicates(lessons, [i for i in visible if lessons[i]["current"]], work)
+    complete = scan_complete and similar_complete
+    if not scan_complete:
+        notices.append(v.TIDY_INCOMPLETE)
     if not similar_complete:
         notices.append(v.TIDY_SIMILAR_BOUND)
-        complete = False
     duplicates, blockers_failed = [], False
-    for keys in components:
-        ids = sorted(i for k in keys for i in by_text[k])
-        if len(ids) < 2:
-            continue
-        kind = v.TIDY_SAME_TEXT if len(keys) == 1 else v.TIDY_SIMILAR_TEXT
-        far = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
-        ids.sort(key=lambda i: (visible[i]["tier"] != APPROVED, _node_time(nodes[i]) or far, i))
-        keep, same = ids[0], ids[1:]
+    for kind, keep, same in groups:
         entry = {"kind": kind, "label": v.TIDY_DUPLICATE_LABELS[kind], "keep": keep, "same": same,
-                 "lessons": [_lesson(visible[i]) for i in ids],
-                 "command": command("learn", "--merge", keep, "--same", *same, "--by", "NAME", repo=repo_arg)}
-        if merge["available"]:
-            try:
-                checked = merge["blockers"](keep, same)
-                if not isinstance(checked, dict) or not checked.get("ok", True):
-                    raise ValueError("merge blockers unavailable")
-                entry["blockers"] = {str(k): list(c) for k, c in (checked.get("blockers") or {}).items()}
-                entry["lostFiles"] = {str(k): list(p) for k, p in (checked.get("lostFiles") or {}).items()}
-                lost = list(dict.fromkeys(p for paths in entry["lostFiles"].values() for p in paths))
-                current = list(visible[keep].get("approvalPaths") or [])
-                wanted = list(dict.fromkeys(current + lost))
-                if lost and visible[keep]["tier"] == APPROVED and len(wanted) <= 8:
-                    args = ["learn", "--paths", keep, "--by", "NAME"]
-                    for p in wanted:
-                        args += ["--path", p]
-                    entry["pathsCommand"] = command(*args, repo=repo_arg)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                 "lessons": [_lesson(lessons[i]) for i in [keep] + same]}
+        if merge_ok:
+            _with_command(entry, cmd(["learn"], [("--merge", keep), ("--same", same), ("--by", "NAME")]))
+            checked = _checked_blockers(merge, keep, same)
+            if checked is None:
                 blockers_failed = True
+            else:
+                entry.update(checked)
+                lost = list(dict.fromkeys(p for paths in checked["lostFiles"].values() for p in paths))
+                wanted = list(dict.fromkeys(list(lessons[keep]["item"].get("approvalPaths") or []) + lost))
+                if lost and lessons[keep]["tier"] == APPROVED and len(wanted) <= 8:
+                    paths_cmd = cmd(["learn"], [("--paths", keep), ("--by", "NAME")] + [("--path", p) for p in wanted])
+                    if paths_cmd is not None:
+                        entry["pathsCommand"] = paths_cmd
+        else:
+            _with_command(entry, None, v.TIDY_MERGE_COMMAND_UNAVAILABLE)
         duplicates.append(entry)
     if blockers_failed:
         notices.append(v.TIDY_BLOCKERS_FAILED)
+        merge_ok = False
     duplicates.sort(key=lambda g: (-len(g["lessons"]), g["keep"]))
 
     # said again ------------------------------------------------------------------------------------------------
     said = []
-    for lesson_id, item in visible.items():
-        if item["tier"] in (PENDING, HINT) and sight[lesson_id]["sessions"] >= 2:
-            n = sight[lesson_id]["sessions"]
-            said.append(dict(_lesson(item), **sight[lesson_id], sessionsLabel=_count(n, complete),
-                             label=v.TIDY_SAID_AGAIN_PENDING % _count(n, complete),
-                             command=command("learn", "--approve", lesson_id, "--by", "NAME", repo=repo_arg),
-                             commands=[command("learn", "--approve", lesson_id, "--by", "NAME", repo=repo_arg),
-                                       command("learn", "--reject", lesson_id, "--by", "NAME", "--reason",
-                                               "REASON", repo=repo_arg)]))
+    for lesson_id in visible:
+        lesson = lessons[lesson_id]
+        n = sight[lesson_id]["sessions"]
+        if lesson["tier"] in (PENDING, HINT) and n >= 2:
+            entry = dict(_lesson(lesson), **sight[lesson_id], sessionsLabel=_count(n, scan_complete),
+                         label=v.TIDY_SAID_AGAIN_PENDING % _count(n, scan_complete))
+            approve = cmd(["learn"], [("--approve", lesson_id), ("--by", "NAME")])
+            reject = cmd(["learn"], [("--reject", lesson_id), ("--by", "NAME"), ("--reason", "REASON")])
+            _with_command(entry, approve)
+            entry["commands"] = [c for c in (approve, reject) if c is not None]
+            said.append(entry)
     said.sort(key=lambda e: (-e["sessions"], e["id"]))
     again = []
-    for lesson_id, node in rejected.items():
-        when = _decision_time(node)
+    for lesson_id, lesson in lessons.items():
+        if lesson["tier"] != REJECTED:
+            continue
+        when = _decision_time(lesson["node"])
         after = _sessions_after(records.get(lesson_id, []), when)
         if after:
-            fields = mb._lesson_fields(node)
-            reconsider = command("learn", "--approve", lesson_id, "--by", "NAME", "--reconsider", repo=repo_arg)
-            again.append(dict({"id": lesson_id, "tier": REJECTED,
-                               "edgeTypes": sorted({e.get("edgeType") for e in node.get("edges", [])
-                                                    if isinstance(e, dict) and e.get("edgeType")}),
-                               "quoteLines": list(fields.get("quoteLines") or [mb.lesson_text(node)]),
-                               "cites": _cites(fields)}, **sight[lesson_id], rejectedAt=_iso(when),
-                              sessionsAfter=after, sessionsLabel=_count(after, complete),
-                              label=v.TIDY_SAID_AGAIN_REJECTED % (_count(after, complete), _iso(when)),
-                              command=reconsider, commands=[reconsider]))
+            entry = dict(_lesson(lesson), **sight[lesson_id], rejectedAt=_iso(when), sessionsAfter=after,
+                         sessionsLabel=_count(after, scan_complete),
+                         label=v.TIDY_SAID_AGAIN_REJECTED % (_count(after, scan_complete), _iso(when)))
+            reconsider = cmd(["learn"], [("--approve", lesson_id), ("--by", "NAME"), ("--reconsider", True)])
+            _with_command(entry, reconsider)
+            entry["commands"] = [reconsider] if reconsider else []
+            again.append(entry)
     again.sort(key=lambda e: (-e["sessionsAfter"], e["id"]))
-    said_again = said + again
 
     # retire, unattached, promote -------------------------------------------------------------------------------
-    approved = {i: it for i, it in visible.items() if it["tier"] == APPROVED}
+    approved = sorted(i for i in visible if lessons[i]["tier"] == APPROVED)
     rules = _instruction_rules(root) if approved else {}
-    anchors, page_trusted = _promoted_anchors(root) if approved else ({}, True)
-    if not page_trusted:
+    anchors, listed, page_state = _promoted_anchors(root) if approved else ({}, {}, "none")
+    if page_state == "side-effects":
+        notices.append(v.TIDY_LEDGER_SIDE_EFFECTS)
+    elif page_state == "untrusted":
         notices.append(v.TIDY_PAGE_UNTRUSTED)
+    page_unchecked = page_state in ("side-effects", "untrusted")
     retire, unattached, promote = [], [], []
-    for lesson_id in sorted(approved):
-        item, node = approved[lesson_id], nodes[lesson_id]
+    for lesson_id in approved:
+        lesson = lessons[lesson_id]
+        item = lesson["item"]
         reasons, details = [], {}
         inactive = [p for p in item.get("approvalPaths") or [] if p not in reached.get(lesson_id, [])]
         if inactive:
@@ -582,89 +866,110 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
             if stale:
                 reasons.append("anchored-code-changed")
                 details["anchor"] = {"anchor": anchors[lesson_id][0], "reason": stale}
-        matched = sorted({src for _, raw in _current_lines(node) for src in rules.get(md.normalised_quote(raw), [])})
+        elif page_unchecked and lesson_id in listed:
+            details["anchor"] = {"anchor": listed[lesson_id], "reason": v.TIDY_NOT_CHECKED}
+        current = lesson["current"] or []
+        matched = [{"line": mb.safe_lesson_display(_strip(raw)), "rule": src} for raw in current
+                   for src in rules.get(md.normalised_quote(raw), [])]
         if matched:
             reasons.append("now-a-rule")
             details["rules"] = matched
-        approved_at = _decision_time(node)
-        if (complete and approved_at is not None and now - approved_at >= datetime.timedelta(days=stale_days)
+        approved_at = _decision_time(lesson["node"])
+        if (scan_complete and approved_at is not None and (now - approved_at).days >= stale_days
                 and not _sessions_after(records.get(lesson_id, []), approved_at)):
             reasons.append("old-unseen")
             details["approvedAt"] = _iso(approved_at)
             details["lastSaid"] = sight[lesson_id]["last"]
         if reasons:
-            retire.append(dict(_lesson(item), reasons=reasons, labels=[v.TIDY_RETIRE_LABELS[r] for r in reasons],
-                               details=details,
-                               command=command("learn", "--reject", lesson_id, "--by", "NAME", "--reason",
-                                               "tidy: " + ", ".join(reasons), repo=repo_arg)))
+            entry = dict(_lesson(lesson), reasons=reasons, labels=[v.TIDY_RETIRE_LABELS[r] for r in reasons],
+                         details=details)
+            retire.append(_with_command(entry, cmd(["learn"], [("--reject", lesson_id), ("--by", "NAME"),
+                                                               ("--reason", "tidy: " + ", ".join(reasons))])))
         files = list(reached.get(lesson_id, []))
-        if not files and attachment_complete:
-            unattached.append(dict(_lesson(item), label=v.TIDY_UNATTACHED_LABEL,
-                                   command=command("learn", "--paths", lesson_id, "--by", "NAME", "--path", "FILE",
-                                                   repo=repo_arg)))
+        if not files and loaded["attachmentComplete"]:
+            entry = dict(_lesson(lesson), label=v.TIDY_UNATTACHED_LABEL)
+            unattached.append(_with_command(entry, cmd(["learn"], [("--paths", lesson_id), ("--by", "NAME"),
+                                                                   ("--path", "FILE")])))
         sessions = sight[lesson_id]["sessions"]
-        if files and sessions >= min_seen and {"BLOCKS", "GOVERNS"} & set(item.get("edgeTypes", [])):
-            promote.append(dict(_lesson(item), paths=files, sessions=sessions,
-                                sessionsLabel=_count(sessions, complete),
-                                label=v.TIDY_PROMOTE_LABEL % _count(sessions, complete)))
-    if not attachment_complete:
+        if (files and current and sessions >= min_seen and not item.get("quarantined")
+                and {"BLOCKS", "GOVERNS"} & set(item.get("edgeTypes", []))):
+            promote.append(dict(_lesson(lesson), paths=files, sessions=sessions,
+                                sessionsLabel=_count(sessions, scan_complete),
+                                label=v.TIDY_PROMOTE_LABEL % _count(sessions, scan_complete)))
+    if not loaded["attachmentComplete"]:
         notices.append(v.TIDY_ATTACHMENT_UNKNOWN)
     promote.sort(key=lambda e: (-e["sessions"], e["id"]))
     promote = _capped(promote, omitted, "promote")
     instruction_files = mw.discover_instruction_files(root) if promote else []
     for entry in promote:
-        entry.update(_promote_block(root, nodes[entry["id"]], approved[entry["id"]], anchors, instruction_files))
-        entry["command"] = command("check", repo=repo_arg)
+        entry.update(_promote_block(root, lessons[entry["id"]], anchors, page_unchecked, instruction_files))
+        _with_command(entry, cmd(["check"], []))
+        entry["commandLabel"] = v.TIDY_PROMOTE_COMMAND_NOTE
 
     # lapsed merges ---------------------------------------------------------------------------------------------
     lapsed = []
     for lesson_id in sorted(merge["states"]):
-        state = merge["states"][lesson_id] or {}
-        if state.get("state") != "lapsed" or lesson_id not in nodes:
+        state = merge["states"][lesson_id]
+        if state.get("state") != "lapsed" or lesson_id not in lessons:
             continue
-        node = nodes[lesson_id]
-        base = _lesson(items[lesson_id]) if lesson_id in items else {
-            "id": lesson_id, "tier": REJECTED if lesson_id in rejected else PENDING, "edgeTypes": [],
-            "quoteLines": list(mb._lesson_fields(node).get("quoteLines") or [mb.lesson_text(node)]),
-            "cites": _cites(mb._lesson_fields(node))}
-        into = state.get("into")
-        unmerge = command("learn", "--unmerge", lesson_id, "--by", "NAME", repo=repo_arg)
-        commands = [unmerge] + ([command("learn", "--merge", into, "--same", lesson_id, "--by", "NAME", repo=repo_arg)]
-                                if into else [])
-        lapsed.append(dict(base, into=into, reason=state.get("reason"),
-                           label=v.TIDY_LAPSED_LABEL % (into, state.get("reason")), command=unmerge,
-                           commands=commands))
+        into, reason = state.get("into"), state.get("reason")
+        unmerge = cmd(["learn"], [("--unmerge", lesson_id), ("--by", "NAME")])
+        again_cmd = cmd(["learn"], [("--merge", into), ("--same", lesson_id), ("--by", "NAME")]) if into else None
+        entry = dict(_lesson(lessons[lesson_id]), into=into, reason=reason,
+                     label=v.TIDY_LAPSED_LABEL % (into, reason))
+        _with_command(entry, unmerge)
+        entry["commands"] = [c for c in (unmerge, again_cmd) if c is not None]
+        lapsed.append(entry)
 
     result = {"ok": True, "exitCode": 0,
               "duplicates": _capped(duplicates, omitted, "duplicates"),
-              "saidAgain": _capped(said_again, omitted, "saidAgain"),
+              "saidAgain": _capped(said + again, omitted, "saidAgain"),
               "retire": _capped(retire, omitted, "retire"),
               "unattached": _capped(unattached, omitted, "unattached"),
               "promote": promote,
               "lapsedMerges": _capped(lapsed, omitted, "lapsedMerges"),
               "omitted": {s: omitted.get(s, 0) for s in v.TIDY_SECTIONS},
-              "complete": complete, "notices": notices, "mergeChecks": merge["available"],
-              "scanned": scan["scanned"], "work": dict(scan["work"]), "skipped": scan["skipped"]}
+              "complete": complete, "notices": notices, "mergeChecks": merge_ok,
+              "scanned": scan["scanned"], "work": work, "skipped": scan["skipped"]}
     result["formatted"] = render_markdown(result)
     return result
 
 
-def _promote_block(root: Path, node: Dict[str, Any], item: Dict[str, Any],
-                   page_anchors: Dict[str, Tuple[str, Dict[str, Any]]], instruction_files: List[str]) -> Dict[str, Any]:
-    """The cited lines verbatim (current lines only) and the anchor promotion would give: the promoted page's sticky
-    anchor, else `memlet_bridge._resolve_lesson_anchor`. Nothing is written."""
-    roles = item.get("lineRoles") or ["current"] * len(item.get("quoteLines", []))
-    lines = [q for q, role in zip(item.get("quoteLines") or [item.get("text", "")], roles) if role != "replaced"]
-    if node["id"] in page_anchors:
-        anchor = page_anchors[node["id"]][0]
+def _promote_block(root: Path, lesson: Dict[str, Any], page_anchors: Dict[str, Tuple[str, Dict[str, Any]]],
+                   page_unchecked: bool, instruction_files: List[str]) -> Dict[str, Any]:
+    """The complete current cited lines (never the display-truncated form), markup neutralised with the display
+    sanitiser, and the anchor promotion would give: the promoted page's sticky anchor, else
+    `memlet_bridge._resolve_lesson_anchor`. Omitted whole when longer than MAX_BLOCK_CHARS. Nothing is written."""
+    out: Dict[str, Any] = {"instructionFiles": list(instruction_files), "suggestion": v.TIDY_PROMOTE_SUGGESTION,
+                           "block": None, "escaped": False}
+    lesson_id = lesson["id"]
+    if lesson_id in page_anchors:
+        anchor, anchor_note = page_anchors[lesson_id][0], None
+    elif page_unchecked:
+        anchor, anchor_note = None, v.TIDY_NOT_CHECKED
     else:
-        found = mb._resolve_lesson_anchor(root, node)
-        anchor = "%s::%s" % found if found else None
-    block = ["- " + lines[0]] + ["  " + line for line in lines[1:]]
+        found = mb._resolve_lesson_anchor(root, lesson["node"])
+        anchor, anchor_note = ("%s::%s" % found if found else None), None
+    out["suggestedAnchor"] = anchor
+    if anchor_note:
+        out["anchorNote"] = anchor_note
+    if lesson["current"] is None:
+        out["blockNote"] = v.TIDY_BLOCK_UNAVAILABLE
+        return out
+    source = [_strip(raw) for raw in lesson["current"]]
+    shown = [mb.safe_lesson_display(line) for line in source]
+    block = ["- " + shown[0]] + ["  " + line for line in shown[1:]]
     if anchor:
         block[-1] += " (`" + anchor + "`)"
-    return {"block": "\n".join(block) + "\n", "suggestedAnchor": anchor, "instructionFiles": list(instruction_files),
-            "suggestion": v.TIDY_PROMOTE_SUGGESTION}
+    text = "\n".join(block) + "\n"
+    if len(text) > MAX_BLOCK_CHARS:
+        out["blockNote"] = v.TIDY_BLOCK_TOO_LONG % MAX_BLOCK_CHARS
+        return out
+    out["block"] = text
+    if shown != source:
+        out["escaped"] = True
+        out["escapedNote"] = v.TIDY_BLOCK_ESCAPED
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -685,13 +990,19 @@ def _code(text: str) -> str:
 
 def _quotes(entry: Dict[str, Any]) -> List[str]:
     out = []
+    roles = entry.get("lineRoles")
     for i, quote in enumerate(entry.get("quoteLines", [])):
         cite = entry["cites"][i] if i < len(entry.get("cites", [])) else None
-        out.append("  > " + quote + (" (" + _code("{file}:{start}-{end}".format(**cite)) + ")" if cite else ""))
+        marker = ""
+        if roles and i < len(roles):
+            marker = (v.REPLACED_MARKER if roles[i] == "replaced" else v.CURRENT_MARKER) + " "
+        out.append("  > " + marker + quote + (" (" + _code("{file}:{start}-{end}".format(**cite)) + ")" if cite else ""))
     return out
 
 
 def _commands(entry: Dict[str, Any]) -> List[str]:
+    if entry.get("command") is None:
+        return ["  " + v.TIDY_NO_COMMAND_LABEL + entry.get("commandNote", v.TIDY_UNSAFE_ARGUMENT)]
     out = ["  " + v.TIDY_COMMAND_LABEL + _code(entry["command"])]
     out += ["  " + v.TIDY_ALSO_LABEL + _code(c) for c in entry.get("commands", []) if c != entry["command"]]
     return out
@@ -714,12 +1025,13 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 for lesson in e["lessons"]:
                     lines.append("  " + _code(lesson["id"]) + ":")
                     lines += ["  " + q for q in _quotes(lesson)]
-                if e.get("blockers"):
+                if any(e.get("blockers", {}).values()):
                     lines.append("  " + v.TIDY_BLOCKERS_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(c) for k, c in sorted(e["blockers"].items()) if c))
                 if any(e.get("lostFiles", {}).values()):
                     lines.append("  " + v.TIDY_LOST_FILES_LABEL + "; ".join(
-                        _code(k) + ": " + ", ".join(_code(p) for p in ps) for k, ps in sorted(e["lostFiles"].items()) if ps))
+                        _code(k) + ": " + ", ".join(_code(p) for p in ps)
+                        for k, ps in sorted(e["lostFiles"].items()) if ps))
                 lines += _commands(e)
                 if e.get("pathsCommand"):
                     lines.append("  " + v.TIDY_ALSO_LABEL + _code(e["pathsCommand"]))
@@ -737,19 +1049,29 @@ def render_markdown(result: Dict[str, Any]) -> str:
                     lines.append("  inactive: " + ", ".join(_code(p) for p in d["inactivePaths"]))
                 if d.get("anchor"):
                     lines.append("  anchor: " + _code(d["anchor"]["anchor"]) + " (" + d["anchor"]["reason"] + ")")
-                if d.get("rules"):
-                    lines.append("  rule: " + ", ".join(_code(s) for s in d["rules"]))
+                for match in d.get("rules", []):
+                    lines.append("  rule: " + _code(match["rule"]) + " says " + _code(match["line"]))
                 if d.get("approvedAt"):
                     lines.append("  approved: " + d["approvedAt"] + "; last said: " + str(d.get("lastSaid")))
             if section == "promote":
-                fence = _fence(e["block"])
                 lines.append("  " + e["suggestion"])
-                lines += ["  " + fence + "markdown"] + ["  " + b for b in e["block"].splitlines()] + ["  " + fence]
-                lines.append("  " + (v.TIDY_ANCHOR_SUGGESTION + _code(e["suggestedAnchor"]) if e["suggestedAnchor"]
-                                     else v.TIDY_NO_ANCHOR))
+                if e["block"] is not None:
+                    fence = _fence(e["block"])
+                    lines += ["  " + fence + "markdown"] + ["  " + b for b in e["block"].splitlines()] + ["  " + fence]
+                    if e.get("escaped"):
+                        lines.append("  " + e["escapedNote"])
+                else:
+                    lines.append("  " + e["blockNote"])
+                if e["suggestedAnchor"]:
+                    lines.append("  " + v.TIDY_ANCHOR_SUGGESTION + _code(e["suggestedAnchor"]))
+                else:
+                    lines.append("  " + (v.TIDY_ANCHOR_NOT_CHECKED if e.get("anchorNote") else v.TIDY_NO_ANCHOR))
                 lines.append("  " + (v.TIDY_INSTRUCTION_FILES + ", ".join(_code(f) for f in e["instructionFiles"])
                                      if e["instructionFiles"] else v.TIDY_NO_INSTRUCTION_FILES))
-                lines.append("  " + v.TIDY_PROMOTE_COMMAND_NOTE + ": " + _code(e["command"]))
+                if e.get("command") is not None:
+                    lines.append("  " + e["commandLabel"] + ": " + _code(e["command"]))
+                else:
+                    lines += _commands(e)
                 continue
             lines += _commands(e)
         if result["omitted"].get(section):
