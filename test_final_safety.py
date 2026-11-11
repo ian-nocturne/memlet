@@ -333,9 +333,11 @@ class A3AcceptPromotionRaceTests(_Repo):
 
 class A4BoundedWorkTests(_Repo):
     def timed(self, fn):
-        start = time.monotonic()
+        # CPU time of this process, not wall time: the bound guards against a quadratic regression and must not
+        # fail because other jobs are running on the machine.
+        start = time.process_time()
         res = fn()
-        return res, time.monotonic() - start
+        return res, time.process_time() - start
 
     def test_reviewer_inputs_finish_fast_through_the_mcp_entry_points(self):
         from memlet_mcp import MemletMCPServer
