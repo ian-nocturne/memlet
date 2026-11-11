@@ -54,7 +54,7 @@ from .audit import (BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED
 from .code_anchors import (NEW_PIN, PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_symbol_fingerprints, extract_file_symbol_hashes,
                            extract_file_symbol_signatures, previous_python_symbol_hashes)
 
-MEMLET_VERSION = "9.2.0"
+MEMLET_VERSION = "9.3.0"
 CONFIG_SCHEMA_VERSION = 1
 MEMLET_DIR = ".memlet"
 WIKI_DIR = ".memlet/wiki"

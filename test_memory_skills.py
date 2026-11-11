@@ -1,4 +1,4 @@
-"""Comprehensive regression tests for the Memlet v9.2.0 procedural skill loop."""
+"""Comprehensive regression tests for the Memlet v9.3.0 procedural skill loop."""
 import contextlib
 import json
 import os
@@ -968,7 +968,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         )
         bench = self.service.action({'action': 'memory_benchmark', 'taskId': 'task-one', 'budget': 3000})
         self.assertTrue(bench['ok'])
-        self.assertEqual('9.2.0', bench['version'])
+        self.assertEqual('9.3.0', bench['version'])
         self.assertGreater(bench['tokenEconomy']['rawCorpusChars'], bench['tokenEconomy']['deliveredPromptChars'])
         self.assertGreater(bench['tokenEconomy']['tokenSavingsVsFullHistoryPct'], 20.0)
         self.assertGreaterEqual(bench['retrievalQuality']['recallAt3'], 0.8)
@@ -2017,10 +2017,10 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertLessEqual(capsule_res['capsuleChars'], 1100)
         self.assertIn('<subagent-memory-capsule', capsule_res['capsuleText'])
 
-        # 3) MCP Server v9.2.0 includes memlet_store_capsule.
+        # 3) MCP Server v9.3.0 includes memlet_store_capsule.
         mcp = MemletMCPServer(self.root, default_task='task-one', default_session=OWNER, standalone=False)
         init_resp = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'})
-        self.assertEqual('9.2.0', init_resp['result']['serverInfo']['version'])
+        self.assertEqual('9.3.0', init_resp['result']['serverInfo']['version'])
         tools_resp = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
         tool_names = [t['name'] for t in tools_resp['result']['tools']]
         self.assertGreaterEqual(len(tool_names), 15)
@@ -2261,7 +2261,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         self.assertGreater(st['reuseIntensity'], 1.0)
 
         bench = memory.benchmark(self.store, 'task-one', budget=3000)
-        self.assertEqual('9.2.0', bench['version'])
+        self.assertEqual('9.3.0', bench['version'])
         self.assertIn('liveProvenance', bench['governance'])
         self.assertGreaterEqual(bench['governance']['liveProvenance']['checkedCount'], 1)
         self.assertEqual(0.0, bench['governance']['identityDriftScore'])
@@ -2300,12 +2300,12 @@ class MemorySkillsLoopTests(unittest.TestCase):
             insp = engine.inspector(budget=2400)
             self.assertTrue(insp['ok'])
             bench = engine.benchmark(budget=2400)
-            self.assertEqual('9.2.0', bench['version'])
+            self.assertEqual('9.3.0', bench['version'])
 
-            # 4) Verify MCP Server v9.2.0 works directly with StandaloneStore and exposes 18 tools
+            # 4) Verify MCP Server v9.3.0 works directly with StandaloneStore and exposes 18 tools
             mcp = MemletMCPServer(tmp, default_task='sdk/demo', default_session='sdk-user', store=engine.store)
             init_res = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'})
-            self.assertEqual('9.2.0', init_res['result']['serverInfo']['version'])
+            self.assertEqual('9.3.0', init_res['result']['serverInfo']['version'])
             tools_res = mcp.handle_rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
             tool_names = [t['name'] for t in tools_res['result']['tools']]
             self.assertGreaterEqual(len(tool_names), 18)

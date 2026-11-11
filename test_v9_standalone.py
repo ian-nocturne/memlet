@@ -82,7 +82,7 @@ class StandaloneSurfaceTests(unittest.TestCase):
         section = text.split('[project.scripts]\n', 1)[1].split('\n[', 1)[0]
         entries = dict(re.findall(r'^([\w-]+)\s*=\s*"([^"]+)"', section, re.M))
         self.assertEqual({'memlet': 'memory_cli:cli', 'memlet-mcp': 'memlet_mcp:main'}, entries)
-        self.assertEqual('9.2.0', VERSION)
+        self.assertEqual('9.3.0', VERSION)
         self.assertIn('version = "' + VERSION + '"', text)
         self.assertEqual(VERSION, wiki.MEMLET_VERSION)
 

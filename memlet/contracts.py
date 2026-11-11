@@ -1,8 +1,8 @@
-"""Typed data contracts and governance invariants for Memlet v9.2.0."""
+"""Typed data contracts and governance invariants for Memlet v9.3.0."""
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-VERSION = "9.2.0"
+VERSION = "9.3.0"
 
 EVIDENCE_STATES = (
     "reported",
