@@ -737,20 +737,30 @@ def _model_proposals_fn():
     return mdtidy.tidy_report_section
 
 
-def _duplicates(lessons: Dict[str, Dict[str, Any]], visible: List[str], work: Dict[str, int]
-                ) -> Tuple[List[Tuple[str, str, List[str]]], bool]:
+def _duplicates(lessons: Dict[str, Dict[str, Any]], visible: List[str], work: Dict[str, int],
+                _counters: Optional[Dict[str, int]] = None) -> Tuple[List[Tuple[str, str, List[str]]], bool]:
     """[(kind, keep, members)] where every member says the same as, or reaches Jaccard 0.8 against, its kept lesson.
     Kept lessons are chosen in the contract's order: approved first, then the earliest line time, then the id."""
     order = kept_lesson_order(lessons, visible)
     key = {i: "\n".join(md.normalised_quote(raw) for raw in lessons[i]["current"]) for i in order}
     order = [i for i in order if key[i].strip()]
     pairs, complete = _similar_pairs(list(dict.fromkeys(key[i] for i in order)), work)
+    # Candidates for a kept lesson are looked up by wording, not found by scanning every lesson: the same members in
+    # the same order as a scan, in work proportional to the lessons that actually match.
+    position = {i: n for n, i in enumerate(order)}
+    by_key: Dict[str, List[str]] = {}
+    for i in order:
+        by_key.setdefault(key[i], []).append(i)
     out, taken = [], set()
     for keep in order:
         if keep in taken:
             continue
         taken.add(keep)
-        members = [i for i in order if i not in taken and (key[i] == key[keep] or key[i] in pairs[key[keep]])]
+        wanted = [key[keep]] + [k for k in pairs.get(key[keep], ()) if k != key[keep]]
+        found = [i for k in dict.fromkeys(wanted) for i in by_key.get(k, ())]
+        if _counters is not None:  # for tests that count work; never part of the report
+            _counters["groupingWork"] = _counters.get("groupingWork", 0) + 1 + len(found)
+        members = sorted((i for i in found if i not in taken), key=position.__getitem__)
         if not members:
             continue
         taken.update(members)
