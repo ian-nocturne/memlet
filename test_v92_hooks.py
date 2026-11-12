@@ -1526,7 +1526,7 @@ class RealGraphTests(_Case):
 # K1: final fixes (each auditor reproduction is a regression test here)
 
 
-BASELINE = "b8749a0"  # Memlet 9.1.1
+BASELINE = "51c2222"  # Memlet 9.1.1
 
 
 def _baseline_source(rel):

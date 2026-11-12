@@ -1538,14 +1538,14 @@ class SkillbookTests(unittest.TestCase):
         self.assertEqual(4, res["items"])
         self.assertNotIn(ids["two"], res["text"])
 
-    def test_byte_identical_compatibility_with_v92_1181ec5(self):
-        """Archive 1181ec5 (9.2.0) into a scratch dir, build a fixture repository with 9.2.0, and verify that
+    def test_byte_identical_compatibility_with_v92_f7b224f(self):
+        """Archive f7b224f (9.2.0) into a scratch dir, build a fixture repository with 9.2.0, and verify that
         every existing library, CLI, MCP, and hook reader produces byte-identical output, and that only
         `memlet admin --help` and the `admin` invalid-choice error list `skillbook` (S9)."""
         v92_src = self.base / "v92_code"
         v92_src.mkdir()
         archive = subprocess.run(
-            ["git", "archive", "1181ec5"],
+            ["git", "archive", "f7b224f"],
             cwd=REPO_ROOT,
             capture_output=True,
             check=True,

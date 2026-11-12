@@ -706,17 +706,17 @@ print(json.dumps(result,sort_keys=True,default=str))
 
     def test_baseline_unavailable_skips_clearly(self):
         with mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['git'], 128, b'', b'unknown revision')):
-            with self.assertRaisesRegex(unittest.SkipTest, '1181ec5.*export or shallow clone'):
+            with self.assertRaisesRegex(unittest.SkipTest, 'f7b224f.*export or shallow clone'):
                 self.baseline()
 
     def baseline(self):
         target = self.base / 'baseline'
         if not target.exists():
             target.mkdir()
-            archive = subprocess.run(['git', 'archive', '1181ec5'], cwd=Path(__file__).parent,
+            archive = subprocess.run(['git', 'archive', 'f7b224f'], cwd=Path(__file__).parent,
                                      capture_output=True)
             if archive.returncode:
-                self.skipTest('9.2.0 compatibility requires readable git commit 1181ec5 (not available in this export or shallow clone)')
+                self.skipTest('9.2.0 compatibility requires readable git commit f7b224f (not available in this export or shallow clone)')
             archive = archive.stdout
             with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
                 # Only this trusted, pinned local commit is extracted.
