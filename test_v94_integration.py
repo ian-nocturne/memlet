@@ -74,3 +74,104 @@ class TidyGrouping(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# One long-lived process (an MCP server, a library caller) must answer like a fresh process after every decision,
+# with the per-read indexes of 9.4 and the model proposals of `dream --tidy` in play together.
+
+import json as _json
+import os as _os
+import subprocess as _subprocess
+import sys as _sys
+from pathlib import Path as _Path
+
+import test_v93_tidy as _tidy_tests
+from unittest import mock as _mock
+
+_REAL_MERGE_FUNCTIONS = mt._merge_functions  # captured before any test replaces the tidy adapter's lookup
+from memlet import memlet_bridge as _mb, memlet_dreamtidy as _dt, memlet_graph as _graph, memlet_wiki as _mw
+
+_HERE = _Path(__file__).resolve().parent
+def probe_view(repo):
+    """What a reader would be told, through five readers. Run in this process and in a fresh child process."""
+    from memlet import memlet_tidy as mt
+    repo = str(repo)
+    items = _mb.dream_items(repo, tiers=("approved", "hint", "pending"))["items"]
+    nb = _graph.neighbors(repo, "billing.py", budget=4000)
+    tidy = mt.tidy_report(repo)
+    hand = _mw.build_handover(repo)
+    lessons = hand.get("approvedLessons") or (hand.get("capsule") or {}).get("approvedLessons") or []
+    view = {
+        "items": sorted((i["id"], i["tier"], tuple(i.get("mergedFrom") or ())) for i in items),
+        "recall": _mb.unified_recall(repo, "refund retry wrapper", budget=4000)["formatted"],
+        "graph": {g: [i["id"] for i in v] for g, v in nb.get("groups", {}).items()},
+        "tidy": {k: [e.get("keep") or e.get("id") for e in tidy.get(k, [])]
+                 for k in ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges",
+                           "mergedLostFiles", "modelSaysSame")},
+        "handoverLessons": _json.dumps(lessons, sort_keys=True, default=str),
+    }
+    return _json.loads(_json.dumps(view, sort_keys=True, default=list))
+
+
+_CHILD = ("import json, sys; sys.path.insert(0, sys.argv[1]); import test_v94_integration as T; "
+          "print(json.dumps(T.probe_view(sys.argv[2]), sort_keys=True))")
+
+
+class OneProcessAnswersLikeAFreshOne(_tidy_tests.Base):
+    A = 'Never call refund() in billing.py without the retry wrapper; it double-charges on timeouts.'
+    B = 'Always wrap refund() calls in billing.py with the retry helper, never call it bare, or a timeout charges the customer twice.'
+    C = 'Never export customer emails from billing.py reports without masking them first.'
+
+    def setUp(self):
+        super().setUp()  # the tidy unit tests default to "merge not available"; here the real functions are used
+        real = _mock.patch.object(mt, '_merge_functions', _REAL_MERGE_FUNCTIONS)
+        real.start()
+        self.addCleanup(real.stop)
+
+    def fresh(self, repo):
+        out = _subprocess.run([_sys.executable, '-B', '-c', _CHILD, str(_HERE), str(repo)], capture_output=True,
+                              text=True, env=dict(_os.environ), cwd=str(repo), timeout=300)
+        self.assertEqual(0, out.returncode, out.stderr[-2000:])
+        return _json.loads(out.stdout)
+
+    def here(self, repo):
+        return probe_view(repo)
+
+    def same(self, repo, step):
+        self.assertEqual(self.fresh(repo), self.here(repo), step)
+
+    def test_reads_after_each_decision_and_each_model_proposal(self):
+        repo = self.make_repo()
+        a = self.learn(repo, 'mon.log', '2026-11-02T10:00:00Z [user] ' + self.A)[0]
+        b = self.learn(repo, 'wed.log', '2026-11-04T10:00:00Z [user] ' + self.B)[0]
+        c = self.learn(repo, 'fri.log', '2026-11-06T10:00:00Z [user] ' + self.C)[0]
+        self.same(repo, 'after learning')
+        self.assertTrue(_mb.learn_approve(repo, [a, c], approver='Robin')['ok'])
+        self.same(repo, 'after approving two')
+
+        def runner(_argv, _prompt, *, stdin_text='', **_kw):
+            rows = [_json.loads(line) for line in stdin_text.splitlines() if line.startswith('{"id"')]
+            ids = [r['id'] for r in rows if 'refund' in r['text']]
+            return _json.dumps([{'same': ids}])
+
+        run = _dt.dream_tidy_run(repo, via=('claude',), runner=runner)
+        self.assertTrue(run['ok'], run)
+        self.assertEqual(1, len(run['addedProposals']), run)
+        here = self.here(repo)
+        self.assertEqual([a], here['tidy']['modelSaysSame'])        # the approved one is suggested as kept
+        self.same(repo, 'after a model proposal')
+        self.assertTrue(_mb.learn_approve(repo, [b], approver='Robin')['ok'])
+        self.same(repo, 'after approving the other lesson of the proposal')
+        self.assertTrue(_mb.learn_merge(repo, a, [b], approver='Robin')['ok'])
+        here = self.here(repo)
+        self.assertEqual([], here['tidy']['modelSaysSame'])         # merged: the proposal is no longer open
+        self.assertNotIn(b, [i[0] for i in here['items']])
+        self.same(repo, 'after the merge')
+        self.assertTrue(_mb.learn_reject(repo, [a], approver='Robin', reason='changed my mind')['ok'])
+        here = self.here(repo)
+        self.assertIn(b, [i[0] for i in here['items']])              # the merge lapsed: the member is back
+        self.assertNotIn(a, here['graph'].get('blocks', []))
+        self.same(repo, 'after rejecting the kept lesson')
+        self.assertTrue(_mb.learn_unmerge(repo, [b], approver='Robin')['ok'])
+        self.same(repo, 'after the unmerge')
