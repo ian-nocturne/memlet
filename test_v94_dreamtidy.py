@@ -13,7 +13,7 @@ Covers:
 - `--dismiss` persistence, non-reproposal while unchanged, and re-eligibility when lesson digest changes.
 - `--dry-run` zero-launch / zero-write guarantee and `admin tidy` read-only mtime + byte preservation.
 - `--save-fixture` and reconstructed corpus replay (`memlet/dream_fixtures/tidy/*.json`).
-- Byte-for-byte comparison with commit `7221b3a` across CLI, library, all 25 MCP tools, hooks, and bridge files.
+- Byte-for-byte comparison with commit `0ca681f` across CLI, library, all 25 MCP tools, hooks, and bridge files.
 - AST mutation check across `proposal_state` and every check of Item 3 (`_check_batch_groups`).
 """
 
@@ -55,7 +55,7 @@ from memlet import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 TIDY_FIXTURE_DIR = REPO_ROOT / "memlet" / "dream_fixtures" / "tidy"
-BASE_COMMIT = "7221b3a"
+BASE_COMMIT = "0ca681f"
 
 DIFF_WORDING_A = (
     "Never invoke `make release` by hand; ship production builds exclusively via `scripts/deploy.sh` in src/deploy.py."
@@ -1008,7 +1008,7 @@ class DryRunReadOnlyCliAndFixturesTests(DreamTidyBase):
 
 class BaselineComparisonAndMutationTests(DreamTidyBase):
     def _extract_baseline(self) -> Path:
-        target = self.base / "baseline_7221b3a"
+        target = self.base / f"baseline_{BASE_COMMIT}"
         if not target.exists():
             target.mkdir()
             archive = subprocess.run(
@@ -1037,7 +1037,7 @@ class BaselineComparisonAndMutationTests(DreamTidyBase):
             with self.assertRaisesRegex(unittest.SkipTest, BASE_COMMIT):
                 self._extract_baseline()
 
-    def test_byte_identical_with_7221b3a_when_no_dream_tidy_has_run(self) -> None:
+    def test_byte_identical_with_0ca681f_when_no_dream_tidy_has_run(self) -> None:
         base_src = self._extract_baseline()
         fixture_repo = self.base / "compat_repo"
         fixture_repo.mkdir()
