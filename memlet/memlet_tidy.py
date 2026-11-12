@@ -727,11 +727,21 @@ def _similar_groups(texts: Dict[str, List[str]]) -> Tuple[List[List[str]], bool]
     return groups, complete
 
 
+def kept_lesson_order(lessons: Dict[str, Dict[str, Any]], ids: Iterable[str]) -> List[str]:
+    """Kept-lesson order: approved first, then the earliest line time, then the smallest id."""
+    return sorted(ids, key=lambda i: (lessons[i]["tier"] != APPROVED, _earliest(lessons[i]) or _FAR, i))
+
+
+def _model_proposals_fn():
+    from . import memlet_dreamtidy as mdtidy
+    return mdtidy.tidy_report_section
+
+
 def _duplicates(lessons: Dict[str, Dict[str, Any]], visible: List[str], work: Dict[str, int]
                 ) -> Tuple[List[Tuple[str, str, List[str]]], bool]:
     """[(kind, keep, members)] where every member says the same as, or reaches Jaccard 0.8 against, its kept lesson.
     Kept lessons are chosen in the contract's order: approved first, then the earliest line time, then the id."""
-    order = sorted(visible, key=lambda i: (lessons[i]["tier"] != APPROVED, _earliest(lessons[i]) or _FAR, i))
+    order = kept_lesson_order(lessons, visible)
     key = {i: "\n".join(md.normalised_quote(raw) for raw in lessons[i]["current"]) for i in order}
     order = [i for i in order if key[i].strip()]
     pairs, complete = _similar_pairs(list(dict.fromkeys(key[i] for i in order)), work)
@@ -974,15 +984,46 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
                       if lessons[keep]["tier"] == APPROVED and len(wanted) <= 8 else None)
             merged_lost.append(_with_command(entry, repair, note or v.TIDY_UNSAFE_ARGUMENT))
 
+    # model proposals (only when .memlet/dream/runs/tidy-proposals.json exists) ---------------------------------
+    seen_nids: Set[str] = set()
+    dup_nids: Set[str] = set()
+    for raw_node in (graph or {}).get("nodes", []):
+        if isinstance(raw_node, dict) and isinstance(raw_node.get("id"), str):
+            nid = raw_node["id"]
+            if nid in seen_nids:
+                dup_nids.add(nid)
+            seen_nids.add(nid)
+    model_same = _model_proposals_fn()(
+        root, lessons=lessons, nodes=nodes, merge=merge, merge_ok=merge_ok, cmd=cmd, duplicate_ids=dup_nids
+    )
+    if model_same is not None:
+        if model_same.get("blockersFailed") and v.TIDY_BLOCKERS_FAILED not in notices:
+            notices.append(v.TIDY_BLOCKERS_FAILED)
+            merge_ok = False
+        for note in model_same.get("notices", []):
+            if note not in notices:
+                notices.append(note)
+
+    said_again_out = _capped(said + again, omitted, "saidAgain")
+    retire_out = _capped(retire, omitted, "retire")
+    unattached_out = _capped(unattached, omitted, "unattached")
+    merged_lost_out = _capped(merged_lost, omitted, "mergedLostFiles")
+    omitted_out: Dict[str, int] = {}
+    for s in v.TIDY_SECTIONS:
+        omitted_out[s] = omitted.get(s, 0)
+        if s == "duplicates" and model_same is not None:
+            omitted_out[v.TIDY_MODEL_SAME_SECTION] = model_same["omitted"]
+
     result = {"ok": True, "exitCode": 0,
               "duplicates": duplicates,
-              "saidAgain": _capped(said + again, omitted, "saidAgain"),
-              "retire": _capped(retire, omitted, "retire"),
-              "unattached": _capped(unattached, omitted, "unattached"),
+              **({v.TIDY_MODEL_SAME_SECTION: model_same["entries"]} if model_same is not None else {}),
+              "saidAgain": said_again_out,
+              "retire": retire_out,
+              "unattached": unattached_out,
               "promote": promote,
               "lapsedMerges": lapsed,
-              "mergedLostFiles": _capped(merged_lost, omitted, "mergedLostFiles"),
-              "omitted": {s: omitted.get(s, 0) for s in v.TIDY_SECTIONS},
+              "mergedLostFiles": merged_lost_out,
+              "omitted": omitted_out,
               "complete": complete, "notices": notices, "mergeChecks": merge_ok,
               "scanned": scan["scanned"], "work": work, "skipped": scan["skipped"]}
     result["formatted"] = render_markdown(result)
@@ -1066,12 +1107,41 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines = [v.TIDY_HEAD, "", v.TIDY_NOTHING_CHANGED, "",
              "- " + v.TIDY_SCAN_LINE % (result["scanned"]["files"], result["scanned"]["bytes"])]
     lines += ["- " + n for n in result["notices"]]
-    for section in v.TIDY_SECTIONS:
+    sections = list(v.TIDY_SECTIONS)
+    if v.TIDY_MODEL_SAME_SECTION in result:
+        sections.insert(1, v.TIDY_MODEL_SAME_SECTION)
+    for section in sections:
         entries = result[section]
-        lines += ["", "### " + v.TIDY_SECTION_HEADINGS[section], ""]
+        heading = (v.TIDY_MODEL_SAME_HEADING if section == v.TIDY_MODEL_SAME_SECTION
+                   else v.TIDY_SECTION_HEADINGS[section])
+        lines += ["", "### " + heading, ""]
         if not entries:
             lines.append("- " + v.TIDY_NONE)
+        shown_disputed = False
         for e in entries:
+            if section == v.TIDY_MODEL_SAME_SECTION:
+                if e.get("disputed") and not shown_disputed:
+                    lines.append("- " + v.TIDY_MODEL_DISPUTED_GROUP)
+                    shown_disputed = True
+                lines.append("- [%s; %s] %s %s (%s); same: %s" % (
+                    e["label"], v.TIDY_MODEL_PROPOSAL_ID_NOTE % _code(e["id"]),
+                    v.TIDY_KEEP_LABEL, _code(e["keep"]), e["lessons"][0]["tier"],
+                    ", ".join(_code(x["id"]) + " (" + x["tier"] + ")" for x in e["lessons"][1:])))
+                for lesson in e["lessons"]:
+                    lines.append("  " + _code(lesson["id"]) + ":")
+                    lines += ["  " + q for q in _quotes(lesson)]
+                if any(e.get("blockers", {}).values()):
+                    lines.append("  " + v.TIDY_BLOCKERS_LABEL + "; ".join(
+                        _code(k) + ": " + ", ".join(r + " — " + v.MERGE_REASONS.get(r, r) for r in c)
+                        for k, c in sorted(e["blockers"].items()) if c))
+                if any(e.get("lostFiles", {}).values()):
+                    lines.append("  " + v.TIDY_LOST_FILES_LABEL + "; ".join(
+                        _code(k) + ": " + ", ".join(_code(p) for p in ps)
+                        for k, ps in sorted(e["lostFiles"].items()) if ps))
+                lines += _commands(e)
+                if e.get("pathsCommand"):
+                    lines.append("  " + v.TIDY_ALSO_LABEL + _code(e["pathsCommand"]))
+                continue
             if section == "duplicates":
                 lines.append("- [%s] %s %s (%s); same: %s" % (
                     e["label"], v.TIDY_KEEP_LABEL, _code(e["keep"]), e["lessons"][0]["tier"],

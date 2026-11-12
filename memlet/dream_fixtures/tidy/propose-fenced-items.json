@@ -1,0 +1,17 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "reconstructed",
+  "vendor": "claude",
+  "model": "haiku",
+  "memletVersion": "9.3.0",
+  "date": "2026-11-12",
+  "note": "Reconstructed dream --tidy proposer answer wrapped in a fenced items envelope accepted by _model_json(unwrap_items=True).",
+  "kind": "tidy-propose",
+  "input": "{\"id\": \"L1\", \"text\": \"2026-11-12T09:00:00Z [user] Never run `make release` directly; deploy only through `scripts/deploy.sh`.\"}\n{\"id\": \"L2\", \"text\": \"2026-11-12T10:00:00Z [user] Do not invoke `make release` for production rollouts; ship with `scripts/deploy.sh`.\"}\n{\"id\": \"L3\", \"text\": \"2026-11-12T11:00:00Z [user] Never skip migration validation in `src/schema.py` before integration checks.\"}",
+  "expected": {
+    "failed": false,
+    "proposalCount": 1,
+    "droppedReasons": []
+  },
+  "answer": "```json\n{\"items\": [{\"same\": [\"L1\", \"L2\"]}]}\n```"
+}

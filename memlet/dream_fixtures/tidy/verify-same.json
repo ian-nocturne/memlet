@@ -1,0 +1,15 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "reconstructed",
+  "vendor": "claude",
+  "model": "sonnet",
+  "memletVersion": "9.3.0",
+  "date": "2026-11-12",
+  "note": "Reconstructed dream --tidy second-opinion SAME verdict; not recorded vendor bytes.",
+  "kind": "tidy-verify",
+  "input": "{\"id\": \"L1\", \"text\": \"2026-11-12T09:00:00Z [user] Never run `make release` directly; deploy only through `scripts/deploy.sh`.\"}\n{\"id\": \"L2\", \"text\": \"2026-11-12T10:00:00Z [user] Do not invoke `make release` for production rollouts; ship with `scripts/deploy.sh`.\"}",
+  "expected": {
+    "verdict": "SAME"
+  },
+  "answer": "{\"verdict\": \"SAME\"}"
+}
