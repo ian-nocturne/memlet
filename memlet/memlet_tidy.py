@@ -993,8 +993,16 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
             if nid in seen_nids:
                 dup_nids.add(nid)
             seen_nids.add(nid)
+    wording_sets = [{keep} | set(same) for _, keep, same in groups]
     model_same = _model_proposals_fn()(
-        root, lessons=lessons, nodes=nodes, merge=merge, merge_ok=merge_ok, cmd=cmd, duplicate_ids=dup_nids
+        root,
+        lessons=lessons,
+        nodes=nodes,
+        merge=merge,
+        merge_ok=merge_ok,
+        cmd=cmd,
+        duplicate_ids=dup_nids,
+        wording_groups=wording_sets,
     )
     if model_same is not None:
         if model_same.get("blockersFailed") and v.TIDY_BLOCKERS_FAILED not in notices:
@@ -1141,6 +1149,8 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 lines += _commands(e)
                 if e.get("pathsCommand"):
                     lines.append("  " + v.TIDY_ALSO_LABEL + _code(e["pathsCommand"]))
+                if e.get("dismissCommand"):
+                    lines.append("  " + v.TIDY_MODEL_DISMISS_LABEL + _code(e["dismissCommand"]))
                 continue
             if section == "duplicates":
                 lines.append("- [%s] %s %s (%s); same: %s" % (

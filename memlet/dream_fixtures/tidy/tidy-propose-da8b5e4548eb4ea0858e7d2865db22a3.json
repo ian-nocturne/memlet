@@ -1,0 +1,17 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "recorded",
+  "vendor": "claude",
+  "model": "haiku",
+  "memletVersion": "9.3.0",
+  "date": "2026-11-12T14:19:58Z",
+  "note": "Explicit capture; model answer and input masked before writing.",
+  "kind": "tidy-propose",
+  "input": "{\"id\": \"L1\", \"text\": \"Never call refund() in billing.py without the retry wrapper; it double-charges on timeouts.\"}\n{\"id\": \"L2\", \"text\": \"Never export customer emails without masking them first.\"}\n{\"id\": \"L3\", \"text\": \"Do not deploy on Fridays after 3pm.\"}\n{\"id\": \"L4\", \"text\": \"Always wrap refund() calls in billing.py with the retry helper, never call it bare, or a timeout charges the customer twice.\"}\n{\"id\": \"L5\", \"text\": \"Never deploy to staging without running the smoke tests first.\"}\n{\"id\": \"L6\", \"text\": \"Never send out customer email addresses unmasked in any export.\"}\n{\"id\": \"L7\", \"text\": \"Never push straight to the release branch; open a pull request.\"}",
+  "answer": "[{\"same\":[\"L1\",\"L4\"]},{\"same\":[\"L2\",\"L6\"]}]\n",
+  "expected": {
+    "failed": false,
+    "proposalCount": 2,
+    "droppedReasons": []
+  }
+}

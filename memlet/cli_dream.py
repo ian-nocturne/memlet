@@ -11,13 +11,15 @@ COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or
 def register(sub):
     from memlet.memlet_dreamcycle import TRUST_BOUNDARY
     parser = sub.add_parser("dream", help=COMMANDS["dream"]["help"], epilog=TRUST_BOUNDARY)
-    parser.add_argument("repo", nargs="?", default=".")
+    parser.add_argument("repo", nargs="?", default=None)
+    parser.add_argument("--repo", dest="repo_opt", default=None, metavar="PATH", help=v.DREAM_REPO_HELP)
     parser.add_argument("--tidy", action="store_true", help=v.DREAM_TIDY_HELP)
-    parser.add_argument("--via", help="Comma-separated proposer vendors (claude,codex,gemini)")
-    parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help="Verifier model: dream.models.verifier.<vendor>; distinct families can check within one vendor; dream.agreement=model is needed only for same-vendor hints")
+    parser.add_argument("--again", action="store_true", help=v.DREAM_TIDY_AGAIN_HELP)
+    parser.add_argument("--via", help=v.DREAM_VIA_HELP)
+    parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help=v.DREAM_VERIFY_WITH_HELP)
     parser.add_argument("--transcript")
     parser.add_argument("--save-fixture", metavar="DIR", help="Explicitly save masked model answers outside .memlet (never overwrite)")
-    parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--max-batches", type=int, default=None, help=v.DREAM_MAX_BATCHES_HELP)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--dismiss", nargs="+", action="extend", metavar="PROPOSAL_ID", help=v.DREAM_TIDY_DISMISS_HELP)
@@ -55,7 +57,7 @@ def _dropped_groups_lines(result):
         lessons = ", ".join(rec.get("lessonIds") or []) or "none"
         lines.append("- Dropped [%s]: %s (batch %s, group #%s; lessons: %s)" % (
             rec["reason"], rec.get("reasonMeaning", rec["reason"]),
-            rec.get("batchId", "?"), rec.get("index", 0), lessons))
+            rec.get("batchId", "?"), rec.get("index", 1), lessons))
     if result.get("droppedGroupsOmitted"):
         lines.append("- %s more dropped group record(s) omitted by the count/byte bounds" % result["droppedGroupsOmitted"])
     return "\n".join(lines) + ("\n" if lines else "")
@@ -65,7 +67,7 @@ def _tidy_markdown(result):
     dropped = _dropped_groups_lines(result)
     total_dropped = len(result.get("droppedGroups", [])) + int(result.get("droppedGroupsOmitted", 0))
     if not result["ok"]:
-        text = "## Dream failed\n\n"
+        text = "## Dream tidy failed\n\n"
         if total_dropped:
             text += "- Dropped groups: %s\n" % total_dropped + dropped + "\n"
         text += "- ERROR: " + result["error"] + "\n"
@@ -87,6 +89,9 @@ def _tidy_markdown(result):
         for code, cnt in sorted((result.get("reasons") or {}).items()):
             meaning = v.DREAM_TIDY_STATE_REASONS.get(code, code)
             text += "- State reason [%s]: %s (%s)\n" % (code, cnt, meaning)
+        for code, cnt in sorted((result.get("invalidRecords") or {}).items()):
+            meaning = v.DREAM_TIDY_INVALID_RECORD_REASONS.get(code, code)
+            text += "- Skipped invalid record [%s]: %s (%s)\n" % (code, cnt, meaning)
         text += "- Dropped groups: %s\n" % total_dropped
         if dropped:
             text += dropped
@@ -103,16 +108,17 @@ def _tidy_markdown(result):
             text += "- %s: state=%s%s%s; keep=%s; lessons=%s%s\n" % (
                 item["id"], item["state"], reason_note, tag, item.get("keep", "?"),
                 ",".join(item.get("lessonIds") or []), ver)
-        text += "\n" + result.get("trustBoundary", "") + "\n"
-        text += "".join("\n- " + notice + "\n" for notice in result.get("notices", []))
+        for notice in result.get("notices", []):
+            text += "- " + notice + "\n"
+        if result.get("trustBoundary"):
+            text += "\n" + result["trustBoundary"] + "\n"
         return text
 
     text = "## Dream tidy %s\n\n" % ("preview" if result.get("dryRun") else "run")
     text += "- Batches: %s; calls: %s; failed batches: %s\n" % (
         result.get("batches", 0), result.get("calls", 0), result.get("failedBatches", 0))
-    text += "- Proposals: %s (new: %s); unexamined lessons: %s\n" % (
-        len(result.get("proposals", [])), len(result.get("addedProposals", [])), result.get("unexaminedLessons", 0))
     if result.get("dryRun"):
+        text += "- Unexamined lessons: %s\n" % result.get("unexaminedLessons", 0)
         v_range = result.get("verificationCallRange") or [0, 0]
         text += "- Planned proposer calls: %s; existing verifier calls: %s; verifier call range: %s..%s\n" % (
             result.get("plannedProposalCalls", 0), result.get("plannedExistingVerificationCalls", 0),
@@ -125,6 +131,9 @@ def _tidy_markdown(result):
             text += "\n### tidy-verify / %s / %s\n\n" % (result["verifierVendor"], result["verifierModel"])
             text += "- Isolation: " + result["verifierIsolation"] + "\n- argv: " + json.dumps(result["verifierArgv"]) + "\n"
             text += "\n".join("    " + line for line in result["verificationPrompt"].splitlines()) + "\n"
+    else:
+        text += "- Proposals: %s (new: %s); unexamined lessons: %s\n" % (
+            len(result.get("proposals", [])), len(result.get("addedProposals", [])), result.get("unexaminedLessons", 0))
     for bid in result.get("retryFailedBatches", []):
         text += "- Would retry failed batch: " + bid + "\n"
     text += "- Dropped groups: %s\n" % total_dropped
@@ -134,8 +143,10 @@ def _tidy_markdown(result):
         text += "- Dropped output: %s\n" % result["droppedOutput"]
     if result.get("verificationSummary"):
         text += "- " + result["verificationSummary"] + "\n"
-    text += "\n" + result.get("trustBoundary", "") + "\n"
-    text += "".join("\n- " + notice + "\n" for notice in result.get("notices", []))
+    for notice in result.get("notices", []):
+        text += "- " + notice + "\n"
+    if result.get("trustBoundary"):
+        text += "\n" + result["trustBoundary"] + "\n"
     return text
 
 
@@ -185,51 +196,59 @@ def _markdown(result):
 
 def dispatch(args):
     tidy = bool(getattr(args, "tidy", False))
+    again = bool(getattr(args, "again", False))
     dismiss = getattr(args, "dismiss", None)
     max_batches = getattr(args, "max_batches", None)
-    if dismiss and not tidy:
+    pos_repo = getattr(args, "repo", None)
+    opt_repo = getattr(args, "repo_opt", None)
+    repo = opt_repo if opt_repo is not None else (pos_repo if pos_repo is not None else ".")
+    if pos_repo is not None and opt_repo is not None:
+        result = {"ok": False, "exitCode": 2, "error": v.DREAM_REPO_CONFLICT, **({"tidy": True} if tidy else {})}
+    elif dismiss and not tidy:
         result = {"ok": False, "exitCode": 2, "error": v.DREAM_DISMISS_REQUIRES_TIDY}
+    elif again and not tidy:
+        result = {"ok": False, "exitCode": 2, "error": v.DREAM_AGAIN_REQUIRES_TIDY}
     elif tidy:
         from memlet.memlet_dreamtidy import DEFAULT_MAX_BATCHES, dream_tidy_dismiss, dream_tidy_run, dream_tidy_status
         if args.transcript or args.skip_failed:
             result = {"ok": False, "exitCode": 2, "error": v.DREAM_TIDY_CONFLICT_ERROR, "tidy": True}
         elif dismiss:
-            if (args.status or args.via or args.verify_with or args.dry_run
+            if (args.status or args.via or args.verify_with or args.dry_run or again
                     or args.save_fixture is not None or max_batches is not None):
                 result = {"ok": False, "exitCode": 2, "error": v.DREAM_TIDY_DISMISS_CONFLICT, "tidy": True}
             else:
-                result = dream_tidy_dismiss(args.repo, dismiss)
+                result = dream_tidy_dismiss(repo, dismiss)
         elif args.status:
-            if (args.via or args.verify_with or args.dry_run
+            if (args.via or args.verify_with or args.dry_run or again
                     or args.save_fixture is not None or max_batches is not None):
                 result = {"ok": False, "exitCode": 2, "error": v.DREAM_TIDY_STATUS_CONFLICT, "tidy": True}
             else:
-                result = dream_tidy_status(args.repo)
+                result = dream_tidy_status(repo)
         elif not args.via:
             result = {"ok": False, "exitCode": 2, "error": v.DREAM_TIDY_MODE_ERROR, "tidy": True}
         else:
             options = {"save_fixture": args.save_fixture} if args.save_fixture is not None else {}
             batches_bound = DEFAULT_MAX_BATCHES if max_batches is None else max_batches
             result = dream_tidy_run(
-                args.repo, **options,
+                repo, **options,
                 via=tuple(x.strip() for x in args.via.split(",")),
-                verify_with=args.verify_with, max_batches=batches_bound, dry_run=args.dry_run)
+                verify_with=args.verify_with, max_batches=batches_bound, dry_run=args.dry_run, again=again)
     elif args.skip_failed:
         if args.status or args.via or args.transcript or args.verify_with:
             result = {"ok": False, "exitCode": 2, "error": "--skip-failed cannot be combined with proposal/status options"}
         else:
-            result = dream_skip_failed(args.repo, args.skip_failed, dry_run=args.dry_run)
+            result = dream_skip_failed(repo, args.skip_failed, dry_run=args.dry_run)
     elif args.status:
         if args.via or args.transcript or args.verify_with:
             result = {"ok": False, "exitCode": 2, "error": "--status cannot be combined with proposal options"}
         else:
-            result = dream_status(args.repo)
+            result = dream_status(repo)
     elif not args.via:
         result = {"ok": False, "exitCode": 2, "error": "Choose --via VENDOR explicitly, or --status"}
     else:
         options = {"save_fixture": args.save_fixture} if args.save_fixture is not None else {}
         batches_bound = 4 if max_batches is None else max_batches
-        result = dream_run(args.repo, **options, via=tuple(x.strip() for x in args.via.split(",")), verify_with=args.verify_with,
+        result = dream_run(repo, **options, via=tuple(x.strip() for x in args.via.split(",")), verify_with=args.verify_with,
                            max_batches=batches_bound, dry_run=args.dry_run, transcript=args.transcript)
     result["command"] = "dream"
     result.setdefault("exitCode", 0 if result["ok"] else 2)

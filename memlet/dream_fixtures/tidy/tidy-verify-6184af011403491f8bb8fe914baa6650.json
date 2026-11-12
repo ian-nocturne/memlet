@@ -1,0 +1,15 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "recorded",
+  "vendor": "claude",
+  "model": "sonnet",
+  "memletVersion": "9.3.0",
+  "date": "2026-11-12T14:19:58Z",
+  "note": "Explicit capture; model answer and input masked before writing.",
+  "kind": "tidy-verify",
+  "input": "{\"id\": \"L1\", \"text\": \"Never call refund() in billing.py without the retry wrapper; it double-charges on timeouts.\"}\n{\"id\": \"L2\", \"text\": \"Always wrap refund() calls in billing.py with the retry helper, never call it bare, or a timeout charges the customer twice.\"}",
+  "answer": "{\"verdict\":\"SAME\"}\n",
+  "expected": {
+    "verdict": "SAME"
+  }
+}

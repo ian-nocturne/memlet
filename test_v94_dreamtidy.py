@@ -312,8 +312,10 @@ class EndToEndAndLifecycleTests(DreamTidyBase):
         st = mdtidy.dream_tidy_status(repo)
         self.assertEqual({"open": 0, "disputed": 0, "stale": 0, "merged": 0, "dismissed": 1}, st["counts"])
 
-        # A new run with the exact same model answer drops the group as `dismissed` and does not bring it back.
-        second = mdtidy.dream_tidy_run(repo, via=("claude",), runner=group_all)
+        # S-3: a subsequent run without `--again` makes zero model calls after dismiss; `--again` re-examines and drops as `dismissed`.
+        second_skip = mdtidy.dream_tidy_run(repo, via=("claude",), runner=group_all)
+        self.assertEqual(0, second_skip["calls"])
+        second = mdtidy.dream_tidy_run(repo, via=("claude",), again=True, runner=group_all)
         self.assertTrue(second["ok"])
         self.assertEqual([], second["addedProposals"])
         self.assertEqual([], second["proposals"])
@@ -561,6 +563,7 @@ class ValidationMalformedAndBoundsTests(DreamTidyBase):
             char_repo,
             via=("claude",),
             max_batches=10,
+            again=True,
             runner=advancing_runner,
             clock=fake_clock,
         )
@@ -739,18 +742,33 @@ class ProposalStateAndVerifierTests(DreamTidyBase):
         (repo / mb.QUEUE_REL).write_bytes(original_queue_bytes)
         self.assertEqual({"state": "open", "reason": None}, mdtidy.proposal_state(prop, mdtidy.load_lessons_by_id(repo)))
 
-        # 4. Post-proposal blocker in `admin tidy`: approve `id_b` while `keep` (`id_a`) remains pending!
+        # 4. M-2 + post-proposal blocker in `admin tidy`:
+        #    - Approving `id_b` makes `kept_lesson_order` choose `id_b` on read (no `keep-not-approved` blocker!).
+        #    - When both are approved with incompatible `approvedEdgeTypes`, `merge_blockers` blocks with no command.
         self.assertTrue(mb.learn_approve(repo, [id_b], approver="Robin")["ok"])
+        self.assertEqual({"state": "open", "reason": None}, mdtidy.proposal_state(prop, mdtidy.load_lessons_by_id(repo)))
+        reordered_tidy = mt.tidy_report(repo)
+        self.assertEqual(1, len(reordered_tidy["modelSaysSame"]))
+        r_entry = reordered_tidy["modelSaysSame"][0]
+        self.assertEqual(id_b, r_entry["keep"])
+        self.assertEqual([id_a], r_entry["same"])
+        self.assertEqual({}, r_entry["blockers"])
+        self.assertIsNotNone(r_entry["command"])
+
+        # Real post-proposal blocker: merge `id_c` into `id_a` so `id_a` (the member under kept `id_b`)
+        # has a member (`member-has-members`), blocking merge while proposal `{id_a, id_b}` stays `open`!
+        self.assertTrue(mb.learn_merge(repo, id_a, [id_c], approver="Robin")["ok"])
         self.assertEqual({"state": "open", "reason": None}, mdtidy.proposal_state(prop, mdtidy.load_lessons_by_id(repo)))
         blocked_tidy = mt.tidy_report(repo)
         self.assertEqual(1, len(blocked_tidy["modelSaysSame"]))
         b_entry = blocked_tidy["modelSaysSame"][0]
         self.assertIsNone(b_entry["command"])
-        self.assertIn("keep-not-approved", b_entry["blockers"][id_b])
-        self.assertIn("keep-not-approved", b_entry["commandNote"])
-        self.assertIn(v.MERGE_REASONS["keep-not-approved"], b_entry["commandNote"])
+        self.assertIn("member-has-members", b_entry["blockers"][id_a])
+        self.assertIn("member-has-members", b_entry["commandNote"])
+        self.assertIn(v.MERGE_REASONS["member-has-members"], b_entry["commandNote"])
         self.assertIn(v.TIDY_NO_COMMAND_LABEL, blocked_tidy["formatted"])
-        self.assertIn(v.MERGE_REASONS["keep-not-approved"], blocked_tidy["formatted"])
+        self.assertIn(v.MERGE_REASONS["member-has-members"], blocked_tidy["formatted"])
+        self.assertTrue(mb.learn_unmerge(repo, id_c, approver="Robin")["ok"])
 
         # 5. Lapse by `lesson-not-shown` (rejecting `id_b`), then reconsidering `id_a` & `id_b` back to approved.
         self.assertTrue(mb.learn_reject(repo, [id_b], approver="Robin", reason="retired")["ok"])
@@ -936,7 +954,8 @@ class DryRunReadOnlyCliAndFixturesTests(DreamTidyBase):
                 self.assertIn("error", payload)
 
     def test_reconstructed_fixtures_replay_and_save_fixture_masks_and_protects(self) -> None:
-        fixtures = sorted(TIDY_FIXTURE_DIR.glob("*.json"))
+        all_fixtures = sorted(TIDY_FIXTURE_DIR.glob("*.json"))
+        fixtures = [fp for fp in all_fixtures if json.loads(fp.read_text(encoding="utf-8")).get("provenance") == "reconstructed"]
         self.assertGreaterEqual(len(fixtures), 4)
         for idx, fx_path in enumerate(fixtures):
             with self.subTest(fixture=fx_path.name):
@@ -1000,6 +1019,7 @@ class DryRunReadOnlyCliAndFixturesTests(DreamTidyBase):
             bad_cap = mdtidy.dream_tidy_run(
                 cap_repo,
                 via=("claude",),
+                again=True,
                 save_fixture=bad_target,
                 runner=lambda *a, **k: "[]",
             )
@@ -1439,6 +1459,702 @@ sys.stdout.write(json.dumps({"identical": identical, "dream_diff": dream_diff}, 
             killed_mutants.append("_check_batch_groups:kept-lesson-order")
 
         self.assertEqual(15, len(killed_mutants))
+
+
+class FixRound1RegressionAndMutantTests(DreamTidyBase):
+    def test_m1_bad_proposals_file_never_breaks_tidy_or_status(self) -> None:
+        repo = self.make_repo("m1_repo")
+        id_a = self.learn_line(repo, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)[0]
+        id_b = self.learn_line(repo, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)[0]
+        id_c = self.learn_line(repo, "c.log", "2026-11-03T09:00:00Z [user] " + UNRELATED_C)[0]
+
+        # Capture clean baseline `admin tidy` output before any proposals file exists.
+        code_clean, out_clean, err_clean = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual((0, ""), (code_clean, err_clean))
+        clean_rep = json.loads(out_clean)
+        self.assertNotIn(v.TIDY_MODEL_SAME_SECTION, clean_rep)
+
+        def assert_other_sections_unchanged(rep: Dict[str, Any]) -> None:
+            for sec in v.TIDY_SECTIONS:
+                self.assertEqual(clean_rep[sec], rep[sec], sec)
+                self.assertEqual(clean_rep["omitted"][sec], rep["omitted"][sec], sec)
+
+        # Create a valid store first so we can mutate individual fields cleanly.
+        run_ok = mdtidy.dream_tidy_run(
+            repo,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+        )
+        self.assertTrue(run_ok["ok"], run_ok)
+        good_store = json.loads((repo / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))
+        target = repo / mdtidy.PROPOSALS_REL
+
+        # 0) Immediate regression checks for M-1 crashes on 9e80e63 (`lessonIds` of lists -> TypeError; deep nesting -> RecursionError).
+        crash_unhashable = copy.deepcopy(good_store)
+        crash_unhashable["proposals"][0]["lessonIds"] = [[id_a], [id_b]]
+        target.write_text(json.dumps(crash_unhashable), encoding="utf-8")
+        c_u0, o_u0, e_u0 = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual((0, ""), (c_u0, e_u0), o_u0)
+        c_s0, o_s0, e_s0 = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+        self.assertEqual((0, ""), (c_s0, e_s0), o_s0)
+
+        # 1) > 4 MiB file: NOT read (os.read not called on it), fixed too-large notice, exit 0 on both commands.
+        target.write_bytes(b"{" + (b" " * (mdtidy.MAX_STORE_BYTES + 128)) + b"}")
+        real_os_read = os.read
+        proposals_ino = os.lstat(str(target)).st_ino
+
+        def guard_no_read_oversized(fd: int, n: int) -> bytes:
+            if os.fstat(fd).st_ino == proposals_ino:
+                raise AssertionError("must not read tidy-proposals.json larger than 4 MiB")
+            return real_os_read(fd, n)
+
+        with mock.patch("os.read", side_effect=guard_no_read_oversized):
+            c_tj, o_tj, e_tj = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+            c_tm, o_tm, e_tm = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "markdown"])
+            c_st, o_st, e_st = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "markdown"])
+        self.assertEqual((0, ""), (c_tj, e_tj))
+        self.assertEqual((0, ""), (c_tm, e_tm))
+        self.assertEqual((0, ""), (c_st, e_st))
+        rep_big = json.loads(o_tj)
+        self.assertEqual([], rep_big[v.TIDY_MODEL_SAME_SECTION])
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_TOO_LARGE, rep_big["notices"])
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_TOO_LARGE, o_st)
+        assert_other_sections_unchanged(rep_big)
+
+        # 2) Corrupt / deeply nested / wrong schema / wrong top-level type / invalid UTF-8.
+        whole_file_bad_cases = [
+            ("deep-recursion", ('{"schema":"memlet.dream_tidy.v1","proposals":' + ("[" * 100000) + ("]" * 100000) + "}").encode("utf-8")),
+            ("invalid-utf8", b'{"schema":"memlet.dream_tidy.v1","proposals":[],"x":"\xff"}'),
+            ("not-json", b"not valid json {{{"),
+            ("wrong-schema", json.dumps(dict(good_store, schema="wrong.v0")).encode("utf-8")),
+            ("top-level-list", b"[1, 2, 3]"),
+            ("proposals-not-list", json.dumps(dict(good_store, proposals={"bad": 1})).encode("utf-8")),
+            ("dismissed-not-list", json.dumps(dict(good_store, dismissed="bad")).encode("utf-8")),
+        ]
+        for label, payload_bytes in whole_file_bad_cases:
+            with self.subTest(case=label):
+                target.write_bytes(payload_bytes)
+                snap_before = tree_state(repo)
+                c1, o1, e1 = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+                c2, _o2, e2 = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "markdown"])
+                c3, o3, e3 = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+                self.assertEqual((0, ""), (c1, e1))
+                self.assertEqual((0, ""), (c2, e2))
+                self.assertEqual((0, ""), (c3, e3))
+                self.assertEqual(snap_before, tree_state(repo))
+                parsed_tidy = json.loads(o1)
+                parsed_st = json.loads(o3)
+                self.assertEqual([], parsed_tidy[v.TIDY_MODEL_SAME_SECTION])
+                self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, parsed_tidy["notices"])
+                self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, parsed_st["notices"])
+                assert_other_sections_unchanged(parsed_tidy)
+
+        # 3) Directory, leaf symlink, symlinked runs/ parent (pointing to empty external dir -> also kills M10), unreadable mode 000.
+        target.unlink()
+        target.mkdir()
+        for cmd_argv in (["admin", "tidy", "--repo", str(repo), "--format", "json"], ["dream", str(repo), "--tidy", "--status", "--format", "json"]):
+            rc, out_s, err_s = run_cli(cmd_argv)
+            self.assertEqual((0, ""), (rc, err_s))
+            self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_s)["notices"])
+        target.rmdir()
+
+        secret_outside = self.base / "outside_secret.json"
+        secret_outside.write_text(json.dumps(good_store), encoding="utf-8")
+        target.symlink_to(secret_outside)
+        rc_sym, out_sym, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        rc_sym_st, out_sym_st, _ = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+        self.assertEqual(0, rc_sym)
+        self.assertEqual(0, rc_sym_st)
+        self.assertEqual([], json.loads(out_sym)[v.TIDY_MODEL_SAME_SECTION])
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_sym)["notices"])
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_sym_st)["notices"])
+        target.unlink()
+
+        runs_dir = repo / dc.RUNS_REL
+        shutil.rmtree(runs_dir)
+        empty_ext = self.base / "empty_external_runs"
+        empty_ext.mkdir()
+        runs_dir.symlink_to(empty_ext, target_is_directory=True)
+        rc_anc, out_anc, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual(0, rc_anc)
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_anc)["notices"])
+        runs_dir.unlink()
+        runs_dir.mkdir(parents=True, exist_ok=True)
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            target.write_text(json.dumps(good_store), encoding="utf-8")
+            os.chmod(str(target), 0)
+            try:
+                rc_u, out_u, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+                rc_ust, out_ust, _ = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+                self.assertEqual(0, rc_u)
+                self.assertEqual(0, rc_ust)
+                self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_u)["notices"])
+                self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_ust)["notices"])
+            finally:
+                os.chmod(str(target), 0o600)
+
+        # 4) Record-by-record validation & Note 4 (status never fails on one bad record and never echoes HANDEDIT).
+        p_valid = copy.deepcopy(good_store["proposals"][0])
+        bad_unhashable_ids = dict(copy.deepcopy(p_valid), lessonIds=[[id_a], [id_b]])
+        bad_digest_list = dict(copy.deepcopy(p_valid), lessonDigests={id_a: ["x"], id_b: "y"})
+        bad_nested_keep = dict(copy.deepcopy(p_valid), keep=["nested"])
+        bad_extra_key = dict(copy.deepcopy(p_valid), injected="HANDEDIT")
+        bad_vendor_list = dict(copy.deepcopy(p_valid), proposer={"vendor": ["claude"], "model": "haiku"})
+        bad_receipt_nested = copy.deepcopy(p_valid)
+        bad_receipt_nested["receipts"] = list(bad_receipt_nested["receipts"]) + [{"extra": ["HANDEDIT"]}]
+
+        mixed = {
+            "schema": v.DREAM_TIDY_SCHEMA,
+            "proposals": [
+                bad_unhashable_ids,
+                bad_digest_list,
+                bad_nested_keep,
+                bad_extra_key,
+                bad_vendor_list,
+                bad_receipt_nested,
+                p_valid,
+            ],
+            "dismissed": ["HANDEDIT", ["bad"]],
+            "droppedGroupsOmitted": "HANDEDIT",
+            "droppedGroups": [
+                {"reason": ["HANDEDIT"], "batchId": "b"},
+                {"reason": "operator HANDEDIT", "batchId": "HANDEDIT", "index": 1, "lessonIds": ["HANDEDIT"]},
+                {"reason": "unknown-row-id", "batchId": "a" * 24, "index": 1, "lessonIds": ["HANDEDIT"]},
+                {"reason": "unknown-row-id", "batchId": "b" * 24, "index": 1, "reasonMeaning": "HANDEDIT", "lessonIds": [id_c]},
+            ],
+            "failedBatches": {
+                "bad-id": {"vendor": "claude", "model": "haiku", "reason": "vendor-error", "at": "2026-11-01T00:00:00Z"},
+                "c" * 24: {"vendor": "claude", "model": "haiku", "reason": ["HANDEDIT"], "at": "2026-11-01T00:00:00Z"},
+                "d" * 24: {"vendor": "claude", "model": "haiku", "reason": "HANDEDIT", "at": "2026-11-01T00:00:00Z"},
+            },
+            "extraTop": "HANDEDIT",
+        }
+        target.write_text(json.dumps(mixed), encoding="utf-8")
+        c_mj, o_mj, e_mj = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        c_mm, o_mm, e_mm = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "markdown"])
+        c_sj, o_sj, e_sj = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+        c_sm, o_sm, e_sm = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "markdown"])
+        self.assertEqual((0, ""), (c_mj, e_mj))
+        self.assertEqual((0, ""), (c_mm, e_mm))
+        self.assertEqual((0, ""), (c_sj, e_sj))
+        self.assertEqual((0, ""), (c_sm, e_sm))
+        for text_out in (o_mj, o_mm, o_sj, o_sm):
+            self.assertNotIn("HANDEDIT", text_out)
+        rep_mixed = json.loads(o_mj)
+        self.assertEqual(1, len(rep_mixed[v.TIDY_MODEL_SAME_SECTION]))
+        assert_other_sections_unchanged(rep_mixed)
+        st_mixed = json.loads(o_sj)
+        self.assertEqual(1, st_mixed["counts"]["open"])
+        self.assertEqual(6, st_mixed["counts"]["stale"])
+        self.assertEqual(6, st_mixed["reasons"]["invalid-proposal"])
+        self.assertEqual(1, len(st_mixed["droppedGroups"]))
+        self.assertEqual(2, st_mixed["invalidRecords"]["invalid-dismissed"])
+        self.assertEqual(3, st_mixed["invalidRecords"]["invalid-dropped-group"])
+        self.assertEqual(3, st_mixed["invalidRecords"]["invalid-failed-batch"])
+
+    def test_m2_kept_lesson_computed_on_read_and_merges_via_real_cli(self) -> None:
+        repo = self.make_repo("m2_repo")
+        id_a = self.learn_line(repo, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)[0]
+        id_b = self.learn_line(repo, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)[0]
+
+        res = mdtidy.dream_tidy_run(
+            repo,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+        )
+        self.assertTrue(res["ok"], res)
+
+        # Hand-editing stored `keep` changes nothing while both lessons are pending.
+        store_path = repo / mdtidy.PROPOSALS_REL
+        edited = json.loads(store_path.read_text(encoding="utf-8"))
+        edited["proposals"][0]["keep"] = id_b
+        store_path.write_text(json.dumps(edited), encoding="utf-8")
+        rep_pending = mt.tidy_report(repo)
+        self.assertEqual(id_a, rep_pending[v.TIDY_MODEL_SAME_SECTION][0]["keep"])
+        self.assertEqual(id_a, mdtidy.dream_tidy_status(repo)["proposals"][0]["keep"])
+
+        # Now a person approves the second lesson (`id_b`) via the real CLI.
+        c_app, _o_app, e_app = run_cli(["learn", "--approve", id_b, "--by", "Reviewer", "--repo", str(repo)])
+        self.assertEqual((0, ""), (c_app, e_app))
+
+        # Even if stored `keep` is hand-edited back to `id_a`, the report computes `id_b` via `kept_lesson_order`,
+        # shows no `keep-not-approved` blocker, and prints a merge command that works through the real CLI.
+        edited = json.loads(store_path.read_text(encoding="utf-8"))
+        edited["proposals"][0]["keep"] = id_a
+        store_path.write_text(json.dumps(edited), encoding="utf-8")
+
+        c_rep, o_rep, e_rep = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual((0, ""), (c_rep, e_rep))
+        rep_after = json.loads(o_rep)
+        self.assertEqual(1, len(rep_after[v.TIDY_MODEL_SAME_SECTION]))
+        entry = rep_after[v.TIDY_MODEL_SAME_SECTION][0]
+        self.assertEqual(id_b, entry["keep"])
+        self.assertEqual([id_a], entry["same"])
+        self.assertEqual({}, entry["blockers"])
+        self.assertNotIn("keep-not-approved", rep_after["formatted"])
+        self.assertIsNotNone(entry["command"])
+
+        merge_argv = shlex.split(entry["command"])
+        self.assertEqual("memlet", merge_argv[0])
+        c_mrg, _o_mrg, e_mrg = run_cli(merge_argv[1:])
+        self.assertEqual((0, ""), (c_mrg, e_mrg))
+
+        st_after = mdtidy.dream_tidy_status(repo)
+        self.assertEqual(1, st_after["counts"]["merged"])
+        self.assertEqual([], mt.tidy_report(repo)[v.TIDY_MODEL_SAME_SECTION])
+
+    def test_s1_wording_overlap_labelled_and_full_subset_hidden_on_read(self) -> None:
+        repo = self.make_repo("s1_repo")
+        id_a1 = self.learn_line(repo, "a1.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)[0]
+        id_a2 = self.learn_line(
+            repo,
+            "a2.log",
+            "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_A.replace("by hand", "manually"),
+        )[0]
+        id_b = self.learn_line(repo, "b.log", "2026-11-03T09:00:00Z [user] " + DIFF_WORDING_B)[0]
+
+        res = mdtidy.dream_tidy_run(
+            repo,
+            via=("claude",),
+            runner=lambda _a, _p, *, stdin_text="", **_k: json.dumps(
+                [{"same": [json.loads(ln)["id"] for ln in stdin_text.splitlines() if ln.strip()]}]
+            ),
+        )
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, len(res["addedProposals"]))
+
+        rep = mt.tidy_report(repo)
+        self.assertEqual(1, len(rep["duplicates"]))
+        self.assertEqual(1, len(rep[v.TIDY_MODEL_SAME_SECTION]))
+        entry = rep[v.TIDY_MODEL_SAME_SECTION][0]
+        self.assertEqual(sorted([id_a1, id_a2]), sorted(entry["wordingOverlap"]))
+        self.assertIn("also listed above as same or similar wording", entry["label"])
+        self.assertIn(id_a1, entry["label"])
+        self.assertIn(id_a2, entry["label"])
+        self.assertIn("also listed above as same or similar wording", rep["formatted"])
+
+        # Read-time check: if a third wording-similar lesson later puts ALL 3 lessons into one wording group,
+        # the existing stored proposal is hidden on read as `already-in-tidy` without running `dream --tidy` again!
+        # Construct two distinct lessons that later become a same-text/similar-text group on read:
+        repo2 = self.make_repo("s1_read_subset")
+        x1 = self.learn_line(repo2, "x1.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)[0]
+        x2 = self.learn_line(repo2, "x2.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)[0]
+        r_x = mdtidy.dream_tidy_run(
+            repo2,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+        )
+        self.assertEqual(1, len(r_x["addedProposals"]))
+        # Passing a wording group containing {x1, x2} at read time hides the proposal as `already-in-tidy`.
+        by_id = mdtidy.load_lessons_by_id(repo2)
+        prop_x = json.loads((repo2 / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))["proposals"][0]
+        self.assertEqual(
+            {"state": "stale", "reason": "already-in-tidy"},
+            mdtidy.proposal_state(prop_x, by_id, wording_groups=[{x1, x2}]),
+        )
+
+    def test_s2_tidy_trust_notice_help_dropped_numbering_and_dismiss_command(self) -> None:
+        repo = self.make_repo("s2_repo")
+        self.learn_line(repo, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+        self.learn_line(repo, "c.log", "2026-11-03T09:00:00Z [user] " + UNRELATED_C)
+
+        # Help text describes `--tidy` behavior for `--via`, `--verify-with`, `--max-batches`, plus `--again`.
+        c_h, o_h, _ = run_cli(["dream", "--help"])
+        self.assertEqual(0, c_h)
+        normalized_help = " ".join(o_h.split())
+        self.assertIn("Comma-separated proposer vendors (claude,codex,gemini); with --tidy, a single proposer vendor", normalized_help)
+        self.assertIn("with --tidy, asks a distinct-family model for a SAME or DIFFERENT second opinion", normalized_help)
+        self.assertIn("default: 4 for dream, 2 with --tidy", normalized_help)
+        self.assertIn("--again", normalized_help)
+
+        # Usage errors under `--tidy` use `## Dream tidy failed`, while plain `dream` keeps `## Dream failed`.
+        c_tf, o_tf, _ = run_cli(["dream", str(repo), "--tidy", "--format", "markdown"])
+        self.assertEqual(2, c_tf)
+        self.assertTrue(o_tf.startswith("## Dream tidy failed"))
+        c_df, o_df, _ = run_cli(["dream", str(repo), "--format", "markdown"])
+        self.assertEqual(2, c_df)
+        self.assertTrue(o_df.startswith("## Dream failed"))
+
+        # Preview, run and status all end with DREAM_TIDY_TRUST_NOTICE (not dc.TRUST_BOUNDARY),
+        # preview omits `Proposals: 0 (new: 0)`, and dropped groups are 1-based (`group #1`, `group #2`).
+        preview = mdtidy.dream_tidy_run(repo, via=("claude",), dry_run=True)
+        preview_md = cli_dream._markdown(preview)
+        self.assertNotIn("Proposals: 0", preview_md)
+        self.assertTrue(preview_md.rstrip().endswith(v.DREAM_TIDY_TRUST_NOTICE))
+        self.assertNotIn("vetoes the hint tier", preview_md)
+
+        run_res = mdtidy.dream_tidy_run(
+            repo,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L3"]}, {"same": ["L1", "L2"]}]),
+        )
+        self.assertTrue(run_res["ok"], run_res)
+        self.assertEqual(1, run_res["droppedGroups"][0]["index"])
+        run_md = cli_dream._markdown(run_res)
+        self.assertIn("group #1", run_md)
+        self.assertTrue(run_md.rstrip().endswith(v.DREAM_TIDY_TRUST_NOTICE))
+        self.assertNotIn("vetoes the hint tier", run_md)
+
+        c_st, o_st, _ = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "markdown"])
+        self.assertEqual(0, c_st)
+        self.assertTrue(o_st.rstrip().endswith(v.DREAM_TIDY_TRUST_NOTICE))
+        self.assertNotIn("vetoes the hint tier", o_st)
+        self.assertIn("group #1", o_st)
+
+        # Open proposal in `admin tidy` shows dismiss command (without `--repo` in cwd, and with `--repo` when passed),
+        # and running the printed dismiss command with `--repo` through the real CLI dismisses it!
+        pid = run_res["addedProposals"][0]
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(str(repo))
+            c_cwd, o_cwd, _ = run_cli(["admin", "tidy", "--format", "markdown"])
+        finally:
+            os.chdir(prev_cwd)
+        self.assertEqual(0, c_cwd)
+        self.assertIn(f"To dismiss: `memlet dream --tidy --dismiss {pid}`", o_cwd)
+
+        c_rp, o_rp, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual(0, c_rp)
+        rp_parsed = json.loads(o_rp)
+        dismiss_cmd = rp_parsed[v.TIDY_MODEL_SAME_SECTION][0]["dismissCommand"]
+        self.assertIn("--repo=", dismiss_cmd)
+        self.assertIn(f"To dismiss: `{dismiss_cmd}`", rp_parsed["formatted"])
+
+        d_argv = shlex.split(dismiss_cmd)
+        c_dis, _o_dis, e_dis = run_cli(d_argv[1:])
+        self.assertEqual((0, ""), (c_dis, e_dis))
+        self.assertEqual(1, mdtidy.dream_tidy_status(repo)["counts"]["dismissed"])
+
+    def test_s3_already_examined_skipped_until_again_and_dismiss_makes_zero_calls(self) -> None:
+        repo = self.make_repo("s3_repo")
+        self.learn_line(repo, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+        self.learn_line(repo, "c.log", "2026-11-03T09:00:00Z [user] " + UNRELATED_C)
+
+        calls: List[str] = []
+
+        def counting_runner(_a: Sequence[str], prompt: str, **_k: Any) -> str:
+            calls.append(prompt)
+            return json.dumps([{"same": ["L1", "L2"]}])
+
+        r1 = mdtidy.dream_tidy_run(repo, via=("claude",), runner=counting_runner)
+        self.assertTrue(r1["ok"], r1)
+        self.assertEqual(1, len(calls))
+        pid = r1["addedProposals"][0]
+        stored = json.loads((repo / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))
+        self.assertEqual(1, len(stored["examinedBatches"]))
+
+        # Second run without `--again` skips the examined batch (0 calls) and reports how many lessons were skipped.
+        r2 = mdtidy.dream_tidy_run(repo, via=("claude",), runner=counting_runner)
+        self.assertTrue(r2["ok"], r2)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, r2["calls"])
+        self.assertEqual(3, r2["alreadyExaminedLessons"])
+        self.assertIn(v.DREAM_TIDY_ALREADY_EXAMINED_NOTICE % 3, r2["notices"])
+
+        # Dismissing a proposal does NOT cause a model call on a subsequent run.
+        self.assertTrue(mdtidy.dream_tidy_dismiss(repo, [pid])["ok"])
+        r3 = mdtidy.dream_tidy_run(repo, via=("claude",), runner=counting_runner)
+        self.assertEqual(0, r3["calls"])
+        self.assertEqual(1, len(calls))
+
+        # `--again` (`again=True`) re-examines the batch!
+        r4 = mdtidy.dream_tidy_run(repo, via=("claude",), again=True, runner=counting_runner)
+        self.assertEqual(1, r4["calls"])
+        self.assertEqual(2, len(calls))
+        self.assertEqual(["dismissed"], [d["reason"] for d in r4["droppedGroups"]])
+
+        # CLI `--again` without `--tidy` is refused cleanly with exit 2.
+        c_ag, _o_ag, _ = run_cli(["dream", str(repo), "--again"])
+        self.assertEqual(2, c_ag)
+
+    def test_s4_duplicate_proposals_deduplicated_first_valid_wins(self) -> None:
+        repo = self.make_repo("s4_repo")
+        cfg, _ = mb._load_config(repo)
+        cfg["dream"] = {"agreement": "model", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}
+        mw.write_managed_text(repo, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        self.learn_line(repo, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+
+        r1 = mdtidy.dream_tidy_run(
+            repo,
+            via=("claude",),
+            verify_with="claude",
+            runner=lambda _a, p, **_k: json.dumps([{"same": ["L1", "L2"]}]) if p == mdtidy.PROPOSE_PROMPT else '{"verdict":"SAME"}',
+        )
+        self.assertTrue(r1["ok"], r1)
+        st_disk = json.loads((repo / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))
+        first_valid = copy.deepcopy(st_disk["proposals"][0])
+        second_valid_unverified = copy.deepcopy(first_valid)
+        second_valid_unverified["verifier"] = None
+        second_valid_unverified["verdict"] = None
+        second_valid_unverified["receipts"] = [r for r in first_valid["receipts"] if r["kind"] == "propose"]
+        invalid_same_id = {"id": first_valid["id"], "lessonIds": "bad"}
+
+        st_disk["proposals"] = [invalid_same_id, first_valid, second_valid_unverified, copy.deepcopy(first_valid)]
+        (repo / mdtidy.PROPOSALS_REL).write_text(json.dumps(st_disk), encoding="utf-8")
+
+        rep = mt.tidy_report(repo)
+        self.assertEqual(1, len(rep[v.TIDY_MODEL_SAME_SECTION]))
+        self.assertEqual("SAME", rep[v.TIDY_MODEL_SAME_SECTION][0]["verdict"])
+
+        status = mdtidy.dream_tidy_status(repo)
+        self.assertEqual(1, status["counts"]["open"])
+        self.assertEqual(1, status["counts"]["stale"])
+        self.assertEqual(2, status["duplicateProposals"])
+        self.assertEqual(2, status["reasons"]["duplicate-proposal"])
+        self.assertEqual(1, status["reasons"]["invalid-proposal"])
+
+    def test_s5_surviving_mutants_killed(self) -> None:
+        # M1: disputed-last sort even when disputed proposal's `keep` ID is alphabetically smaller than SAME's `keep`.
+        repo_m1 = self.make_repo("s5_m1")
+        cfg, _ = mb._load_config(repo_m1)
+        cfg["dream"] = {"agreement": "model", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}
+        mw.write_managed_text(repo_m1, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        pair_texts = [
+            ("2026-11-01T09:00:00Z [user] Never invoke `make release` by hand; ship via `scripts/deploy.sh` in src/deploy.py.",
+             "2026-11-01T09:01:00Z [user] Do not call `make release` during rollouts; run `scripts/deploy.sh` for src/deploy.py."),
+            ("2026-11-01T09:02:00Z [user] Never skip migration checks in src/schema.py before running smoke validation.",
+             "2026-11-01T09:03:00Z [user] Do not bypass src/schema.py migration verification ahead of smoke checks."),
+        ]
+        pair_ids: List[Tuple[str, str]] = []
+        for idx, (t1, t2) in enumerate(pair_texts):
+            i1 = self.learn_line(repo_m1, f"p{idx}_1.log", t1)[0]
+            i2 = self.learn_line(repo_m1, f"p{idx}_2.log", t2)[0]
+            pair_ids.append((i1, i2))
+        # Pick whichever pair has the smaller kept ID to receive DIFFERENT so ID order alone would put disputed FIRST!
+        lessons_loaded = mdtidy._load_repository_lessons(repo_m1)["lessons"]
+        keeps = [mt.kept_lesson_order(lessons_loaded, list(p))[0] for p in pair_ids]
+        smaller_idx = 0 if keeps[0] < keeps[1] else 1
+        disputed_marker = "make release" if smaller_idx == 0 else "migration"
+
+        def m1_runner(_a: Sequence[str], prompt: str, *, stdin_text: str = "", **_k: Any) -> str:
+            if prompt == mdtidy.PROPOSE_PROMPT:
+                rows = {json.loads(ln)["id"]: json.loads(ln)["text"] for ln in stdin_text.splitlines() if ln.strip()}
+                g_rel = [k for k, t in rows.items() if "make release" in t]
+                g_mig = [k for k, t in rows.items() if "migration" in t]
+                return json.dumps([{"same": g_rel}, {"same": g_mig}])
+            return '{"verdict":"DIFFERENT"}' if disputed_marker in stdin_text else '{"verdict":"SAME"}'
+
+        self.assertTrue(mdtidy.dream_tidy_run(repo_m1, via=("claude",), verify_with="claude", runner=m1_runner)["ok"])
+        entries_m1 = mt.tidy_report(repo_m1)[v.TIDY_MODEL_SAME_SECTION]
+        self.assertEqual([False, True], [e["disputed"] for e in entries_m1])
+        self.assertGreater(entries_m1[0]["keep"], entries_m1[1]["keep"])
+
+        # M4: subset check (`<=` vs `==`) when model proposes 2 lessons from a 3-lesson wording duplicate group.
+        repo_m4 = self.make_repo("s5_m4")
+        self.learn_line(repo_m4, "w1.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo_m4, "w2.log", "2026-11-01T09:01:00Z [user] " + DIFF_WORDING_A.replace("by hand", "manually"))
+        self.learn_line(repo_m4, "w3.log", "2026-11-01T09:02:00Z [user] " + DIFF_WORDING_A.replace("by hand", "directly"))
+        r_m4 = mdtidy.dream_tidy_run(
+            repo_m4,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+        )
+        self.assertEqual([], r_m4["addedProposals"])
+        self.assertEqual(["already-in-tidy"], [d["reason"] for d in r_m4["droppedGroups"]])
+
+        # M5: live row filter drops a group when a lesson changes/gets rejected during the model call.
+        repo_m5 = self.make_repo("s5_m5")
+        _m5_a = self.learn_line(repo_m5, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)[0]
+        m5_b = self.learn_line(repo_m5, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)[0]
+
+        def mutating_runner(*_a: Any, **_k: Any) -> str:
+            self.assertTrue(mb.learn_reject(repo_m5, [m5_b], approver="Robin", reason="concurrently retired")["ok"])
+            return json.dumps([{"same": ["L1", "L2"]}])
+
+        r_m5 = mdtidy.dream_tidy_run(repo_m5, via=("claude",), runner=mutating_runner)
+        self.assertEqual([], r_m5["addedProposals"])
+        self.assertEqual(["unknown-row-id"], [d["reason"] for d in r_m5["droppedGroups"]])
+
+        # M6: verdict object with extra keys (`{"verdict": "SAME", "why": "extra"}`) is rejected even with valid verdict value!
+        repo_m6 = self.make_repo("s5_m6")
+        mw.write_managed_text(repo_m6, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        self.learn_line(repo_m6, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo_m6, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+        r_m6 = mdtidy.dream_tidy_run(
+            repo_m6,
+            via=("claude",),
+            verify_with="claude",
+            runner=lambda _a, p, **_k: json.dumps([{"same": ["L1", "L2"]}])
+            if p == mdtidy.PROPOSE_PROMPT
+            else '{"verdict":"SAME","why":"extra"}',
+        )
+        self.assertEqual(0, r_m6["verifiedProposals"])
+        self.assertEqual(1, r_m6["droppedOutput"])
+        self.assertIsNone(json.loads((repo_m6 / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))["proposals"][0]["verdict"])
+
+        # M7: failed batches retried BEFORE earlier non-failed batches when multiple pending batches exist.
+        repo_m7 = self.make_repo("s5_m7")
+        self.learn_many(
+            repo_m7,
+            "m7.log",
+            [f"2026-11-01T10:{i // 60:02d}:{i % 60:02d}Z [user] Never bypass check #{i} in src/deploy.py." for i in range(130)],
+        )
+        m7_n = {"n": 0}
+
+        def m7_run1(*_a: Any, **_k: Any) -> str:
+            m7_n["n"] += 1
+            return "not json" if m7_n["n"] == 2 else "[]"
+
+        r_m7_1 = mdtidy.dream_tidy_run(repo_m7, via=("claude",), max_batches=3, runner=m7_run1)
+        self.assertEqual(1, r_m7_1["failedBatches"])
+        failed_bid = next(iter(json.loads((repo_m7 / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))["failedBatches"]))
+        r_m7_2 = mdtidy.dream_tidy_run(repo_m7, via=("claude",), max_batches=1, again=True, runner=lambda *a, **k: "[]")
+        self.assertEqual(failed_bid, r_m7_2["callLog"][0]["batchId"])
+
+        # M8: 32-call cap stops a run with >31 verifiable proposals at exactly 32 calls.
+        repo_m8 = self.make_repo("s5_m8")
+        mw.write_managed_text(repo_m8, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        m8_lines = []
+        for idx in range(35):
+            m8_lines.append(f"2026-11-01T10:{idx:02d}:00Z [user] Never edit cfg_{idx:02d}.yaml in src/deploy.py by hand.")
+            m8_lines.append(f"2026-11-01T10:{idx:02d}:01Z [user] Do not modify cfg_{idx:02d}.yaml from src/deploy.py manually.")
+        self.learn_many(repo_m8, "m8.log", m8_lines)
+
+        def m8_runner(_a: Sequence[str], prompt: str, *, stdin_text: str = "", **_k: Any) -> str:
+            if prompt == mdtidy.VERIFY_PROMPT:
+                return '{"verdict":"SAME"}'
+            by_cfg: Dict[str, List[str]] = {}
+            for ln in stdin_text.splitlines():
+                if ln.strip():
+                    row = json.loads(ln)
+                    tok = next(w for w in row["text"].split() if w.startswith("cfg_"))
+                    by_cfg.setdefault(tok, []).append(row["id"])
+            return json.dumps([{"same": g} for g in by_cfg.values() if len(g) == 2][:30])
+
+        r_m8 = mdtidy.dream_tidy_run(repo_m8, via=("claude",), verify_with="claude", max_batches=10, runner=m8_runner)
+        self.assertEqual(32, r_m8["calls"])
+        self.assertTrue(r_m8.get("budgetStopped"))
+
+        # M12: per-proposal same-family verifier skip when an existing proposal was proposed by `claude/sonnet`
+        # and a subsequent run configures proposer `haiku` + verifier `sonnet`.
+        repo_m12 = self.make_repo("s5_m12")
+        cfg_sonnet = {"dream": {"agreement": "model", "models": {"claude": "sonnet", "verifier": {"claude": "haiku"}}}}
+        mw.write_managed_text(repo_m12, mw.CONFIG_PATH, json.dumps(cfg_sonnet, indent=2) + "\n")
+        self.learn_line(repo_m12, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo_m12, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+        r_m12_1 = mdtidy.dream_tidy_run(
+            repo_m12,
+            via=("claude",),
+            runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+        )
+        self.assertEqual(1, len(r_m12_1["addedProposals"]))
+        mw.write_managed_text(repo_m12, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        r_m12_2 = mdtidy.dream_tidy_run(
+            repo_m12,
+            via=("claude",),
+            verify_with="claude",
+            runner=lambda *a, **k: '{"verdict":"SAME"}',
+        )
+        self.assertEqual(0, r_m12_2["calls"])
+        self.assertTrue(any("same model family as proposer" in n for n in r_m12_2["notices"]))
+        self.assertEqual(1, mdtidy.dream_tidy_status(repo_m12)["counts"]["open"])
+
+        # M13: oversized lesson (> 24,000 chars) skipped with oversized notice and never sent in stdin.
+        repo_m13 = self.make_repo("s5_m13")
+        # Build a multi-line lesson (2 lines of 13,000 chars -> 26,000 chars > 24,000 batch bound, within 16,384 line cap).
+        big_src = self.base / "oversized_m13.log"
+        big_src.write_text(
+            "2026-11-01T09:00:00Z [user] Never bypass oversized guard in src/deploy.py " + ("a" * 13000) + "\n"
+            "2026-11-01T09:00:01Z [user] " + ("b" * 13000) + "\n",
+            encoding="utf-8",
+        )
+        # Directly test `_build_batches` + `dream_tidy_run` with a >24,000-char readerText lesson.
+        self.learn_line(repo_m13, "s1.log", "2026-11-01T09:01:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo_m13, "s2.log", "2026-11-01T09:02:00Z [user] " + DIFF_WORDING_B)
+        orig_load = mdtidy._load_repository_lessons
+
+        def load_with_oversized(root_p: Path) -> Dict[str, Any]:
+            data = orig_load(root_p)
+            first_lid = sorted(data["lessonsById"])[0]
+            data["lessonsById"][first_lid]["readerText"] = "x" * 25000
+            return data
+
+        with mock.patch.object(mdtidy, "_load_repository_lessons", side_effect=load_with_oversized):
+            r_m13 = mdtidy.dream_tidy_run(repo_m13, via=("claude",), runner=lambda *a, **k: "[]")
+        self.assertEqual(1, r_m13["unexaminedLessons"])
+        self.assertIn(v.DREAM_TIDY_OVERSIZED_NOTICE % 1, r_m13["notices"])
+
+        # M14: already-verified proposals are NOT verified again on a subsequent `--verify-with` run.
+        repo_m14 = self.make_repo("s5_m14")
+        mw.write_managed_text(repo_m14, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        self.learn_line(repo_m14, "a.log", "2026-11-01T09:00:00Z [user] " + DIFF_WORDING_A)
+        self.learn_line(repo_m14, "b.log", "2026-11-02T09:00:00Z [user] " + DIFF_WORDING_B)
+        r_m14_1 = mdtidy.dream_tidy_run(
+            repo_m14,
+            via=("claude",),
+            verify_with="claude",
+            runner=lambda _a, p, **_k: json.dumps([{"same": ["L1", "L2"]}]) if p == mdtidy.PROPOSE_PROMPT else '{"verdict":"SAME"}',
+        )
+        self.assertEqual(2, r_m14_1["calls"])
+        r_m14_2 = mdtidy.dream_tidy_run(
+            repo_m14,
+            via=("claude",),
+            verify_with="claude",
+            runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-verify or re-propose")),
+        )
+        self.assertEqual(0, r_m14_2["calls"])
+
+    def test_recorded_fixtures_replay_through_real_parser(self) -> None:
+        recorded = [
+            fp
+            for fp in sorted(TIDY_FIXTURE_DIR.glob("*.json"))
+            if json.loads(fp.read_text(encoding="utf-8")).get("provenance") == "recorded"
+        ]
+        self.assertEqual(3, len(recorded))
+        for idx, fx_path in enumerate(recorded):
+            with self.subTest(fixture=fx_path.name):
+                fx = json.loads(fx_path.read_text(encoding="utf-8"))
+                self.assertEqual("memlet.dream_fixture.v1", fx["schema"])
+                self.assertEqual("recorded", fx["provenance"])
+                repo = self.make_repo(f"rec_fx_{idx}")
+                (repo / "billing.py").write_text("def refund():\n    return True\n", encoding="utf-8")
+                cfg, _ = mb._load_config(repo)
+                cfg["dream"] = {"agreement": "model", "models": {"claude": "haiku", "verifier": {"claude": "sonnet"}}}
+                mw.write_managed_text(repo, mw.CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+                rows = [json.loads(line) for line in fx["input"].splitlines() if line.strip()]
+                for r_i, row in enumerate(rows):
+                    line_text = row["text"]
+                    if "[user]" not in line_text:
+                        line_text = f"2026-11-01T09:00:{r_i:02d}Z [user] " + line_text
+                    self.learn_line(repo, f"rec_{idx}_{r_i}.log", line_text)
+
+                seen_stdin: List[str] = []
+                if fx["kind"] == "tidy-propose":
+                    def rec_propose_runner(_a: Sequence[str], _p: str, *, stdin_text: str = "", ans: str = fx["answer"], **_k: Any) -> str:
+                        seen_stdin.append(stdin_text)
+                        return ans
+
+                    rep = mdtidy.dream_tidy_run(repo, via=(fx["vendor"],), runner=rec_propose_runner)
+                    self.assertEqual([fx["input"]], seen_stdin)
+                    actual = {
+                        "failed": not rep["ok"],
+                        "proposalCount": len(rep["proposals"]),
+                        "droppedReasons": [r["reason"] for r in rep["droppedGroups"]],
+                    }
+                    self.assertEqual(fx["expected"], actual)
+                else:
+                    seed = mdtidy.dream_tidy_run(
+                        repo,
+                        via=("claude",),
+                        runner=lambda *a, **k: json.dumps([{"same": ["L1", "L2"]}]),
+                    )
+                    self.assertTrue(seed["ok"], seed)
+
+                    def rec_verify_runner(_a: Sequence[str], prompt: str, *, stdin_text: str = "", ans: str = fx["answer"], **_k: Any) -> str:
+                        if prompt == mdtidy.VERIFY_PROMPT:
+                            seen_stdin.append(stdin_text)
+                            return ans
+                        return "[]"
+
+                    rep = mdtidy.dream_tidy_run(repo, via=("claude",), verify_with=fx["vendor"], runner=rec_verify_runner)
+                    self.assertTrue(rep["ok"], rep)
+                    self.assertEqual([fx["input"]], seen_stdin)
+                    stored = json.loads((repo / mdtidy.PROPOSALS_REL).read_text(encoding="utf-8"))
+                    self.assertEqual(fx["expected"]["verdict"], stored["proposals"][0]["verdict"])
 
 
 if __name__ == "__main__":

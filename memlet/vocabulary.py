@@ -411,15 +411,30 @@ SKILL_OMITTED_REASONS = "Lesson(s) left out: %s. Read them with `memlet recall`.
 DREAM_TIDY_SCHEMA = "memlet.dream_tidy.v1"
 DREAM_TIDY_HELP = "Point out lessons that may say the same thing in different words; proposes only"
 DREAM_TIDY_DISMISS_HELP = "Dismiss one or more dream --tidy proposals while their lessons stay unchanged"
+DREAM_TIDY_AGAIN_HELP = "Re-examine batches that were already looked at (with --tidy)"
+DREAM_REPO_HELP = "Repository path (default: current directory)"
+DREAM_VIA_HELP = (
+    "Comma-separated proposer vendors (claude,codex,gemini); "
+    "with --tidy, a single proposer vendor"
+)
+DREAM_VERIFY_WITH_HELP = (
+    "Verifier model: dream.models.verifier.<vendor>; distinct families can check within one vendor; "
+    "dream.agreement=model is needed only for same-vendor hints; "
+    "with --tidy, asks a distinct-family model for a SAME or DIFFERENT second opinion per proposal"
+)
+DREAM_MAX_BATCHES_HELP = "Maximum batches per run (1..10; default: 4 for dream, 2 with --tidy)"
 DREAM_TIDY_CONFLICT_ERROR = "--tidy cannot be combined with --transcript or --skip-failed"
 DREAM_TIDY_MODE_ERROR = "Choose --via VENDOR, --dismiss PROPOSAL_ID, or --status with --tidy"
-DREAM_TIDY_DISMISS_CONFLICT = "--dismiss cannot be combined with proposal, dry-run or status options"
-DREAM_TIDY_STATUS_CONFLICT = "--status cannot be combined with proposal, dry-run or dismiss options"
+DREAM_TIDY_DISMISS_CONFLICT = "--dismiss cannot be combined with proposal, dry-run, --again or status options"
+DREAM_TIDY_STATUS_CONFLICT = "--status cannot be combined with proposal, dry-run, --again or dismiss options"
 DREAM_DISMISS_REQUIRES_TIDY = "--dismiss requires --tidy"
+DREAM_AGAIN_REQUIRES_TIDY = "--again requires --tidy"
+DREAM_REPO_CONFLICT = "Positional repository conflicts with --repo"
 DREAM_TIDY_SINGLE_VENDOR = "dream --tidy accepts a single --via vendor"
 DREAM_TIDY_UNKNOWN_PROPOSAL = "unknown proposal id: %s"
 DREAM_TIDY_INVALID_PROPOSAL_ID = "invalid proposal id: %s"
 DREAM_TIDY_UNEXAMINED_NOTICE = "%d lesson(s) were not looked at in this run (batch or call bound reached)."
+DREAM_TIDY_ALREADY_EXAMINED_NOTICE = "%d lesson(s) were skipped as already examined; pass --again to re-examine them."
 DREAM_TIDY_OVERSIZED_NOTICE = "%d lesson(s) exceeded the 24,000-character batch bound and were not looked at."
 DREAM_TIDY_ALL_DROPPED_ERROR = (
     "Every proposed group in this batch failed validation as malformed output; "
@@ -428,6 +443,12 @@ DREAM_TIDY_ALL_DROPPED_ERROR = (
 DREAM_TIDY_VERIFIER_DROPPED = "%s: dropped verifier verdict from %s/%s: invalid or failed output"
 DREAM_TIDY_VERIFIER_SKIPPED_FAMILY = "%s: skipped verifier %s/%s: same model family as proposer"
 DREAM_TIDY_VERIFICATION_SUMMARY = "Second-model checks: %d proposal(s) checked; %d SAME; %d DIFFERENT (disputed)."
+DREAM_TIDY_TRUST_NOTICE = (
+    "A model's grouping and SAME or DIFFERENT verdict are opinions, not decisions; "
+    "nothing was merged or changed, and only `memlet learn --merge ... --by NAME` merges. "
+    "Vendor receipts are local digest integrity records, not signatures: anyone who can write "
+    ".memlet can forge them."
+)
 DREAM_TIDY_VERDICTS = ("SAME", "DIFFERENT")
 DREAM_TIDY_DROP_REASONS = {
     "invalid-group": "the group is not an object with a bounded string-array `same` field",
@@ -441,10 +462,18 @@ DREAM_TIDY_DROP_REASONS = {
 DREAM_TIDY_STATE_REASONS = {
     "dismissed": "the proposal was dismissed by a person",
     "already-merged": "the lessons in the proposal are already merged together",
+    "already-in-tidy": "the lessons are already a same-text or similar-text group of the tidy report",
     "lesson-missing": "a lesson in the proposal no longer exists in the queue",
     "lesson-changed": "a lesson in the proposal changed its merge digest",
     "lesson-not-shown": "a lesson in the proposal is no longer shown by the shared reader",
     "invalid-proposal": "the proposal record or vendor receipt is incomplete or invalid",
+    "duplicate-proposal": "duplicate proposal record with an id already seen",
+}
+DREAM_TIDY_INVALID_RECORD_REASONS = {
+    "invalid-dismissed": "a dismissed entry is not a valid proposal id",
+    "invalid-dropped-group": "a dropped-group record has an invalid field or type",
+    "invalid-failed-batch": "a failed-batch record has an invalid field or type",
+    "invalid-store-field": "an optional store metadata field has an invalid type or value",
 }
 DREAM_TIDY_BATCH_FAILURE_REASONS = {
     "vendor-error": "the vendor CLI call failed or timed out",
@@ -461,10 +490,14 @@ TIDY_MODEL_SAME_VERDICT_LABEL = "second model %s/%s: SAME"
 TIDY_MODEL_DISPUTED_VERDICT_LABEL = "second model %s/%s: DIFFERENT"
 TIDY_MODEL_DISPUTED_PREFIX = "disputed — "
 TIDY_MODEL_DISPUTED_GROUP = "Disputed (a second model answered DIFFERENT):"
+TIDY_MODEL_WORDING_OVERLAP_LABEL = "also listed above as same or similar wording: %s"
 TIDY_MODEL_PROPOSAL_ID_NOTE = "proposal %s"
 TIDY_MODEL_DISMISS_LABEL = "To dismiss: "
 TIDY_MODEL_PROPOSALS_UNREADABLE = (
     "dream --tidy proposals file could not be read or validated; model proposals were skipped"
+)
+TIDY_MODEL_PROPOSALS_TOO_LARGE = (
+    "dream --tidy proposals file exceeds the 4 MiB read bound and was not read; model proposals were skipped"
 )
 DREAM_TIDY_PROPOSE_SCHEMA_ITEM = (
     '{"additionalProperties": false, "properties": {"same": {"items": {"maxLength": 8, "type": "string"}, '

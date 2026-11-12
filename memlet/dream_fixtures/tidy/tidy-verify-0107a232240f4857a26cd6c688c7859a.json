@@ -1,0 +1,15 @@
+{
+  "schema": "memlet.dream_fixture.v1",
+  "provenance": "recorded",
+  "vendor": "claude",
+  "model": "sonnet",
+  "memletVersion": "9.3.0",
+  "date": "2026-11-12T14:19:58Z",
+  "note": "Explicit capture; model answer and input masked before writing.",
+  "kind": "tidy-verify",
+  "input": "{\"id\": \"L1\", \"text\": \"Never export customer emails without masking them first.\"}\n{\"id\": \"L2\", \"text\": \"Never send out customer email addresses unmasked in any export.\"}",
+  "answer": "{\"verdict\":\"SAME\"}\n",
+  "expected": {
+    "verdict": "SAME"
+  }
+}
