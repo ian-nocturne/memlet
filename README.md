@@ -113,7 +113,7 @@ $ memlet learn --pending
   tier=hint; two models of the same vendor agreed; proposers=claude/tool-free; verification=claude:SUPPORTED
 ```
 
-After `memlet learn --approve DRM-57dcb2bf896f99ee DRM-cf04d035ece3c7b4 --by "ray"`, the two approved lessons and the remaining hint come back in separate groups, and the replaced instruction is quarantined next to the current one:
+After `memlet learn --approve DRM-57dcb2bf896f99ee DRM-cf04d035ece3c7b4 --by "robin"`, the two approved lessons and the remaining hint come back in separate groups, and the replaced instruction is quarantined next to the current one:
 
 ```console
 $ memlet recall "deploy release"
@@ -210,8 +210,8 @@ Nothing was changed. Every line below is a proposal: Memlet merges, retires and 
 The person ran that command with their name, then approved the kept lesson and the two others:
 
 ```console
-$ memlet learn --merge=DRM-75f799a0db0d --same DRM-bcb5889e3869 DRM-3c3aa9d5909b --by=ray
-## Memlet learn — merged by ray
+$ memlet learn --merge=DRM-75f799a0db0d --same DRM-bcb5889e3869 DRM-3c3aa9d5909b --by=robin
+## Memlet learn — merged by robin
 
 - merged: `DRM-bcb5889e3869` → `DRM-75f799a0db0d`
 - merged: `DRM-3c3aa9d5909b` → `DRM-75f799a0db0d`
@@ -264,7 +264,7 @@ A real headless Claude Code session (haiku) in that repository, with no Memlet h
 
 What this is: a report of what a person might want to tidy, a working command where there is something to run, and a file other agents can load. What it is not: Memlet does not decide that two lessons mean the same thing. It compares wording, so "use the retry wrapper for refunds" and the sentence above are two lessons until a person merges them.
 
-(Output shortened where marked with `...`. `<billing file>`, `<report file>`, `<snapshot>` and `<repository>` stand for real paths, for the same reason as in the examples above.)
+(Output shortened where marked with `...`. `<billing file>`, `<report file>`, `<snapshot>` and `<repository>` stand for real paths, for the same reason as in the examples above; `robin` stands for the name of the person who ran the commands.)
 
 ---
 
@@ -395,13 +395,13 @@ memlet dream --status
 
 # Review and decide; a name is required
 memlet learn --pending
-memlet learn --approve DRM-7306e549ab93 --by "ray"
-memlet learn --reject  DRM-bfd29ed9b65e --by "ray" --reason "one-off workaround"
-memlet learn --approve DRM-7306e549ab93 --by "ray" --reconsider   # change your mind later
+memlet learn --approve DRM-7306e549ab93 --by "robin"
+memlet learn --reject  DRM-bfd29ed9b65e --by "robin" --reason "one-off workaround"
+memlet learn --approve DRM-7306e549ab93 --by "robin" --reconsider   # change your mind later
 
 # Attach an approved lesson to files (up to 8); a new approval, recorded like any other
-memlet learn --approve DRM-7306e549ab93 --by "ray" --path <file> --path <other file>
-memlet learn --paths   DRM-7306e549ab93 --by "ray" --path <file>   # change the files later
+memlet learn --approve DRM-7306e549ab93 --by "robin" --path <file> --path <other file>
+memlet learn --paths   DRM-7306e549ab93 --by "robin" --path <file>   # change the files later
 ```
 
 **How a lesson reaches a file.** Hooks, `admin graph` and the Routlet files use one rule. A lesson is attached to a file only if (a) a person attached it with `--path`, or (b) one of its current cited lines names the file as a whole path token, spelled exactly, and the file exists and is tracked by git. The token must start the line or follow whitespace or an opening quote, backtick or bracket: `src\deploy.py` and `pkg:deploy.py` do not name `deploy.py`. The scope tag never attaches a lesson, and neither do replaced lines or pending relations. Attached paths are part of the approval digest: edit them by hand and the lesson goes back to pending. Approving a lesson again (`--reconsider`) or changing its paths re-seals only the relations that are already approved; pending and rejected relations keep their decisions, and the result lists both. If an attached file is deleted or renamed, the attachment goes inactive and the approval stays; recreate the file and it comes back. Hints use the same literal rule, for display only. In reader JSON a lesson carries `paths` only when a person attached them or the read was filtered by file. `check --changed` and the PostToolUse hook still match lessons by scope as in 9.1.1, for information, and now say which rule matched (`via: "scope"` or `via: "path"`).
@@ -508,8 +508,8 @@ Arms: `none` (no memory), `handover` (a capsule built from the approved lessons)
 
 ```bash
 memlet admin tidy                                              # read-only report; every line is a proposal
-memlet learn --merge DRM-75f799a0db0d --same DRM-bcb5889e3869 --by "ray"
-memlet learn --unmerge DRM-bcb5889e3869 --by "ray"             # show the member separately again
+memlet learn --merge DRM-75f799a0db0d --same DRM-bcb5889e3869 --by "robin"
+memlet learn --unmerge DRM-bcb5889e3869 --by "robin"             # show the member separately again
 memlet admin skillbook                                         # print the skill file that would be written
 memlet admin skillbook --write --out .claude/skills            # write <out>/memlet-lessons/SKILL.md
 memlet admin skillbook --check .claude/skills/memlet-lessons/SKILL.md   # still what Memlet would write?

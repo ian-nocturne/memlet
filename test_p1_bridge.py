@@ -128,7 +128,7 @@ class LearnTests(_RepoCase):
         self.assertEqual(before, (self.repo / mb.QUEUE_REL).read_bytes())
         ids = self.ids_by_title()
         main_id = self.pick(ids, "main()")
-        self.assertTrue(mb.learn_approve(self.repo, [main_id], approver="ray")["ok"])
+        self.assertTrue(mb.learn_approve(self.repo, [main_id], approver="robin")["ok"])
         # an appended transcript adds only the new lesson; the approval and the old pins are untouched
         _write_jsonl(self.transcript, _records([
             {"type": "user", "timestamp": "2026-11-09T10:00:00Z",
@@ -173,7 +173,7 @@ class PromoteTests(_RepoCase):
         self.learn()
         ids = self.ids_by_title()
         main_id, rel_id = self.pick(ids, "main()"), self.pick(ids, "release branch")
-        res = mb.learn_approve(self.repo, [main_id, rel_id], approver="ray")
+        res = mb.learn_approve(self.repo, [main_id, rel_id], approver="robin")
         self.assertTrue(res["ok"], res)
         self.assertEqual(sorted([main_id, rel_id]), sorted(res["promotion"]["promoted"]))
         return ids, main_id, rel_id
@@ -232,17 +232,17 @@ class PromoteTests(_RepoCase):
         self.learn()
         ids = self.ids_by_title()
         wk_id = self.pick(ids, "Workaround")
-        res = mb.learn_reject(self.repo, [wk_id], approver="ray", reason="not a lesson")
+        res = mb.learn_reject(self.repo, [wk_id], approver="robin", reason="not a lesson")
         self.assertTrue(res["ok"], res)
         self.assertNotIn(wk_id, [n["id"] for n in mb.learn_pending(self.repo)["pendingNodes"]])
         self.assertFalse((self.repo / mb.PROMOTED_PAGE).exists())  # nothing approved yet: no page created
-        mb.learn_approve(self.repo, [self.pick(ids, "main()")], approver="ray")
+        mb.learn_approve(self.repo, [self.pick(ids, "main()")], approver="robin")
         self.assertNotIn(wk_id, (self.repo / mb.PROMOTED_PAGE).read_text())
         u = mb.unified_recall(self.repo, "migration dry run workaround", budget=800)
         self.assertNotIn(wk_id, u["formatted"])
         self.assertNotIn(wk_id, json.dumps(u["sections"]))
         # a rejected item cannot be approved afterwards
-        again = mb.learn_approve(self.repo, [wk_id], approver="ray")
+        again = mb.learn_approve(self.repo, [wk_id], approver="robin")
         self.assertFalse(again["ok"])
         self.assertIn("already_rejected", again["error"])
 
@@ -275,13 +275,13 @@ class PromoteTests(_RepoCase):
 
     def test_unknown_and_unverifiable_approvals_are_refused(self):
         self.learn()
-        res = mb.learn_approve(self.repo, ["DRM-doesnotexist"], approver="ray")
+        res = mb.learn_approve(self.repo, ["DRM-doesnotexist"], approver="robin")
         self.assertFalse(res["ok"])
         self.assertIn("unknown_id", res["error"])
         main_id = self.pick(self.ids_by_title(), "main()")
         snap = self.snapshot_file()
         snap.write_text(snap.read_text().replace("Never call main()", "Please call main()"))
-        res = mb.learn_approve(self.repo, [main_id], approver="ray")
+        res = mb.learn_approve(self.repo, [main_id], approver="robin")
         self.assertFalse(res["ok"])
         self.assertIn("pin_does_not_verify", res["error"])
         self.assertEqual("pending", md.approval_state(next(n for n in self.queue()["nodes"] if n["id"] == main_id), "node"))
@@ -310,8 +310,8 @@ class UnifiedRecallTests(_RepoCase):
         self.learn()
         ids = self.ids_by_title()
         main_id, rel_id, wk_id = self.pick(ids, "main()"), self.pick(ids, "release"), self.pick(ids, "Workaround")
-        mb.learn_approve(self.repo, [main_id], approver="ray")
-        mb.learn_reject(self.repo, [rel_id], approver="ray")
+        mb.learn_approve(self.repo, [main_id], approver="robin")
+        mb.learn_reject(self.repo, [rel_id], approver="robin")
         root, _store = self._store()
         u = mb.unified_recall(self.repo, "main tests release deploy staging", budget=1200, store=str(root),
                               task="t/one")
@@ -352,7 +352,7 @@ class UnifiedRecallTests(_RepoCase):
         self._index()
         self.learn()
         ids = self.ids_by_title()
-        mb.learn_approve(self.repo, [self.pick(ids, "main()"), self.pick(ids, "release")], approver="ray")
+        mb.learn_approve(self.repo, [self.pick(ids, "main()"), self.pick(ids, "release")], approver="robin")
         _root, store = self._store()
         seen_items = set()
         for budget in list(range(0, 160, 7)) + [200, 300, 500]:
@@ -636,7 +636,7 @@ class PrivateKeyFixTests(_RepoCase):
              "Never expose credentials -----BEGIN PRIVATE KEY-----\n" + PEM_B64 + "\n-----END PRIVATE KEY-----"}}]))
         self.learn()
         nid = self.pick(self.ids_by_title(), "Never expose credentials")
-        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="ray")["ok"])
+        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="robin")["ok"])
         self.assertIn("Never expose credentials [REDACTED_SECRET_BLOCK]", self.snapshot_file().read_text())
         self._assert_clean()
 
@@ -656,7 +656,7 @@ class PrivateKeyFixTests(_RepoCase):
         nid = self.pick(self.ids_by_title(), "migration twice")
         span = next(n for n in self.queue()["nodes"] if n["id"] == nid)["primaryPin"]["span"]
         self.assertTrue(span.endswith(f":{len(stored)}"), span)  # pins still address the original line
-        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="ray")["ok"])
+        self.assertTrue(mb.learn_approve(self.repo, [nid], approver="robin")["ok"])
         self._assert_clean()
 
 

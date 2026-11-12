@@ -65,7 +65,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         argv = shlex.split(group['command'])
         self.assertEqual('memlet', argv[0])
         self.assertIn('NAME', group['command'])  # the person's name is theirs to fill in
-        argv = [a.replace('NAME', 'Ray') for a in argv[1:]]
+        argv = [a.replace('NAME', 'Robin') for a in argv[1:]]
         before = self.shown(repo)
         code, out, err = run_cli(argv)
         self.assertEqual((0, ''), (code, err), out)
@@ -89,22 +89,22 @@ class TidyAndMergeTogether(tidy_tests.Base):
 
     def test_a_refused_merge_is_shown_as_blocked_and_the_command_refuses(self):
         repo, first, second, third = self.fixture()
-        self.assertTrue(mb.learn_reject(repo, [first], approver='Ray', reason='not a rule')['ok'])
+        self.assertTrue(mb.learn_reject(repo, [first], approver='Robin', reason='not a rule')['ok'])
         report = mt.tidy_report(repo)
         # a rejected lesson is not offered as a duplicate at all
         self.assertEqual([], [g for g in report['duplicates'] if first in [g['keep']] + list(g['same'])])
         refused = mb.merge_blockers(repo, first, [second])
         self.assertTrue(refused['ok'])  # computed; refused through blockers
         self.assertTrue(refused['blockers'][second])
-        code, out, err = run_cli(['learn', '--merge', first, '--same', second, '--by', 'Ray', '--repo', str(repo)])
+        code, out, err = run_cli(['learn', '--merge', first, '--same', second, '--by', 'Robin', '--repo', str(repo)])
         self.assertNotEqual(0, code)
         self.assertEqual('none', mb.merge_view(repo)['states'][second]['state'])
 
     def test_a_lapsed_merge_is_reported_and_the_member_is_shown_again(self):
         repo, first, second, third = self.fixture()
-        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Robin')['ok'])
         self.assertNotIn(second, self.shown(repo))
-        self.assertTrue(mb.learn_reject(repo, [first], approver='Ray', reason='changed my mind')['ok'])
+        self.assertTrue(mb.learn_reject(repo, [first], approver='Robin', reason='changed my mind')['ok'])
         self.assertIn(second, self.shown(repo))  # nothing a person did not decide stays hidden
         report = mt.tidy_report(repo)
         lapsed = {e['id']: e for e in report['lapsedMerges']}
@@ -114,26 +114,26 @@ class TidyAndMergeTogether(tidy_tests.Base):
         for command in lapsed[second].get('commands') or []:
             argv = shlex.split(command)
             self.assertEqual('memlet', argv[0])
-            memory_cli._build_parser().parse_args([a.replace('NAME', 'Ray') for a in argv[1:]])  # accepted by the real parser
+            memory_cli._build_parser().parse_args([a.replace('NAME', 'Robin') for a in argv[1:]])  # accepted by the real parser
 
     def test_the_skill_file_leaves_out_a_merged_member_and_brings_it_back_when_the_merge_lapses(self):
         repo, first, second, third = self.fixture()
-        self.assertTrue(mb.learn_approve(repo, [first, second, third], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, [first, second, third], approver='Robin')['ok'])
         both = sb.build_skill(repo)
         self.assertTrue(both['ok'], both)
         for ident in (first, second, third):
             self.assertIn('lesson %s ' % ident, both['text'])
-        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Robin')['ok'])
         merged = sb.build_skill(repo)
         self.assertIn('lesson %s ' % first, merged['text'])
         self.assertNotIn(second, merged['text'])  # not as an item, a label or a citation
         self.assertEqual(both['items'] - 1, merged['items'])
-        self.assertTrue(mb.learn_unmerge(repo, [second], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_unmerge(repo, [second], approver='Robin')['ok'])
         self.assertEqual(both['text'], sb.build_skill(repo)['text'])  # same state, same bytes
 
     def test_an_unknown_kept_lesson_is_named_once(self):
         repo, first, second, third = self.fixture()
-        code, out, err = run_cli(['learn', '--merge', 'DRM-nope', '--same', first, second, '--by', 'Ray',
+        code, out, err = run_cli(['learn', '--merge', 'DRM-nope', '--same', first, second, '--by', 'Robin',
                                   '--repo', str(repo), '--format', 'markdown'])
         self.assertEqual(2, code)
         self.assertEqual(1, (out + err).count('DRM-nope: '), out + err)
@@ -141,7 +141,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
 
     def test_tidy_stays_read_only_with_merges_present(self):
         repo, first, second, third = self.fixture()
-        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_merge(repo, first, [second], approver='Robin')['ok'])
         before = tidy_tests.tree_state(repo)
         for fmt in ('json', 'markdown'):
             code, out, err = run_cli(['admin', 'tidy', '--repo', str(repo), '--format', fmt])
@@ -150,7 +150,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
             self.assertEqual(before, tidy_tests.tree_state(repo), fmt)
 
     def printed(self, command):
-        argv = [a.replace('NAME', 'Ray').replace('--path=FILE', '--path=billing.py')
+        argv = [a.replace('NAME', 'Robin').replace('--path=FILE', '--path=billing.py')
                 for a in shlex.split(command)[1:]]
         code, out, err = run_cli(argv)
         self.assertEqual((0, ''), (code, err), out)
@@ -172,12 +172,12 @@ class TidyAndMergeTogether(tidy_tests.Base):
 
     def test_path_changes_refuse_members_and_report_kept_lost_files(self):
         repo, a, b, _ = self.fixture()
-        self.assertTrue(mb.learn_approve(repo, [a, b], approver='Ray', paths=['anchor.py'])['ok'])
-        self.assertTrue(mb.learn_merge(repo, a, [b], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, [a, b], approver='Robin', paths=['anchor.py'])['ok'])
+        self.assertTrue(mb.learn_merge(repo, a, [b], approver='Robin')['ok'])
         queue = repo / mb.QUEUE_REL
         for args in (['--paths', b], ['--approve', b]):
             before = queue.read_bytes()
-            code, out, err = run_cli(['learn', *args, '--path', 'billing.py', '--by', 'Ray', '--repo', str(repo)])
+            code, out, err = run_cli(['learn', *args, '--path', 'billing.py', '--by', 'Robin', '--repo', str(repo)])
             self.assertEqual(2, code, out)
             refused = json.loads(out)
             self.assertEqual(a, refused['keep'])
@@ -185,7 +185,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
             self.assertEqual(before, queue.read_bytes())
             repaired = self.printed(refused['pathCommands'][a])
             self.assertIn('billing.py', repaired['paths'])
-        changed = mb.learn_paths(repo, [a], approver='Ray', paths=['billing.py'])
+        changed = mb.learn_paths(repo, [a], approver='Robin', paths=['billing.py'])
         self.assertEqual({b: ['anchor.py']}, changed['lostFiles'])
         report = mt.tidy_report(repo)
         lost = report['mergedLostFiles'][0]
@@ -193,14 +193,14 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.printed(lost['command'])
         self.assertEqual([], mt.tidy_report(repo)['mergedLostFiles'])
         self.assertEqual('merged', mb.merge_view(repo)['states'][b]['state'])
-        mb.learn_approve(repo, [a], approver='Ray', reconsider=True, paths=['billing.py'])
+        mb.learn_approve(repo, [a], approver='Robin', reconsider=True, paths=['billing.py'])
         self.assertIn(b, mt.tidy_report(repo)['mergedLostFiles'][0]['lostFiles'])
 
     def test_tidy_merge_then_paths_commands_from_other_directory(self):
         import os
         repo, a, b, _ = self.fixture()
-        self.assertTrue(mb.learn_approve(repo, [a], approver='Ray', paths=['billing.py'])['ok'])
-        self.assertTrue(mb.learn_approve(repo, [b], approver='Ray', paths=['anchor.py'])['ok'])
+        self.assertTrue(mb.learn_approve(repo, [a], approver='Robin', paths=['billing.py'])['ok'])
+        self.assertTrue(mb.learn_approve(repo, [b], approver='Robin', paths=['anchor.py'])['ok'])
         renamed = self.base / "remote ' quoted"
         repo.rename(renamed)
         repo = renamed
@@ -224,14 +224,14 @@ class TidyAndMergeTogether(tidy_tests.Base):
         from memlet import vocabulary as v
         repo, a, b, c = self.fixture()
         # The earliest lesson becomes a member; the later kept lesson has a holding member.
-        self.assertTrue(mb.learn_merge(repo, b, [c], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_merge(repo, b, [c], approver='Robin')['ok'])
         report = mt.tidy_report(repo)
         group = report['duplicates'][0]
         self.assertIsNone(group['command'])
         self.assertIn('member-has-members', group['blockers'][b])
         self.assertIn(v.MERGE_REASONS['member-has-members'], group['blockerMessages'][b])
         self.assertIn(v.MERGE_REASONS['member-has-members'], report['formatted'])
-        self.assertTrue(mb.learn_reject(repo, [b], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_reject(repo, [b], approver='Robin')['ok'])
         entry = mt.tidy_report(repo)['lapsedMerges'][0]
         self.assertEqual(v.MERGE_REASONS['keep-rejected'], entry['message'])
         self.assertEqual([entry['command']], entry['commands'])
@@ -258,7 +258,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.printed(rejected['command'])
         # An approved unanchored lesson has a real paths command.
         loose = self.learn(repo, 'loose.log', '2026-11-01T00:00:00Z [user] Never skip the unique health probe.')[0]
-        mb.learn_approve(repo, [loose], approver='Ray')
+        mb.learn_approve(repo, [loose], approver='Robin')
         entry = next(e for e in mt.tidy_report(repo)['unattached'] if e['id'] == loose)
         self.printed(entry['command'])
         self.assertEqual(['billing.py'], next(i for i in mb.dream_items(repo)['items'] if i['id'] == loose)['paths'])
@@ -275,7 +275,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.printed(retire['command'])
         self.assertNotIn(a, self.shown(repo, tiers=('approved',)))
         # A changed digest with compatible relations permits the report's re-merge alternative.
-        mb.learn_merge(repo, b, [c], approver='Ray')
+        mb.learn_merge(repo, b, [c], approver='Robin')
         graph = mb._load_queue(repo)[0]
         next(n for n in graph['nodes'] if n['id'] == c)['merge']['keepDigest'] = 'old'
         self.save_graph(repo, graph)
@@ -287,7 +287,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
     def test_skill_export_never_becomes_rules_and_rejected_lesson_disappears(self):
         from memlet import memlet_graph as mg, memlet_wiki as mw, audit
         repo, a, b, c = self.fixture()
-        mb.learn_approve(repo, [a, b, c], approver='Ray')
+        mb.learn_approve(repo, [a, b, c], approver='Robin')
         def readings():
             return [run_cli(args) for args in (
                 ['recall', 'refund', '--repo', str(repo)],
@@ -308,7 +308,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.assertNotIn('.ai-memory/memlet-lessons/SKILL.md', mw.import_source_files(repo))
         for entry in mt.tidy_report(repo, min_seen=1)['promote']:
             self.assertNotIn(rel, entry['instructionFiles'])
-        mb.learn_reject(repo, [a, b], approver='Ray')
+        mb.learn_reject(repo, [a, b], approver='Robin')
         self.assertNotIn(LINE, run_cli(['recall', 'refund', '--repo', str(repo)])[1])
         skill = repo / rel
         # Ownership survives editing and old versions; an ordinary skill still supplies rules.
@@ -324,15 +324,15 @@ class TidyAndMergeTogether(tidy_tests.Base):
 
     def test_skill_writer_checker_and_caps_with_holding_merge(self):
         repo, a, b, c = self.fixture()
-        mb.learn_reject(repo, [c], approver='Ray')
+        mb.learn_reject(repo, [c], approver='Robin')
         c = self.learn(repo, 'unattached.log', '2026-11-05T00:00:00Z [user] Never publish unreviewed changes.')[0]
-        mb.learn_approve(repo, [a, b, c], approver='Ray')
-        mb.learn_paths(repo, [c], approver='Ray', paths=['anchor.py'])
+        mb.learn_approve(repo, [a, b, c], approver='Robin')
+        mb.learn_paths(repo, [c], approver='Robin', paths=['anchor.py'])
         target = self.base / 'exports'
         before = sb.write_skill(repo, out=target)
         self.assertTrue(before['ok'], before)
         self.assertTrue(sb.check_skill(before['path'], repo_path=repo)['current'])
-        mb.learn_merge(repo, a, [b], approver='Ray')
+        mb.learn_merge(repo, a, [b], approver='Robin')
         self.assertFalse(sb.check_skill(before['path'], repo_path=repo)['current'])
         after = sb.write_skill(repo, out=target)
         self.assertTrue(after['ok'], after)
@@ -351,7 +351,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         import os
         from pathlib import Path
         repo, a, b, c = self.fixture()
-        mb.learn_approve(repo, [a], approver='Ray')
+        mb.learn_approve(repo, [a], approver='Robin')
         old = os.getcwd()
         try:
             os.chdir(self.base)
@@ -382,10 +382,10 @@ class TidyAndMergeTogether(tidy_tests.Base):
 
     def test_unknown_keep_message_and_merged_per_line_citations(self):
         repo, a, b, _ = self.fixture()
-        result = mb.learn_merge(repo, 'DRM-unknown', [b], approver='Ray')
+        result = mb.learn_merge(repo, 'DRM-unknown', [b], approver='Robin')
         self.assertIn('DRM-unknown', result['error'])
         self.assertNotIn(b + ':', result['error'])
-        mb.learn_merge(repo, a, [b], approver='Ray')
+        mb.learn_merge(repo, a, [b], approver='Robin')
         pending = mb.learn_pending(repo, _record_review=False)
         group = pending['mergedLessons'][0]
         for item in [group] + group['members']:
@@ -401,7 +401,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         for start in range(0, len(lines), 22):
             ids.extend(self.learn(repo, 'many%d.log' % start, *lines[start:start+22]))
         self.assertEqual(221, len(ids))
-        self.assertTrue(mb.learn_approve(repo, ids, approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, ids, approver='Robin')['ok'])
         code, out, err = run_cli(['init', str(repo), '--hooks', '--guard'])
         self.assertEqual(0, code, out)
         def hook(session):
@@ -473,9 +473,9 @@ class TidyAndMergeTogether(tidy_tests.Base):
             text = 'Never omit unique review %d.' % i
             a = self.learn(repo, 'keep%d.log' % i, '2026-11-01T00:00:00Z [user] ' + text)[0]
             b = self.learn(repo, 'member%d.log' % i, '2026-11-02T00:00:00Z [user] ' + text)[0]
-            mb.learn_approve(repo, [a], approver='Ray', paths=['anchor.py'])
-            mb.learn_approve(repo, [b], approver='Ray', paths=['billing.py'])
-            mb.learn_merge(repo, a, [b], approver='Ray')
+            mb.learn_approve(repo, [a], approver='Robin', paths=['anchor.py'])
+            mb.learn_approve(repo, [b], approver='Robin', paths=['billing.py'])
+            mb.learn_merge(repo, a, [b], approver='Robin')
         full = mt.tidy_report(repo)
         self.assertEqual(3, len(full['mergedLostFiles']))
         with mock.patch.object(v, 'TIDY_SECTION_CAP', 2):
@@ -491,7 +491,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         import threading
         from concurrent.futures import ThreadPoolExecutor
         repo, a, b, c = self.fixture()
-        mb.learn_approve(repo, [a, b, c], approver='Ray')
+        mb.learn_approve(repo, [a, b, c], approver='Robin')
         target = self.base / 'concurrent'
         real_build, real_replace = sb.build_skill, sb.os.replace
         key = str(md.queue_lock_path(repo / mb.QUEUE_REL))
@@ -509,7 +509,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         with mock.patch.object(sb, 'build_skill', build), mock.patch.object(sb.os, 'replace', replace):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 def newer():
-                    mb.learn_merge(repo, a, [b], approver='Ray')
+                    mb.learn_merge(repo, a, [b], approver='Robin')
                     return sb.write_skill(repo, out=target)
                 older = pool.submit(sb.write_skill, repo, out=target)
                 newest = pool.submit(newer)
@@ -536,7 +536,7 @@ class TidyAndMergeTogether(tidy_tests.Base):
         self.assertTrue(result['ok'], result)
         ids = [i['id'] for i in mb.learn_pending(repo)['pendingNodes']]
         self.assertEqual(2, len(ids))
-        mb.learn_merge(repo, ids[0], [ids[1]], approver='Ray')
+        mb.learn_merge(repo, ids[0], [ids[1]], approver='Robin')
         result = mb.learn_pending(repo, _record_review=False)
         group = result['mergedLessons'][0]
         text = result['formatted'].split('## Merged lessons', 1)[1]

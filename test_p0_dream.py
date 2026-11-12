@@ -148,7 +148,7 @@ class ApprovalApiTests(_QueueFixture):
         self.assertEqual({"L-CLI-OLD", "L-CLI-NEW"}, {n["id"] for n in pend["pendingNodes"]})
         self.assertEqual(3, pend["counts"]["pendingEdges"])
 
-        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD", "L-CLI-NEW"], approver="ray")
+        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD", "L-CLI-NEW"], approver="robin")
         self.assertTrue(rec["ok"], rec)
         self.assertEqual(["L-CLI-OLD", "L-CLI-NEW"], rec["applied"])
         self.assertEqual("recorded", rec["snapshotSource"])
@@ -157,7 +157,7 @@ class ApprovalApiTests(_QueueFixture):
         graph = json.loads(out_json.read_text(encoding="utf-8"))
         for n in graph["nodes"]:
             self.assertEqual("approved", n["approval"]["decision"])
-            self.assertEqual("ray", n["approval"]["by"])
+            self.assertEqual("robin", n["approval"]["by"])
             self.assertEqual(md.node_approval_digest(n), n["approval"]["digest"])
             self.assertEqual("memlet.dream_approval.v1", n["approval"]["schema"])
             self.assertIn(n["verdict"], ("SUPPORTED", "ALREADY_SUPERSEDED"))
@@ -169,7 +169,7 @@ class ApprovalApiTests(_QueueFixture):
         with contextlib.closing(sqlite3.connect(str(out_db))) as conn:
             rows = dict(conn.execute("SELECT id, verdict FROM ontology_nodes").fetchall())
             self.assertEqual({"L-CLI-OLD": "SUPPORTED", "L-CLI-NEW": "SUPPORTED"}, rows)
-            self.assertEqual({("approved", "ray")}, set(conn.execute("SELECT decision, decided_by FROM ontology_nodes").fetchall()))
+            self.assertEqual({("approved", "robin")}, set(conn.execute("SELECT decision, decided_by FROM ontology_nodes").fetchall()))
             self.assertEqual({("VALID",)}, set(conn.execute("SELECT edge_verdict FROM ontology_edges").fetchall()))
 
         res = md.run_dream_recall(str(out_json), query_text="git-hooks pytest")
@@ -188,7 +188,7 @@ class ApprovalApiTests(_QueueFixture):
 
     def test_approval_is_idempotent(self):
         _tmp, _logs, out_json, _db, _r = self._build()
-        md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="ray")
+        md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="robin")
         before = out_json.read_bytes()
         again = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="someone-else")
         self.assertEqual([], again["applied"])
@@ -203,13 +203,13 @@ class ApprovalApiTests(_QueueFixture):
             encoding="utf-8",
         )
         before = out_json.read_bytes()
-        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="ray")
+        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="robin")
         self.assertFalse(rec["ok"])
         self.assertEqual([], rec["applied"])
         self.assertTrue(rec["refused"][0]["reason"].startswith("pin_does_not_verify:"), rec)
         self.assertEqual(before, out_json.read_bytes())
         # L-CLI-NEW's own pin (line 2) still verifies, but its SUPERSEDES edge targets line 1: refused as a whole.
-        rec_new = md.approve_queue_items(str(out_json), ["L-CLI-NEW"], approver="ray")
+        rec_new = md.approve_queue_items(str(out_json), ["L-CLI-NEW"], approver="robin")
         self.assertEqual([], rec_new["applied"])
         self.assertIn("pin_does_not_verify", rec_new["refused"][0]["reason"])
         self.assertTrue(all(n["verdict"] == "PENDING" for n in json.loads(out_json.read_text(encoding="utf-8"))["nodes"]))
@@ -217,17 +217,17 @@ class ApprovalApiTests(_QueueFixture):
     def test_approval_without_locatable_snapshot_is_refused(self):
         tmp, logs, out_json, _db, _r = self._build()
         shutil.rmtree(logs)
-        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="ray")
+        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="robin")
         self.assertFalse(rec["ok"])
         self.assertEqual("no_snapshot_to_verify_pins", rec["refused"][0]["reason"])
 
     def test_reject_is_final_and_never_recalled(self):
         _tmp, logs, out_json, _db, _r = self._build()
-        rej = md.reject_queue_items(str(out_json), ["L-CLI-NEW"], approver="ray", reason="not a real rule")
+        rej = md.reject_queue_items(str(out_json), ["L-CLI-NEW"], approver="robin", reason="not a real rule")
         self.assertEqual(["L-CLI-NEW"], rej["applied"])
-        flip = md.approve_queue_items(str(out_json), ["L-CLI-NEW"], approver="ray")
+        flip = md.approve_queue_items(str(out_json), ["L-CLI-NEW"], approver="robin")
         self.assertEqual("already_rejected", flip["refused"][0]["reason"])
-        md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="ray")
+        md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="robin")
         res = md.run_dream_recall(str(out_json), snapshot_path=str(logs), query_text="git-hooks")
         self.assertEqual(["L-CLI-OLD"], res["includedNodeIds"])
         self.assertEqual(1, res["excludedUndecidedOrRejected"]["rejectedNodes"])
@@ -235,7 +235,7 @@ class ApprovalApiTests(_QueueFixture):
 
     def test_unknown_id_and_missing_approver(self):
         _tmp, _logs, out_json, _db, _r = self._build()
-        rec = md.approve_queue_items(str(out_json), ["NOPE"], approver="ray")
+        rec = md.approve_queue_items(str(out_json), ["NOPE"], approver="robin")
         self.assertEqual("unknown_id", rec["refused"][0]["reason"])
         with self.assertRaises(ValueError):
             md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="  ")
@@ -252,7 +252,7 @@ class ApprovalApiTests(_QueueFixture):
                 conn.execute("CREATE TABLE ontology_edges (edge_id TEXT PRIMARY KEY, edge_type TEXT NOT NULL, from_id TEXT NOT NULL, "
                              "to_id TEXT NOT NULL, target_label TEXT NOT NULL, src_span TEXT NOT NULL, src_sha256 TEXT NOT NULL, "
                              "target_span TEXT, target_sha256 TEXT, vendor_origin TEXT)")
-        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="ray")
+        rec = md.approve_queue_items(str(out_json), ["L-CLI-OLD"], approver="robin")
         self.assertEqual(out_db.resolve(), Path(rec["dbPath"]).resolve())
         with contextlib.closing(sqlite3.connect(str(out_db))) as conn:
             rows = dict(conn.execute("SELECT id, decision FROM ontology_nodes").fetchall())
@@ -262,19 +262,19 @@ class ApprovalApiTests(_QueueFixture):
         _tmp, _logs, out_json, _db, _r = self._build()
         graph = json.loads(out_json.read_text(encoding="utf-8"))
         eid = graph["edges"][0]["edgeId"]
-        rec = md.approve_queue_items(str(out_json), [eid], approver="ray")
+        rec = md.approve_queue_items(str(out_json), [eid], approver="robin")
         self.assertEqual([eid], rec["applied"])
         graph = json.loads(out_json.read_text(encoding="utf-8"))
         copies = [e for e in graph["edges"] if e["edgeId"] == eid]
         copies += [e for n in graph["nodes"] for e in n["edges"] if e["edgeId"] == eid]
         self.assertEqual(2, len(copies))
-        self.assertTrue(all(e["edgeVerdict"] == "VALID" and e["approval"]["by"] == "ray" for e in copies))
+        self.assertTrue(all(e["edgeVerdict"] == "VALID" and e["approval"]["by"] == "robin" for e in copies))
 
 
 class RecallVerificationTests(_QueueFixture):
     def _approved(self):
         tmp, logs, out_json, out_db, r = self._build()
-        md.approve_queue_items(str(out_json), ["L-CLI-OLD", "L-CLI-NEW"], approver="ray")
+        md.approve_queue_items(str(out_json), ["L-CLI-OLD", "L-CLI-NEW"], approver="robin")
         return tmp, logs, out_json
 
     def test_tampered_snapshot_is_rejected_by_default_recall(self):
@@ -398,7 +398,7 @@ class NestedPathTests(unittest.TestCase):
         graph = json.loads(q.read_text(encoding="utf-8"))
         self.assertEqual("team/day1/s1.log:2", graph["nodes"][0]["primaryPin"]["span"])
         self.assertTrue(md.verify_ontology_contract(graph, snap)["ok"])
-        self.assertEqual(["L-NEST"], md.approve_queue_items(str(q), ["L-NEST"], approver="ray")["applied"])
+        self.assertEqual(["L-NEST"], md.approve_queue_items(str(q), ["L-NEST"], approver="robin")["applied"])
         self.assertEqual(["L-NEST"], md.run_dream_recall(str(q), query_text="no-verify")["includedNodeIds"])
 
     def test_unsafe_paths_still_rejected(self):

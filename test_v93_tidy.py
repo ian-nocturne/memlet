@@ -277,7 +277,7 @@ class SaidAgain(Base):
     def test_rejected_lesson_said_again_only_after_its_rejection(self):
         repo = self.make_repo()
         nid = self.learn(repo, 's1.log', '2026-05-01T10:00:00Z [user] ' + LINE)[0]
-        self.assertTrue(mb.learn_reject(repo, [nid], approver='Ray', reason='no')['ok'])
+        self.assertTrue(mb.learn_reject(repo, [nid], approver='Robin', reason='no')['ok'])
         self.set_decision_time(repo, {nid}, '2026-06-01T00:00:00Z')
         self.snapshot(repo, 'before.log-0000000005.log', '2026-05-20T10:00:00Z [user] ' + LINE)
         self.assertEqual([], self.report(repo)['saidAgain'])
@@ -307,7 +307,7 @@ class Supersession(Base):
                                 'title': 'new rule', 'src_spans': [f + ':2'],
                                 'edges': [{'edge_type': 'SUPERSEDES', 'to_id': 'OLD', 'src_span': f + ':2',
                                            'target_span': f + ':1'}]}])
-        self.assertTrue(mb.learn_approve(repo, ['OLD', 'NEW'], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, ['OLD', 'NEW'], approver='Robin')['ok'])
         for i in range(2):
             self.snapshot(repo, 'oldrepeat%d-0123456789.log' % i, '2026-03-01T00:00:00Z [user] ' + self.OLD)
         return repo
@@ -347,7 +347,7 @@ class Supersession(Base):
                           'scope_tag': 'billing.py', 'src_spans': [a, b], 'superseded_by_src': b,
                           'edges': [{'edge_type': 'SUPERSEDES', 'target': 'deploy', 'src_span': b, 'target_span': a}]})
         (repo / mb.QUEUE_REL).write_text(json.dumps(md.dream_pin_and_validate(cands, mapping)))
-        self.assertTrue(mb.learn_approve(repo, ['PAIR0', 'PAIR1'], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, ['PAIR0', 'PAIR1'], approver='Robin')['ok'])
         for i in range(2):
             self.snapshot(repo, 'middle-repeat%d-0123456789.log' % i, '2026-03-01T00:00:00Z [user] ' + quotes[1])
         reader = {i['id']: i for i in mb.dream_items(repo)['items']}
@@ -383,10 +383,10 @@ class Duplicates(Base):
         self.assertNotIn('blockers', same)
         self.assertIsNone(same['command'])  # no merge in this build: no command the parser would refuse
         self.assertEqual(v.TIDY_MERGE_COMMAND_UNAVAILABLE, same['commandNote'])
-        self.assertTrue(mb.learn_approve(repo, [late], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, [late], approver='Robin')['ok'])
         same = next(g for g in self.report(repo)['duplicates'] if g['kind'] == 'same-text')
         self.assertEqual(late, same['keep'])  # an approved lesson first
-        self.assertTrue(mb.learn_reject(repo, [early], approver='Ray', reason='x')['ok'])
+        self.assertTrue(mb.learn_reject(repo, [early], approver='Robin', reason='x')['ok'])
         self.assertNotIn(early, json.dumps(self.report(repo)['duplicates']))  # rejected lessons never take part
 
     def test_every_member_reaches_the_threshold_against_its_kept_lesson(self):
@@ -409,7 +409,7 @@ class RetireUnattachedPromote(Base):
         out = []
         for name, line in names_lines:
             out += self.learn(repo, name, line)
-        self.assertTrue(mb.learn_approve(repo, out, approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, out, approver='Robin')['ok'])
         return out
 
     def test_now_a_rule_compares_instruction_rules_not_the_promoted_page(self):
@@ -428,7 +428,7 @@ class RetireUnattachedPromote(Base):
         repo = self.make_repo()
         (repo / 'notes.py').write_text('x = 1\n')
         refund = self.approved(repo, ('s1.log', '2026-11-01T10:00:00Z [user] ' + LINE))[0]
-        self.assertTrue(mb.learn_paths(repo, [refund], approver='Ray', paths=['notes.py'])['ok'])
+        self.assertTrue(mb.learn_paths(repo, [refund], approver='Robin', paths=['notes.py'])['ok'])
         self.assertIn('memlet:anchor billing.py::refund', (repo / mb.PROMOTED_PAGE).read_text())
         self.assertEqual([], self.report(repo)['retire'])
         (repo / 'notes.py').unlink()
@@ -517,7 +517,7 @@ class Bounds(Base):
         for i in range(2):  # two pending pairs: two duplicate groups, four said-again entries
             self.learn(repo, 'p%d.log' % i, *['2026-11-0%dT10:00:00Z [user] %s' % (i + 1, t) for t in pair])
         approved = self.learn(repo, 'r.log', *['2026-11-01T11:00:00Z [user] ' + t for t in rules + free + ['Never call refund() in billing.py on weekends.', 'Never edit billing.py without a checklist.']])
-        self.assertTrue(mb.learn_approve(repo, approved, approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, approved, approver='Robin')['ok'])
         ids = self.node_ids_by_line(repo)
         lapsed = [ids['2026-11-01T11:00:00Z [user] ' + t] for t in free]
         keep = ids['2026-11-01T11:00:00Z [user] ' + rules[0]]
@@ -559,7 +559,7 @@ class Bounds(Base):
         """F4: a huge line, an undecodable line, `.jsonl`, a subdirectory, a symlink, an unreadable file."""
         repo = self.make_repo()
         nid = self.learn(repo, 's1.log', '2026-01-01T10:00:00Z [user] ' + LINE)[0]
-        self.assertTrue(mb.learn_approve(repo, [nid], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, [nid], approver='Robin')['ok'])
         self.set_decision_time(repo, {nid}, '2026-02-01T00:00:00Z')
         snap = repo / mb.SNAPSHOT_REL
         self.assertEqual(['old-unseen'], self.report(repo)['retire'][0]['reasons'])
@@ -702,7 +702,7 @@ class Hostile(Base):
         self.git(repo, 'add', '--', odd)
         keep = self.learn(repo, 's1.log', '2026-11-01T10:00:00Z [user] ' + hostile)[0]
         other = self.learn(repo, 's2.log', '2026-11-02T10:00:00Z [user] ' + hostile)[0]
-        self.assertTrue(mb.learn_approve(repo, [keep], approver='Ray', paths=[odd])['ok'])
+        self.assertTrue(mb.learn_approve(repo, [keep], approver='Robin', paths=[odd])['ok'])
         # An approved id that looks like an option, accepted by the queue API.
         graph = mb._load_queue(repo)[0]
         dash = '--approve=VICTIM'
@@ -716,7 +716,7 @@ class Hostile(Base):
             if e.get('fromId') == keep:
                 e['fromId'] = dash
         self.save_graph(repo, graph)
-        self.assertTrue(mb.learn_approve(repo, [dash], approver='Ray', paths=[odd], reconsider=True)['ok'])
+        self.assertTrue(mb.learn_approve(repo, [dash], approver='Robin', paths=[odd], reconsider=True)['ok'])
         (repo / odd).unlink()  # attachment-inactive: the hostile path appears in details
         lost = ['-lost $(x).py']
 
@@ -768,7 +768,7 @@ class Merge(Base):
         member = self.learn(repo, 's2.log', '2026-11-02T10:00:00Z [user] Never call refund() from billing.py unless wrapped in retry.')[0]
         lapsed = self.learn(repo, 's3.log', '2026-11-03T10:00:00Z [user] ' + FRIDAY)[0]
         twin = self.learn(repo, 's4.log', '2026-11-04T10:00:00Z [user] ' + FRIDAY)[0]
-        self.assertTrue(mb.learn_approve(repo, [keep], approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, [keep], approver='Robin')['ok'])
         return repo, keep, member, lapsed, twin
 
     def test_absent_merge_functions_are_reported(self):
@@ -878,7 +878,7 @@ class ReadOnlyAndCompatibility(Base):
         repo = self.make_repo(agents='# Rules\n- Always keep `anchor.py::guard` enabled.\n- ' + FRIDAY + '\n')
         a = self.learn(repo, 's1.log', '2026-11-01T10:00:00Z [user] ' + LINE, '2026-11-01T10:01:00Z [user] ' + FRIDAY)
         self.learn(repo, 's2.log', '2026-11-02T10:00:00Z [user] ' + LINE)
-        self.assertTrue(mb.learn_approve(repo, a, approver='Ray')['ok'])
+        self.assertTrue(mb.learn_approve(repo, a, approver='Robin')['ok'])
         mw.build_handover(repo, write=True)
         return repo
 

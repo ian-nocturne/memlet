@@ -1605,7 +1605,7 @@ if ids:
 assert mb.learn_from_transcript(repo, repo / "session.log")["ok"]
 pend = mb.learn_pending(repo, _record_review=False)
 pids = [it["id"] for it in pend["pendingNodes"]]
-assert mb.learn_approve(repo, pids[:1], approver="ray", paths=["src/billing.py"])["ok"]
+assert mb.learn_approve(repo, pids[:1], approver="robin", paths=["src/billing.py"])["ok"]
 assert mw._build_handover(repo, write=True)["ok"]
 """
         subprocess.run(
