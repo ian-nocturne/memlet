@@ -1323,7 +1323,7 @@ class SkillbookTests(unittest.TestCase):
 
         # S3: A file whose digest matches but was written by another Memlet version is `stale: written by Memlet X`,
         # not `edited`; and `--write` without `--force` overwrites it cleanly.
-        for other_ver in ("9.1.0", "9.4.0"):
+        for other_ver in ("9.1.0", "99.0.0"):  # an older and a newer release, never the current one
             with mock.patch.object(sb, "VERSION", other_ver):
                 other_built = sb.build_skill(self.root, name="custom-skill")
             out_path.write_text(other_built["text"], encoding="utf-8")

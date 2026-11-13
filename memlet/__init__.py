@@ -1,5 +1,5 @@
-"""Memlet v9.3.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
-VERSION = "9.3.0"
+"""Memlet v9.4.0 — Modular Local-First Bitemporal Memory & Self-Healing Skill Engine."""
+VERSION = "9.4.0"
 
 from .contracts import (
     EVIDENCE_STATES,
