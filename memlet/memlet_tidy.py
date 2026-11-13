@@ -732,6 +732,37 @@ def kept_lesson_order(lessons: Dict[str, Dict[str, Any]], ids: Iterable[str]) ->
     return sorted(ids, key=lambda i: (lessons[i]["tier"] != APPROVED, _earliest(lessons[i]) or _FAR, i))
 
 
+def _choose_kept_lesson(
+    lessons: Dict[str, Dict[str, Any]],
+    ordered: Sequence[str],
+    merge: Dict[str, Any],
+    *,
+    merge_ok: bool = True,
+) -> Tuple[str, List[str], str, Optional[Dict[str, Any]], bool]:
+    """Try at most the first three candidates in `ordered`; return `(keep, same, reason, checked, blockers_failed)`."""
+    first = ordered[0]
+    first_reason = "approved" if lessons[first]["tier"] == APPROVED else "earliest"
+    if not merge_ok or not merge.get("available"):
+        return first, list(ordered[1:]), first_reason, None, False
+    earlier_codes: List[str] = []
+    first_checked: Optional[Dict[str, Any]] = None
+    for idx, cand in enumerate(ordered[:3]):
+        others = [x for x in ordered if x != cand]
+        chk = _checked_blockers(merge, cand, others)
+        if chk is None:
+            return first, list(ordered[1:]), first_reason, None, True
+        if idx == 0:
+            first_checked = chk
+        if not any(chk["blockers"].values()):
+            reason = first_reason if idx == 0 else ("the earlier ones cannot be kept: " + ", ".join(earlier_codes))
+            return cand, others, reason, chk, False
+        for _, codes in sorted(chk["blockers"].items()):
+            for code in codes:
+                if code not in earlier_codes:
+                    earlier_codes.append(code)
+    return first, list(ordered[1:]), first_reason, first_checked, False
+
+
 def _model_proposals_fn():
     from . import memlet_dreamtidy as mdtidy
     return mdtidy.tidy_report_section
@@ -834,13 +865,18 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
     duplicates, blockers_failed = [], False
     groups.sort(key=lambda g: (-len(g[2]), g[1]))
     omitted["duplicates"] = max(0, len(groups) - v.TIDY_SECTION_CAP)
-    for kind, keep, same in groups[:v.TIDY_SECTION_CAP]:
+    for kind, keep0, same0 in groups[:v.TIDY_SECTION_CAP]:
+        ordered_group = [keep0] + list(same0)
+        keep, same, keep_reason, checked, failed_one = _choose_kept_lesson(
+            lessons, ordered_group, merge, merge_ok=merge_ok
+        )
         entry = {"kind": kind, "label": v.TIDY_DUPLICATE_LABELS[kind], "keep": keep, "same": same,
                  "lessons": [_lesson(lessons[i]) for i in [keep] + same]}
+        if keep != keep0:  # the usual choice (approved, earliest, smallest id) is not explained: 9.3.0 output
+            entry["keepReason"] = keep_reason
         if merge_ok:
             _with_command(entry, cmd(["learn"], [("--merge", keep), ("--same", same), ("--by", "NAME")]))
-            checked = _checked_blockers(merge, keep, same)
-            if checked is None:
+            if failed_one or checked is None:
                 blockers_failed = True
                 _with_command(entry, None, v.TIDY_BLOCKERS_FAILED)
             else:
@@ -1145,10 +1181,13 @@ def render_markdown(result: Dict[str, Any]) -> str:
                     e["label"], v.TIDY_MODEL_PROPOSAL_ID_NOTE % _code(e["id"]),
                     v.TIDY_KEEP_LABEL, _code(e["keep"]), e["lessons"][0]["tier"],
                     ", ".join(_code(x["id"]) + " (" + x["tier"] + ")" for x in e["lessons"][1:])))
+                if e.get("keepReason"):
+                    lines.append("  " + v.TIDY_KEEP_REASON_LABEL + e["keepReason"])
                 for lesson in e["lessons"]:
                     lines.append("  " + _code(lesson["id"]) + ":")
                     lines += ["  " + q for q in _quotes(lesson)]
-                if any(e.get("blockers", {}).values()):
+                has_blockers = any(e.get("blockers", {}).values())
+                if has_blockers:
                     lines.append("  " + v.TIDY_BLOCKERS_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(r + " — " + v.MERGE_REASONS.get(r, r) for r in c)
                         for k, c in sorted(e["blockers"].items()) if c))
@@ -1156,9 +1195,10 @@ def render_markdown(result: Dict[str, Any]) -> str:
                     lines.append("  " + v.TIDY_LOST_FILES_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(_code(p) for p in ps)
                         for k, ps in sorted(e["lostFiles"].items()) if ps))
-                lines += _commands(e)
+                if not (has_blockers and e.get("command") is None):
+                    lines += _commands(e)
                 if e.get("pathsCommand"):
-                    lines.append("  " + v.TIDY_ALSO_LABEL + _code(e["pathsCommand"]))
+                    lines.append("  " + v.MERGE_ATTACH_LABEL + _code(e["pathsCommand"]))
                 if e.get("dismissCommand"):
                     lines.append("  " + v.TIDY_MODEL_DISMISS_LABEL + _code(e["dismissCommand"]))
                 continue
@@ -1166,19 +1206,23 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 lines.append("- [%s] %s %s (%s); same: %s" % (
                     e["label"], v.TIDY_KEEP_LABEL, _code(e["keep"]), e["lessons"][0]["tier"],
                     ", ".join(_code(x["id"]) + " (" + x["tier"] + ")" for x in e["lessons"][1:])))
+                if e.get("keepReason"):
+                    lines.append("  " + v.TIDY_KEEP_REASON_LABEL + e["keepReason"])
                 for lesson in e["lessons"]:
                     lines.append("  " + _code(lesson["id"]) + ":")
                     lines += ["  " + q for q in _quotes(lesson)]
-                if any(e.get("blockers", {}).values()):
+                has_blockers = any(e.get("blockers", {}).values())
+                if has_blockers:
                     lines.append("  " + v.TIDY_BLOCKERS_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(r + " — " + v.MERGE_REASONS.get(r, r) for r in c) for k, c in sorted(e["blockers"].items()) if c))
                 if any(e.get("lostFiles", {}).values()):
                     lines.append("  " + v.TIDY_LOST_FILES_LABEL + "; ".join(
                         _code(k) + ": " + ", ".join(_code(p) for p in ps)
                         for k, ps in sorted(e["lostFiles"].items()) if ps))
-                lines += _commands(e)
+                if not (has_blockers and e.get("command") is None):
+                    lines += _commands(e)
                 if e.get("pathsCommand"):
-                    lines.append("  " + v.TIDY_ALSO_LABEL + _code(e["pathsCommand"]))
+                    lines.append("  " + v.MERGE_ATTACH_LABEL + _code(e["pathsCommand"]))
                 continue
             head = "- " + _code(e["id"]) + " (" + e["tier"] + ")"
             if section == "retire":

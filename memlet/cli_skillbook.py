@@ -35,7 +35,7 @@ def register(sub) -> None:
     parser.add_argument("--out", default=None, metavar="DIR", help=v.SKILL_CLI_OUT_HELP)
     parser.add_argument("--force", action="store_true", help=v.SKILL_CLI_FORCE_HELP)
     parser.add_argument("--check", default=None, metavar="PATH", help=v.SKILL_CLI_CHECK_HELP)
-    parser.add_argument("--format", choices=("json", "markdown"), default="json", help="Output format (default: json).")
+    cli_plugins.add_format_option(parser, help="Output format (default: json).")
 
 
 def dispatch(args) -> Dict[str, Any]:

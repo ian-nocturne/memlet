@@ -27,8 +27,11 @@ class _Format(argparse.Action):
         namespace._format_explicit = True
 
 
-def add_format_option(parser, choices=("json", "markdown"), default="json"):
-    parser.add_argument("--format", action=_Format, default=default, choices=list(choices))
+def add_format_option(parser, choices=("json", "markdown"), default="json", help=None):
+    kwargs = {"action": _Format, "default": default, "choices": list(choices)}
+    if help is not None:
+        kwargs["help"] = help
+    parser.add_argument("--format", **kwargs)
 
 
 def load() -> List[Any]:

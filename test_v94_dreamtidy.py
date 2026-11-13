@@ -486,7 +486,9 @@ class ValidationMalformedAndBoundsTests(DreamTidyBase):
         self.assertEqual([60, 2], run1_batches)
         self.assertEqual(1, r1["failedBatches"])
         self.assertEqual(1, len(r1["addedProposals"]))
-        self.assertEqual(60, r1["unexaminedLessons"])
+        self.assertEqual(0, r1["unexaminedLessons"])
+        self.assertEqual(60, r1["failedBatchLessons"])
+        self.assertIn(v.DREAM_TIDY_FAILED_BATCH_NOTICE % 60, r1["notices"])
 
         st1 = mdtidy.dream_tidy_status(repo)
         self.assertEqual(1, st1["failedBatches"])
@@ -766,7 +768,7 @@ class ProposalStateAndVerifierTests(DreamTidyBase):
         self.assertIn("member-has-members", b_entry["blockers"][id_a])
         self.assertIn("member-has-members", b_entry["commandNote"])
         self.assertIn(v.MERGE_REASONS["member-has-members"], b_entry["commandNote"])
-        self.assertIn(v.TIDY_NO_COMMAND_LABEL, blocked_tidy["formatted"])
+        self.assertNotIn(v.TIDY_NO_COMMAND_LABEL, blocked_tidy["formatted"])
         self.assertIn(v.MERGE_REASONS["member-has-members"], blocked_tidy["formatted"])
         self.assertTrue(mb.learn_unmerge(repo, id_c, approver="Robin")["ok"])
 
@@ -788,6 +790,11 @@ class ProposalStateAndVerifierTests(DreamTidyBase):
             mdtidy.proposal_state(prop, mdtidy.load_lessons_by_id(repo)),
         )
         dismissed_prop = dict(copy.deepcopy(prop), dismissed=True)
+        self.assertEqual(
+            {"state": "merged", "reason": "already-merged"},
+            mdtidy.proposal_state(dismissed_prop, mdtidy.load_lessons_by_id(repo)),
+        )
+        self.assertTrue(mb.learn_unmerge(repo, id_b, approver="Robin")["ok"])
         self.assertEqual(
             {"state": "dismissed", "reason": "dismissed"},
             mdtidy.proposal_state(dismissed_prop, mdtidy.load_lessons_by_id(repo)),
@@ -1015,15 +1022,25 @@ class DryRunReadOnlyCliAndFixturesTests(DreamTidyBase):
 
         sym_dir = self.base / "sym_fixtures"
         sym_dir.symlink_to(out_dir, target_is_directory=True)
-        for bad_target in (cap_repo / ".memlet" / "captured", sym_dir):
-            bad_cap = mdtidy.dream_tidy_run(
-                cap_repo,
-                via=("claude",),
-                again=True,
-                save_fixture=bad_target,
-                runner=lambda *a, **k: "[]",
-            )
-            self.assertTrue(any("fixture capture failed" in n for n in bad_cap["notices"]))
+        inside_cap = mdtidy.dream_tidy_run(
+            cap_repo,
+            via=("claude",),
+            again=True,
+            save_fixture=cap_repo / ".memlet" / "captured",
+            runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must refuse .memlet target before calling model")),
+        )
+        self.assertFalse(inside_cap["ok"])
+        self.assertEqual(0, inside_cap["calls"])
+        self.assertIn("fixture directory must be outside .memlet", inside_cap["error"])
+
+        sym_cap = mdtidy.dream_tidy_run(
+            cap_repo,
+            via=("claude",),
+            again=True,
+            save_fixture=sym_dir,
+            runner=lambda *a, **k: "[]",
+        )
+        self.assertTrue(any("fixture capture failed" in n for n in sym_cap["notices"]))
 
 
 class BaselineComparisonAndMutationTests(DreamTidyBase):
@@ -1128,6 +1145,18 @@ tree_root = Path(sys.argv[1])
 sys.path.insert(0, str(tree_root))
 import memory_cli, memlet_mcp
 from memlet import memlet_wiki as mw, memlet_bridge as mb, memlet_graph as mg, memlet_anchors as ma, memlet_tidy as mt
+
+# The version string is an accepted difference between releases: both sides report the compared release's version,
+# so a skill file written by one side is "current", not "written by another version", for the other.
+import importlib as _il
+for _name, _attr in (("memlet", "VERSION"), ("memlet.contracts", "VERSION"), ("memlet.memlet_wiki", "MEMLET_VERSION"),
+                     ("memlet.memlet_skillbook", "VERSION"), ("memlet_mcp", "SERVER_VERSION")):
+    try:
+        _m = _il.import_module(_name)
+    except Exception:
+        continue
+    if hasattr(_m, _attr):
+        setattr(_m, _attr, "9.3.0")
 
 repo = Path(sys.argv[2])
 srv = memlet_mcp.MemletMCPServer(root=repo)
@@ -1401,6 +1430,19 @@ sys.stdout.write(json.dumps({"identical": identical, "dream_diff": dream_diff}, 
             assert [r["reason"] for r in drp2] == ["already-in-tidy", "merge-blocked", "dismissed"]
             assert len(acc2) == 1 and acc2[0]["keep"] == al
 
+            acc3, drp3, mal3 = fn(
+                [{"same": ["L8", "L5"]}],
+                batch_rows,
+                lessons,
+                nodes,
+                dup_sets,
+                merge,
+                {dismissed_pid},
+                "b3",
+            )
+            assert mal3 is False and drp3 == []
+            assert len(acc3) == 1 and acc3[0]["keep"] == pe
+
         check_cbg(mdtidy._check_batch_groups)
 
         cbg_source = inspect.getsource(mdtidy._check_batch_groups)
@@ -1552,10 +1594,13 @@ class FixRound1RegressionAndMutantTests(DreamTidyBase):
         # 3) Directory, leaf symlink, symlinked runs/ parent (pointing to empty external dir -> also kills M10), unreadable mode 000.
         target.unlink()
         target.mkdir()
-        for cmd_argv in (["admin", "tidy", "--repo", str(repo), "--format", "json"], ["dream", str(repo), "--tidy", "--status", "--format", "json"]):
-            rc, out_s, err_s = run_cli(cmd_argv)
-            self.assertEqual((0, ""), (rc, err_s))
-            self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_s)["notices"])
+        rc_td, out_td, err_td = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        rc_sd, out_sd, err_sd = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "json"])
+        self.assertEqual((0, ""), (rc_td, err_td))
+        self.assertEqual((0, ""), (rc_sd, err_sd))
+        self.assertNotIn(v.TIDY_MODEL_SAME_SECTION, json.loads(out_td))
+        self.assertNotIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_td)["notices"])
+        self.assertNotIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_sd)["notices"])
         target.rmdir()
 
         secret_outside = self.base / "outside_secret.json"
@@ -1577,7 +1622,12 @@ class FixRound1RegressionAndMutantTests(DreamTidyBase):
         runs_dir.symlink_to(empty_ext, target_is_directory=True)
         rc_anc, out_anc, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
         self.assertEqual(0, rc_anc)
-        self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_anc)["notices"])
+        self.assertNotIn(v.TIDY_MODEL_SAME_SECTION, json.loads(out_anc))
+        self.assertNotIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_anc)["notices"])
+        (empty_ext / "tidy-proposals.json").write_text(json.dumps(good_store), encoding="utf-8")
+        rc_anc_f, out_anc_f, _ = run_cli(["admin", "tidy", "--repo", str(repo), "--format", "json"])
+        self.assertEqual(0, rc_anc_f)
+        self.assertIn(v.TIDY_MODEL_PROPOSALS_UNREADABLE, json.loads(out_anc_f)["notices"])
         runs_dir.unlink()
         runs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1766,7 +1816,7 @@ class FixRound1RegressionAndMutantTests(DreamTidyBase):
         normalized_help = " ".join(o_h.split())
         self.assertIn("Comma-separated proposer vendors (claude,codex,gemini); with --tidy, a single proposer vendor", normalized_help)
         self.assertIn("with --tidy, asks a distinct-family model for a SAME or DIFFERENT second opinion", normalized_help)
-        self.assertIn("default: 4 for dream, 2 with --tidy", normalized_help)
+        self.assertIn("1..20, default 4; with --tidy 1..10, default 2", normalized_help)
         self.assertIn("--again", normalized_help)
 
         # Usage errors under `--tidy` use `## Dream tidy failed`, while plain `dream` keeps `## Dream failed`.
@@ -1794,7 +1844,8 @@ class FixRound1RegressionAndMutantTests(DreamTidyBase):
         self.assertEqual(1, run_res["droppedGroups"][0]["index"])
         run_md = cli_dream._markdown(run_res)
         self.assertIn("group #1", run_md)
-        self.assertTrue(run_md.rstrip().endswith(v.DREAM_TIDY_TRUST_NOTICE))
+        self.assertIn(v.DREAM_TIDY_TRUST_NOTICE, run_md)
+        self.assertTrue(run_md.rstrip().endswith(v.DREAM_TIDY_NEXT_STEP))
         self.assertNotIn("vetoes the hint tier", run_md)
 
         c_st, o_st, _ = run_cli(["dream", str(repo), "--tidy", "--status", "--format", "markdown"])
@@ -2075,8 +2126,11 @@ class FixRound1RegressionAndMutantTests(DreamTidyBase):
 
         with mock.patch.object(mdtidy, "_load_repository_lessons", side_effect=load_with_oversized):
             r_m13 = mdtidy.dream_tidy_run(repo_m13, via=("claude",), runner=lambda *a, **k: "[]")
-        self.assertEqual(1, r_m13["unexaminedLessons"])
+        self.assertEqual(0, r_m13["unexaminedLessons"])
+        self.assertEqual(1, r_m13["oversizedLessons"])
+        self.assertEqual(1, r_m13["nothingToCompare"])
         self.assertIn(v.DREAM_TIDY_OVERSIZED_NOTICE % 1, r_m13["notices"])
+        self.assertNotIn(v.DREAM_TIDY_UNEXAMINED_NOTICE % 1, r_m13["notices"])
 
         # M14: already-verified proposals are NOT verified again on a subsequent `--verify-with` run.
         repo_m14 = self.make_repo("s5_m14")

@@ -33,7 +33,7 @@ def register(sub):
     parser.add_argument("--repo", default=".", help="Repository to inspect (default: current directory).")
     parser.add_argument("--stale-days", type=_days, default=180, metavar="N", help="Age for old unseen lessons in days (default: 180).")
     parser.add_argument("--min-seen", type=_min_seen, default=3, metavar="N", help="Sessions needed for promotion (default: 3).")
-    parser.add_argument("--format", choices=("json", "markdown"), default="json", help="Output format (default: json).")
+    cli_plugins.add_format_option(parser, help="Output format (default: json).")
 
 
 def dispatch(args):

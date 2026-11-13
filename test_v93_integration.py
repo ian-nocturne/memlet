@@ -223,8 +223,15 @@ class TidyAndMergeTogether(tidy_tests.Base):
     def test_blocked_duplicates_and_lapses_have_sentences_and_only_working_commands(self):
         from memlet import vocabulary as v
         repo, a, b, c = self.fixture()
-        # The earliest lesson becomes a member; the later kept lesson has a holding member.
+        # When only `b` holds a member, 9.4 (SF-6) rescues the group by suggesting `b` as kept.
         self.assertTrue(mb.learn_merge(repo, b, [c], approver='Robin')['ok'])
+        rescued = mt.tidy_report(repo)['duplicates'][0]
+        self.assertEqual(b, rescued['keep'])
+        self.assertEqual('the earlier ones cannot be kept: member-has-members', rescued['keepReason'])
+        self.assertIsNotNone(rescued['command'])
+        # Once `a` also holds a member, no candidate can be kept and `a` is shown with its blockers and no command.
+        d = self.learn(repo, 'thursday.log', '2026-11-05T10:00:00Z [user] Never export customer emails without masking.')[0]
+        self.assertTrue(mb.learn_merge(repo, a, [d], approver='Robin')['ok'])
         report = mt.tidy_report(repo)
         group = report['duplicates'][0]
         self.assertIsNone(group['command'])

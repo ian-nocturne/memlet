@@ -321,6 +321,11 @@ def _configure_help(parser, sub):
                             for name, meta in _PLUGIN_COMMANDS.items() if not meta.get('product') and name in ('anchors', 'eval'))
     for child in set(commands.values()):
         _add_global_options(child)
+    dream_parser = commands.get('dream')
+    if dream_parser is not None:
+        for action in dream_parser._actions:
+            if action.dest in ('_global_root', '_global_task', '_global_session', '_global_standalone'):
+                action.help = argparse.SUPPRESS
     admin = sub.add_parser('admin', help='Advanced and legacy commands.',
                            allow_abbrev=False,
                            formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -613,11 +618,11 @@ def main():
     _validate_modes(args, parser)
     if args.action == 'recall' and args.budget is None:
         args.budget = 1200 if args.unified or args.positional_query is not None or args.files is not None else 6000
-    human = args.action in _product_commands()
+    human = args.action in _product_commands() or (args.action in _PLUGIN_COMMANDS and hasattr(args, 'format'))
     if human and not getattr(args, '_format_explicit', False) and sys.stdout.isatty():
         args.format = 'markdown'
     result = _main(args, parser)
-    if human and args.format == 'markdown' and isinstance(result, dict) and '_cli_text' not in result:
+    if human and getattr(args, 'format', None) == 'markdown' and isinstance(result, dict) and '_cli_text' not in result:
         rendered = _text_result(result)
         result['_cli_text'] = rendered + ('\n' if rendered and not rendered.endswith('\n') else '')
     return result

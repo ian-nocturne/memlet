@@ -90,7 +90,7 @@ import test_v93_tidy as _tidy_tests
 from unittest import mock as _mock
 
 _REAL_MERGE_FUNCTIONS = mt._merge_functions  # captured before any test replaces the tidy adapter's lookup
-from memlet import memlet_bridge as _mb, memlet_dreamtidy as _dt, memlet_graph as _graph, memlet_wiki as _mw
+from memlet import handover_bridge as _hb, memlet_bridge as _mb, memlet_dreamtidy as _dt, memlet_graph as _graph, memlet_skillbook as _sb, memlet_wiki as _mw
 
 _HERE = _Path(__file__).resolve().parent
 def probe_view(repo):
@@ -110,6 +110,10 @@ def probe_view(repo):
                  for k in ("duplicates", "saidAgain", "retire", "unattached", "promote", "lapsedMerges",
                            "mergedLostFiles", "modelSaysSame")},
         "handoverLessons": _json.dumps(lessons, sort_keys=True, default=str),
+        "mergeStates": _mb.merge_view(repo).get("states", {}),
+        "skillCount": _sb.build_skill(repo).get("includedCount", 0),
+        "tidyStatusLessons": _dt.dream_tidy_status(repo).get("counts", {}),
+        "inspectCfg": _mw.read_config(_Path(repo))[0],
     }
     return _json.loads(_json.dumps(view, sort_keys=True, default=list))
 

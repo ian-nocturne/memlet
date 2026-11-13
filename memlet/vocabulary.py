@@ -422,7 +422,7 @@ DREAM_VERIFY_WITH_HELP = (
     "dream.agreement=model is needed only for same-vendor hints; "
     "with --tidy, asks a distinct-family model for a SAME or DIFFERENT second opinion per proposal"
 )
-DREAM_MAX_BATCHES_HELP = "Maximum batches per run (1..10; default: 4 for dream, 2 with --tidy)"
+DREAM_MAX_BATCHES_HELP = "Maximum batches per run (1..20, default 4; with --tidy 1..10, default 2)"
 DREAM_TIDY_CONFLICT_ERROR = "--tidy cannot be combined with --transcript or --skip-failed"
 DREAM_TIDY_MODE_ERROR = "Choose --via VENDOR, --dismiss PROPOSAL_ID, or --status with --tidy"
 DREAM_TIDY_DISMISS_CONFLICT = "--dismiss cannot be combined with proposal, dry-run, --again or status options"
@@ -436,6 +436,8 @@ DREAM_TIDY_INVALID_PROPOSAL_ID = "invalid proposal id: %s"
 DREAM_TIDY_UNEXAMINED_NOTICE = "%d lesson(s) were not looked at in this run (batch or call bound reached)."
 DREAM_TIDY_ALREADY_EXAMINED_NOTICE = "%d lesson(s) were skipped as already examined; pass --again to re-examine them."
 DREAM_TIDY_OVERSIZED_NOTICE = "%d lesson(s) exceeded the 24,000-character batch bound and were not looked at."
+DREAM_TIDY_FAILED_BATCH_NOTICE = "%d lesson(s) were not looked at because their batch failed and will be retried on the next run."
+DREAM_TIDY_NOTHING_TO_COMPARE_NOTICE = "%d single-lesson batch(es) had nothing to compare (no model call made)."
 DREAM_TIDY_ALL_DROPPED_ERROR = (
     "Every proposed group in this batch failed validation as malformed output; "
     "batch remains failed and will be retried on the next explicit run."
@@ -456,7 +458,7 @@ DREAM_TIDY_DROP_REASONS = {
     "fewer-than-two": "the group has fewer than two distinct row ids",
     "duplicate-row-id": "a row id appears in more than one group of this batch",
     "already-in-tidy": "the lessons are already a same-text or similar-text group of the tidy report",
-    "merge-blocked": "merge_blockers reported a blocker for the suggested kept lesson and the others",
+    "merge-blocked": "learn --merge would refuse to merge these lessons",
     "dismissed": "the proposal was previously dismissed while its lessons remained unchanged",
 }
 DREAM_TIDY_STATE_REASONS = {
@@ -481,6 +483,8 @@ DREAM_TIDY_BATCH_FAILURE_REASONS = {
     "all-groups-malformed": "every proposed group in the batch was dropped because of malformed output",
 }
 TIDY_MODEL_SAME_SECTION = "modelSaysSame"
+TIDY_KEEP_REASON_LABEL = "Suggested because: "
+DREAM_TIDY_NEXT_STEP = "Next step: run `memlet admin tidy` to read proposals and merge commands."
 TIDY_MODEL_SAME_HEADING = (
     "A model thinks these say the same thing (read both; a model's opinion is not a decision)"
 )

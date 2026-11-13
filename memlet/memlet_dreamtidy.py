@@ -85,7 +85,7 @@ _RECEIPT_KEYS = frozenset((
     "receiptSha256",
 ))
 _RECEIPT_REQUIRED_KEYS = _RECEIPT_KEYS - frozenset(("verdict",))
-_DROPPED_KEYS = frozenset(("batchId", "index", "reason", "reasonMeaning", "lessonIds", "blockers"))
+_DROPPED_KEYS = frozenset(("batchId", "index", "reason", "reasonMeaning", "lessonIds", "blockers", "blockerMessages"))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -283,6 +283,7 @@ def _clean_dropped_group(rec: Any, known_ids: Optional[Set[str]] = None) -> Opti
         or type(reason) is not str
         or reason not in v.DREAM_TIDY_DROP_REASONS
         or ("reasonMeaning" in rec and type(rec["reasonMeaning"]) is not str)
+        or ("blockerMessages" in rec and type(rec["blockerMessages"]) is not dict)
         or type(lesson_ids) is not list
         or len(lesson_ids) > MAX_BATCH_LESSONS * 2
         or any(
@@ -317,6 +318,10 @@ def _clean_dropped_group(rec: Any, known_ids: Optional[Set[str]] = None) -> Opti
                 clean_blockers[lid] = list(codes)
         if clean_blockers:
             clean["blockers"] = clean_blockers
+            clean["blockerMessages"] = {
+                lid: [c + " — " + v.MERGE_REASONS[c] for c in codes]
+                for lid, codes in clean_blockers.items()
+            }
     return clean
 
 
@@ -362,8 +367,6 @@ def proposal_state(
     """
     if not _valid_proposal_record(proposal):
         return {"state": "stale", "reason": "invalid-proposal"}
-    if proposal.get("dismissed") is True:
-        return {"state": "dismissed", "reason": "dismissed"}
     lesson_ids = proposal["lessonIds"]
     digests = proposal["lessonDigests"]
     if not isinstance(lessons_by_id, dict) or any(
@@ -382,6 +385,8 @@ def proposal_state(
         return {"state": "stale", "reason": "lesson-not-shown"}
     if wording_groups is not None and any(set(lesson_ids).issubset(w) for w in wording_groups):
         return {"state": "stale", "reason": "already-in-tidy"}
+    if proposal.get("dismissed") is True:
+        return {"state": "dismissed", "reason": "dismissed"}
     return {"state": "open", "reason": None}
 
 
@@ -509,7 +514,10 @@ def _sync_dismissed(store: Dict[str, Any]) -> Dict[str, Any]:
     out["dismissed"] = dismissed
     if type(store.get("droppedGroups")) is list:
         out["droppedGroups"] = [
-            clean for rec in store["droppedGroups"] for clean in (_clean_dropped_group(rec),) if clean is not None
+            {k: val for k, val in clean.items() if k != "blockerMessages"}
+            for rec in store["droppedGroups"]
+            for clean in (_clean_dropped_group(rec),)
+            if clean is not None
         ]
     if type(store.get("droppedGroupsOmitted")) is int and store["droppedGroupsOmitted"] >= 0:
         out["droppedGroupsOmitted"] = store["droppedGroupsOmitted"]
@@ -543,16 +551,19 @@ def _sync_dismissed(store: Dict[str, Any]) -> Dict[str, Any]:
         out["failedBatches"] = clean_failed
     if type(store.get("lastRun")) is dict:
         lr = store["lastRun"]
+        _lr_int_keys = (
+            "batches", "calls", "failedBatches", "addedProposals",
+            "unexaminedLessons", "alreadyExaminedLessons",
+            "failedBatchLessons", "oversizedLessons", "nothingToCompare",
+        )
         if (
-            set(lr) <= {"runId", "at", "batches", "calls", "failedBatches", "addedProposals", "unexaminedLessons", "alreadyExaminedLessons"}
+            set(lr) <= {"runId", "at", "again", *_lr_int_keys}
             and type(lr.get("runId")) is str
             and bool(_BATCH_ID_RE.fullmatch(lr["runId"]))
             and type(lr.get("at")) is str
             and md._valid_utc_stamp(lr["at"])
-            and all(
-                type(lr.get(k, 0)) is int and lr.get(k, 0) >= 0
-                for k in ("batches", "calls", "failedBatches", "addedProposals", "unexaminedLessons", "alreadyExaminedLessons")
-            )
+            and type(lr.get("again", False)) is bool
+            and all(type(lr.get(k, 0)) is int and lr.get(k, 0) >= 0 for k in _lr_int_keys)
         ):
             out["lastRun"] = copy.deepcopy(lr)
     return out
@@ -623,8 +634,18 @@ def _read_bounded_store_text(target: Path) -> Tuple[str, Optional[str]]:
         return "unreadable", None
 
 
+def _has_regular_proposals_target(root: Path) -> bool:
+    """True only when a regular file exists at (or behind a symlink at) `tidy-proposals.json`."""
+    try:
+        return (Path(root) / PROPOSALS_REL).is_file()
+    except OSError:
+        return False
+
+
 def _load_store_for_read(root: Path, *, known_lesson_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Bounded, total read of `tidy-proposals.json` for read-only callers (`admin tidy` and `dream --tidy --status`)."""
+    if not _has_regular_proposals_target(root):
+        return {"state": "absent"}
     cur = Path(root)
     parts = tuple(PROPOSALS_REL.split("/"))
     for idx, part in enumerate(parts):
@@ -750,6 +771,12 @@ def _load_store_for_read(root: Path, *, known_lesson_ids: Optional[Set[str]] = N
     if "lastRun" in obj and type(obj["lastRun"]) is not dict:
         bump_invalid("invalid-store-field")
 
+    valid_examined: List[str] = []
+    if type(obj.get("examinedBatches")) is list:
+        valid_examined = list(dict.fromkeys(
+            x for x in obj["examinedBatches"] if type(x) is str and bool(_DIGEST_RE.fullmatch(x))
+        ))
+
     return {
         "state": "ok",
         "proposals": valid_proposals,
@@ -757,6 +784,7 @@ def _load_store_for_read(root: Path, *, known_lesson_ids: Optional[Set[str]] = N
         "droppedGroups": dropped_groups,
         "droppedGroupsOmitted": dropped_omitted,
         "failedRecords": failed_records,
+        "examinedBatches": valid_examined,
         "invalidProposals": invalid_proposal_count,
         "duplicateProposals": duplicate_proposal_count,
         "invalidRecords": invalid_records,
@@ -873,19 +901,29 @@ def _dropped_record(
     }
     if blockers:
         rec["blockers"] = blockers
+        rec["blockerMessages"] = {
+            lid: [c + " — " + v.MERGE_REASONS.get(c, c) for c in codes]
+            for lid, codes in blockers.items()
+        }
     return rec
 
 
 def _keep_dropped(target: Dict[str, Any], records: Sequence[Dict[str, Any]], key: str = "droppedGroups") -> None:
-    kept = target.setdefault(key, [])
-    total_before = len(kept) + int(target.get("droppedGroupsOmitted", 0))
+    kept = list(target.get(key) or [])
+    omitted = int(target.get("droppedGroupsOmitted", 0))
     for record in records:
-        if (
-            len(kept) < MAX_DROPPED_RECORDS
-            and len(json.dumps(kept + [record], ensure_ascii=False).encode("utf-8")) <= MAX_DROPPED_BYTES
+        if len(json.dumps([record], ensure_ascii=False).encode("utf-8")) > MAX_DROPPED_BYTES:
+            omitted += 1
+            continue
+        kept.append(record)
+        while kept and (
+            len(kept) > MAX_DROPPED_RECORDS
+            or len(json.dumps(kept, ensure_ascii=False).encode("utf-8")) > MAX_DROPPED_BYTES
         ):
-            kept.append(record)
-    target["droppedGroupsOmitted"] = total_before + len(records) - len(kept)
+            kept.pop(0)
+            omitted += 1
+    target[key] = kept
+    target["droppedGroupsOmitted"] = omitted
 
 
 def _check_batch_groups(
@@ -947,14 +985,15 @@ def _check_batch_groups(
     accepted: List[Dict[str, Any]] = []
     for idx, lesson_ids in stage2:
         ordered = mt.kept_lesson_order(lessons, lesson_ids)
-        keep, same = ordered[0], ordered[1:]
         group_set = set(ordered)
         if any(group_set <= dup_set for dup_set in tidy_duplicate_sets):
             reason = "already-in-tidy"
             dropped.append(_dropped_record(batch_id, idx, reason, ordered))
             continue
-        checked = mt._checked_blockers(merge, keep, same) if merge.get("available") else None
-        if checked is None or any(checked["blockers"].values()):
+        keep, same, _keep_reason, checked, failed_one = mt._choose_kept_lesson(
+            lessons, ordered, merge, merge_ok=bool(merge.get("available"))
+        )
+        if failed_one or checked is None or any(checked["blockers"].values()):
             reason = "merge-blocked"
             blocker_codes = {k: list(vals) for k, vals in (checked or {}).get("blockers", {}).items() if vals}
             dropped.append(_dropped_record(batch_id, idx, reason, ordered, blockers=blocker_codes))
@@ -1052,6 +1091,9 @@ def dream_tidy_run(
         "verifiedProposals": 0,
         "disputedProposals": 0,
         "unexaminedLessons": 0,
+        "failedBatchLessons": 0,
+        "oversizedLessons": 0,
+        "nothingToCompare": 0,
         "alreadyExaminedLessons": 0,
         "errors": [],
         "notices": [],
@@ -1088,11 +1130,10 @@ def dream_tidy_run(
             raise ValueError("unknown vendor")
         if type(max_batches) is not int or not 1 <= max_batches <= MAX_BATCHES:
             raise ValueError("max_batches must be 1..%d" % MAX_BATCHES)
+        dc._check_fixture_directory(save_fixture)
 
         dream_cfg = config.get("dream") if isinstance(config.get("dream"), dict) else {}
         models = dream_cfg.get("models") if isinstance(dream_cfg.get("models"), dict) else {}
-        _, agreement, cfg_notices = mb.dream_settings(config)
-        report["notices"].extend(cfg_notices)
         verifier_models = models.get("verifier") if isinstance(models.get("verifier"), dict) else {}
         proposer_model = models.get(proposer_vendor, vc.DEFAULT_MODELS[proposer_vendor])
         verifier_model = (
@@ -1107,19 +1148,30 @@ def dream_tidy_run(
             chosen.append((verify_with, verifier_model))
         if any(not vc.valid_model(m) for _, m in chosen):
             raise ValueError("invalid model id; expected [A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}")
-        if agreement == "model" or verify_with:
-            for index, (vendor_name, model_name) in enumerate(chosen):
+        if verify_with:
+            prop_source = (
+                "dream.models." + proposer_vendor
+                if proposer_vendor in models
+                else "default proposer (%s/%s)" % (proposer_vendor, proposer_model)
+            )
+            ver_source = (
+                "dream.models.verifier." + verify_with
+                if verify_with in verifier_models
+                else "default verifier (%s/%s)" % (verify_with, verifier_model)
+            )
+            for src_label, (vendor_name, model_name) in ((prop_source, chosen[0]), (ver_source, chosen[1])):
                 if vendor_name in vc.MODEL_FAMILIES and vc.model_family(vendor_name, model_name) is None:
-                    key = "dream.models.verifier." + vendor_name if index >= 1 else "dream.models." + vendor_name
                     raise ValueError(
-                        key
-                        + " must contain exactly one known family token under dream.agreement="
-                        + agreement
-                        + "; no recognisable family; accepted families: "
+                        src_label
+                        + " must contain exactly one known model family for dream --tidy --verify-with; "
+                        + "no recognisable family; accepted families: "
                         + ", ".join(vc.MODEL_FAMILIES[vendor_name])
                     )
-        if verify_with and vc.same_model(proposer_vendor, proposer_model, verify_with, verifier_model):
-            raise ValueError("dream.models.verifier has the same family as a proposer under dream.agreement=" + agreement)
+            if vc.same_model(proposer_vendor, proposer_model, verify_with, verifier_model):
+                raise ValueError(
+                    "dream --tidy --verify-with requires distinct model families (%s=%s/%s has the same family as %s=%s/%s)"
+                    % (prop_source, proposer_vendor, proposer_model, ver_source, verify_with, verifier_model)
+                )
 
         if runner is None:
             for vendor_name in dict.fromkeys(vn for vn, _ in chosen):
@@ -1144,23 +1196,60 @@ def dream_tidy_run(
         merge = loaded["merge"]
         lessons_by_id = loaded["lessonsById"]
 
-        batches, oversized = _build_batches(lessons, lessons_by_id)
+        all_built_batches, oversized = _build_batches(lessons, lessons_by_id)
+        single_batches = [b for b in all_built_batches if len(b["lessonIds"]) < 2]
+        batches = [b for b in all_built_batches if len(b["lessonIds"]) >= 2]
+        report["oversizedLessons"] = len(oversized)
+        report["nothingToCompare"] = len(single_batches)
         if oversized:
             report["notices"].append(v.DREAM_TIDY_OVERSIZED_NOTICE % len(oversized))
+        if single_batches:
+            report["notices"].append(v.DREAM_TIDY_NOTHING_TO_COMPARE_NOTICE % len(single_batches))
+
+        all_batch_ids = [b["batchId"] for b in batches]
+        all_batch_id_set = set(all_batch_ids)
+        current_ex_digests = {b["examinedDigest"] for b in batches}
 
         existing_store, _ = _read_store(root)
         store = existing_store if existing_store is not None else _empty_store()
-        pending_batches, retry_ids, skipped_batches = _select_plan_batches(batches, store, again=bool(again))
+        prior_plan_ids = [p.get("batchId") for p in store.get("plan", []) if isinstance(p, dict)]
+        prior_ex_set = set(store.get("examinedBatches", []))
+        continuing_again = (
+            bool(again)
+            and bool((store.get("lastRun") or {}).get("again"))
+            and prior_plan_ids == all_batch_ids
+            and any(b["examinedDigest"] not in prior_ex_set for b in batches)
+        )
+        if again and batches and not continuing_again:
+            if dry_run:
+                store = copy.deepcopy(store)
+                store["examinedBatches"] = [d for d in store.get("examinedBatches", []) if d not in current_ex_digests]
+                store["completedBatches"] = [bid for bid in store.get("completedBatches", []) if bid not in all_batch_id_set]
+                store["plan"] = []
+            else:
+                with md.queue_lock(root / mb.QUEUE_REL):
+                    live_s, _ = _read_store(root)
+                    if live_s is not None:
+                        live_s["examinedBatches"] = [
+                            d for d in live_s.get("examinedBatches", []) if d not in current_ex_digests
+                        ]
+                        live_s["completedBatches"] = [
+                            bid for bid in live_s.get("completedBatches", []) if bid not in all_batch_id_set
+                        ]
+                        live_s["plan"] = []
+                        _write_store(root, live_s)
+                        store = live_s
+                    else:
+                        store = _empty_store()
+
+        pending_batches, retry_ids, skipped_batches = _select_plan_batches(batches, store, again=False)
         skipped_lesson_count = sum(len(b["lessonIds"]) for b in skipped_batches)
         report["alreadyExaminedLessons"] = skipped_lesson_count
         if skipped_lesson_count:
             report["notices"].append(v.DREAM_TIDY_ALREADY_EXAMINED_NOTICE % skipped_lesson_count)
 
-        all_batch_ids = [b["batchId"] for b in batches]
-        all_batch_id_set = set(all_batch_ids)
         resuming = (
-            not again
-            and [p.get("batchId") for p in store.get("plan", []) if isinstance(p, dict)] == all_batch_ids
+            [p.get("batchId") for p in store.get("plan", []) if isinstance(p, dict)] == all_batch_ids
             and (len(set(store.get("completedBatches", []))) < len(all_batch_ids) or bool(store.get("failedBatches")))
         )
         already_covered_batch_ids = {b["batchId"] for b in skipped_batches}
@@ -1244,7 +1333,7 @@ def dream_tidy_run(
                 )
             covered = {lid for b in batches if b["batchId"] in planned_batch_ids for lid in b["lessonIds"]}
             all_shown = [lid for b in batches for lid in b["lessonIds"]]
-            unexamined = len([lid for lid in all_shown if lid not in covered]) + len(oversized)
+            unexamined = len([lid for lid in all_shown if lid not in covered])
             report["unexaminedLessons"] = unexamined
             if unexamined:
                 report["notices"].append(v.DREAM_TIDY_UNEXAMINED_NOTICE % unexamined)
@@ -1270,6 +1359,7 @@ def dream_tidy_run(
                 report["done"] = True
             else:
                 examined_batch_ids: Set[str] = set(already_covered_batch_ids)
+                failed_this_run_ids: Set[str] = set()
                 attempted_verify: Set[str] = set()
                 checked_same = 0
                 checked_diff = 0
@@ -1423,6 +1513,7 @@ def dream_tidy_run(
                             }
                             _write_store(root, locked_store)
                         examined_batch_ids.discard(bid)
+                        failed_this_run_ids.add(bid)
                         consecutive_failures += 1
                         if consecutive_failures >= 3:
                             report["consecutiveFailureStopped"] = True
@@ -1459,6 +1550,10 @@ def dream_tidy_run(
                             dismissed_set,
                             bid,
                         )
+                        if not all_malformed:
+                            locked_store["droppedGroups"] = [
+                                r for r in locked_store.get("droppedGroups", []) if r.get("batchId") != bid
+                            ]
                         _keep_dropped(locked_store, dropped)
                         _keep_dropped(report, dropped)
                         capture(
@@ -1525,15 +1620,25 @@ def dream_tidy_run(
                                     report["addedProposals"].append(pid)
                                 if pid not in report["proposals"]:
                                     report["proposals"].append(pid)
-                            if bid not in locked_store.setdefault("completedBatches", []):
-                                locked_store["completedBatches"].append(bid)
-                            if ex_digest not in locked_store.setdefault("examinedBatches", []):
-                                locked_store["examinedBatches"].append(ex_digest)
+                            has_merge_blocked = any(r.get("reason") == "merge-blocked" for r in dropped)
+                            if has_merge_blocked:
+                                locked_store["completedBatches"] = [
+                                    x for x in locked_store.get("completedBatches", []) if x != bid
+                                ]
+                                locked_store["examinedBatches"] = [
+                                    d for d in locked_store.get("examinedBatches", []) if d != ex_digest
+                                ]
+                            else:
+                                if bid not in locked_store.setdefault("completedBatches", []):
+                                    locked_store["completedBatches"].append(bid)
+                                if ex_digest not in locked_store.setdefault("examinedBatches", []):
+                                    locked_store["examinedBatches"].append(ex_digest)
                             locked_store.setdefault("failedBatches", {}).pop(bid, None)
                             _write_store(root, locked_store)
 
                     if all_malformed:
                         examined_batch_ids.discard(bid)
+                        failed_this_run_ids.add(bid)
                         report["failedBatches"] += 1
                         report["errors"].append(v.DREAM_TIDY_ALL_DROPPED_ERROR)
                         consecutive_failures += 1
@@ -1546,9 +1651,17 @@ def dream_tidy_run(
                     if verify_with:
                         verify_open_proposals()
 
-                covered_lessons = {lid for b in batches if b["batchId"] in examined_batch_ids for lid in b["lessonIds"]}
-                all_shown_lessons = [lid for b in batches for lid in b["lessonIds"]]
-                unexamined = len([lid for lid in all_shown_lessons if lid not in covered_lessons]) + len(oversized)
+                failed_batch_lessons = sum(
+                    len(b["lessonIds"]) for b in batches if b["batchId"] in failed_this_run_ids
+                )
+                report["failedBatchLessons"] = failed_batch_lessons
+                if failed_batch_lessons:
+                    report["notices"].append(v.DREAM_TIDY_FAILED_BATCH_NOTICE % failed_batch_lessons)
+                unexamined = sum(
+                    len(b["lessonIds"])
+                    for b in batches
+                    if b["batchId"] not in examined_batch_ids and b["batchId"] not in failed_this_run_ids
+                )
                 report["unexaminedLessons"] = unexamined
                 if unexamined:
                     report["notices"].append(v.DREAM_TIDY_UNEXAMINED_NOTICE % unexamined)
@@ -1564,11 +1677,15 @@ def dream_tidy_run(
                     locked_store["lastRun"] = {
                         "runId": run_id,
                         "at": md._utc_now_iso(),
+                        "again": bool(again and unexamined > 0),
                         "batches": report["batches"],
                         "calls": report["calls"],
                         "failedBatches": report["failedBatches"],
                         "addedProposals": len(report["addedProposals"]),
                         "unexaminedLessons": report["unexaminedLessons"],
+                        "failedBatchLessons": report["failedBatchLessons"],
+                        "oversizedLessons": report["oversizedLessons"],
+                        "nothingToCompare": report["nothingToCompare"],
                         "alreadyExaminedLessons": report["alreadyExaminedLessons"],
                     }
                     _write_store(root, locked_store)
@@ -1609,31 +1726,57 @@ def dream_tidy_dismiss(repo: Any = ".", proposal_ids: Sequence[str] = ()) -> Dic
             store, exists = _read_store(root)
             if not exists or store is None:
                 raise ValueError(v.DREAM_TIDY_UNKNOWN_PROPOSAL % wanted[0])
-            known = {p.get("id") for p in store.get("proposals", []) if isinstance(p, dict)} | set(store.get("dismissed", []))
+            proposals_by_id = {
+                p["id"]: p for p in store.get("proposals", []) if isinstance(p, dict) and isinstance(p.get("id"), str)
+            }
+            already = set(store.get("dismissed", []))
+            known = set(proposals_by_id) | already
             for pid in wanted:
                 if pid not in known:
                     raise ValueError(v.DREAM_TIDY_UNKNOWN_PROPOSAL % pid)
-            already = set(store.get("dismissed", []))
-            applied, unchanged = [], []
+            loaded = _load_repository_lessons(root)
+            lessons = loaded["lessons"]
+            lessons_by_id = loaded["lessonsById"]
+            wording_groups = _tidy_duplicate_sets(lessons, lessons_by_id)
+            applied: List[str] = []
+            unchanged: List[str] = []
+            not_dismissed: List[Dict[str, Any]] = []
             for pid in wanted:
-                if pid in already:
+                prop = proposals_by_id.get(pid)
+                if prop is None:
+                    unchanged.append(pid)
+                    continue
+                st = proposal_state(prop, lessons_by_id, wording_groups=wording_groups)
+                if st["state"] == "open":
+                    if pid not in already:
+                        store.setdefault("dismissed", []).append(pid)
+                        already.add(pid)
+                    prop["dismissed"] = True
+                    applied.append(pid)
+                elif st["state"] == "dismissed":
                     unchanged.append(pid)
                 else:
-                    store.setdefault("dismissed", []).append(pid)
-                    already.add(pid)
-                    applied.append(pid)
-            for prop in store.get("proposals", []):
-                if isinstance(prop, dict) and prop.get("id") in already:
-                    prop["dismissed"] = True
+                    code = st["reason"] or st["state"]
+                    sentence = v.DREAM_TIDY_STATE_REASONS.get(code, code)
+                    not_dismissed.append({
+                        "id": pid,
+                        "state": st["state"],
+                        "reason": code,
+                        "reasonMeaning": sentence,
+                        "message": "not dismissed: %s — %s" % (st["state"], sentence),
+                    })
             if applied:
                 _write_store(root, store)
-        return {
+        out_res: Dict[str, Any] = {
             "ok": True,
             "tidy": True,
             "exitCode": 0,
             "dismissed": applied,
             "unchanged": unchanged,
         }
+        if not_dismissed:
+            out_res["notDismissed"] = not_dismissed
+        return out_res
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
         return dict(mb._fail(str(exc), 2), tidy=True)
 
@@ -1692,6 +1835,7 @@ def dream_tidy_status(repo: Any = ".") -> Dict[str, Any]:
                     "id": pid,
                     "state": state_name,
                     "reason": reason,
+                    "reasonMeaning": v.DREAM_TIDY_STATE_REASONS.get(reason, reason) if reason else None,
                     "keep": ordered_ids[0],
                     "lessonIds": ordered_ids,
                     "proposer": {"vendor": prop["proposer"]["vendor"], "model": prop["proposer"]["model"]},
@@ -1711,12 +1855,24 @@ def dream_tidy_status(repo: Any = ".") -> Dict[str, Any]:
             dropped_omitted = 0
             failed_records = []
 
+        cur_batches, _ = _build_batches(lessons, lessons_by_id)
+        shown_ids = [lid for lid, info in lessons_by_id.items() if info.get("shown") and info.get("readerText")]
+        ex_digests = set(loaded_store.get("examinedBatches", [])) if store_state == "ok" else set()
+        ex_lids = {
+            lid for b in cur_batches if len(b["lessonIds"]) >= 2 and b["examinedDigest"] in ex_digests for lid in b["lessonIds"]
+        }
+        unexamined_shown = len([lid for lid in shown_ids if lid not in ex_lids])
+        reason_meanings = {code: v.DREAM_TIDY_STATE_REASONS.get(code, code) for code in sorted(reasons)}
+
         return {
             "ok": True,
             "tidy": True,
             "exitCode": 0,
             "counts": counts,
+            "shownLessons": len(shown_ids),
+            "unexaminedLessons": unexamined_shown,
             "reasons": reasons,
+            "reasonMeanings": reason_meanings,
             "duplicateProposals": duplicate_proposals,
             "invalidRecords": invalid_records,
             "proposals": evaluated,
@@ -1764,13 +1920,7 @@ def tidy_report_section(
     Returns `None` when `tidy-proposals.json` does not exist so the report stays byte-identical to 9.3.0.
     Strictly read-only: opens no lock, creates no file or directory, calls no model, and never fails the report.
     """
-    target = root / PROPOSALS_REL
-    problem = mw.managed_path_problem(root, PROPOSALS_REL, leaf="file")
-    if problem:
-        if os.path.lexists(str(_existing_problem_path(root, PROPOSALS_REL) or target)):
-            return {"entries": [], "omitted": 0, "notices": [v.TIDY_MODEL_PROPOSALS_UNREADABLE], "blockersFailed": False}
-        return None
-    if not os.path.lexists(str(target)):
+    if not _has_regular_proposals_target(root):
         return None
     loaded_store = _load_store_for_read(root)
     if loaded_store["state"] == "absent":
@@ -1797,7 +1947,9 @@ def tidy_report_section(
         if st["state"] != "open":
             continue
         ordered = mt.kept_lesson_order(lessons, prop["lessonIds"])
-        keep, same = ordered[0], ordered[1:]
+        keep, same, keep_reason, checked, failed_one = mt._choose_kept_lesson(
+            lessons, ordered, merge, merge_ok=merge_ok
+        )
         proposer = {"vendor": prop["proposer"]["vendor"], "model": prop["proposer"]["model"]}
         verifier = copy.deepcopy(prop["verifier"]) if prop.get("verifier") else None
         verdict = prop.get("verdict")
@@ -1829,7 +1981,8 @@ def tidy_report_section(
             "id": prop["id"],
             "keep": keep,
             "same": same,
-            "lessons": [mt._lesson(lessons[lid]) for lid in ordered],
+            "keepReason": keep_reason,
+            "lessons": [mt._lesson(lessons[lid]) for lid in [keep] + same],
             "proposer": proposer,
             "verifier": verifier,
             "verdict": verdict,
@@ -1844,8 +1997,7 @@ def tidy_report_section(
             entry["wordingOverlapLabel"] = overlap_label
         if merge_ok:
             mt._with_command(entry, cmd(["learn"], [("--merge", keep), ("--same", same), ("--by", "NAME")]))
-            checked = mt._checked_blockers(merge, keep, same)
-            if checked is None:
+            if failed_one or checked is None:
                 blockers_failed = True
                 mt._with_command(entry, None, v.TIDY_BLOCKERS_FAILED)
             else:

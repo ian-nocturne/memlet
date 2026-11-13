@@ -1,6 +1,7 @@
 """Explicit Dream CLI; importing/registering never launches a vendor."""
 from . import vocabulary as v
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
+import argparse
 import json
 from memlet.cli_plugins import add_format_option
 from memlet.memlet_dreamcycle import REJECTION_MEANINGS, dream_ingest, dream_run, dream_status, dream_skip_failed
@@ -10,21 +11,27 @@ COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or
 
 def register(sub):
     from memlet.memlet_dreamcycle import TRUST_BOUNDARY
-    parser = sub.add_parser("dream", help=COMMANDS["dream"]["help"], epilog=TRUST_BOUNDARY)
-    parser.add_argument("repo", nargs="?", default=None)
+    parser = sub.add_parser(
+        "dream",
+        help=COMMANDS["dream"]["help"],
+        description=COMMANDS["dream"]["help"] + "; with --tidy, ask a model which shown lessons say the same thing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Dream cycle: " + TRUST_BOUNDARY + "\n\nWith --tidy: " + v.DREAM_TIDY_TRUST_NOTICE,
+    )
+    parser.add_argument("repo", nargs="?", default=None, help=v.DREAM_REPO_HELP)
     parser.add_argument("--repo", dest="repo_opt", default=None, metavar="PATH", help=v.DREAM_REPO_HELP)
     parser.add_argument("--tidy", action="store_true", help=v.DREAM_TIDY_HELP)
     parser.add_argument("--again", action="store_true", help=v.DREAM_TIDY_AGAIN_HELP)
     parser.add_argument("--via", help=v.DREAM_VIA_HELP)
     parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help=v.DREAM_VERIFY_WITH_HELP)
-    parser.add_argument("--transcript")
+    parser.add_argument("--transcript", help="Native session transcript to snapshot and examine (dream cycle only)")
     parser.add_argument("--save-fixture", metavar="DIR", help="Explicitly save masked model answers outside .memlet (never overwrite)")
     parser.add_argument("--max-batches", type=int, default=None, help=v.DREAM_MAX_BATCHES_HELP)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Show planned calls and prompts without calling a vendor or writing")
+    parser.add_argument("--status", action="store_true", help="Show waiting sessions and failed batches, or proposal status with --tidy")
     parser.add_argument("--dismiss", nargs="+", action="extend", metavar="PROPOSAL_ID", help=v.DREAM_TIDY_DISMISS_HELP)
     parser.add_argument("--skip-failed", metavar="BATCH_ID", help="Record a failed batch as completed-with-rejections; no model call")
-    add_format_option(parser)
+    add_format_option(parser, help="Output format (default: markdown on a terminal, json when piped)")
 
 
 def _rejections(result):
@@ -55,8 +62,17 @@ def _dropped_groups_lines(result):
     lines = []
     for rec in result.get("droppedGroups", []):
         lessons = ", ".join(rec.get("lessonIds") or []) or "none"
-        lines.append("- Dropped [%s]: %s (batch %s, group #%s; lessons: %s)" % (
-            rec["reason"], rec.get("reasonMeaning", rec["reason"]),
+        blocker_detail = ""
+        if rec.get("blockers"):
+            parts = [
+                "%s: %s" % (lid, ", ".join("%s — %s" % (c, v.MERGE_REASONS.get(c, c)) for c in codes))
+                for lid, codes in sorted(rec["blockers"].items())
+                if codes
+            ]
+            if parts:
+                blocker_detail = ": " + "; ".join(parts)
+        lines.append("- Dropped [%s]: %s%s (batch %s, group #%s; lessons: %s)" % (
+            rec["reason"], rec.get("reasonMeaning", rec["reason"]), blocker_detail,
             rec.get("batchId", "?"), rec.get("index", 1), lessons))
     if result.get("droppedGroupsOmitted"):
         lines.append("- %s more dropped group record(s) omitted by the count/byte bounds" % result["droppedGroupsOmitted"])
@@ -68,24 +84,54 @@ def _tidy_markdown(result):
     total_dropped = len(result.get("droppedGroups", [])) + int(result.get("droppedGroupsOmitted", 0))
     if not result["ok"]:
         text = "## Dream tidy failed\n\n"
+        started_run = bool(
+            result.get("batches")
+            or result.get("calls")
+            or result.get("failedBatches")
+            or result.get("proposals")
+            or result.get("addedProposals")
+        )
+        if started_run:
+            fb_count = result.get("failedBatches", 0)
+            fb_label = ("%s (will be retried on the next run)" % fb_count) if fb_count else str(fb_count)
+            text += "- Batches: %s; calls: %s; failed batches: %s\n" % (
+                result.get("batches", 0), result.get("calls", 0), fb_label)
+            text += "- Proposals: %s (new: %s); unexamined lessons: %s\n" % (
+                len(result.get("proposals", [])), len(result.get("addedProposals", [])), result.get("unexaminedLessons", 0))
+            if result.get("addedProposals"):
+                text += "- New proposal ids: %s\n" % ", ".join(result["addedProposals"])
         if total_dropped:
-            text += "- Dropped groups: %s\n" % total_dropped + dropped + "\n"
+            text += "- Dropped groups: %s\n" % total_dropped + dropped + ("" if started_run else "\n")
         text += "- ERROR: " + result["error"] + "\n"
         if result.get("droppedOutput"):
             text += "- Dropped output: %s\n" % result["droppedOutput"]
+        if started_run:
+            if result.get("verificationSummary"):
+                text += "- " + result["verificationSummary"] + "\n"
+            for notice in result.get("notices", []):
+                text += "- " + notice + "\n"
+            if result.get("trustBoundary"):
+                text += "\n" + result["trustBoundary"] + "\n"
+            if result.get("proposals"):
+                text += "\n" + v.DREAM_TIDY_NEXT_STEP + "\n"
         return text
     if "dismissed" in result:
         text = "## Dream tidy dismiss\n\n"
         text += "- Dismissed: %s\n" % (", ".join(result["dismissed"]) if result["dismissed"] else "none")
         if result.get("unchanged"):
             text += "- Already dismissed: %s\n" % ", ".join(result["unchanged"])
+        for item in result.get("notDismissed", []):
+            text += "- %s: %s\n" % (item["id"], item["message"])
         return text
     if "counts" in result:
         counts = result.get("counts", {})
         text = "## Dream tidy status\n\n"
-        text += "- Open: %s; disputed: %s; stale: %s; merged: %s; dismissed: %s\n" % (
+        text += "- Open: %s (of them disputed: %s); stale: %s; merged: %s; dismissed: %s\n" % (
             counts.get("open", 0), counts.get("disputed", 0), counts.get("stale", 0),
             counts.get("merged", 0), counts.get("dismissed", 0))
+        if "unexaminedLessons" in result:
+            text += "- Shown lessons never examined: %s (of %s)\n" % (
+                result["unexaminedLessons"], result.get("shownLessons", 0))
         for code, cnt in sorted((result.get("reasons") or {}).items()):
             meaning = v.DREAM_TIDY_STATE_REASONS.get(code, code)
             text += "- State reason [%s]: %s (%s)\n" % (code, cnt, meaning)
@@ -102,12 +148,18 @@ def _tidy_markdown(result):
                 fb.get("reason", "?"), fb.get("reasonMeaning", fb.get("reason", "?")))
         for item in result.get("proposals", []):
             tag = " [disputed]" if item.get("disputed") else ""
+            prop_info = item.get("proposer") or {}
+            prop_str = "; proposer=%s/%s" % (prop_info.get("vendor", "?"), prop_info.get("model", "?"))
             ver = ("; verifier=%s/%s (%s)" % (item["verifier"]["vendor"], item["verifier"]["model"], item["verdict"])
                    if item.get("verifier") else "")
-            reason_note = (" (%s)" % item["reason"]) if item.get("reason") else ""
-            text += "- %s: state=%s%s%s; keep=%s; lessons=%s%s\n" % (
+            if item.get("reason"):
+                meaning = item.get("reasonMeaning") or v.DREAM_TIDY_STATE_REASONS.get(item["reason"], item["reason"])
+                reason_note = " (%s — %s)" % (item["reason"], meaning)
+            else:
+                reason_note = ""
+            text += "- %s: state=%s%s%s; keep=%s; lessons=%s%s%s\n" % (
                 item["id"], item["state"], reason_note, tag, item.get("keep", "?"),
-                ",".join(item.get("lessonIds") or []), ver)
+                ",".join(item.get("lessonIds") or []), prop_str, ver)
         for notice in result.get("notices", []):
             text += "- " + notice + "\n"
         if result.get("trustBoundary"):
@@ -134,6 +186,8 @@ def _tidy_markdown(result):
     else:
         text += "- Proposals: %s (new: %s); unexamined lessons: %s\n" % (
             len(result.get("proposals", [])), len(result.get("addedProposals", [])), result.get("unexaminedLessons", 0))
+        if result.get("addedProposals"):
+            text += "- New proposal ids: %s\n" % ", ".join(result["addedProposals"])
     for bid in result.get("retryFailedBatches", []):
         text += "- Would retry failed batch: " + bid + "\n"
     text += "- Dropped groups: %s\n" % total_dropped
@@ -147,6 +201,8 @@ def _tidy_markdown(result):
         text += "- " + notice + "\n"
     if result.get("trustBoundary"):
         text += "\n" + result["trustBoundary"] + "\n"
+    if not result.get("dryRun"):
+        text += "\n" + v.DREAM_TIDY_NEXT_STEP + "\n"
     return text
 
 

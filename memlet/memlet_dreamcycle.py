@@ -771,10 +771,17 @@ def _verification_candidates(root, vendor, model, agreement):
     return sorted(out, key=lambda n: min(r["at"] for r in n["proposers"] if trusted_record(r, n)))
 
 
-def _fixture_directory(directory):
+def _check_fixture_directory(directory):
+    if directory is None:
+        return
     path = Path(directory).absolute()
-    if ".memlet" in path.parts:
+    if ".memlet" in path.parts or ".memlet" in path.resolve(strict=False).parts:
         raise ValueError("fixture directory must be outside .memlet")
+
+
+def _fixture_directory(directory):
+    _check_fixture_directory(directory)
+    path = Path(directory).absolute()
     for part in [path] + list(path.parents):
         if part.is_symlink():
             raise ValueError("refusing symlinked fixture directory")
@@ -841,6 +848,7 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
             raise ValueError("unknown vendor")
         if type(max_batches) is not int or not 1 <= max_batches <= MAX_BATCHES:
             raise ValueError("max_batches must be 1..%d" % MAX_BATCHES)
+        _check_fixture_directory(save_fixture)
         dream_cfg = config.get("dream") if isinstance(config.get("dream"), dict) else {}
         models = dream_cfg.get("models") if isinstance(dream_cfg.get("models"), dict) else {}
         _, agreement, report["notices"] = mb.dream_settings(config)
