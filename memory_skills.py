@@ -6,7 +6,7 @@ ordinary UTF-8 SKILL.md packages under <root>/memory_skills/<task>/<name>/.
 Skills are reference procedures, never auto-executed shell hooks or authority.
 """
 
-from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context, _run_owned_git
 import ast
 import hashlib
 import json
@@ -16,6 +16,7 @@ import re
 import subprocess
 import tempfile
 import time
+import weakref
 from collections import Counter
 from pathlib import Path
 
@@ -669,7 +670,10 @@ def ensure_schema(db):
     now_m = time.monotonic()
     db_id = id(db)
     if now_m - _ENSURED_DB_TS.get(db_id, -10.0) < 1.5:
-        if _call_foreign(lambda: db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_skills'").fetchone()):
+        row = _call_foreign(lambda: db.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('memory_skills', 'memory_links')"
+        ).fetchone())
+        if row and row[0] == 2:
             return
     for sql in (
         '''CREATE TABLE IF NOT EXISTS memory_skills (
@@ -1351,6 +1355,16 @@ def stage_skill_from_experience(db, root, task, revision, event_key, exp_item_id
                                 card, source, valid_from=None, valid_until=None,
                                 event_at=None, skill_spec=None):
     """Validate and record a skill change in DB, returning a row to materialize."""
+    return _stage_skill_from_experience(
+        db, root, task, revision, event_key, exp_item_id, op,
+        card, source, valid_from=valid_from, valid_until=valid_until,
+        event_at=event_at, skill_spec=skill_spec,
+    )
+
+
+def _stage_skill_from_experience(db, root, task, revision, event_key, exp_item_id, op,
+                                 card, source, valid_from=None, valid_until=None,
+                                 event_at=None, skill_spec=None, _git_branch=None):
     ledger._identifier(task, 'task')
     ledger._identifier(event_key, 'event_key')
     ledger._identifier(exp_item_id, 'experienceId')
@@ -1506,7 +1520,7 @@ def stage_skill_from_experience(db, root, task, revision, event_key, exp_item_id
             'supersedesSkillVersion': existing['version'] if existing else 0,
             'createdBySession': created_by,
             'referencedFiles': ref_files,
-            'gitBranch': source.get('gitBranch') or (existing['source'].get('gitBranch') if existing else None) or detect_git_branch(root),
+            'gitBranch': source.get('gitBranch') or (existing['source'].get('gitBranch') if existing else None) or (detect_git_branch(root) if _git_branch is None else _git_branch),
         }
         if consolidated_from:
             new_source['consolidatedFrom'] = consolidated_from
@@ -2082,15 +2096,84 @@ def _invalidate_task_link_cache(task=None):
         _TASK_LINK_CACHE.pop(k, None)
 
 
+_CONN_TOKEN_COUNTER = 0
+
+
+class _ConnToken:
+    __slots__ = ("uid", "__weakref__")
+
+    def __init__(self, uid):
+        self.uid = uid
+
+    def __call__(self):
+        return self.uid
+
+
+def _evict_dead_conn_keys(conn_id):
+    for k in [k for k in list(_TASK_LINK_CACHE) if isinstance(k, tuple) and len(k) > 1 and k[0] == conn_id]:
+        _TASK_LINK_CACHE.pop(k, None)
+
+
+def _conn_weak_handle(db, create=False):
+    global _CONN_TOKEN_COUNTER
+    try:
+        cid = ("direct", id(db))
+        ref = weakref.ref(db, lambda _r, c=cid: _evict_dead_conn_keys(c))
+        return cid, ref, db
+    except TypeError:
+        pass
+    try:
+        row = _call_foreign(lambda: db.execute("SELECT _memlet_link_token()").fetchone())
+        if row and isinstance(row[0], int):
+            return ("sqlite", row[0]), None, None
+    except Exception:
+        if not create:
+            return None, None, None
+    if not create:
+        return None, None, None
+    try:
+        _CONN_TOKEN_COUNTER += 1
+        uid = _CONN_TOKEN_COUNTER
+        cid = ("sqlite", uid)
+        tok = _ConnToken(uid)
+        _call_foreign(lambda: db.create_function("_memlet_link_token", 0, tok))
+        return cid, weakref.ref(tok, lambda _r, c=cid: _evict_dead_conn_keys(c)), tok
+    except Exception:
+        return None, None, None
+
+
+def _sweep_dead_task_link_cache():
+    dead = [k for k, v in list(_TASK_LINK_CACHE.items()) if v[0]() is None]
+    for k in dead:
+        _TASK_LINK_CACHE.pop(k, None)
+
+
+def _task_link_revision(db):
+    try:
+        return _call_foreign(lambda: (
+            db.execute("PRAGMA data_version").fetchone()[0],
+            db.execute("PRAGMA schema_version").fetchone()[0],
+            db.total_changes,
+            db.in_transaction,
+        ))
+    except Exception:
+        return None
+
+
 def _load_task_link_graph(db, task):
     """Load and cache adjacency list, out-degrees, and sorted [[wiki_links]] per node for a task in a single SQL query."""
-    ckey = (_db_identity_key(db), task)
-    revision = _call_foreign(lambda: (db.execute("PRAGMA data_version").fetchone()[0], db.total_changes, db.in_transaction))
-    cached = _TASK_LINK_CACHE.get(ckey)
-    # data_version is connection-local. Retain the bounded connection reference,
-    # not id(db), so a new connection cannot reuse a former connection's revision.
-    if cached is not None and cached[0] is db and cached[1] == revision and not revision[2]:
-        return cached[2]
+    _sweep_dead_task_link_cache()
+    revision = _task_link_revision(db)
+    conn_id, _, _ = _conn_weak_handle(db, create=False) if revision is not None else (None, None, None)
+    ckey = (conn_id, task) if conn_id is not None else None
+    if ckey is not None:
+        cached = _TASK_LINK_CACHE.get(ckey)
+        if cached is not None:
+            alive = cached[0]()
+            if alive is None:
+                _TASK_LINK_CACHE.pop(ckey, None)
+            elif (conn_id[0] != "direct" or alive is db) and cached[1] == revision and not revision[3]:
+                return cached[2]
     ensure_schema(db)
 
     edge_rows = _call_foreign(lambda: db.execute(
@@ -2119,10 +2202,19 @@ def _load_task_link_graph(db, task):
 
     graph = {'adj': adj, 'out_deg': out_deg, 'wiki_links': wiki_links}
     # An uncommitted graph may be rolled back without changing total_changes.
-    if not revision[2]:
-        if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE:
-            _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
-        _TASK_LINK_CACHE[ckey] = (db, revision, graph)
+    if revision is not None and not revision[3]:
+        existing_ref = _TASK_LINK_CACHE.get(ckey, (None,))[0] if ckey is not None else None
+        if existing_ref is not None and existing_ref() is not None:
+            conn_ref = existing_ref
+        else:
+            conn_id, conn_ref, _ = _conn_weak_handle(db, create=True)
+            ckey = (conn_id, task) if conn_id is not None else None
+        post_rev = _task_link_revision(db) if (ckey is not None and conn_ref is not None) else None
+        if ckey is not None and conn_ref is not None and post_rev is not None and not post_rev[3]:
+            _sweep_dead_task_link_cache()
+            if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE and ckey not in _TASK_LINK_CACHE:
+                _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
+            _TASK_LINK_CACHE[ckey] = (conn_ref, post_rev, graph)
     return graph
 
 
@@ -3327,6 +3419,8 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
             for r in _call_foreign(lambda: list(db.execute("SELECT * FROM memory_skills WHERE task=? AND status='active' ORDER BY event_id DESC", (task,)).fetchall()))
         ]
         rev = current['revision']
+        store_root = None
+        default_git_branch = None
         for sk in skills_rows:
             p = Path(sk['skill_path'])
             if not p.exists() or p.is_symlink() or not p.is_file():
@@ -3359,7 +3453,11 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
             new_triggers = parsed['triggers'] or _triggers_for(new_card, sk['source'], sk['triggers'])
             new_title = ledger._text(parsed['title'] or sk['title'], 'title', 240, empty=False)
             new_desc = ledger._text(f"{new_card['situation']} (조건: {new_card['conditions'][:240]})", 'description', 1000, empty=False)
-            ref_files = _extract_referenced_files(new_card, root=_call_foreign(lambda: store.root), explicit_files=sk['source'].get('referencedFiles'))
+            if store_root is None:
+                store_root = _call_foreign(lambda: store.root)
+            if default_git_branch is None:
+                default_git_branch = detect_git_branch(store_root)
+            ref_files = _extract_referenced_files(new_card, root=store_root, explicit_files=sk['source'].get('referencedFiles'))
             if is_explicit_user_coedit:
                 target_ev_state = 'user-confirmed'
                 target_ver_status = 'verified'
@@ -3380,7 +3478,7 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
                 'coeditedBySession': active_session,
                 'supersedesSkillVersion': sk['version'],
                 'referencedFiles': ref_files or sk['source'].get('referencedFiles', []),
-                'gitBranch': detect_git_branch(_call_foreign(lambda: store.root)),
+                'gitBranch': default_git_branch,
             }
             body = render_skill_markdown(
                 name=sk['name'],
@@ -3485,24 +3583,26 @@ def _detect_git_head_state(root):
     if not root:
         return '', False
     try:
-        proc_sha = subprocess.run(
+        rc_sha, out_sha, _ = _run_owned_git(
             ['git', 'rev-parse', 'HEAD'],
             cwd=str(root),
             capture_output=True,
             text=True,
             timeout=2.0,
+            _run=subprocess.run,
         )
-        if proc_sha.returncode != 0:
+        if rc_sha != 0:
             return '', False
-        head_sha = (proc_sha.stdout or '').strip()
-        proc_st = subprocess.run(
+        head_sha = (out_sha or '').strip()
+        rc_st, out_st, _ = _run_owned_git(
             ['git', 'status', '--porcelain', '-uno'],
             cwd=str(root),
             capture_output=True,
             text=True,
             timeout=2.0,
+            _run=subprocess.run,
         )
-        dirty = bool((proc_st.stdout or '').strip()) if proc_st.returncode == 0 else False
+        dirty = bool((out_st or '').strip()) if rc_st == 0 else False
         return head_sha, dirty
     except (OSError, subprocess.SubprocessError):
         return '', False
@@ -3583,17 +3683,22 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
                 raise ValueError('비어 있지 않은 검증 명령(command)이 필요해요.')
             cmd_args = cmd_str
             use_shell = True
+        cmd_cwd = str(_call_foreign(lambda: store.root))
+        cmd_timeout = min(max(float(timeout or 15.0), 1.0), 30.0)
         try:
-            proc = subprocess.run(
-                cmd_args,
-                shell=use_shell,
-                cwd=str(_call_foreign(lambda: store.root)),
-                capture_output=True,
-                text=True,
-                timeout=min(max(float(timeout or 15.0), 1.0), 30.0),
+            exit_code, out_s, err_s = _call_foreign(
+                lambda: (lambda p: (int(p.returncode), p.stdout or '', p.stderr or ''))(
+                    subprocess.run(
+                        cmd_args,
+                        shell=use_shell,
+                        cwd=cmd_cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=cmd_timeout,
+                    )
+                )
             )
-            exit_code = int(proc.returncode)
-            combined_out = ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
+            combined_out = (out_s + '\n' + err_s).strip()
         except subprocess.TimeoutExpired as exc:
             exit_code = 124
             combined_out = f"TimeoutExpired after {timeout}s: {exc}"

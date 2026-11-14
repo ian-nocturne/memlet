@@ -131,11 +131,11 @@ def _gitignore_notice(root: Path) -> Optional[str]:
     if not (root / ".git").exists():
         return None
     try:
-        r = subprocess.run(["git", "check-ignore", "-q", "--no-index", ".memlet/dream/APPROVAL-QUEUE.json"],
-                           cwd=str(root), capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
+        rc, _, _ = md._run_owned_git(["git", "check-ignore", "-q", "--no-index", ".memlet/dream/APPROVAL-QUEUE.json"],
+                                    cwd=str(root), capture_output=True, text=True, timeout=10, _run=subprocess.run)
+        if rc == 0:
             return None
-        if r.returncode == 1:
+        if rc == 1:
             return ("`.memlet/` is not git-ignored: the Dream queue and transcript snapshot hold conversation text. "
                     "Add `.memlet/` to `.gitignore` (Memlet does not edit it for you).")
     except (OSError, subprocess.SubprocessError):
@@ -639,6 +639,10 @@ class _LessonPathContext(dict):
         super().update(values)
 
 
+def _valid_path_context(context: Any) -> Optional[_LessonPathContext]:
+    return context if isinstance(context, _LessonPathContext) else None
+
+
 def _active_lesson_path_context(root: Path) -> Optional[_LessonPathContext]:
     return md._read_cache("lesson_path_contexts").get(root)
 
@@ -654,6 +658,11 @@ def _lesson_path_available(context):
     return not context.get("work") or context["work"].available()
 
 
+def _lesson_path_exhausted(context):
+    work = context.get("work")
+    return bool(work and work.exhausted)
+
+
 @md.fresh_read
 def valid_lesson_path(root, path, *, context=None):
     """Exact, contained regular file; an attachment names a location, not content identity.
@@ -665,7 +674,8 @@ def valid_lesson_path(root, path, *, context=None):
     if context is None:
         active = _active_lesson_path_context(root)
         context = active if active is not None else _LessonPathContext(root)
-    if not _lesson_path_available(context):
+    work = context.get("work")
+    if work and work.exhausted:
         return False
     if not isinstance(path, str):
         return False
@@ -686,9 +696,12 @@ def _valid_lesson_path(root, path, context):
     directories = context["directories"]
     try:
         for part in path.split("/"):
-            if not _lesson_path_available(context):
+            work = context.get("work")
+            if work and work.exhausted:
                 return False
             if cursor not in directories:
+                if len(directories) < 8 and not _lesson_path_available(context):
+                    return False
                 work = context.get("work")
                 if work and work.counters is not None:
                     key = cursor.relative_to(root).as_posix()
@@ -739,8 +752,10 @@ def _attachment_reader(fn):
             return fn(repo_path, *args, **kwargs)
         if "_read_state" in fn.__code__.co_varnames:
             kwargs = dict(kwargs, _read_state=state)
-        if kwargs.get("_path_context") is not None:
-            return fn(repo_path, *args, **kwargs)
+        valid_ctx = _valid_path_context(kwargs.get("_path_context"))
+        if valid_ctx is not None:
+            return fn(repo_path, *args, **dict(kwargs, _path_context=valid_ctx))
+        kwargs = dict(kwargs, _path_context=None)
         with _lesson_path_projection(root, None) as context:
             result = fn(repo_path, *args, **dict(kwargs, _path_context=context))
             if context.get("attachmentIncomplete"):
@@ -759,6 +774,7 @@ def lesson_path_context(repo_path=".", *, remaining=None, _read_state=None, cont
     An invalid/unreadable git work tree fails closed for automatic attachments.
     """
     root = mw._resolve_root(repo_path)
+    context = _valid_path_context(context)
     if context is None:
         context = _active_lesson_path_context(root)
         if context is None:
@@ -771,44 +787,22 @@ def lesson_path_context(repo_path=".", *, remaining=None, _read_state=None, cont
     context["is_git"] = is_git
     complete = not is_git
     if is_git and _lesson_path_available(context):
-        process = None
-        selector = selectors.DefaultSelector()
-        complete = False
         work = context.get("work")
-        try:
-            if work:
-                work.count("gitCalls")
-            process = subprocess.Popen(["git", "ls-files", "-z", "--cached", "--"], cwd=str(root),
-                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            selector.register(process.stdout, selectors.EVENT_READ)
-            data = bytearray()
-            allowance = LITERAL_FILES_TIMEOUT if remaining is None else min(LITERAL_FILES_TIMEOUT, max(0, remaining))
-            if work and work.bounded:
-                allowance = min(allowance, max(0, work.deadline - work.clock()))
-            deadline = time.monotonic() + allowance
-            while time.monotonic() < deadline and len(data) <= LITERAL_FILES_MAX_BYTES and _lesson_path_available(context):
-                remaining = max(0, deadline - time.monotonic())
-                if work and work.bounded:
-                    remaining = min(remaining, max(0, work.deadline - work.clock()))
-                if not selector.select(remaining):
-                    break
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    complete = True
-                    break
-                data.extend(chunk)
-            complete = complete and len(data) <= LITERAL_FILES_MAX_BYTES and process.wait(timeout=max(.001, deadline - time.monotonic())) == 0
-            if complete:
-                context["tracked"] = set(data.decode("utf-8", "surrogateescape").split("\0"))
-        except (OSError, subprocess.SubprocessError):
-            complete = False
-        finally:
-            selector.close()
-            if process is not None:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-                process.stdout.close()
+        if work:
+            work.count("gitCalls")
+        allowance = LITERAL_FILES_TIMEOUT if remaining is None else min(LITERAL_FILES_TIMEOUT, max(0, remaining))
+        if work and work.bounded:
+            allowance = min(allowance, max(0, work.deadline - getattr(work, "last_now", 0.0)))
+        complete, raw_tracked = md._read_owned_git_stream(
+            ["git", "ls-files", "-z", "--cached", "--"],
+            cwd=str(root),
+            allowance=allowance,
+            max_bytes=LITERAL_FILES_MAX_BYTES,
+            _popen=subprocess.Popen,
+            _read=os.read,
+        )
+        if complete:
+            context["tracked"] = set(raw_tracked.decode("utf-8", "surrogateescape").split("\0"))
     if not complete:
         context["attachmentIncomplete"] = True
         if context.get("work"):
@@ -850,7 +844,7 @@ def literal_lesson_paths(root, scope, text, *, context=None):
     """
     context = lesson_path_context(root, _read_state=md._active_read_state()) if context is None else context
     root = context["root"]
-    if not _lesson_path_available(context):
+    if _lesson_path_exhausted(context):
         return []
     if text in context["literal"]:
         return list(context["literal"][text])
@@ -861,7 +855,7 @@ def literal_lesson_paths(root, scope, text, *, context=None):
     raw.extend(tokens)
     out = []
     for path in dict.fromkeys(raw):
-        if not _lesson_path_available(context):
+        if _lesson_path_exhausted(context):
             break
         path = path.replace("\\", "/").removeprefix("./")
         if (path in named and len(path) <= 80 and (not context["is_git"] or path in context["tracked"])
@@ -889,7 +883,7 @@ def _lesson_literal_paths(node, root, context):
     evidence = list(zip(fields.get("cites", []), roles))
     replaced = {c["span"] for c, role in evidence if role == "replaced"}
     for edge in node.get("edges", []):
-        if not _lesson_path_available(context):
+        if _lesson_path_exhausted(context):
             return []
         if md.approval_state(edge, "edge") == TIER_APPROVED and edge.get("edgeVerdict") == "VALID":
             for pin in md._item_pins(edge, "edge") + [edge.get("citedTargetPin")]:
@@ -903,7 +897,7 @@ def _lesson_literal_paths(node, root, context):
                             evidence.append((md._resolve_pin(context["snapshot"], span), "current"))
     seen = set()
     for cite, role in evidence:
-        if not _lesson_path_available(context):
+        if _lesson_path_exhausted(context):
             break
         identity = (cite["span"], cite.get("sha256"))
         if role != "current" or identity in seen:
@@ -1814,22 +1808,23 @@ def _promote_locked(root: Path) -> Dict[str, Any]:
 
 @md.fresh_read
 def promoted_rule_entries(root: Path, *, _counters: Optional[Dict[str, int]] = None,
-                          _read_state: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                          _read_state: Optional[Any] = None, _path_context=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """(fresh, stale) rule-index-shaped entries for `memlet_recall`: a promoted rule is fresh only while its line is
     exactly the text Memlet renders from the approved Dream item, that item is still approved for the same content
     (approval digest), and its citations verify against the snapshot. Re-checked on every call; no model call."""
     state = md._active_read_state()
+    _path_context = _valid_path_context(_path_context)
     rkey = Path(root).resolve()
     cached = md._read_cache("promoted_entries", state=state).get(rkey)
     if cached is not None:
         cached_fresh, cached_stale = cached
         return [dict(e) for e in cached_fresh], [dict(e) for e in cached_stale]
-    fresh, stale = _promoted_rule_entries_scoped(root, _read_state=state)
+    fresh, stale = _promoted_rule_entries_scoped(root, _read_state=state, _path_context=_path_context)
     md._read_cache("promoted_entries", state=state)[rkey] = ([dict(e) for e in fresh], [dict(e) for e in stale])
     return fresh, stale
 
 
-def _promoted_rule_entries_scoped(root: Path, *, _read_state: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _promoted_rule_entries_scoped(root: Path, *, _read_state: Optional[Any] = None, _path_context=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     page = root / PROMOTED_PAGE
     if _symlinked(root, (PROMOTED_PAGE,)) or not page.is_file():
         return [], []
@@ -1854,7 +1849,7 @@ def _promoted_rule_entries_scoped(root: Path, *, _read_state: Optional[Any] = No
     view_by_id = {str(n.get("id")): n for n in (md._approved_view(graph, _copy=False)[0].get("nodes") or [])} if graph else {}
     merges = merge_view(root, context=dict(graph=graph, snapshot=snap), _read_state=_read_state) if any("merge" in n for n in by_id.values()) else {"states": {}}
     hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
-    quarantined = {i["id"] for i in dream_items(root, _graph=graph, _read_state=_read_state)["items"] if i.get("quarantined")}
+    quarantined = {i["id"] for i in dream_items(root, _graph=graph, _read_state=_read_state, _path_context=_path_context)["items"] if i.get("quarantined")}
     fresh, stale = [], []
     for r in rules:
         node = by_id.get(r["id"])
@@ -1882,7 +1877,7 @@ def _promoted_rule_entries_scoped(root: Path, *, _read_state: Optional[Any] = No
 # unified recall
 
 
-def _rules_items(root: Path, query: str, *, _read_state: Optional[Any] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], List[str]]:
+def _rules_items(root: Path, query: str, *, _read_state: Optional[Any] = None, _path_context=None) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], List[str]]:
     """({"rules": query matches, "safety": always-on importance-1 rules}, their sources, notices).
     With a rule index: BM25 over its verified entries. Without one: the deterministic parsed fallback
     (`memlet_recall.parsed_rule_entries`), labelled as such and never presented as reviewed; it has no safety list."""
@@ -1890,7 +1885,7 @@ def _rules_items(root: Path, query: str, *, _read_state: Optional[Any] = None) -
     from memlet.memlet_index import INDEX_PAGE
     mode = "index" if (root / INDEX_PAGE).is_file() else "parsed"
     # promoted Dream lessons are shown once, in the `dream` section, with their transcript citation
-    promoted = [e["source"] for e in promoted_rule_entries(root, _read_state=_read_state)[0]]
+    promoted = [e["source"] for e in promoted_rule_entries(root, _read_state=_read_state, _path_context=_path_context)[0]]
     res, picked = mr.recall_items(root, query, k=mr.MAX_K, safety=(mode == "index"), exclude=promoted,
                                   fallback=True)
     notices = []
@@ -1973,7 +1968,7 @@ def _dream_items(root: Path, query: str, *, _read_state: Optional[Any] = None, _
                       "title": n.get("title"), "quote": lesson_text(n), "source": source, "text": text, **_lesson_fields(n)})
         if items[-1].get("quoteLines"):
             items[-1]["text"] = f"- [{nid}] ({md.category_label(n.get('category'))}) {label}\n" + _lesson_quote_block(items[-1])
-    states = {it["id"]: it for it in dream_items(root, _read_state=_read_state)["items"]}
+    states = {it["id"]: it for it in dream_items(root, _read_state=_read_state, _path_context=_path_context)["items"]}
     present = {i["id"] for i in items}
     for nid, state in states.items():
         if nid not in present and any(md.approval_state(e, "edge") != TIER_APPROVED for e in by_id.get(nid, {}).get("edges", [])):
@@ -1985,7 +1980,7 @@ def _dream_items(root: Path, query: str, *, _read_state: Optional[Any] = None, _
         item.update(states[item["id"]])
         item["quote"] = item["text"]
         item["text"] = render_recall_lesson(item)
-    promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
+    promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root, _read_state=_read_state, _path_context=_path_context)[0]}
     entries = []
     for it in items:
         entry = promoted_by_id.get(it["id"])
@@ -2130,7 +2125,7 @@ def _unified_recall_scoped(repo_path=".", query="", *, budget=1200, store=None, 
     rules_mode = "index"
     if "rules" in wanted:
         try:
-            got, srcs, extra = _rules_items(root, query, _read_state=_read_state)
+            got, srcs, extra = _rules_items(root, query, _read_state=_read_state, _path_context=_path_context)
             cands["rules"], cands["safety"] = got["rules"], got["safety"]
             sources["rules"], sources["safety"] = srcs["rules"], srcs["safety"]
             cands["staleRules"], sources["staleRules"] = got["staleRules"], srcs["staleRules"]
@@ -2396,13 +2391,13 @@ def _accept_locked(root: Path, names: List[str], dry_run: bool) -> Dict[str, Any
 
 def _git_z(root: Path, args: List[str]) -> Tuple[Optional[List[str]], str]:
     try:
-        r = subprocess.run(["git"] + args, cwd=str(root), capture_output=True, timeout=30)
+        rc, stdout, stderr = md._run_owned_git(["git"] + args, cwd=str(root), capture_output=True, timeout=30, _run=subprocess.run)
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"git is unavailable ({exc}); pass the changed files explicitly"
-    if r.returncode != 0:
-        err = (r.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[0]
+    if rc != 0:
+        err = (stderr.decode("utf-8", "replace").strip().splitlines() or [""])[0]
         return None, ("not a git repository or unknown base ref; pass the changed files explicitly: " + err)[:300]
-    return [t for t in r.stdout.decode("utf-8", "surrogateescape").split("\0")], ""
+    return [t for t in stdout.decode("utf-8", "surrogateescape").split("\0")], ""
 
 
 @md.fresh_read
@@ -2551,7 +2546,7 @@ def changed_check(repo_path=".", *, base=None, files=None, _read_state: Optional
             body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
             page_rules = mw._extract_rules(body, rel)
             if rel == PROMOTED_PAGE:  # same rule as handover: only lessons that still verify are rules
-                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
+                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root, _read_state=_read_state, _path_context=_path_context)[0]}
                 page_rules = [r for r in page_rules if r["line"] in live]
             rules.extend(page_rules)
     mw._attach_sidecar(root, rules)  # wiki rules must acquire accepted anchors BEFORE path filtering
@@ -3030,7 +3025,7 @@ def merge_blockers(repo_path=".", keep="", same=(), *, context=None, _read_state
         kept = nodes.get(keep)
         def relations(n):
             return (n or {}).get("_mergeRelations", set())
-        path_context = context if isinstance(context, _LessonPathContext) else context.get("pathContext")
+        path_context = _valid_path_context(context if isinstance(context, _LessonPathContext) else context.get("pathContext"))
         if path_context is None:
             path_context = lesson_path_context(root, _read_state=md._active_read_state())
             context["pathContext"] = path_context
@@ -3115,6 +3110,7 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
 
 def _dream_items_reader(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None,
                         include_merged=False, _read_state: Optional[Any] = None, _path_context=None):
+    _path_context = _valid_path_context(_path_context)
     read_state = _read_state if _read_state is not None else md._active_read_state()
     if (read_state is not None and _graph is None and files is None and query == ""
             and type(tiers) in (list, tuple, set, frozenset)

@@ -184,9 +184,10 @@ def _current(lines: List[Dict[str, Any]]) -> Optional[List[str]]:
     return [ln["raw"] for ln in current]
 
 
-def _load_lessons(root: Path, graph: Dict[str, Any]) -> Dict[str, Any]:
+def _load_lessons(root: Path, graph: Dict[str, Any], *, path_context=None) -> Dict[str, Any]:
     nodes = {n["id"]: n for n in graph.get("nodes", []) if isinstance(n, dict) and isinstance(n.get("id"), str)}
-    with mb._lesson_path_projection(root, None) as context:
+    cm = contextlib.nullcontext(path_context) if path_context is not None else mb._lesson_path_projection(root, None)
+    with cm as context:
         read = (mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, _path_context=context) if nodes
                 else {"ok": True, "items": [], "notices": []})
         reached = {k: list(p) for k, p in context["paths"].items()}
@@ -534,15 +535,16 @@ def _sessions_after(records: List[Dict[str, Any]], when: Optional[datetime.datet
 
 
 def _sightings(root: Path, lessons: Dict[str, Dict[str, Any]], merge: Dict[str, Any], *, max_bytes: int,
-               now: datetime.datetime, graph=None) -> Dict[str, Any]:
+               now: datetime.datetime, graph=None, path_context=None) -> Dict[str, Any]:
     reached = {}
     # Only this scan asks the shared reader for holding members. It supplies the same
     # verified current/replaced projection that delivery uses, without exposing members.
     if _holding_members(merge):
         raw = _raw_index(graph or {})
-        with mb._lesson_path_projection(root, None) as path_context:
-            read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, include_merged=True, _path_context=path_context)
-            reached = {i: list(paths) for i, paths in path_context["paths"].items()}
+        cm = contextlib.nullcontext(path_context) if path_context is not None else mb._lesson_path_projection(root, None)
+        with cm as ctx:
+            read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, include_merged=True, _path_context=ctx)
+            reached = {i: list(paths) for i, paths in ctx["paths"].items()}
         lessons = dict(lessons)
         for item in read.get("items", []):
             if item.get("mergedInto"):
@@ -582,12 +584,14 @@ def lesson_sightings(repo_path=".", *, ids=None, max_bytes=MAX_BYTES, clock=None
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": str(exc), "complete": False, "scanned": {"files": 0, "bytes": 0},
                 "sightings": {}}
-    loaded = _load_lessons(root, graph)
-    if not loaded["ok"]:
-        error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
-        return {"ok": False, "error": error, "complete": False, "scanned": {"files": 0, "bytes": 0}, "sightings": {}}
-    merge = merge_checks(root, loaded["nodes"], context={"graph": graph})
-    scan = _sightings(root, loaded["lessons"], merge, max_bytes=max_bytes, now=_now(clock), graph=graph)
+    now = _now(clock)
+    with mb._lesson_path_projection(root, None) as path_context:
+        loaded = _load_lessons(root, graph, path_context=path_context)
+        if not loaded["ok"]:
+            error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
+            return {"ok": False, "error": error, "complete": False, "scanned": {"files": 0, "bytes": 0}, "sightings": {}}
+        merge = merge_checks(root, loaded["nodes"], context={"graph": graph, "pathContext": path_context})
+        scan = _sightings(root, loaded["lessons"], merge, max_bytes=max_bytes, now=now, graph=graph, path_context=path_context)
     keep = None if ids is None else set(mb._ids(ids))
     sightings = {i: _summary(r) for i, r in scan["grouped"].items() if keep is None or i in keep}
     notices = ([why] if why else []) + scan["notices"] + ([merge["notice"]] if merge["notice"] else [])
@@ -836,19 +840,20 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
         return {"ok": False, "exitCode": 2, "error": str(exc), "formatted": "- ERROR: " + str(exc) + "\n"}
     now = _now(clock)
     notices: List[str] = [why] if why else []
-    loaded = _load_lessons(root, graph)
-    if not loaded["ok"]:
-        error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
-        return {"ok": False, "exitCode": 1, "error": error, "formatted": "- ERROR: " + error + "\n"}
-    notices.extend(n for n in loaded["notices"] if n not in notices)
-    lessons, nodes, reached = loaded["lessons"], loaded["nodes"], loaded["reached"]
-    merge_context = {"graph": graph}
-    merge = merge_checks(root, nodes, context=merge_context)
-    if merge["notice"]:
-        notices.append(merge["notice"])
-    merge_ok = merge["available"]
-    holding = _holding_members(merge)
-    scan = _sightings(root, lessons, merge, max_bytes=max_bytes, now=now, graph=graph)
+    with mb._lesson_path_projection(root, None) as path_context:
+        loaded = _load_lessons(root, graph, path_context=path_context)
+        if not loaded["ok"]:
+            error = "; ".join(loaded["notices"]) or v.GRAPH_EVIDENCE_ERROR
+            return {"ok": False, "exitCode": 1, "error": error, "formatted": "- ERROR: " + error + "\n"}
+        notices.extend(n for n in loaded["notices"] if n not in notices)
+        lessons, nodes, reached = loaded["lessons"], loaded["nodes"], loaded["reached"]
+        merge_context = {"graph": graph, "pathContext": path_context}
+        merge = merge_checks(root, nodes, context=merge_context)
+        if merge["notice"]:
+            notices.append(merge["notice"])
+        merge_ok = merge["available"]
+        holding = _holding_members(merge)
+        scan = _sightings(root, lessons, merge, max_bytes=max_bytes, now=now, graph=graph, path_context=path_context)
     notices.extend(scan["notices"])
     scan_complete = scan["complete"]
     records = scan["grouped"]

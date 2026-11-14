@@ -90,7 +90,8 @@ class _Work:
     def __init__(self, bounded=False, clock=None, counters=None):
         self.bounded = bounded
         self.clock = _monotonic if clock is None else lambda: _call_foreign(clock)
-        self.deadline = self.clock() + MAX_NEIGHBOR_SECONDS if bounded else None
+        self.last_now = self.clock() if bounded else 0.0
+        self.deadline = self.last_now + MAX_NEIGHBOR_SECONDS if bounded else None
         self.counters = counters
         self.parse_start = ca._PYTHON_BINDING_PARSE_COUNT
         if counters is not None:
@@ -119,10 +120,12 @@ class _Work:
     def available(self):
         if self.exhausted:
             return False
-        if self.bounded and self.clock() >= self.deadline:
-            self.exhausted = True
-            self.skip(v.GRAPH_WORK_NOTICE)
-            return False
+        if self.bounded:
+            self.last_now = self.clock()
+            if self.last_now >= self.deadline:
+                self.exhausted = True
+                self.skip(v.GRAPH_WORK_NOTICE)
+                return False
         return True
 
 
@@ -217,7 +220,7 @@ class _History:
                             if number >= min(event_bound, MAX_HISTORY_QUERIES):
                                 self.notice(v.GRAPH_EVENTS_NOTICE)
                                 break
-                            if not work.available() or len(recovered) >= event_bound:
+                            if (number == 0 and not work.available()) or len(recovered) >= event_bound:
                                 self.notice(v.GRAPH_EVENTS_NOTICE)
                                 break
                             item_rows = mb.decision_events(root, item_id=ident)
@@ -238,11 +241,11 @@ class _History:
                     if len(rows) > event_bound:
                         self.notice(v.GRAPH_EVENTS_NOTICE)
                         rows = []
+                    if rows and not work.available():
+                        self.decisions, self.conflicts = {}, set()
+                        self.notice(v.GRAPH_EVENTS_NOTICE)
+                        rows = []
                     for row in rows:
-                        if not work.available():
-                            self.decisions, self.conflicts = {}, set()
-                            self.notice(v.GRAPH_EVENTS_NOTICE)
-                            break
                         # An observation of an untouched relation is not a new decision.
                         if row["decision"] in ("left-pending", "left-rejected", "left-approved"):
                             continue
@@ -566,9 +569,13 @@ def _fresh_classification(root, rules, pins, work, *, _read_state=None):
         work.count("anchorsClassified", len(classified))
         return classified
     completed, anchors, consumed = [], {}, 0
+    if rules and not work.available():
+        work.skip(v.GRAPH_WORK_NOTICE)
+        rules[:] = []
+        return []
     for r in rules:
         refs = {(mw._resolve_ref_path(root, r["source"], p), sym) for p, sym in r["refs"]}
-        if consumed + len(refs) > MAX_NEIGHBOR_ANCHORS or not work.available():
+        if consumed + len(refs) > MAX_NEIGHBOR_ANCHORS or work.exhausted:
             work.skip(v.GRAPH_WORK_NOTICE)
             break
         # Retain the shared classifier and its worst-anchor rule status. Work
@@ -618,10 +625,10 @@ def _slice(graph, path, ident, work=None):
     candidates = []
     rejected = mb.tier_config(graph, {}).get("_dreamRejectedQuoteHashes", set())
     quote_hashes = {}
+    if graph.get("nodes") and not work.available():
+        # Incomplete veto/context indexing cannot authorize a prefix.
+        return dict(graph, nodes=[], edges=[])
     for node in graph.get("nodes", []):
-        if not work.available():
-            # Incomplete veto/context indexing cannot authorize a prefix.
-            return dict(graph, nodes=[], edges=[])
         nid = node.get("id")
         paths = {path for part in md.lesson_lines(node) for line in part["quote"].split("\n")
                  for path in mb._lesson_path_candidates(line)}
@@ -698,7 +705,7 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
         graph = dict(graph, nodes=[], edges=[])
     work.count("lessonCandidatesValidated", len(graph.get("nodes", [])))
     read = (mb.dream_items(root, tiers=(APPROVED,) if as_of else (APPROVED, HINT), _graph=graph, _read_state=_read_state, _path_context=path_context)
-            if work.available() else dict(ok=True, items=[], notices=[]))
+            if not work.exhausted else dict(ok=True, items=[], notices=[]))
     if not read["ok"]:
         raise ValueError(v.GRAPH_EVIDENCE_ERROR)
     notices = [GRAPH_TIME_NOTICE] + ([GRAPH_HISTORY_NOTICE] if as_of else [])
@@ -742,9 +749,8 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
         else:
             nodes[fid]["validFrom"] = _earliest([nodes[fid]["validFrom"], since])
         return fid
-    for item in read["items"]:
-        if not work.available():
-            break
+    items_to_project = [] if (read["items"] and not work.available()) else read["items"]
+    for item in items_to_project:
         node = raw[item["id"]]
         start, end = history.interval(node, "node", as_of)
         if item["tier"] == HINT:

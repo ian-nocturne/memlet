@@ -187,13 +187,13 @@ def _same_doc(a: Any, b: Any) -> bool:
 
 def _git(root: Path, args: List[str], timeout: float = 10.0) -> Optional[str]:
     try:
-        r = subprocess.run(["git"] + args, cwd=str(root), capture_output=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+        rc, stdout, _ = md._run_owned_git(["git"] + args, cwd=str(root), capture_output=True, timeout=timeout,
+                                         stdin=subprocess.DEVNULL, _run=subprocess.run)
     except (OSError, subprocess.SubprocessError):
         return None
-    if r.returncode != 0:
+    if rc != 0:
         return None
-    return r.stdout.decode("utf-8", "surrogateescape")
+    return stdout.decode("utf-8", "surrogateescape")
 
 
 def default_cli_path() -> Path:
@@ -245,11 +245,15 @@ def probe_command(prefix: str, cwd: Path) -> bool:
     line = f"{prefix} admin hook probe"
     argv = ["/bin/sh", "-c", line] if os.path.exists("/bin/sh") else shlex.split(line)
     try:
-        r = subprocess.run(argv, cwd=str(cwd), input=b"", capture_output=True, timeout=30, env=env)
-        doc = json.loads(r.stdout.decode("utf-8", "replace").strip() or "null")
+        rc, out_bytes = _call_foreign(
+            lambda: (lambda p: (p.returncode, p.stdout))(
+                subprocess.run(argv, cwd=str(cwd), input=b"", capture_output=True, timeout=30, env=env)
+            )
+        )
+        doc = json.loads(out_bytes.decode("utf-8", "replace").strip() or "null")
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
-    return r.returncode == 0 and isinstance(doc, dict) and doc.get("memletHook") == HOOK_PROTOCOL
+    return rc == 0 and isinstance(doc, dict) and doc.get("memletHook") == HOOK_PROTOCOL
 
 
 @md.fresh_read
@@ -929,9 +933,9 @@ def _gitignore_notice(root: Path, rel: str) -> Optional[str]:
     if _git(root, ["rev-parse", "--is-inside-work-tree"]) is None:
         return None
     try:
-        r = subprocess.run(["git", "check-ignore", "-q", "--no-index", rel], cwd=str(root), capture_output=True,
-                           timeout=10, stdin=subprocess.DEVNULL)
-        if r.returncode == 0:
+        rc, _, _ = md._run_owned_git(["git", "check-ignore", "-q", "--no-index", rel], cwd=str(root), capture_output=True,
+                                    timeout=10, stdin=subprocess.DEVNULL, _run=subprocess.run)
+        if rc == 0:
             return None
     except (OSError, subprocess.SubprocessError):
         pass

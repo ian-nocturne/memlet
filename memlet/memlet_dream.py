@@ -17,14 +17,22 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from collections.abc import Iterator as InputIterator
+from collections.abc import (
+    Iterator as InputIterator,
+    Mapping as InputMapping,
+    Sequence as InputSequence,
+    Set as InputSet,
+)
 import datetime
 import hashlib
 import json
 import os
 import re
+import selectors
 import sqlite3
+import subprocess
 import threading
+import time
 import unicodedata
 from pathlib import Path, PurePath, PosixPath, WindowsPath, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
@@ -125,6 +133,46 @@ def call_foreign(fn, *args, **kwargs):
     """
     with _suspend_read_state():
         return fn(*args, **kwargs)
+
+
+def _run_owned_git(args, *, _run=subprocess.run, **kwargs):
+    """Run a read-only git child process built by Memlet without suspending read state."""
+    proc = _run(args, **kwargs)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _read_owned_git_stream(args, *, cwd, allowance, max_bytes, _popen=subprocess.Popen, _read=os.read):
+    """Stream bounded output from a read-only git child process without suspending read state."""
+    process = None
+    selector = selectors.DefaultSelector()
+    complete = False
+    data = bytearray()
+    try:
+        process = _popen(args, cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + allowance
+        while time.monotonic() < deadline and len(data) <= max_bytes:
+            remaining = max(0, deadline - time.monotonic())
+            if not selector.select(remaining):
+                break
+            chunk = _read(process.stdout.fileno(), 65536)
+            if not chunk:
+                complete = True
+                break
+            data.extend(chunk)
+        complete = (complete and len(data) <= max_bytes
+                    and process.wait(timeout=max(.001, deadline - time.monotonic())) == 0)
+        return complete, bytes(data) if complete else b""
+    except (OSError, subprocess.SubprocessError):
+        return False, b""
+    finally:
+        selector.close()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
 
 
 @contextlib.contextmanager
@@ -229,6 +277,8 @@ def _materialise_read_argument(value):
             return list(value)
         if isinstance(value, os.PathLike):
             return Path(os.fspath(value))
+        if isinstance(value, (str, bytes, bytearray, memoryview, InputMapping, InputSequence, InputSet)):
+            return value
         return list(value)
     except Exception:
         return value
@@ -253,7 +303,11 @@ def fresh_read(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        bound = _normalise_read_arguments(signature.bind(*args, **kwargs))
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            return fn(*args, **kwargs)
+        bound = _normalise_read_arguments(bound)
         handed = bound.arguments.get("_read_state")
         with work_counters(bound.arguments.get("_counters")), _enter_read_scope(handed) as state:
             if "_read_state" in signature.parameters:

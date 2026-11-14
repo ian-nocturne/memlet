@@ -31,7 +31,7 @@ starts a daemon, calls a network or LLM, or opens `.env*` files or other secret 
 
 from __future__ import annotations
 
-from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context, _run_owned_git
 
 from .vocabulary import (HINT as TIER_HINT, REJECTED as TIER_REJECTED)
 from .vocabulary import suggested_label
@@ -223,14 +223,14 @@ def _rel(root: Path, p: Path) -> str:
 
 def _git_head(root: Path) -> Optional[str]:
     try:
-        out = subprocess.run(
+        rc, stdout, _ = _run_owned_git(
             ["git", "rev-parse", "--verify", "-q", "HEAD"],
-            cwd=str(root), capture_output=True, text=True, timeout=10,
+            cwd=str(root), capture_output=True, text=True, timeout=10, _run=subprocess.run,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    sha = out.stdout.strip()
-    return sha if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha) else None
+    sha = stdout.strip()
+    return sha if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha) else None
 
 
 @fresh_read
@@ -2400,15 +2400,15 @@ def _clip(text: str, limit: int) -> str:
 def _git_modified_count(root: Path) -> Optional[int]:
     """Working-tree entries from `git status --porcelain`, ignoring Memlet's own `.memlet/` files."""
     try:
-        out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
-                             cwd=str(root), capture_output=True, text=True, timeout=10,
-                             env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))  # read-only: never take .git/index.lock
+        rc, stdout, _ = _run_owned_git(["git", "status", "--porcelain", "--untracked-files=normal"],
+                                       cwd=str(root), capture_output=True, text=True, timeout=10,
+                                       env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"), _run=subprocess.run)  # read-only: never take .git/index.lock
     except (OSError, subprocess.SubprocessError):
         return None
-    if out.returncode != 0:
+    if rc != 0:
         return None
     count = 0
-    for line in out.stdout.splitlines():
+    for line in stdout.splitlines():
         path = line[3:].strip().strip('"').split(" -> ")[-1]
         if path and not (path == MEMLET_DIR + "/" or path.startswith(MEMLET_DIR + "/")):
             count += 1

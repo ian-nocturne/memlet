@@ -1,6 +1,6 @@
 """Zero-dependency StandaloneStore, StandaloneService, and high-level MemoryEngine SDK decoupled from Memlet WorkStore."""
 
-from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context, _run_owned_git
 from contextlib import contextmanager
 import hashlib
 import json
@@ -25,9 +25,9 @@ def default_standalone_task_id():
     """Use one canonical repository identity for CLI and MCP standalone defaults."""
     cwd = Path.cwd().resolve()
     try:
-        proc = subprocess.run(['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
-                              capture_output=True, text=True, check=True)
-        root = Path(proc.stdout.strip()).resolve()
+        _, stdout, _ = _run_owned_git(['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
+                                      capture_output=True, text=True, check=True, _run=subprocess.run)
+        root = Path(stdout.strip()).resolve()
     except (OSError, subprocess.CalledProcessError):
         root = cwd
     digest = hashlib.sha1(os.fsencode(str(root))).hexdigest()[:8]

@@ -1253,6 +1253,12 @@ def _should_bypass_cold_onnx(query, terms, counts, entity, doc_entries):
 
 def retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
              known_at=None, before=None, after=None, shared=False, federated=False):
+    return _retrieve(db, task, query=query, budget=budget, limit=limit, root=root, at=at,
+                     known_at=known_at, before=before, after=after, shared=shared, federated=federated)
+
+
+def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
+              known_at=None, before=None, after=None, shared=False, federated=False, _current_branch=None):
     started = time.monotonic()
     ledger._identifier(task, 'task')
     query = ledger._text(query, 'query', 2000)
@@ -1337,7 +1343,7 @@ def retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
     if len(query_facets) >= 2:
         _indexing_core.score_decor_facets_postings(query_facets, lex_index, ranked, signals, coverage_by_idx)
 
-    current_branch = skills_ledger.detect_git_branch(root) if root is not None else ''
+    current_branch = (skills_ledger.detect_git_branch(root) if root is not None else '') if _current_branch is None else _current_branch
 
     # Pillar 2: Prospective Memory Form-Monitor-Trigger evaluation (O(|prospective_indices|))
     prospective_triggers, prosp_boost_by_idx = _evaluate_prospective_triggers(
@@ -1865,6 +1871,7 @@ def learn(store, task, session, revision, operation, entries):
             raise ValueError('memory revision changed; refresh before writing')
         _call_foreign(lambda: store._check_input_lease(db, task))
         changed, touched, skill_changes = [], set(), []
+        default_git_branch = None
         for n, entry in enumerate(entries):
             allowed = {'id','kind','op','content','sourceRefs','certainty','validFrom','validUntil',
                        'entities','aliases','scope','shareEvidence','experience','case','skill','reason',
@@ -1897,7 +1904,12 @@ def learn(store, task, session, revision, operation, entries):
             capture_mode = entry.get('captureMode', 'strict')
             if capture_mode not in ('strict', 'auto-draft'):
                 raise ValueError('captureMode must be strict or auto-draft')
-            git_branch = ledger._text(entry.get('gitBranch') or skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)), 'gitBranch', 120)
+            raw_branch = entry.get('gitBranch')
+            if not raw_branch:
+                if default_git_branch is None:
+                    default_git_branch = skills_ledger.detect_git_branch(_call_foreign(lambda: store.root))
+                raw_branch = default_git_branch
+            git_branch = ledger._text(raw_branch, 'gitBranch', 120)
             source = {'kind':'agent-extraction','session':session,'operation':operation,'sourceRefs':refs,
                       'certainty':'explicit-user' if explicit else 'derived', 'requestedKind':requested_kind,
                       'captureMode':capture_mode,
@@ -1963,10 +1975,13 @@ def learn(store, task, session, revision, operation, entries):
                         end = inferred.get('validUntil')
                         source['foresight'] = inferred
                 if should_synthesize:
-                    staged_skill = skills_ledger.stage_skill_from_experience(
+                    if default_git_branch is None and not source.get('gitBranch'):
+                        default_git_branch = skills_ledger.detect_git_branch(_call_foreign(lambda: store.root))
+                    staged_skill = skills_ledger._stage_skill_from_experience(
                         db, _call_foreign(lambda: store.root), task, revision+1, 'skill-learn:'+digest([operation,n]),
                         item_id, op, card, source, valid_from=start, valid_until=end,
                         skill_spec=skill_spec if isinstance(skill_spec, dict) else None,
+                        _git_branch=default_git_branch,
                     )
                     if staged_skill and staged_skill.get('skill'):
                         sk = staged_skill['skill']
@@ -2907,6 +2922,7 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
         retracted_ids = []
         now = round(time.time(), 3)
         next_rev = current['revision'] + 1
+        default_git_branch = skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)) if (not dry_run and clusters) else None
 
         for c_idx, member_rows in enumerate(clusters):
             member_rows.sort(key=lambda r: (float(r.get('event_at') or 0.0), r['item_id']))
@@ -2961,7 +2977,7 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
                     'links': merged_links,
                     'consolidatedFrom': member_ids,
                     'consolidatedAt': now,
-                    'gitBranch': skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)),
+                    'gitBranch': default_git_branch,
                 }
                 _call_foreign(lambda: ledger.record(
                     db, task, next_rev, cons_op + ':assert',
@@ -3507,6 +3523,10 @@ def build_subagent_capsule(store, task, plan='', files=None, worker='', budget=1
     specific `plan` and `files`, preventing subagents from repeating pitfalls or violating task constraints
     without bloating their context window with full task history.
     """
+    return _build_subagent_capsule(store, task, plan=plan, files=files, worker=worker, budget=budget)
+
+
+def _build_subagent_capsule(store, task, plan='', files=None, worker='', budget=1200, _current_branch=None):
     ledger._identifier(task, 'task')
     budget = ledger._integer(budget, 'budget', 300, 12000)
     pf = preflight_check(store, task, plan=plan, files=files)
@@ -3515,7 +3535,7 @@ def build_subagent_capsule(store, task, plan='', files=None, worker='', budget=1
         task_row = _call_foreign(lambda: db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
-        ret = retrieve(db, task, query=probe_q, budget=min(2400, budget * 2), limit=4, root=_call_foreign(lambda: store.root))
+        ret = _retrieve(db, task, query=probe_q, budget=min(2400, budget * 2), limit=4, root=_call_foreign(lambda: store.root), _current_branch=_current_branch)
 
     top_skills = []
     for sk in (ret.get('primarySkills') or ret.get('skills', []))[:2]:
@@ -3809,7 +3829,8 @@ def benchmark(store, task, budget=6000):
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
         skills_ledger.sync_task_links(db, task)
-        skills_ledger.detect_git_branch(_call_foreign(lambda: store.root))
+        bench_root = _call_foreign(lambda: store.root)
+        bench_branch = skills_ledger.detect_git_branch(bench_root)
         all_active = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(ledger.FIELDS.values()) + ['instruction', 'report', 'fact', 'experience', 'case', 'hypothesis'],
@@ -3923,7 +3944,7 @@ def benchmark(store, task, budget=6000):
             except Exception:
                 pass
 
-        rep_ret = retrieve(db, task, query=rep_query, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
+        rep_ret = _retrieve(db, task, query=rep_query, budget=budget, limit=8, root=bench_root, _current_branch=bench_branch)
 
         content_by_id = {r['item_id']: r['content'] for r in recall_rows}
         skill_body_by_id = {(s.get('skill_id') or s.get('skillId')): (s.get('body') or '') for s in active_skills}
@@ -3969,7 +3990,7 @@ def benchmark(store, task, budget=6000):
             if not q_str:
                 continue
             evaluated_queries += 1
-            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
+            ret = _retrieve(db, task, query=q_str, budget=budget, limit=8, root=bench_root, _current_branch=bench_branch)
             latencies.append(float(ret.get('elapsedMs') or 0.0))
             sufficiency_count += len(ret.get('sufficiencyPromotions', []))
             diversity_scores.append(float(ret.get('stage1DiversityScore') or 1.0))
@@ -4029,7 +4050,7 @@ def benchmark(store, task, budget=6000):
         multi_aspect_eval = len(multi_aspect_pairs)
         multi_aspect_hits = 0
         for id_a, id_b, mq in multi_aspect_pairs:
-            mret = retrieve(db, task, query=mq, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
+            mret = _retrieve(db, task, query=mq, budget=budget, limit=8, root=bench_root, _current_branch=bench_branch)
             latencies.append(float(mret.get('elapsedMs') or 0.0))
             recalled_m = (
                 {x['item_id'] for x in mret['items']}
@@ -4062,7 +4083,7 @@ def benchmark(store, task, budget=6000):
                 if query_words:
                     seen_pairs.add((s_id, t_id))
                     assoc_eval += 1
-                    ret = retrieve(db, task, query=' '.join(query_words), budget=budget, limit=12, root=_call_foreign(lambda: store.root))
+                    ret = _retrieve(db, task, query=' '.join(query_words), budget=budget, limit=12, root=bench_root, _current_branch=bench_branch)
                     latencies.append(float(ret.get('elapsedMs') or 0.0))
                     recalled_all = (
                         {x['item_id'] for x in ret['items']}
@@ -4109,7 +4130,7 @@ def benchmark(store, task, budget=6000):
         case_hits = 0
         for c_row in case_rows:
             q_str = _distinctive_query_for_content(c_row['content'], doc_freq, max_terms=4)
-            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
+            ret = _retrieve(db, task, query=q_str, budget=budget, limit=8, root=bench_root, _current_branch=bench_branch)
             latencies.append(float(ret.get('elapsedMs') or 0.0))
             if any(c['item_id'] == c_row['item_id'] for c in ret.get('cases', [])):
                 case_hits += 1
@@ -4125,7 +4146,7 @@ def benchmark(store, task, budget=6000):
         abstention_eval = len(abstention_queries)
         abstention_hits = 0
         for aq in abstention_queries:
-            aret = retrieve(db, task, query=aq, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
+            aret = _retrieve(db, task, query=aq, budget=budget, limit=8, root=bench_root, _current_branch=bench_branch)
             if aret.get('abstained') and not aret.get('primaryItems') and not aret.get('primarySkills'):
                 abstention_hits += 1
 
@@ -4223,7 +4244,7 @@ def benchmark(store, task, budget=6000):
         '실패: python3 server.py --port 4388 Address already in use -> 해결: lsof -ti :4388 확인 후 기존 웹 프로세스만 안전 교체',
     )
     contrastive_ok = bool(contrastive_sample and contrastive_sample.get('contrastiveDiff') and len(contrastive_sample.get('avoidance') or []) >= 2)
-    capsule_sample = build_subagent_capsule(store, task, plan='server.py 교체 전 점검', files=['server.py'], worker='bench-worker', budget=1200)
+    capsule_sample = _build_subagent_capsule(store, task, plan='server.py 교체 전 점검', files=['server.py'], worker='bench-worker', budget=1200, _current_branch=bench_branch)
     capsule_ok = bool(capsule_sample.get('ok') and capsule_sample.get('withinBudget'))
 
     lat_sorted = sorted(latencies) if latencies else [0.0]
@@ -4320,7 +4341,7 @@ def benchmark(store, task, budget=6000):
             'identityDriftRate': prov_info['identityDriftRate'],
             'identityDriftScore': prov_info['identityDriftScore'],
             'coreEventOverwriteCount': prov_info['coreEventOverwriteCount'],
-            'gitBranch': skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)),
+            'gitBranch': bench_branch,
             'zeroExternalApiCost': True,
             'appendOnlyImmutableLedger': True,
             'fileHashStalenessGuard': True,

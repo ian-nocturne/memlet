@@ -128,15 +128,19 @@ def check_vendor(vendor, *, config=None, timeout=60):
         return result(False, refusal)
     try:
         with tempfile.TemporaryDirectory(prefix="memlet-auth-") as empty:
-            r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
-                               timeout=max(.01, min(60, timeout)), env=_runner_env(), cwd=empty)
-        if len(r.stdout or "") > 262144:
+            rc, out_text = _call_foreign(
+                lambda: (lambda p: (p.returncode, p.stdout))(
+                    subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
+                                   timeout=max(.01, min(60, timeout)), env=_runner_env(), cwd=empty)
+                )
+            )
+        if len(out_text or "") > 262144:
             return result(False, "authentication response exceeds bound")
-        st = json.loads(r.stdout or "{}")
+        st = json.loads(out_text or "{}")
     except (OSError, subprocess.SubprocessError, ValueError):
         return result(False, "could not confirm subscription authentication")
-    if r.returncode != 0 or not isinstance(st, dict):
-        return result(False, "refusing: `claude auth status` exited %s or returned an invalid object" % r.returncode)
+    if rc != 0 or not isinstance(st, dict):
+        return result(False, "refusing: `claude auth status` exited %s or returned an invalid object" % rc)
     if not (st.get("loggedIn") and st.get("authMethod") == "claude.ai" and st.get("apiProvider") == "firstParty"
             and st.get("subscriptionType")):
         return result(False, "refusing: Claude is not authenticated by a claude.ai subscription")
@@ -221,7 +225,9 @@ def run_vendor(vendor, prompt, *, stdin_text="", timeout=120, max_output_bytes=2
             rc = 0
         else:
             with tempfile.TemporaryDirectory(prefix="memlet-vendor-") as empty:
-                rc, text = _capture(_claude_argv(model) + [prompt], stdin_text.encode("utf-8"), timeout, limit, empty)
+                rc, text = _call_foreign(
+                    lambda: _capture(_claude_argv(model) + [prompt], stdin_text.encode("utf-8"), timeout, limit, empty)
+                )
         if not isinstance(text, str) or len(text.encode("utf-8")) > limit:
             return dict(result, error="vendor output exceeds byte limit or is not text")
         if rc:

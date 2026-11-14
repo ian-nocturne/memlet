@@ -17,7 +17,7 @@ structured JSON, human-readable Markdown, or GitHub Code Scanning SARIF v2.1.0.
 
 from __future__ import annotations
 
-from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context, _run_owned_git
 
 from pathlib import Path
 from .vocabulary import suggested_label
@@ -851,30 +851,31 @@ def _resolve_git_commit(repo_root: Path, ref: str) -> str:
             any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in ref)):
         raise ValueError("invalid Git ref: option-like, empty, or contains whitespace/control characters")
     for separator in (["--end-of-options"], []):
-        proc = subprocess.run(
+        rc, stdout, _ = _run_owned_git(
             ["git", "rev-parse", "--verify"] + separator + [ref + "^{commit}"],
-            cwd=str(repo_root), capture_output=True, text=True, timeout=3.0,
+            cwd=str(repo_root), capture_output=True, text=True, timeout=3.0, _run=subprocess.run,
         )
-        oid = proc.stdout.strip()
-        if proc.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid):
+        oid = stdout.strip()
+        if rc == 0 and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid):
             return oid.lower()
     raise ValueError("cannot resolve Git commit ref: " + ref)
 
 
 def _git_show_text(repo_root: Path, ref: str, rel_path: str) -> Optional[str]:
     try:
-        p_show = subprocess.run(
+        rc_show, out_show, _ = _run_owned_git(
             ["git", "show", "--no-ext-diff", "--no-textconv", f"{ref}:{rel_path}", "--"],
             cwd=str(repo_root),
             capture_output=True,
             text=True,
             timeout=3.0,
+            _run=subprocess.run,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if p_show.returncode != 0:
+    if rc_show != 0:
         return None
-    return p_show.stdout
+    return out_show
 
 
 def _signatures_from_text(content: str, file_name: str) -> Tuple[Dict[str, Any], Dict[str, str]]:
@@ -912,16 +913,18 @@ def _compute_git_diff_changes(
         if head_oid is not None:
             diff_cmd.append(head_oid)
         diff_cmd.append("--")
-        proc = subprocess.run(
+        rc_diff, out_diff, err_diff = _run_owned_git(
             diff_cmd,
             cwd=str(repo_root),
             capture_output=True,
             text=True,
             timeout=5.0,
+            _run=subprocess.run,
         )
-        if proc.returncode != 0:
-            diff_info["error"] = (proc.stderr or proc.stdout or "").strip()
+        if rc_diff != 0:
+            diff_info["error"] = (err_diff or out_diff or "").strip()
             return diff_info
+        proc = type("_GitDiffOut", (), {"stdout": out_diff})()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         diff_info["error"] = str(exc)
         return diff_info
@@ -1071,7 +1074,7 @@ def _node_accepts_syntax(path: Path) -> Optional[bool]:
     if not node:
         return None
     try:
-        return subprocess.run([node, "--check", str(path)], capture_output=True, timeout=10).returncode == 0
+        return _call_foreign(lambda: subprocess.run([node, "--check", str(path)], capture_output=True, timeout=10).returncode == 0)
     except (OSError, subprocess.SubprocessError):
         return None
 
