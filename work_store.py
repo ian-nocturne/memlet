@@ -69,7 +69,7 @@ class WorkStore:
 
     @contextmanager
     def db(self, write=False):
-        db = sqlite3.connect(str(self.path), timeout=5)
+        db = memory_skills._connect_sqlite(str(self.path), timeout=5)
         db.row_factory = sqlite3.Row
         try:
             if write:

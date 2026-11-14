@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timedelta
@@ -1258,8 +1259,10 @@ def retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
 
 
 def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
-              known_at=None, before=None, after=None, shared=False, federated=False, _current_branch=None):
+              known_at=None, before=None, after=None, shared=False, federated=False, _current_branch=None, _link_graphs=None):
     started = time.monotonic()
+    if _link_graphs is None and isinstance(db, sqlite3.Connection):
+        _link_graphs = {}
     ledger._identifier(task, 'task')
     query = ledger._text(query, 'query', 2000)
     budget = ledger._integer(budget, 'budget', 0, 100000)
@@ -1396,7 +1399,7 @@ def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
         budget=min(2400, max(600, budget // 2)) if budget > 0 else 0,
         limit=min(4, limit), root=root, at=at, known_at=known_at,
         before=before, after=after, shared=shared, semantic_config=eff_skill_sem_cfg,
-        seed_node_scores=seed_node_scores, federated=bool(federated),
+        seed_node_scores=seed_node_scores, federated=bool(federated), _link_graphs=_link_graphs,
     )
     for sk_item in skill_retrieval['items'][:4]:
         sk_sig = sk_item.get('signals') or {}
@@ -1453,7 +1456,7 @@ def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
             for idx, r in enumerate(rows):
                 item_index_by_id.setdefault(r['item_id'], []).append(idx)
         ppr_scores, ppr_prov = skills_ledger.ppr_propagate(
-            db, task, seed_node_scores, max_hops=2, alpha=0.55,
+            db, task, seed_node_scores, max_hops=2, alpha=0.55, _link_graphs=_link_graphs,
         )
         w_ppr = w_channels.get('ppr', 0.40)
         for tgt_id, raw_ppr in ppr_scores.items():
@@ -1522,7 +1525,7 @@ def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
         if original_source.get('sourceRefs'):
             item['source']['sourceRefs']=[{k:r.get(k) for k in ('itemId','eventId','kind','contentSha256')} for r in original_source['sourceRefs']]
             item['source']['details']='read item for full quotes and experience conditions'
-        item_links = skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=8)
+        item_links = skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=8, _link_graphs=_link_graphs)
         item.update(excerpt=content[a:b], excerptStart=a, excerptEnd=b, contentChars=len(content),
                     score=round(ranked[i], 8), signals=signals.get(i, {}), links=item_links)
         if i in assoc_sources:
@@ -1568,7 +1571,7 @@ def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
             'kind': row['kind'],
             'summary': first_line,
             'score': round(ranked[i], 8),
-            'links': skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=4),
+            'links': skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=4, _link_graphs=_link_graphs),
             'disclosureStage': 'index',
             'readCommand': f"memory_cli.py --task {task} read --id {row['item_id']}",
         })
@@ -1589,7 +1592,7 @@ def _retrieve(db, task, query='', budget=6000, limit=8, root=None, at=None,
                     'source': row['source'],
                     'excerpt': row['content'][:400],
                     'score': round(ranked[i], 8),
-                    'links': skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=6),
+                    'links': skills_ledger.node_wiki_links(db, row['task'], row['item_id'], limit=6, _link_graphs=_link_graphs),
                     'associativeFrom': assoc_sources.get(i),
                     'sharedFromTask': row.get('sharedFromTask'),
                     'sharedMode': row.get('sharedMode'),
@@ -2191,6 +2194,7 @@ def cases(store, task, limit=25):
     limit = ledger._integer(limit, 'limit', 1, 200)
     with _foreign_context(lambda: store.db()) as db:
         rows = _call_foreign(lambda: ledger.current(db, task, kinds=['case']))[:limit]
+        case_link_graphs = {} if isinstance(db, sqlite3.Connection) else None
         out = []
         for r in rows:
             pseudo = {
@@ -2200,7 +2204,7 @@ def cases(store, task, limit=25):
                 'source': r['source'],
                 'excerpt': r['content'][:500],
                 'score': 1.0,
-                'links': skills_ledger.node_wiki_links(db, task, r['item_id'], limit=8),
+                'links': skills_ledger.node_wiki_links(db, task, r['item_id'], limit=8, _link_graphs=case_link_graphs),
             }
             out.append(_case_summary_entry(pseudo))
         return {'taskId': task, 'cases': out}

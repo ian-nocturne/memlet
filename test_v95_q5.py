@@ -862,7 +862,7 @@ print(json.dumps([g1, g2]))
             warnings.simplefilter("ignore", ResourceWarning)
             for i in range(40):
                 db_path = wdir / f"wal_{i}.sqlite"
-                conn = sqlite3.connect(str(db_path))
+                conn = ms._connect_sqlite(str(db_path))
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
                 ms.ensure_schema(conn)
@@ -888,7 +888,7 @@ print(json.dumps([g1, g2]))
                     open_targets.append(target)
         self.assertEqual(open_targets, [])
         dead_refs = [v[0] for v in ms._TASK_LINK_CACHE.values()]
-        probe = sqlite3.connect(":memory:")
+        probe = ms._connect_sqlite(":memory:")
         try:
             probe.row_factory = sqlite3.Row
             ms.ensure_schema(probe)
@@ -903,7 +903,7 @@ print(json.dumps([g1, g2]))
 
     def test_fix5c_link_cache_schema_version_sees_drop_recreate(self):
         db_path = (self.scratch / "fix5c_drop.sqlite").resolve()
-        conn = sqlite3.connect(str(db_path))
+        conn = ms._connect_sqlite(str(db_path))
         try:
             conn.row_factory = sqlite3.Row
             ms.ensure_schema(conn)

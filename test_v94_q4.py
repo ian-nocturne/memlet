@@ -243,7 +243,7 @@ print(json.dumps(out,sort_keys=True))
         try:
             for label, n in (('A', 4), ('B', 800)):
                 path = self.scratch / ('links-' + label + '.sqlite')
-                db = sqlite3.connect(path)
+                db = skills._connect_sqlite(path)
                 connections.append(db)
                 db.row_factory = sqlite3.Row
                 skills.ensure_schema(db)

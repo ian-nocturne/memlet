@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -2096,18 +2097,17 @@ def _invalidate_task_link_cache(task=None):
         _TASK_LINK_CACHE.pop(k, None)
 
 
+class _MemletConnection(sqlite3.Connection):
+    """Store-owned SQLite connection supporting weak references for cross-call link-graph caching."""
+
+
+def _connect_sqlite(*args, **kwargs):
+    kwargs.setdefault("factory", _MemletConnection)
+    return sqlite3.connect(*args, **kwargs)
+
+
 _CONN_TOKEN_COUNTER = 0
 _DIRECT_CONN_IDS = weakref.WeakKeyDictionary()
-
-
-class _ConnToken:
-    __slots__ = ("uid", "__weakref__")
-
-    def __init__(self, uid):
-        self.uid = uid
-
-    def __call__(self):
-        return self.uid
 
 
 def _sweep_dead_task_link_cache():
@@ -2119,54 +2119,43 @@ def _sweep_dead_task_link_cache():
 def _conn_weak_handle(db, create=False):
     global _CONN_TOKEN_COUNTER
     try:
+        conn_ref = weakref.ref(db)
         uid = _DIRECT_CONN_IDS.get(db)
         if uid is not None:
-            return ("direct", uid), weakref.ref(db)
+            return ("direct", uid), conn_ref
         if create:
             _CONN_TOKEN_COUNTER += 1
             uid = _CONN_TOKEN_COUNTER
             _DIRECT_CONN_IDS[db] = uid
-            return ("direct", uid), weakref.ref(db)
-        return None, None
+            return ("direct", uid), conn_ref
     except TypeError:
         pass
-    if _TASK_LINK_CACHE:
-        try:
-            row = _call_foreign(lambda: db.execute("SELECT _memlet_link_token()").fetchone())
-            if row and isinstance(row[0], int):
-                cid = ("sqlite", row[0])
-                existing_ref = next(
-                    (v[0] for k, v in _TASK_LINK_CACHE.items() if isinstance(k, tuple) and len(k) > 1 and k[0] == cid and v[0]() is not None),
-                    None,
-                )
-                if existing_ref is not None or not create:
-                    return cid, existing_ref
-        except Exception:
-            if not create:
-                return None, None
-    if not create:
-        return None, None
-    try:
-        _CONN_TOKEN_COUNTER += 1
-        uid = _CONN_TOKEN_COUNTER
-        tok = _ConnToken(uid)
-        _call_foreign(lambda: db.create_function("_memlet_link_token", 0, tok))
-        conn_ref = weakref.ref(tok)
-        return ("sqlite", uid), conn_ref
-    except Exception:
-        return None, None
+    return None, None
 
 
 def _task_link_revision(db):
     try:
         return _call_foreign(lambda: (
-            db.execute("PRAGMA data_version").fetchone()[0],
-            db.execute("PRAGMA schema_version").fetchone()[0],
-            db.total_changes,
-            db.in_transaction,
-        ))
+            (db.total_changes, db.in_transaction),
+            (
+                db.execute("PRAGMA data_version").fetchone()[0],
+                db.execute("PRAGMA schema_version").fetchone()[0],
+                db.total_changes,
+                db.in_transaction,
+            ),
+        )[1])
     except Exception:
         return None
+
+
+def _scoped_task_link_graph(db, task, link_graphs=None):
+    if link_graphs is not None:
+        graph = link_graphs.get(task)
+        if graph is None:
+            graph = _load_task_link_graph(db, task)
+            link_graphs[task] = graph
+        return graph
+    return _load_task_link_graph(db, task)
 
 
 def _load_task_link_graph(db, task):
@@ -2182,14 +2171,17 @@ def _load_task_link_graph(db, task):
                 _TASK_LINK_CACHE.pop(ckey, None)
             else:
                 revision = _task_link_revision(db)
-                if revision is not None and (conn_id[0] != "direct" or alive is db) and cached[1] == revision and not revision[3]:
+                if revision is not None and alive is db and cached[1] == revision and not revision[3]:
                     return cached[2]
-    ensure_schema(db)
 
-    edge_rows = _call_foreign(lambda: db.execute(
-        'SELECT source_id, target_id, relation, weight FROM memory_links WHERE task=? ORDER BY weight DESC, target_id ASC',
-        (task,),
-    ).fetchall())
+    query_sql = 'SELECT source_id, target_id, relation, weight FROM memory_links WHERE task=? ORDER BY weight DESC, target_id ASC'
+    try:
+        edge_rows = _call_foreign(lambda: db.execute(query_sql, (task,)).fetchall())
+    except sqlite3.OperationalError as exc:
+        if 'no such table' not in str(exc).lower():
+            raise
+        ensure_schema(db)
+        edge_rows = _call_foreign(lambda: db.execute(query_sql, (task,)).fetchall())
     adj = {}
     out_neighbors = {}
     max_w_by_src = {}
@@ -2211,15 +2203,15 @@ def _load_task_link_graph(db, task):
         wiki_links[u] = [f"[[{t_id}]]" for t_id, _ in ordered]
 
     graph = {'adj': adj, 'out_deg': out_deg, 'wiki_links': wiki_links}
-    # An uncommitted graph may be rolled back without changing total_changes.
-    post_rev = _task_link_revision(db)
-    if post_rev is not None and not post_rev[3]:
-        if existing_ref is not None and existing_ref() is not None:
-            conn_ref = existing_ref
-        else:
-            conn_id, conn_ref = _conn_weak_handle(db, create=True)
-            ckey = (conn_id, task) if conn_id is not None else None
-        if ckey is not None and conn_ref is not None:
+    if existing_ref is not None and existing_ref() is not None:
+        conn_ref = existing_ref
+    else:
+        conn_id, conn_ref = _conn_weak_handle(db, create=True)
+        ckey = (conn_id, task) if conn_id is not None else None
+    if ckey is not None and conn_ref is not None:
+        # An uncommitted graph may be rolled back without changing total_changes.
+        post_rev = _task_link_revision(db)
+        if post_rev is not None and not post_rev[3]:
             _sweep_dead_task_link_cache()
             if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE and ckey not in _TASK_LINK_CACHE:
                 _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
@@ -2244,11 +2236,11 @@ _PPR_REL_MULTIPLIER = {
 }
 
 
-def ppr_propagate(db, task, seed_scores, max_hops=2, alpha=0.55):
+def ppr_propagate(db, task, seed_scores, max_hops=2, alpha=0.55, *, _link_graphs=None):
     """2-Hop Hub-Penalized Personalized PageRank over in-memory cached memory_links."""
     if not seed_scores:
         return {}, {}
-    graph = _load_task_link_graph(db, task)
+    graph = _scoped_task_link_graph(db, task, _link_graphs)
     adj = graph['adj']
     if not adj:
         return {}, {}
@@ -2317,9 +2309,9 @@ def ppr_propagate(db, task, seed_scores, max_hops=2, alpha=0.55):
     return combined, provenance
 
 
-def node_wiki_links(db, task, node_id, limit=8):
+def node_wiki_links(db, task, node_id, limit=8, *, _link_graphs=None):
     """Return formatted [[target_id]] links for a given item/skill/case node from in-memory link graph cache."""
-    graph = _load_task_link_graph(db, task)
+    graph = _scoped_task_link_graph(db, task, _link_graphs)
     return list((graph['wiki_links'].get(node_id) or [])[:limit])
 
 
@@ -2556,8 +2548,10 @@ def retrieve_federated_archetypes(db, current_task, query='', limit=2):
 def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
                     project_only=False, verified_candidates_only=False,
                     include_verified_candidates=True, shared=False,
-                    include_inactive=False, limit=200, federated=False):
+                    include_inactive=False, limit=200, federated=False, *, _link_graphs=None):
     """Bitemporal snapshot of task skills."""
+    if _link_graphs is None and isinstance(db, sqlite3.Connection):
+        _link_graphs = {}
     ledger._identifier(task, 'task')
     limit = ledger._integer(limit, 'limit', 0, 1000)
     now = time.time()
@@ -2617,7 +2611,7 @@ def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
             continue
         if after is not None and row['event_at'] <= ledger._timestamp(after, 'after'):
             continue
-        row['links'] = node_wiki_links(db, row['task'], row['skill_id'])
+        row['links'] = node_wiki_links(db, row['task'], row['skill_id'], _link_graphs=_link_graphs)
         filtered.append(row)
 
     if shared and not project_only and not verified_candidates_only:
@@ -2632,7 +2626,7 @@ def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
                 shared_rows = snapshot_skills(
                     db, other['id'], at=at, known_at=known_at, before=before, after=after,
                     project_only=True, include_verified_candidates=include_verified_candidates,
-                    shared=False, include_inactive=False, limit=200,
+                    shared=False, include_inactive=False, limit=200, _link_graphs=_link_graphs,
                 )
                 for r in shared_rows:
                     if r['name'] in local_names:
@@ -2726,8 +2720,10 @@ def _embed_skills_cached(rows, searchable):
 def retrieve_skills(db, task, query='', budget=2400, limit=4, root=None,
                     at=None, known_at=None, before=None, after=None, shared=False,
                     include_project_verified=True, semantic_config=None,
-                    seed_node_scores=None, primary_limit=2, index_limit=4, federated=False):
+                    seed_node_scores=None, primary_limit=2, index_limit=4, federated=False, *, _link_graphs=None):
     """Scoped hybrid retrieval over active procedural skills with 2-hop associative expansion & progressive index."""
+    if _link_graphs is None and isinstance(db, sqlite3.Connection):
+        _link_graphs = {}
     ledger._identifier(task, 'task')
     query = ledger._text(query, 'query', 2000)
     budget = ledger._integer(budget, 'budget', 0, 50000)
@@ -2736,6 +2732,7 @@ def retrieve_skills(db, task, query='', budget=2400, limit=4, root=None,
         db, task, at=at, known_at=known_at, before=before, after=after,
         project_only=False, include_verified_candidates=include_project_verified,
         shared=bool(shared), include_inactive=False, limit=500, federated=bool(federated),
+        _link_graphs=_link_graphs,
     )
 
     if not rows or limit == 0 or budget == 0:
@@ -2827,7 +2824,7 @@ def retrieve_skills(db, task, query='', budget=2400, limit=4, root=None,
             if r['task'] == task:
                 id_to_idx[r['skill_id']] = idx
                 id_to_idx[r['experience_id']] = idx
-        ppr_scores, ppr_prov = ppr_propagate(db, task, seed_map, max_hops=2, alpha=0.55)
+        ppr_scores, ppr_prov = ppr_propagate(db, task, seed_map, max_hops=2, alpha=0.55, _link_graphs=_link_graphs)
         for node_id, raw_ppr in ppr_scores.items():
             target_idx = id_to_idx.get(node_id)
             if target_idx is None:
@@ -4027,6 +4024,7 @@ def skill_metrics(db, task):
     consolidated_count = sum(1 for s in skills_rows if s['source'].get('consolidatedFrom'))
 
     per_skill = []
+    metrics_link_graphs = {} if isinstance(db, sqlite3.Connection) else None
     total_positive_touches = 0
     total_used = 0
     total_helpful = 0
@@ -4070,7 +4068,7 @@ def skill_metrics(db, task):
             'staleReasons': s['staleness']['reasons'],
             'actrActivation': s['staleness'].get('actrActivation', 0.5),
             'consolidatedFrom': s['source'].get('consolidatedFrom', []),
-            'links': node_wiki_links(db, task, s['skill_id']),
+            'links': node_wiki_links(db, task, s['skill_id'], _link_graphs=metrics_link_graphs),
         })
 
     overall_adoption = round(min(1.0, total_positive_touches / total_impressions), 4) if total_impressions > 0 else None

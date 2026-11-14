@@ -204,7 +204,7 @@ class StandaloneStore:
     @contextmanager
     def db(self, write: bool = False):
         with self._lock:
-            conn = sqlite3.connect(str(self.db_path), timeout=15.0)
+            conn = skills_ledger._connect_sqlite(str(self.db_path), timeout=15.0)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")

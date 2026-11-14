@@ -660,7 +660,7 @@ def _lesson_path_available(context):
 
 def _lesson_path_exhausted(context):
     work = context.get("work")
-    return bool(work and work.exhausted)
+    return bool(work and work.overdue())
 
 
 @md.fresh_read
@@ -674,8 +674,7 @@ def valid_lesson_path(root, path, *, context=None):
     if context is None:
         active = _active_lesson_path_context(root)
         context = active if active is not None else _LessonPathContext(root)
-    work = context.get("work")
-    if work and work.exhausted:
+    if _lesson_path_exhausted(context):
         return False
     if not isinstance(path, str):
         return False
@@ -696,11 +695,11 @@ def _valid_lesson_path(root, path, context):
     directories = context["directories"]
     try:
         for part in path.split("/"):
-            work = context.get("work")
-            if work and work.exhausted:
+            if _lesson_path_exhausted(context):
                 return False
             if cursor not in directories:
-                if len(directories) < 8 and not _lesson_path_available(context):
+                work = context.get("work")
+                if len(directories) < 8 and getattr(work, "_caller_clock", True) and not _lesson_path_available(context):
                     return False
                 work = context.get("work")
                 if work and work.counters is not None:
@@ -743,21 +742,29 @@ def _attachment_result(result, context):
 
 def _attachment_reader(fn):
     import functools
+    import inspect
+    signature = inspect.signature(fn)
+
     @functools.wraps(fn)
-    def read(repo_path=".", *args, **kwargs):
+    def read(*args, **kwargs):
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            return fn(*args, **kwargs)
+        repo_path = bound.arguments.get("repo_path", ".")
         state = md._active_read_state()
         try:
             root = mw._resolve_root(repo_path)
         except ValueError:
-            return fn(repo_path, *args, **kwargs)
-        if "_read_state" in fn.__code__.co_varnames:
+            return fn(*args, **kwargs)
+        if "_read_state" in signature.parameters:
             kwargs = dict(kwargs, _read_state=state)
         valid_ctx = _valid_path_context(kwargs.get("_path_context"))
         if valid_ctx is not None:
-            return fn(repo_path, *args, **dict(kwargs, _path_context=valid_ctx))
+            return fn(*args, **dict(kwargs, _path_context=valid_ctx))
         kwargs = dict(kwargs, _path_context=None)
         with _lesson_path_projection(root, None) as context:
-            result = fn(repo_path, *args, **dict(kwargs, _path_context=context))
+            result = fn(*args, **dict(kwargs, _path_context=context))
             if context.get("attachmentIncomplete"):
                 _attachment_result(result, context)
                 if "formatted" in result and "tokenBudget" not in result:
