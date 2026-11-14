@@ -887,14 +887,17 @@ print(json.dumps([g1, g2]))
                 if "wal_" in target and ".sqlite" in target:
                     open_targets.append(target)
         self.assertEqual(open_targets, [])
-        dead_keys = set(ms._TASK_LINK_CACHE)
+        dead_refs = [v[0] for v in ms._TASK_LINK_CACHE.values()]
         probe = sqlite3.connect(":memory:")
         try:
             probe.row_factory = sqlite3.Row
             ms.ensure_schema(probe)
-            ms._load_task_link_graph(probe, "T")
-            self.assertFalse(dead_keys & set(ms._TASK_LINK_CACHE))
+            probe_graph = ms._load_task_link_graph(probe, "T")
+            self.assertEqual(probe_graph["adj"], {})
             self.assertEqual(len(ms._TASK_LINK_CACHE), 1)
+            live_ref = next(iter(ms._TASK_LINK_CACHE.values()))[0]
+            self.assertIsNotNone(live_ref())
+            self.assertTrue(all(live_ref is not dr for dr in dead_refs))
         finally:
             probe.close()
 
