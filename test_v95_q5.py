@@ -19,6 +19,7 @@ import tempfile
 import types
 import unittest
 import warnings
+import weakref
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -129,10 +130,27 @@ def _wrap_mapping(value, kind: str):
     return value
 
 
+_EXTRA_VOLATILE_KEYS = frozenset({
+    "decidedAt", "createdAt", "promotedAt", "mergedAt",
+    "approvedAt", "rejectedAt", "ingestedAt", "checkedAt",
+})
+
+
+def _strip_extra_volatile(obj):
+    if isinstance(obj, dict):
+        return {
+            k: ("<VOLATILE>" if k in _EXTRA_VOLATILE_KEYS else _strip_extra_volatile(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_strip_extra_volatile(x) for x in obj]
+    return obj
+
+
 def _canon_result(value, repo: Path):
     if isinstance(value, collections.abc.Mapping) and not isinstance(value, dict):
         value = dict(value)
-    return trs._canon(value, repo)
+    return _strip_extra_volatile(trs._canon(value, repo))
 
 
 def _str_enum_for(value: str):
@@ -854,7 +872,10 @@ print(json.dumps([g1, g2]))
                 self.assertIs(graph, ms._load_task_link_graph(conn, "T"))
                 del conn
             gc.collect()
-        self.assertEqual(len(ms._TASK_LINK_CACHE), 0)
+        self.assertTrue(
+            all(isinstance(v[0], weakref.ReferenceType) and v[0]() is None for v in ms._TASK_LINK_CACHE.values()),
+            f"Expected only dead weakrefs after dropping connections, got: {ms._TASK_LINK_CACHE!r}",
+        )
         open_targets = []
         fd_dir = Path("/dev/fd")
         if fd_dir.is_dir():
@@ -866,6 +887,16 @@ print(json.dumps([g1, g2]))
                 if "wal_" in target and ".sqlite" in target:
                     open_targets.append(target)
         self.assertEqual(open_targets, [])
+        dead_keys = set(ms._TASK_LINK_CACHE)
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.row_factory = sqlite3.Row
+            ms.ensure_schema(probe)
+            ms._load_task_link_graph(probe, "T")
+            self.assertFalse(dead_keys & set(ms._TASK_LINK_CACHE))
+            self.assertEqual(len(ms._TASK_LINK_CACHE), 1)
+        finally:
+            probe.close()
 
     def test_fix5c_link_cache_schema_version_sees_drop_recreate(self):
         db_path = (self.scratch / "fix5c_drop.sqlite").resolve()

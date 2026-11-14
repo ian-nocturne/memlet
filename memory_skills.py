@@ -2109,17 +2109,11 @@ class _ConnToken:
         return self.uid
 
 
-def _evict_dead_conn_keys(conn_id):
-    for k in [k for k in list(_TASK_LINK_CACHE) if isinstance(k, tuple) and len(k) > 1 and k[0] == conn_id]:
-        _TASK_LINK_CACHE.pop(k, None)
-
-
 def _conn_weak_handle(db, create=False):
     global _CONN_TOKEN_COUNTER
     try:
         cid = ("direct", id(db))
-        ref = weakref.ref(db, lambda _r, c=cid: _evict_dead_conn_keys(c))
-        return cid, ref, db
+        return cid, weakref.ref(db), db
     except TypeError:
         pass
     try:
@@ -2137,7 +2131,7 @@ def _conn_weak_handle(db, create=False):
         cid = ("sqlite", uid)
         tok = _ConnToken(uid)
         _call_foreign(lambda: db.create_function("_memlet_link_token", 0, tok))
-        return cid, weakref.ref(tok, lambda _r, c=cid: _evict_dead_conn_keys(c)), tok
+        return cid, weakref.ref(tok), tok
     except Exception:
         return None, None, None
 
