@@ -2109,33 +2109,6 @@ class _ConnToken:
         return self.uid
 
 
-def _conn_weak_handle(db, create=False):
-    global _CONN_TOKEN_COUNTER
-    try:
-        cid = ("direct", id(db))
-        return cid, weakref.ref(db), db
-    except TypeError:
-        pass
-    try:
-        row = _call_foreign(lambda: db.execute("SELECT _memlet_link_token()").fetchone())
-        if row and isinstance(row[0], int):
-            return ("sqlite", row[0]), None, None
-    except Exception:
-        if not create:
-            return None, None, None
-    if not create:
-        return None, None, None
-    try:
-        _CONN_TOKEN_COUNTER += 1
-        uid = _CONN_TOKEN_COUNTER
-        cid = ("sqlite", uid)
-        tok = _ConnToken(uid)
-        _call_foreign(lambda: db.create_function("_memlet_link_token", 0, tok))
-        return cid, weakref.ref(tok), tok
-    except Exception:
-        return None, None, None
-
-
 def _sweep_dead_task_link_cache():
     dead = [k for k, v in list(_TASK_LINK_CACHE.items()) if v[0]() is None]
     for k in dead:
@@ -2154,19 +2127,62 @@ def _task_link_revision(db):
         return None
 
 
+def _store_task_link_cache(db, conn_id, ckey, graph):
+    conn_ref = next(
+        (
+            v[0]
+            for k, v in _TASK_LINK_CACHE.items()
+            if isinstance(k, tuple) and len(k) > 1 and k[0] == conn_id and v[0]() is not None
+        ),
+        None,
+    )
+    if conn_ref is None:
+        try:
+            conn_ref = weakref.ref(db)
+        except TypeError:
+            pass
+
+    def _rev_and_bind():
+        nonlocal conn_ref
+        rev = (
+            db.execute("PRAGMA data_version").fetchone()[0],
+            db.execute("PRAGMA schema_version").fetchone()[0],
+            db.total_changes,
+            db.in_transaction,
+        )
+        if not rev[3] and conn_ref is None:
+            global _CONN_TOKEN_COUNTER
+            _CONN_TOKEN_COUNTER += 1
+            uid = _CONN_TOKEN_COUNTER
+            tok = _ConnToken(uid)
+            db.create_function(f"_memlet_lt_{uid}", 0, tok)
+            conn_ref = weakref.ref(tok)
+        return rev
+
+    try:
+        post_rev = _call_foreign(_rev_and_bind)
+    except Exception:
+        return
+    if conn_ref is not None and post_rev is not None and not post_rev[3]:
+        _sweep_dead_task_link_cache()
+        if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE and ckey not in _TASK_LINK_CACHE:
+            _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
+        _TASK_LINK_CACHE[ckey] = (conn_ref, post_rev, graph)
+
+
 def _load_task_link_graph(db, task):
     """Load and cache adjacency list, out-degrees, and sorted [[wiki_links]] per node for a task in a single SQL query."""
     _sweep_dead_task_link_cache()
-    revision = _task_link_revision(db)
-    conn_id, _, _ = _conn_weak_handle(db, create=False) if revision is not None else (None, None, None)
-    ckey = (conn_id, task) if conn_id is not None else None
-    if ckey is not None:
-        cached = _TASK_LINK_CACHE.get(ckey)
-        if cached is not None:
-            alive = cached[0]()
-            if alive is None:
-                _TASK_LINK_CACHE.pop(ckey, None)
-            elif (conn_id[0] != "direct" or alive is db) and cached[1] == revision and not revision[3]:
+    conn_id = id(db)
+    ckey = (conn_id, task)
+    cached = _TASK_LINK_CACHE.get(ckey)
+    if cached is not None:
+        alive = cached[0]()
+        if alive is None:
+            _TASK_LINK_CACHE.pop(ckey, None)
+        else:
+            revision = _task_link_revision(db)
+            if revision is not None and (alive is db or isinstance(alive, _ConnToken)) and cached[1] == revision and not revision[3]:
                 return cached[2]
     ensure_schema(db)
 
@@ -2196,19 +2212,7 @@ def _load_task_link_graph(db, task):
 
     graph = {'adj': adj, 'out_deg': out_deg, 'wiki_links': wiki_links}
     # An uncommitted graph may be rolled back without changing total_changes.
-    if revision is not None and not revision[3]:
-        existing_ref = _TASK_LINK_CACHE.get(ckey, (None,))[0] if ckey is not None else None
-        if existing_ref is not None and existing_ref() is not None:
-            conn_ref = existing_ref
-        else:
-            conn_id, conn_ref, _ = _conn_weak_handle(db, create=True)
-            ckey = (conn_id, task) if conn_id is not None else None
-        post_rev = _task_link_revision(db) if (ckey is not None and conn_ref is not None) else None
-        if ckey is not None and conn_ref is not None and post_rev is not None and not post_rev[3]:
-            _sweep_dead_task_link_cache()
-            if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE and ckey not in _TASK_LINK_CACHE:
-                _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
-            _TASK_LINK_CACHE[ckey] = (conn_ref, post_rev, graph)
+    _store_task_link_cache(db, conn_id, ckey, graph)
     return graph
 
 
