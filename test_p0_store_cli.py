@@ -254,12 +254,12 @@ class CliContractTests(unittest.TestCase):
     def test_version(self):
         proc = subprocess.run([sys.executable,str(REPO/'memory_cli.py'),'--version'], capture_output=True,text=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual('9.4.0', proc.stdout.strip())
-        self.assertEqual('9.4.0', VERSION)
+        self.assertEqual('9.5.0', proc.stdout.strip())
+        self.assertEqual('9.5.0', VERSION)
         from memlet.contracts import VERSION as contract_version
-        self.assertEqual('9.4.0', contract_version)
-        # Existing SDK/protocol tests pin SERVER_VERSION to 9.4.0; preserve it.
-        self.assertEqual('9.4.0', memlet_mcp.SERVER_VERSION)
+        self.assertEqual('9.5.0', contract_version)
+        # Existing SDK/protocol tests pin SERVER_VERSION to 9.5.0; preserve it.
+        self.assertEqual('9.5.0', memlet_mcp.SERVER_VERSION)
 
 
 if __name__ == '__main__':

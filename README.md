@@ -270,7 +270,7 @@ What this is: a report of what a person might want to tidy, a working command wh
 
 ## From principle to code
 
-| Principle | Built today (9.4) | Not yet, or weaker than it sounds |
+| Principle | Built today (9.5) | Not yet, or weaker than it sounds |
 | :--- | :--- | :--- |
 | 1. An address you can re-check | `init`, `check`, `check --changed` / `--accept`; stale rules set apart in `recall`, `handover`, hooks and MCP; Python symbols compared by AST, including names rebound elsewhere in the module; `admin anchors` proposes anchors for rules that only mention a function; exact TS/JS comparison with tree-sitter if a repository opts in; a lesson reaches a file only through a path a person attached (`learn --approve/--paths … --path`) or a tracked file its cited lines name | TS/JS is a lexical scan by default and never `active`. Anchor suggestions are proposals, not proofs of uniqueness. A lesson whose lines name no file and that nobody attached reaches no file; `admin graph stats` counts them. |
 | 2. Propose, verify, approve | `dream --via claude` with an optional second-model check; keyword `learn`; MCP hosts can submit as an untrusted proposer; trust tier (`approved`, `hint`, `pending`) computed on every read; approval only by name, never over MCP; every decision is written to a decision log; `admin tidy` proposes merges, second looks and promotions and a person runs them (`learn --merge`) | Only the `claude` CLI can be launched, so the default two-vendor agreement cannot produce a hint today. Approvals, receipts and the decision log are integrity records, not signatures. |
@@ -302,7 +302,7 @@ In a terminal these print readable text. When output is piped or captured they p
 ### 1. Install and initialise
 
 ```bash
-pip install git+https://github.com/ian-nocturne/memlet.git@v9.4.0
+pip install git+https://github.com/ian-nocturne/memlet.git@v9.5.0
 memlet init .     # writes .memlet/config.json, .memlet/ledger.sqlite3, .memlet/wiki/INDEX.md
 ```
 
@@ -558,11 +558,17 @@ memlet dream --tidy --dismiss TDP-77e357dc924c1b9b             # not the same: d
 | `memlet admin skillbook [--repo DIR] [--name NAME] [--max-lines N] [--budget N]` / `--write [--out DIR] [--force]` / `--check PATH` | Approved lessons as an Agent Skill (`SKILL.md`): preview, write, check. |
 | `memlet admin eval init\|questions\|run\|score\|report\|resolve\|selftest` | Sealed, time-split memory experiment. |
 | `memlet admin --help` | Every other command: memory store, rules/wiki, Dream internals (`dream-build`, `dream-recall`), benchmarks, maintenance. |
-| `memlet --version` | Prints `9.4.0`. |
+| `memlet --version` | Prints `9.5.0`. |
 
 Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in exact parser), `compatible-unverified` (changed but signature-compatible, a TS/JS lexical match, or a Python name rebound elsewhere in the module: `symbol_rebound_in_module`), `stale` (removed, required arguments changed, or file moved), `unpinned` (no baseline yet), `path-exists` (the rule names a path only).
 
 ## Upgrading
+
+### From 9.4
+
+- Reads do less work and give the same bytes: captured (piped) output of every command, hook, MCP tool and both Routlet files is byte-identical to 9.4.0 except the version string. What you can see is time: on the very large repository described under "How far it has been tested", SessionStart now prints its output where 9.4.0 printed nothing at its deadline.
+- For library callers: a one-shot iterator (a generator, for example) passed where Memlet expects a list is read once on entry and answers like the equal list; 9.4.0 read some of them twice, and the second pass saw nothing.
+- The task-memory store sees another process's change at once: a task's link graph is reused only while SQLite reports its database unchanged and is never shared between two databases (9.4.0 could answer from another database's graph, or miss a new link for 0.8 seconds), and the Git branch is read on every call (9.4.0 kept it for 10 seconds).
 
 ### From 9.3
 
@@ -603,8 +609,9 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 - **Anchor suggestions are proposals.** Unscanned folders and nested repositories can hold other definitions.
 - **Static only.** Python anchors are compared by AST; dynamic `getattr`, `exec`, `setattr` and monkeypatching are not evaluated, and the check that a pinned name is not rebound elsewhere in its module is static too. The default TS/JS scanner is lexical: JSX text with apostrophes and some regex literals read as syntax errors, getters/setters and overloads are not extracted, and `tsc` is not run.
 - **The guard makes the agent read; it does not judge.** It cannot tell whether an edit violates a prohibition, it denies a given file and set of lessons once per session, and the agent decides what to do next. Context from `--jit` arrives with the tool result, after the call ran.
-- **Hooks give up rather than block.** Each hook has its own deadline (7 seconds for SessionStart), inside the 10-second timeout Memlet installs for Claude Code, and then prints nothing. On a very large repository (5,000 files, 2,000 lessons) the SessionStart hook reaches that deadline and prints nothing, with or without the new flags; the 9.1.1 handover is the cost. The session bookkeeping added in 9.2 never costs a hook its 9.1.1 output: when it would wait on a lock or run out of time, it is skipped. A lesson longer than the graph's 8,000-character output cap is never quoted and so never guards. An instruction file with more than 200 rules makes the `replaced` group incomplete, which switches the guard off for that repository (a skill file Memlet wrote does not count).
+- **Hooks give up rather than block.** Each hook has its own deadline (7 seconds for SessionStart), inside the 10-second timeout Memlet installs for Claude Code, and then prints nothing. Up to 9.4 that happened at SessionStart on a very large repository (5,000 files, 2,000 rules, 2,000 lessons); with 9.5 the same repository finished in 3 to 4 seconds (see "How far it has been tested"). It can still give up on a larger repository, a slower or busier machine, or when thousands of anchored files have to be parsed for the first time. The session bookkeeping added in 9.2 never costs a hook its 9.1.1 output: when it would wait on a lock or run out of time, it is skipped. A lesson longer than the graph's 8,000-character output cap is never quoted and so never guards. An instruction file with more than 200 rules makes the `replaced` group incomplete, which switches the guard off for that repository (a skill file Memlet wrote does not count).
 - **Tidying compares wording unless you ask a model.** On its own, `admin tidy` finds duplicates and "said again" by equal or overlapping words; two lessons that mean the same in different words are not found. `dream --tidy` asks a model, whose grouping is an opinion: it can miss pairs, it never compares lessons that fell into different batches, and only the `claude` CLI can be launched, so the second opinion comes from another Claude model family, not another vendor. Its receipts are local integrity records, which anyone who can write `.memlet` can forge. A session is identified by its stored file name: a copy stored under another name counts again, and different transcripts with the same file name count once. When any stored session could not be read in full, counts say "at least".
+- **Reads are not atomic across files.** Every read starts from the disk: what one call read is reused by a later call only when its bytes, or the SQLite database revision, are unchanged. A read that runs while another process is writing can see some files before the write and some after, as in 9.4 and earlier. Library arguments are plain data: path-like and one-shot iterable arguments are read once on entry, and objects whose own methods call back into Memlet are not supported.
 - **A skill file is a snapshot.** An agent that loads it reads the lessons as they were when it was written; nothing re-checks them at load time. Re-run `admin skillbook --write` after approvals change, or check with `--check`. Merge records, like approvals, detect later edits but do not show who acted.
 - **A merge in the middle of a session** can make the guard deny that file once more, for the smaller set of lessons.
 - **History is partial.** The decision log starts with 9.2 and is advisory, local and unauthenticated; the queue is the truth for the present. Written anchors have no pin time, and the moment an anchor first went stale is not recorded.
@@ -616,7 +623,7 @@ Anchor states: `active` (pinned and unchanged; Python, or TS/JS with an opted-in
 - The acting hooks ran in headless Claude Code sessions (haiku) on the final 9.2 code, in a scratch repository. The first Edit of a file with an approved prohibition was denied with the lesson quoted, the model judged that its change (adding a comment) did not violate it, repeated the call, and the edit succeeded (Example 3); at Stop, nothing from the denial was queued as a lesson. The session was then resumed and compacted with `/compact`: SessionStart delivered the capsule after the resume and again after the compaction, the model quoted the lesson from it afterwards, and a further edit of the same file was not denied. Not observed separately: what the PreCompact instructions did to the summary, and the `--jit` context as the model received it (the model reported being informed of the lesson after its edit, and the session state records the delivery). Interactive sessions, `ask` mode and subagents were exercised only through piped hook input.
 - The 9.3 commands ran end to end in a scratch repository without a model (Example 4), and the written skill was loaded once by a real headless Claude Code session (haiku), which quoted the lessons for the file it was asked about. Other agents that read Agent Skills were not tried.
 - `memlet dream --tidy --via claude --verify-with claude` ran once against the real Claude CLI (haiku proposing, sonnet checking, three calls) on seven made-up lessons from three sessions: it grouped the two pairs that said the same thing in different words and nothing else, both showed in `admin tidy`, and the printed merge command worked. The three raw answers are in `memlet/dream_fixtures/tidy/` as recorded fixtures. One run on seven lessons says nothing about how often a model is right on yours.
-- Measured on a busy host, with 5,000 files, 2,000 rules and 2,000 lessons: about 1.2 s for one file's graph neighbourhood and 0.4–0.5 s for the PreToolUse hook.
+- Measured on a 12-core host under load (load average about 7), with 5,000 files, 2,000 rules and 2,000 lessons, through the real hook entry point, three runs each: SessionStart printed nothing at its 7-second deadline with 9.3.0 and 9.4.0, and printed its output in 2.9 to 4.0 s with 9.5.0. About 1.2 s for one file's graph neighbourhood and 0.4–0.5 s for the PreToolUse hook (measured for 9.2).
 - The model-answer fixtures in `memlet/dream_fixtures/` are the seven dream-cycle answers as before — five reconstructed from earlier run records (the shapes that broke 9.1: a timestamp copied into a citation id, a `json` code fence, a fenced `{"items": …}` wrapper, plus well-formed answers) and two recorded from a real run with `--save-fixture` (a proposer answer with one accepted and one rejected candidate, and a `MISSING_CONDITION` verdict) — plus, under `tidy/`, three recorded and four reconstructed answers for `dream --tidy`. Each file says which kind it is.
 - `memlet dream` was run against the real Claude CLI in scratch repositories, about a dozen calls in total (Example 2 is one of those runs). Those runs changed the design three times: see the row format, the failed-batch rule and the accepted answer envelopes in section 5. The default second-model check of 9.1.1 was run once the same way.
 - On 9.1 code, hooks installed with `--hooks --dream` ran in one headless Claude Code session (the checked rules arrived at session start, and the session was snapshotted at Stop without a model call), and six MCP tools, including `memlet_dream_next` and `memlet_dream_submit`, were called from one `codex exec` session; the submitted lesson stayed pending as an untrusted `host` proposal. The PostToolUse and PreCompact hooks were last exercised in a real session on 9.0-era code.
@@ -668,7 +675,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ian-nocturne/memlet@v9.4.0
+      - uses: ian-nocturne/memlet@v9.5.0
         with:
           mode: "audit" # only supported mode
           repo-path: "."

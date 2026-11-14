@@ -58,7 +58,7 @@ from .code_anchors import (NEW_PIN, PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_s
                            extract_file_symbol_signatures, previous_python_symbol_hashes)
 from .memlet_dream import fresh_read
 
-MEMLET_VERSION = "9.4.0"
+MEMLET_VERSION = "9.5.0"
 CONFIG_SCHEMA_VERSION = 1
 MEMLET_DIR = ".memlet"
 WIKI_DIR = ".memlet/wiki"

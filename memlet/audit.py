@@ -1933,7 +1933,7 @@ def format_audit_sarif(report: Dict[str, Any]) -> Dict[str, Any]:
                     "driver": {
                         "name": "Memlet",
                         "informationUri": "https://github.com/ian-nocturne/memlet",
-                        "version": "9.4.0",
+                        "version": "9.5.0",
                         "rules": rules,
                     }
                 },
