@@ -1606,7 +1606,7 @@ class MemorySkillsLoopTests(unittest.TestCase):
         ret1 = self.store.memory('task-one', 'server.py 포트 4388 무중단 교체')['retrieval']
         self.assertFalse(ret1['abstained'])
         self.assertIn('task-one', memory._TASK_INVERTED_INDEX)
-        self.assertIn('task-one', skills_ledger._TASK_LINK_CACHE)
+        self.assertTrue(any(key[1] == 'task-one' for key in skills_ledger._TASK_LINK_CACHE))
         cached_rev = memory._TASK_INVERTED_INDEX['task-one']['revision']
         self.assertGreaterEqual(cached_rev, 1)
 

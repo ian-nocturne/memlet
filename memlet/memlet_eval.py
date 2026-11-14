@@ -5,6 +5,8 @@ Session input is an in-repo directory of JSON files: each is a list of records
 must lie wholly on one side of the split. Missing/descending timestamps fail
 closed. Keys are literal, case-insensitive token-boundary patterns, never regexes.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import contextlib
 import datetime as dt
@@ -750,7 +752,7 @@ def run_eval(repo_path='.', *, run, via, arms=None, max_calls=100, dry_run=False
             raise ValueError('invalid arms')
         tasks, contexts = [], {}
         for q in questions:
-            built = (context_builder or build_contexts)(root, m, q)
+            built = _call_foreign(lambda: (context_builder or build_contexts)(root, m, q))
             for arm in m['arms']:
                 c = built[arm]
                 if c['budget'] != m['budget'] or wiki.estimate_tokens(c['text']) > m['budget']:

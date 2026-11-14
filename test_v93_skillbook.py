@@ -986,7 +986,7 @@ class SkillbookTests(unittest.TestCase):
 
         def patched_dream_items(repo_root, *a, **kw):
             r = orig_dream_items(repo_root, *a, **kw)
-            ctx = mb._lesson_path_active.get()
+            ctx = kw.get("_path_context")
             if ctx is not None:
                 ctx["paths"].update(unsafe_paths_map)
             return r

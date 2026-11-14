@@ -14,6 +14,8 @@ read inside the shared reader is separate, has its own existing bounds, and is n
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 import contextlib
 import datetime
 import os
@@ -54,7 +56,7 @@ _FAR = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
 
 
 def _now(clock: Optional[Callable[[], Any]]) -> datetime.datetime:
-    value = clock() if clock is not None else datetime.datetime.now(datetime.timezone.utc)
+    value = _call_foreign(lambda: clock()) if clock is not None else datetime.datetime.now(datetime.timezone.utc)
     if isinstance(value, (int, float)):
         return datetime.datetime.fromtimestamp(value, datetime.timezone.utc)
     if value.tzinfo is None:
@@ -185,7 +187,7 @@ def _current(lines: List[Dict[str, Any]]) -> Optional[List[str]]:
 def _load_lessons(root: Path, graph: Dict[str, Any]) -> Dict[str, Any]:
     nodes = {n["id"]: n for n in graph.get("nodes", []) if isinstance(n, dict) and isinstance(n.get("id"), str)}
     with mb._lesson_path_projection(root, None) as context:
-        read = (mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph) if nodes
+        read = (mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, _path_context=context) if nodes
                 else {"ok": True, "items": [], "notices": []})
         reached = {k: list(p) for k, p in context["paths"].items()}
         attachment_complete = not context.get("attachmentIncomplete")
@@ -274,6 +276,7 @@ def _merge_functions() -> Tuple[Any, Any]:
     return getattr(mb, "merge_view", None), getattr(mb, "merge_blockers", None)
 
 
+@md.fresh_read
 def merge_checks(repo_path=".", ids: Optional[Iterable[str]] = None, *, context=None) -> Dict[str, Any]:
     """The single place this module learns about merges: `memlet_bridge.merge_view` and `merge_blockers` when this
     build has both, else "merge checks not available in this build". What `merge_view` returns is checked against the
@@ -538,7 +541,7 @@ def _sightings(root: Path, lessons: Dict[str, Dict[str, Any]], merge: Dict[str, 
     if _holding_members(merge):
         raw = _raw_index(graph or {})
         with mb._lesson_path_projection(root, None) as path_context:
-            read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, include_merged=True)
+            read = mb.dream_items(root, tiers=(APPROVED, HINT, PENDING), _graph=graph, include_merged=True, _path_context=path_context)
             reached = {i: list(paths) for i, paths in path_context["paths"].items()}
         lessons = dict(lessons)
         for item in read.get("items", []):
@@ -570,6 +573,7 @@ def _load(repo_path) -> Tuple[Path, Dict[str, Any], str]:
     return root, graph or {"nodes": [], "edges": []}, why
 
 
+@md.fresh_read
 def lesson_sightings(repo_path=".", *, ids=None, max_bytes=MAX_BYTES, clock=None) -> Dict[str, Any]:
     """{ok, complete, scanned: {files, bytes}, sightings: {id: {sessions, first, last, where}}} plus `work` (entries
     listed, files opened, bytes read, lines read and compared, match work), `skipped` and `notices`. Read-only."""
@@ -818,6 +822,7 @@ def _invalid(stale_days, min_seen) -> bool:
             or type(min_seen) is not int or min_seen < 1)
 
 
+@md.fresh_read
 def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_bytes=MAX_BYTES) -> Dict[str, Any]:
     """{ok, duplicates, saidAgain, retire, unattached, promote, lapsedMerges, omitted, complete, notices, formatted}
     plus `mergeChecks`, `scanned`, `work` and `skipped`. Writes nothing; proposes only."""
@@ -1046,7 +1051,7 @@ def tidy_report(repo_path=".", *, stale_days=180, min_seen=3, clock=None, max_by
         nodes=nodes,
         merge=merge,
         merge_ok=merge_ok,
-        cmd=cmd,
+        cmd=None, _repo_arg=repo_arg,
         duplicate_ids=dup_nids,
         wording_groups=wording_sets,
     )

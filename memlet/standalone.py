@@ -1,4 +1,6 @@
 """Zero-dependency StandaloneStore, StandaloneService, and high-level MemoryEngine SDK decoupled from Memlet WorkStore."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 from contextlib import contextmanager
 import hashlib
 import json
@@ -36,9 +38,9 @@ def legacy_standalone_notice(store, task_id):
     """Point to older memories without copying them or changing task selection."""
     if task_id == 'standalone/main':
         return None
-    with store.db() as db:
-        has_current = db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', (task_id,)).fetchone()
-        has_legacy = db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', ('standalone/main',)).fetchone()
+    with _foreign_context(lambda: store.db()) as db:
+        has_current = _call_foreign(lambda: db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', (task_id,)).fetchone())
+        has_legacy = _call_foreign(lambda: db.execute('SELECT 1 FROM memory_items WHERE task=? LIMIT 1', ('standalone/main',)).fetchone())
     if not has_current and has_legacy:
         return 'Older memories live under standalone/main; read them with --task standalone/main (MCP: task="standalone/main").'
     return None
@@ -115,7 +117,7 @@ class StandaloneStore:
             try:
                 conn.backup(out)
             finally:
-                out.close()
+                _call_foreign(lambda: out.close())
             return str(dest)
         finally:
             conn.close()
@@ -195,7 +197,7 @@ class StandaloneStore:
                 )"""
             )
             conn.execute("CREATE TABLE IF NOT EXISTS memory_seeds (task TEXT PRIMARY KEY)")
-            ledger.ensure_schema(conn)
+            _call_foreign(lambda: ledger.ensure_schema(conn))
             skills_ledger.ensure_schema(conn)
             memory.ensure_schema(conn)
 
@@ -231,41 +233,41 @@ class StandaloneStore:
         return d
 
     def _check_input_lease(self, db, task: str, token: str = ""):
-        cols = {r[1] for r in db.execute("PRAGMA table_info(input_leases)").fetchall()}
+        cols = {r[1] for r in _call_foreign(lambda: list(db.execute("PRAGMA table_info(input_leases)").fetchall()))}
         if "task" in cols:
-            row = db.execute("SELECT token, expires FROM input_leases WHERE task=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT token, expires FROM input_leases WHERE task=?", (task,)).fetchone())
             if row and float(row["expires"] or 0.0) > time.time() and row["token"] != token:
                 raise ValueError("input delivery in progress; retry memory write after send finishes")
         else:
-            row = db.execute("SELECT token, expires_at FROM input_leases WHERE task_id=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT token, expires_at FROM input_leases WHERE task_id=?", (task,)).fetchone())
             if row and float(row["expires_at"] or 0.0) > time.time() and row["token"] != token:
                 raise ValueError("input delivery in progress; retry memory write after send finishes")
 
     def acquire_input(self, task: str, owner: str, token: str) -> bool:
         with self.db(True) as db:
-            row = db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone())
             if not row or row["owner"] != owner:
                 raise ValueError("Owner changed; input was not sent. Check the current owner.")
-            lease = db.execute("SELECT * FROM input_leases WHERE task=?", (task,)).fetchone()
+            lease = _call_foreign(lambda: db.execute("SELECT * FROM input_leases WHERE task=?", (task,)).fetchone())
             if lease and float(lease["expires"] or 0.0) > time.time() and lease["token"] != token:
                 raise ValueError("Another input for this task is being processed. Try again later.")
             if lease and float(lease["expires"] or 0.0) > time.time() and lease["token"] == token:
                 return False
-            db.execute(
+            _call_foreign(lambda: db.execute(
                 "INSERT OR REPLACE INTO input_leases (task, owner, token, expires) VALUES (?,?,?,?)",
                 (task, owner, token, time.time() + 600.0),
-            )
+            ))
             return True
 
     def release_input(self, task: str, token: str):
         with self.db(True) as db:
-            db.execute("DELETE FROM input_leases WHERE task=? AND token=?", (task, token))
+            _call_foreign(lambda: db.execute("DELETE FROM input_leases WHERE task=? AND token=?", (task, token)))
 
     def get(self, task_id: str):
         with self.db() as conn:
             row = self.row(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
             if row:
-                core = ledger.current(conn, task_id, list(ledger.FIELDS.values()))
+                core = _call_foreign(lambda: ledger.current(conn, task_id, list(ledger.FIELDS.values())))
                 row["body"] = {**row["body"], **memory.effective_fields({"current": core})}
         if row is None:
             raise ValueError("Task not found.")
@@ -273,7 +275,7 @@ class StandaloneStore:
 
     def _seed_memory(self, db, item):
         tid = item["id"]
-        if db.execute("SELECT 1 FROM memory_seeds WHERE task=?", (tid,)).fetchone():
+        if _call_foreign(lambda: db.execute("SELECT 1 FROM memory_seeds WHERE task=?", (tid,)).fetchone()):
             return
         body = item["body"]
         source = {
@@ -283,37 +285,37 @@ class StandaloneStore:
         }
         for field, kind in ledger.FIELDS.items():
             if body.get(field):
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, tid, item["revision"], "legacy:" + field, kind,
                     "field:" + field, "assert", body[field], {**source, "field": field}, 0,
-                )
+                ))
         for field, kind in (("lastRequest", "instruction"), ("latestResult", "report")):
             if body.get(field):
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, tid, item["revision"], "legacy:" + field, kind,
                     "legacy:" + field, "assert", body[field], {**source, "field": field},
                     body.get("lastHumanAt", 0) if kind == "instruction" else 0,
-                )
-        db.execute("INSERT OR IGNORE INTO memory_seeds VALUES(?)", (tid,))
+                ))
+        _call_foreign(lambda: db.execute("INSERT OR IGNORE INTO memory_seeds VALUES(?)", (tid,)))
 
     def _replace_memory_field(self, db, current, field, value, source, event_at):
         tid = current["id"]
         kind = ledger.FIELDS[field]
         target = "field:" + field
         revision = current["revision"] + 1
-        for row in db.execute(
+        for row in _call_foreign(lambda: list(db.execute(
             "SELECT * FROM memory_items WHERE task=? AND kind=? AND status='active'",
             (tid, kind),
-        ).fetchall():
+        ).fetchall())):
             item = ledger._public(row)
             if item["kind"] == kind and (item["item_id"] != target or not value):
                 key = "field:" + _fingerprint([revision, field, item["item_id"], "retract"])
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, tid, revision, key, kind, item["item_id"],
                     "retract", source=source, event_at=event_at,
-                )
+                ))
         if value:
-            old = ledger.get_item(db, tid, target)
+            old = _call_foreign(lambda: ledger.get_item(db, tid, target))
             if (
                 old and old["status"] == "active" and old["content"] == value
                 and (old.get("valid_from") is None or old["valid_from"] <= time.time())
@@ -321,48 +323,48 @@ class StandaloneStore:
             ):
                 return
             operation = "replace" if old and old["status"] == "active" else "assert"
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, tid, revision, "field:" + _fingerprint([revision, field, value]),
                 kind, target, operation, value, source, event_at,
-            )
+            ))
 
     def _link(self, db, task: str, session: str, role: str, evidence: str):
         _text(session, 240, True)
         if role not in ("responsible", "previous", "worker", "reviewer", "reference"):
             raise ValueError("Invalid session role.")
-        cols = {r[1] for r in db.execute("PRAGMA table_info(sessions)").fetchall()}
+        cols = {r[1] for r in _call_foreign(lambda: list(db.execute("PRAGMA table_info(sessions)").fetchall()))}
         ev_col = "evidence" if "evidence" in cols else "reason"
-        db.execute(
+        _call_foreign(lambda: db.execute(
             f"INSERT INTO sessions (task, session, role, {ev_col}, created) VALUES (?,?,?,?,?) "
             f"ON CONFLICT(task, session) DO UPDATE SET role=excluded.role, {ev_col}=excluded.{ev_col}",
             (task, session, role, _text(evidence, 1000, True), time.time()),
-        )
+        ))
 
     def link(self, task: str, session: str, role: str = "reference", evidence: str = "user-link"):
         self.get(task)
         if role == "responsible":
             raise ValueError("Change the owner through the handoff command.")
         with self.db(True) as db:
-            if db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone()[0] == session:
+            if _call_foreign(lambda: db.execute("SELECT owner FROM tasks WHERE id=?", (task,)).fetchone())[0] == session:
                 raise ValueError("Change the current owner role through the handoff command.")
             self._link(db, task, session, role, evidence)
         return self.get(task)
 
     def links(self, task: str):
         with self.db() as db:
-            return [dict(r) for r in db.execute("SELECT * FROM sessions WHERE task=? ORDER BY created, session", (task,))]
+            return [dict(r) for r in _call_foreign(lambda: list(db.execute("SELECT * FROM sessions WHERE task=? ORDER BY created, session", (task,))))]
 
     def for_session(self, session: str):
         with self.db() as db:
-            rows = db.execute(
+            rows = _call_foreign(lambda: db.execute(
                 "SELECT t.* FROM tasks t JOIN sessions s ON s.task=t.id WHERE s.session=? ORDER BY t.updated DESC",
                 (session,),
-            ).fetchall()
+            ).fetchall())
         return [self.row(r) for r in rows]
 
     def list(self):
         with self.db() as db:
-            return [self.row(r) for r in db.execute("SELECT * FROM tasks ORDER BY updated DESC LIMIT 500")]
+            return [self.row(r) for r in _call_foreign(lambda: list(db.execute("SELECT * FROM tasks ORDER BY updated DESC LIMIT 500")))]
 
     def attempts(self, task: str):
         return []
@@ -383,29 +385,29 @@ class StandaloneStore:
             "source": source,
         }
         with self.db(True) as db:
-            inserted = db.execute(
+            inserted = _call_foreign(lambda: db.execute(
                 "INSERT OR IGNORE INTO tasks (id, title, project, owner, state, revision, body, created, updated) VALUES (?,?,?,?,?,?,?,?,?)",
                 (task, title, project, owner, "active", 1, _encoded(body), now, now),
-            )
+            ))
             if owner and inserted.rowcount:
                 self._link(db, task, owner, "responsible", source)
             if inserted.rowcount:
-                self._seed_memory(db, self.row(db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()))
+                self._seed_memory(db, self.row(_call_foreign(lambda: db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone())))
         return self.get(task)
 
     def transfer(self, task: str, previous: str, successor: str, context_id: str, input_token: str = ""):
         with self.db(True) as db:
             self._check_input_lease(db, task, input_token)
-            row = db.execute("SELECT owner, revision FROM tasks WHERE id=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT owner, revision FROM tasks WHERE id=?", (task,)).fetchone())
             if not row or row["owner"] != previous:
                 raise ValueError("Owner changed. The new session was created, but ownership transfer was deferred.")
-            ctx = db.execute("SELECT revision FROM contexts WHERE id=? AND task=?", (context_id, task)).fetchone()
+            ctx = _call_foreign(lambda: db.execute("SELECT revision FROM contexts WHERE id=? AND task=?", (context_id, task)).fetchone())
             if ctx and ctx["revision"] != row["revision"]:
                 raise ValueError("Task context changed during handoff. Review the created conversation before transferring ownership.")
             if previous:
                 self._link(db, task, previous, "previous", "explicit-handoff:" + context_id)
             self._link(db, task, successor, "responsible", "accepted-handoff:" + context_id)
-            db.execute("UPDATE tasks SET owner=?, revision=revision+1, updated=? WHERE id=?", (successor, time.time(), task))
+            _call_foreign(lambda: db.execute("UPDATE tasks SET owner=?, revision=revision+1, updated=? WHERE id=?", (successor, time.time(), task)))
 
     def ensure_standalone_task(self, task_id: str, session: str = None, project: str = "", title: str = "", goal: str = ""):
         task_id = _text(task_id or "standalone/main", 240, True)
@@ -437,11 +439,11 @@ class StandaloneStore:
             retrieval["queryOmittedChars"] = max(0, len(q_str) - 2000)
         at = memory.timestamp(options.get("at"), "at")
         known = memory.timestamp(options.get("known_at"), "known_at")
-        active = ledger.current(
+        active = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(ledger.FIELDS.values()) + ["fact", "experience", "case", "hypothesis"],
             at=at, known_at=known,
-        )
+        ))
         return {
             "version": memory.VERSION,
             "taskId": task,
@@ -453,7 +455,7 @@ class StandaloneStore:
             "skills": skills_ledger.snapshot_skills(db, task, at=at, known_at=known),
             "skillHistory": skills_ledger.skill_events(db, task, limit=20),
             "links": skills_ledger.get_links(db, task, limit=80),
-            "history": ledger.history(db, task, 30),
+            "history": _call_foreign(lambda: ledger.history(db, task, 30)),
             "retrieval": retrieval,
         }
 
@@ -464,7 +466,7 @@ class StandaloneStore:
         if include_retrieval and query and memory.vectors._MODEL is not None:
             index_result = memory.index_task(self, task)
         with self.db() as db:
-            row = db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone())
             if not row:
                 raise ValueError("Task not found.")
             view = self._memory_view(db, task, query, budget, include_retrieval, **options)
@@ -478,7 +480,7 @@ class StandaloneStore:
         ):
             index_result = memory.index_task(self, task)
             with self.db() as db:
-                row = db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone()
+                row = _call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone())
                 view = self._memory_view(db, task, query, budget, include_retrieval, **options)
                 rev = row["revision"]
         return {**view, "revision": rev, "indexing": index_result}
@@ -491,7 +493,7 @@ class StandaloneStore:
         before = memory.timestamp(options.get("before"), "before")
         after = memory.timestamp(options.get("after"), "after")
         with self.db() as db:
-            row = db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone()
+            row = _call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (task,)).fetchone())
             if not row:
                 raise ValueError("Task not found.")
             items = skills_ledger.snapshot_skills(
@@ -521,15 +523,15 @@ class StandaloneStore:
             raise ValueError("Provide between 1 and 30 memory changes.")
         payload = _fingerprint({"revision": revision, "patches": patches})
         with self.db(True) as db:
-            prior = db.execute(
+            prior = _call_foreign(lambda: db.execute(
                 "SELECT * FROM memory_batches WHERE task=? AND operation=?",
                 (task, operation),
-            ).fetchone()
+            ).fetchone())
             if prior:
                 if prior["digest"] != payload:
                     raise ValueError("The content of this memory request changed.")
                 return json.loads(prior["result"])
-            current = self.row(db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone())
+            current = self.row(_call_foreign(lambda: db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()))
             if not current or current["revision"] != revision:
                 raise ValueError("Task was updated. Review its current state.")
             self._check_input_lease(db, task)
@@ -546,38 +548,38 @@ class StandaloneStore:
                     raise ValueError("Only goals, decisions, constraints, next actions and open issues can be changed.")
                 value = _text(patch.get("content", ""), 8000, op in ("assert", "replace"))
                 evidence = _text(patch.get("evidence", ""), 2000)
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, task, revision + 1, "patch:" + _fingerprint([operation, i]), kind,
                     patch.get("id"), op, value, {**source, "evidence": evidence}, now,
                     valid_from=memory.timestamp(patch.get("validFrom"), "validFrom"),
                     valid_until=memory.timestamp(patch.get("validUntil"), "validUntil"),
-                )
+                ))
                 touched.add(kind)
-            active = ledger.current(db, task, list(touched))
+            active = _call_foreign(lambda: ledger.current(db, task, list(touched)))
             manual = body.setdefault("_manualFields", {})
             for field, kind in ledger.FIELDS.items():
                 if kind in touched:
                     combined = "\n".join(r["content"] for r in active if r["kind"] == kind)
                     body[field] = _text(combined, 8000)
                     manual[field] = True
-            db.execute(
+            _call_foreign(lambda: db.execute(
                 "UPDATE tasks SET body=?, revision=revision+1, updated=? WHERE id=?",
                 (_encoded(body), now, task),
-            )
+            ))
             result = {"taskId": task, "revision": revision + 1, "operationId": operation, "changedKinds": sorted(touched)}
-            db.execute("INSERT INTO memory_batches VALUES(?,?,?,?)", (task, operation, payload, _encoded(result)))
+            _call_foreign(lambda: db.execute("INSERT INTO memory_batches VALUES(?,?,?,?)", (task, operation, payload, _encoded(result))))
         return result
 
     def context(self, task: str, extra: dict = None, expected_revision: int = None, query: str = ""):
         if query:
             memory.index_task(self, task)
         with self.db(True) as db:
-            item = self.row(db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone())
+            item = self.row(_call_foreign(lambda: db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()))
             if not item:
                 raise ValueError("Task not found.")
             if expected_revision is not None and item["revision"] != expected_revision:
                 raise ValueError("Memory changed while preparing the handoff. Prepare it again with the current state.")
-            links = [dict(r) for r in db.execute("SELECT * FROM sessions WHERE task=? ORDER BY created, session", (task,))]
+            links = [dict(r) for r in _call_foreign(lambda: list(db.execute("SELECT * FROM sessions WHERE task=? ORDER BY created, session", (task,))))]
             body = {
                 "taskId": task,
                 "project": item["project"],
@@ -592,10 +594,10 @@ class StandaloneStore:
             }
             body.update(memory.effective_fields(body["memory"]))
             cid = _fingerprint(body)
-            db.execute(
+            _call_foreign(lambda: db.execute(
                 "INSERT OR IGNORE INTO contexts VALUES(?,?,?,?,?)",
                 (cid, task, item["revision"], _encoded(body), time.time()),
-            )
+            ))
         folder = self.root / "work_contexts"
         folder.mkdir(exist_ok=True, mode=0o700)
         path = folder / (cid + ".json")
@@ -616,7 +618,7 @@ class StandaloneService:
         self.flow = flow
 
     def publish_task_note(self, task: dict, links: list, originals: list = ()):
-        mem = self.store.memory(task["id"], include_retrieval=False)
+        mem = _call_foreign(lambda: self.store.memory(task["id"], include_retrieval=False))
         body = dict(task["body"])
         body.update(memory.effective_fields(mem))
         plain = lambda v: str(v or "").replace("\x00", "")
@@ -651,7 +653,7 @@ class StandaloneService:
         )
         for p in sources:
             parts += ["- " + md_link(p, Path(p).name)]
-        parts += ["- 업무 원장: " + md_link(self.store.path, "Memlet 업무 원장"), "", "## 연결된 대화", ""]
+        parts += ["- 업무 원장: " + md_link(_call_foreign(lambda: self.store.path), "Memlet 업무 원장"), "", "## 연결된 대화", ""]
         for row in links or []:
             parts += ["- " + row["role"] + ": `" + row["session"] + "`"]
         for key, title in (
@@ -710,9 +712,9 @@ class StandaloneService:
         return str(target)
 
     def checkpoint_packet(self, tid: str, query: str = ""):
-        task = self.store.get(tid)
-        note = self.publish_task_note(task, self.store.links(tid), [])
-        return self.store.context(
+        task = _call_foreign(lambda: self.store.get(tid))
+        note = self.publish_task_note(task, _call_foreign(lambda: self.store.links(tid)), [])
+        return _call_foreign(lambda: self.store.context(
             tid,
             {
                 "knowledgeNote": note,
@@ -724,7 +726,7 @@ class StandaloneService:
             },
             expected_revision=task["revision"],
             query=query,
-        )
+        ))
 
     def context_prompt(self, tid: str, query: str = "", writable: bool = True):
         packet = self.checkpoint_packet(tid, query)
@@ -806,7 +808,7 @@ class StandaloneService:
         lines += [
             "업무 노트: " + str(body.get("knowledgeNote", "")),
             "전체 근거 보관본: " + packet["path"],
-            "기억 원장: " + str(self.store.path),
+            "기억 원장: " + str(_call_foreign(lambda: self.store.path)),
             body["handoffRule"],
             memory.tool_contract(self.root, tid, body["responsibleSession"], writable),
         ]
@@ -818,15 +820,15 @@ class StandaloneService:
         instruction = instruction.strip()
         identity = "input:" + _fingerprint([sid, input_token or input_at])
         raw_hash = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
-        with self.store.db(True) as db:
+        with _foreign_context(lambda: self.store.db(True)) as db:
             try:
-                self.store._check_input_lease(db, tid, input_token)
+                _call_foreign(lambda: self.store._check_input_lease(db, tid, input_token))
             except ValueError:
                 return
-            task = self.store.row(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+            task = _call_foreign(lambda: self.store.row(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()))
             if not task or task["owner"] != sid:
                 return
-            if ledger.get_item(db, tid, identity):
+            if _call_foreign(lambda: ledger.get_item(db, tid, identity)):
                 return
             body = task["body"]
             provenance = {
@@ -836,33 +838,33 @@ class StandaloneService:
                 "originalSha256": raw_hash,
                 "originalChars": len(instruction),
             }
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, tid, task["revision"] + 1, identity, "instruction", identity, "assert",
                 instruction[:100000], provenance, input_at,
-            )
+            ))
             summary = _text(instruction[:8000])
             body.update(lastRequest=summary, lastHumanAt=input_at)
-            db.execute("UPDATE tasks SET body=?, revision=revision+1, updated=? WHERE id=?", (_encoded(body), time.time(), tid))
+            _call_foreign(lambda: db.execute("UPDATE tasks SET body=?, revision=revision+1, updated=? WHERE id=?", (_encoded(body), time.time(), tid)))
 
     def augment_turn(self, sid: str, raw_text: str, formatted_text: str, request_id: str) -> str:
         if not isinstance(raw_text, str) or len(raw_text) > 100000:
             return formatted_text
-        if self.registry and hasattr(self.registry, "relation") and self.registry.relation(sid):
+        if _call_foreign(lambda: bool(self.registry) and hasattr(self.registry, "relation") and bool(self.registry.relation(sid))):
             return formatted_text
-        tasks = [t for t in self.store.for_session(sid) if t["owner"] == sid]
+        tasks = [t for t in _call_foreign(lambda: list(self.store.for_session(sid))) if t["owner"] == sid]
         if not tasks:
             return formatted_text
         task = tasks[0]
         tid = task["id"]
         self._record_owner_input(tid, sid, raw_text, time.time(), "chat", request_id)
-        view = self.store.memory(tid, raw_text, 4000, shared=True)
+        view = _call_foreign(lambda: self.store.memory(tid, raw_text, 4000, shared=True))
         recall_id = memory.record_recall(self.store, tid, sid, request_id, raw_text, view["retrieval"])
         context, _ = memory.build_turn_context(self.store, tid, sid, view, recall_id, query=raw_text)
-        with self.store.db(True) as db:
-            db.execute(
+        with _foreign_context(lambda: self.store.db(True)) as db:
+            _call_foreign(lambda: db.execute(
                 "INSERT OR REPLACE INTO memory_turn_prompts VALUES(?,?,?,?,?,?,?)",
                 (recall_id, tid, sid, request_id, raw_text, memory.digest(formatted_text), memory.digest(context)),
-            )
+            ))
         return formatted_text + '\n\n<memlet-context id="' + recall_id + '">\n' + context + "\n</memlet-context>"
 
     def strip_memory_for_display(self, instruction: str) -> str:
@@ -878,8 +880,8 @@ class StandaloneService:
         )
         if not match:
             return instruction
-        with self.store.db() as db:
-            row = db.execute("SELECT * FROM memory_turn_prompts WHERE id=?", (match.group(1),)).fetchone()
+        with _foreign_context(lambda: self.store.db()) as db:
+            row = _call_foreign(lambda: db.execute("SELECT * FROM memory_turn_prompts WHERE id=?", (match.group(1),)).fetchone())
         if (
             row
             and row["formatted_hash"] == memory.digest(instruction[:start])
@@ -892,13 +894,13 @@ class StandaloneService:
         action = body.get("action")
         tid = body.get("taskId", "")
         if action == "memory_patch":
-            result = self.store.patch_memory(tid, body.get("revision"), body.get("operationId"), body.get("patches"))
-            return {"ok": True, "result": result, "memory": self.store.memory(tid)}
+            result = _call_foreign(lambda: self.store.patch_memory(tid, body.get("revision"), body.get("operationId"), body.get("patches")))
+            return {"ok": True, "result": result, "memory": _call_foreign(lambda: self.store.memory(tid))}
         if action == "memory_search":
             options = {k: body[k] for k in ("at", "known_at", "before", "after", "shared", "federated", "limit") if k in body}
-            result = self.store.memory(tid, body.get("query", ""), body.get("budget", 6000), **options)
+            result = _call_foreign(lambda: self.store.memory(tid, body.get("query", ""), body.get("budget", 6000), **options))
             result["recallId"] = memory.record_recall(
-                self.store, tid, self.store.get(tid)["owner"], "api:" + str(time.time_ns()), body.get("query", ""), result["retrieval"]
+                self.store, tid, _call_foreign(lambda: self.store.get(tid))["owner"], "api:" + str(time.time_ns()), body.get("query", ""), result["retrieval"]
             )
             return {"ok": True, "memory": result}
         if action == "memory_learn":
@@ -920,7 +922,7 @@ class StandaloneService:
             if body.get("skillId"):
                 return {"ok": True, "skill": memory.read_skill(self.store, tid, body["skillId"])}
             options = {k: body[k] for k in ("at", "known_at", "before", "after", "shared", "federated", "limit", "budget") if k in body}
-            return {"ok": True, **self.store.skills(tid, body.get("query", ""), include_inactive=body.get("includeInactive", False), **options)}
+            return {"ok": True, **_call_foreign(lambda: self.store.skills(tid, body.get("query", ""), include_inactive=body.get("includeInactive", False), **options))}
         if action == "memory_skill_manage":
             if body.get("op") == "sync" or body.get("sync") is True:
                 return memory.sync_skills(self.store, tid, body.get("session", ""))
@@ -929,13 +931,13 @@ class StandaloneService:
             }
             return memory.manage_skill(self.store, tid, body.get("session", ""), body.get("revision"), body.get("operationId"), spec)
         if action == "memory_stats":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.stats(self.store, tid)}
         if action == "memory_cases":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.cases(self.store, tid, limit=body.get("limit", 25))}
         if action == "memory_links":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.links(self.store, tid, node_id=body.get("nodeId"), limit=body.get("limit", 100))}
         if action == "memory_capture":
             payload = body.get("payload") if isinstance(body.get("payload"), dict) else {
@@ -943,20 +945,20 @@ class StandaloneService:
             }
             return memory.auto_capture(self.store, tid, body.get("session", ""), payload)
         if action == "memory_preflight":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.preflight_check(
                 self.store, tid, plan=body.get("plan", ""), files=body.get("files"), action_type=body.get("actionType")
             )
         if action == "memory_capsule":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.build_subagent_capsule(
                 self.store, tid, plan=body.get("plan", ""), files=body.get("files"), worker=body.get("worker", ""), budget=int(body.get("budget", 1200))
             )
         if action == "memory_heal_skills":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.heal_skills(self.store, tid, session=body.get("session", ""), dry_run=bool(body.get("dryRun", False)))
         if action == "memory_verify_skill":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.verify_skill(
                 self.store, tid, body.get("session", ""), body.get("skillId", ""),
                 command=body.get("command"), execution_proof=body.get("executionProof"),
@@ -972,13 +974,13 @@ class StandaloneService:
             return memory.repo_benchmark(work_dir=body.get("workDir"))
         if action == "memory_audit":
             return memory.audit_repo(
-                repo_path=body.get("repoPath") or self.store.root,
+                repo_path=body.get("repoPath") or _call_foreign(lambda: self.store.root),
                 base_ref=body.get("baseRef"),
                 head_ref=body.get("headRef", "HEAD"),
                 output_format=body.get("format", "json"),
             )
         if action == "memory_trajectory":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {
                 "ok": True,
                 **memory.attribute_trajectory(
@@ -987,27 +989,27 @@ class StandaloneService:
                 ),
             }
         if action == "memory_benchmark":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.benchmark(self.store, tid, budget=body.get("budget", 6000))}
         if action == "memory_inspector":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.inspector(self.store, tid, budget=body.get("budget", 6000))}
         if action == "memory_scenes":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return {"ok": True, **memory.scenes(self.store, tid)}
         if action == "memory_consolidate":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.consolidate_memories(
                 self.store, tid, session=body.get("session", ""),
                 similarity_threshold=body.get("similarityThreshold", 0.35), dry_run=bool(body.get("dryRun", False)),
             )
         if action == "memory_sync_markdown":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.sync_markdown(
                 self.store, tid, session=body.get("session", ""), note_path=body.get("notePath"), explicit_user=body.get("explicitUser")
             )
         if action == "memory_export":
-            self.store.get(tid)
+            _call_foreign(lambda: self.store.get(tid))
             return memory.export_rules(
                 self.store, tid, targets=body.get("targets"), target_dir=body.get("targetDir"),
                 write_files=bool(body.get("writeFiles", False)), lang=body.get("lang", "ko"),
@@ -1034,7 +1036,7 @@ class MemoryEngine:
         eff_task = default_task or task
         eff_session = default_session or session
         eff_project = project or (eff_task.split("/", 1)[0] if "/" in str(eff_task) else "default")
-        if hasattr(root_or_store, "db") and hasattr(root_or_store, "root"):
+        if _call_foreign(lambda: hasattr(root_or_store, "db")) and _call_foreign(lambda: hasattr(root_or_store, "root")):
             self.store = root_or_store
         else:
             self.store = StandaloneStore(root_or_store, default_owner=eff_session)
@@ -1042,13 +1044,13 @@ class MemoryEngine:
         self.session = eff_session
         self.project = eff_project
         if isinstance(self.store, StandaloneStore):
-            self.store.ensure_task(eff_task, owner=eff_session, project=eff_project)
+            _call_foreign(lambda: self.store.ensure_task(eff_task, owner=eff_session, project=eff_project))
 
     def brief(self, query: str = "", budget: int = 4000, shared: bool = False):
-        return self.store.memory(self.task, query=query, budget=budget, include_retrieval=bool(query), shared=shared)
+        return _call_foreign(lambda: self.store.memory(self.task, query=query, budget=budget, include_retrieval=bool(query), shared=shared))
 
     def recall(self, query: str = "", budget: int = 6000, limit: int = 8, session: str = None, shared: bool = False, federated: bool = False):
-        res = self.store.memory(self.task, query=query, budget=budget, limit=limit, shared=shared, federated=federated)
+        res = _call_foreign(lambda: self.store.memory(self.task, query=query, budget=budget, limit=limit, shared=shared, federated=federated))
         res["recallId"] = memory.record_recall(
             self.store, self.task, session or self.session, "sdk:" + str(time.time_ns()), query, res["retrieval"],
         )
@@ -1068,8 +1070,8 @@ class MemoryEngine:
 
     def learn(self, entries: list, operation_id: str, revision: int = None, session: str = None):
         if revision is None:
-            with self.store.db() as db:
-                t_row = db.execute("SELECT revision FROM tasks WHERE id=?", (self.task,)).fetchone()
+            with _foreign_context(lambda: self.store.db()) as db:
+                t_row = _call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (self.task,)).fetchone())
                 revision = int(t_row["revision"]) if t_row else 1
         return memory.learn(self.store, self.task, session or self.session, revision, operation_id, entries)
 
@@ -1116,14 +1118,14 @@ class MemoryEngine:
 
     def audit(self, repo_path=None, base_ref: str = None, head_ref: str = "HEAD", output_format: str = "json"):
         return memory.audit_repo(
-            repo_path or self.store.root,
+            repo_path or _call_foreign(lambda: self.store.root),
             base_ref=base_ref,
             head_ref=head_ref,
             output_format=output_format,
         )
 
     def skills(self, query: str = "", include_inactive: bool = False):
-        return self.store.skills(self.task, query=query, include_inactive=include_inactive)
+        return _call_foreign(lambda: self.store.skills(self.task, query=query, include_inactive=include_inactive))
 
     def read_skill(self, skill_id: str):
         return memory.read_skill(self.store, self.task, skill_id)

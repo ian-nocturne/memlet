@@ -7,6 +7,9 @@ Supports:
 - Makefile / *.mk: Make target contracts
 - Explicit resolution status (`exact`, `contract`, `unsupported`, `parse_error`) so unsupported files are never silently treated as verified symbols.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _read_cache
+
 import ast
 import copy
 import hashlib
@@ -15,8 +18,6 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-_FILE_HASH_AST_CACHE = {}
-_FILE_SIGNATURE_CACHE = {}
 
 _TS_JS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
 _MAKE_NAMES = {"makefile", "gnumakefile"}
@@ -31,18 +32,19 @@ def _digest(value) -> str:
 
 
 def cached_file_sha(file_path) -> str:
-    """Fast stat-keyed file SHA-256 helper."""
+    """File SHA-256, memoized only on the current synchronous read stack."""
+    cache = _read_cache("source_file_hash_ast")
     p = Path(file_path)
     try:
         st = p.stat()
         key = (str(p), st.st_mtime_ns, st.st_size)
-        cached = _FILE_HASH_AST_CACHE.get(key)
+        cached = cache.get(key)
         if cached is not None:
             return cached[0]
         sha = hashlib.sha256(p.read_bytes()).hexdigest()
-        if len(_FILE_HASH_AST_CACHE) > 512:
-            _FILE_HASH_AST_CACHE.clear()
-        _FILE_HASH_AST_CACHE[key] = (sha, None)
+        if len(cache) > 512:
+            cache.clear()
+        cache[key] = (sha, None)
         return sha
     except OSError:
         return ""
@@ -1011,6 +1013,7 @@ def _extract_makefile_signatures(src_text: str) -> dict:
 
 def extract_file_symbol_signatures(file_path):
     """Extract call-contract signatures for functions/classes/interfaces/scripts/targets in file_path."""
+    cache = _read_cache("source_file_signatures")
     p = Path(file_path)
     try:
         if p.is_symlink() or not p.is_file():
@@ -1031,7 +1034,7 @@ def extract_file_symbol_signatures(file_path):
                 "symbols": {},
             }
         key = (str(p), st.st_mtime_ns, st.st_size)
-        cached = _FILE_SIGNATURE_CACHE.get(key)
+        cached = cache.get(key)
         if cached is not None:
             return cached
         raw_bytes = p.read_bytes()
@@ -1106,9 +1109,9 @@ def extract_file_symbol_signatures(file_path):
         "__language__": language,
         "symbols": sigs,
     }
-    if len(_FILE_SIGNATURE_CACHE) > 512:
-        _FILE_SIGNATURE_CACHE.clear()
-    _FILE_SIGNATURE_CACHE[key] = res
+    if len(cache) > 512:
+        cache.clear()
+    cache[key] = res
     return res
 
 
@@ -1296,6 +1299,7 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Option
     if basis == PYTHON_HASH_BASIS:
         basis = None
     legacy = basis is not None  # any previous basis: computed fresh, never cached
+    cache = _read_cache("source_file_hash_ast")
     p = Path(file_path)
     try:
         if p.is_symlink() or not p.is_file():
@@ -1304,7 +1308,7 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Option
         if st.st_size > 2 * 1024 * 1024:
             return {}
         key = (str(p), st.st_mtime_ns, st.st_size)
-        cached = _FILE_HASH_AST_CACHE.get(key)
+        cached = cache.get(key)
         if not legacy and cached is not None and cached[1] is not None:
             return cached[1]
         raw_bytes = p.read_bytes()
@@ -1343,14 +1347,14 @@ def extract_file_symbol_hashes(file_path, *, legacy: bool = False, basis: Option
                 else:
                     symbol_hashes[short_name] = _digest({qn: hv for qn, hv in sorted(entries)})
             if not legacy:
-                _FILE_HASH_AST_CACHE[key] = (sha, symbol_hashes)
+                cache[key] = (sha, symbol_hashes)
             return symbol_hashes
         except SyntaxError:
             pass
     sig_info = extract_file_symbol_signatures(p)
     for sym_name, sig in (sig_info.get("symbols") or {}).items():
         symbol_hashes[sym_name] = sig.get("normAstHash") or sig.get("sigHash") or ""
-    _FILE_HASH_AST_CACHE[key] = (sha, symbol_hashes)
+    cache[key] = (sha, symbol_hashes)
     return symbol_hashes
 
 
@@ -1386,13 +1390,13 @@ EXACT_PROVIDER_ENV = "MEMLET_EXACT_PARSERS"  # "0" / "off": never auto-load opti
 
 def register_exact_provider(provider) -> None:
     """Register `provider` for each of its languages (replacing a previous one). Raises ValueError on a bad basis."""
-    basis = getattr(provider, "basis", None)
+    basis = _call_foreign(lambda: getattr(provider, "basis", None))
     if not isinstance(basis, str) or not _BASIS_RE.fullmatch(basis) or basis in (TS_LEXICAL_BASIS, PYTHON_HASH_BASIS,
                                                                                     "legacy", "contract-v1"):
         raise ValueError(f"invalid exact-provider basis: {basis!r}")
-    if not isinstance(getattr(provider, "name", None), str) or not provider.name:
+    if not isinstance(_call_foreign(lambda: getattr(provider, "name", None)), str) or not _call_foreign(lambda: provider.name):
         raise ValueError("an exact provider needs a name")
-    for lang in getattr(provider, "languages", ()) or ():
+    for lang in _call_foreign(lambda: tuple(getattr(provider, "languages", ()) or ())):
         _EXACT_PROVIDERS[str(lang)] = provider
     _EXACT_CACHE.clear()
 
@@ -1418,7 +1422,7 @@ def _autoload_exact_providers() -> None:
     except Exception:  # an optional parser must never break the default path
         return
     if provider is not None:
-        for lang in provider.languages:
+        for lang in _call_foreign(lambda: tuple(provider.languages)):
             _EXACT_PROVIDERS.setdefault(lang, provider)
 
 
@@ -1440,25 +1444,25 @@ def exact_symbol_fingerprints(file_path, language: str, *, basis: Optional[str] 
     provider = exact_provider(language)
     if provider is None:
         return None, None
-    if allowed is not None and getattr(provider, "name", None) not in set(allowed):
+    if allowed is not None and _call_foreign(lambda: getattr(provider, "name", None)) not in set(allowed):
         return None, None
-    if basis is not None and provider.basis != basis:
-        return provider.basis, None
+    if basis is not None and _call_foreign(lambda: provider.basis) != basis:
+        return _call_foreign(lambda: provider.basis), None
     p = Path(file_path)
     try:
         st = p.lstat()
     except OSError:
-        return provider.basis, None
-    key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino, provider.basis, id(provider))
+        return _call_foreign(lambda: provider.basis), None
+    key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino, _call_foreign(lambda: provider.basis), id(provider))
     from .memlet_wiki import read_regular_text  # contained reader: no symlink leaf, no FIFO, size cap
     text = read_regular_text(p, 2 * 1024 * 1024)
     if text is None:
-        return provider.basis, None
+        return _call_foreign(lambda: provider.basis), None
     key = key + (hashlib.sha256(text.encode("utf-8")).hexdigest(),)  # never trust stat metadata alone
     if key in _EXACT_CACHE:
-        return provider.basis, _EXACT_CACHE[key]
+        return _call_foreign(lambda: provider.basis), _EXACT_CACHE[key]
     try:
-        raw = provider.fingerprint(str(p), text)
+        raw = _call_foreign(lambda: provider.fingerprint(str(p), text))
     except Exception:
         raw = None
     result = None
@@ -1471,7 +1475,7 @@ def exact_symbol_fingerprints(file_path, language: str, *, basis: Optional[str] 
     if len(_EXACT_CACHE) > 512:
         _EXACT_CACHE.clear()
     _EXACT_CACHE[key] = result
-    return provider.basis, result
+    return _call_foreign(lambda: provider.basis), result
 
 
 def is_breaking_symbol_change(old_sig, curr_sig):

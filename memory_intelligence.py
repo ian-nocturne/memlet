@@ -4,6 +4,8 @@ The current conversation model does semantic extraction through learn(). This
 module validates sources and scope; it never calls a language model or executes
 stored procedures. Unverified interpretations remain hypotheses/reported cards.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import hashlib
 import json
 import math
@@ -52,7 +54,7 @@ def ensure_schema(db):
            id TEXT PRIMARY KEY,task TEXT NOT NULL,session TEXT NOT NULL,request_id TEXT NOT NULL,
            raw_text TEXT NOT NULL,formatted_hash TEXT NOT NULL,context_hash TEXT NOT NULL)''',
     ):
-        db.execute(sql)
+        _call_foreign(lambda: db.execute(sql))
     skills_ledger.ensure_schema(db)
 
 
@@ -277,15 +279,15 @@ def chunks(content):
 
 
 def index_task(store, task, limit=None):
-    config = settings(store.root)
+    config = settings(_call_foreign(lambda: store.root))
     if not config['semantic']:
         return {'enabled': False, 'indexedItems': 0}
     limit = config['indexBatch'] if limit is None else ledger._integer(limit, 'limit', 0, 1000)
-    with store.db() as db:
-        rows = ledger.snapshot(db,task,limit=5000)
-        pending = [r for r in rows if not db.execute(
+    with _foreign_context(lambda: store.db()) as db:
+        rows = _call_foreign(lambda: ledger.snapshot(db,task,limit=5000))
+        pending = [r for r in rows if not _call_foreign(lambda: db.execute(
             'SELECT 1 FROM memory_vectors WHERE task=? AND item_id=? AND event_id=? AND model=? LIMIT 1',
-            (task, r['item_id'], r['event_id'], vectors.MODEL)).fetchone()][:limit]
+            (task, r['item_id'], r['event_id'], vectors.MODEL)).fetchone())][:limit]
     done = 0
     try:
         for item in pending:
@@ -293,15 +295,15 @@ def index_task(store, task, limit=None):
             if not spans:
                 continue
             encoded = vectors.embed([item['content'][a:b] for a, b in spans])
-            with store.db(True) as db:
-                live = db.execute('SELECT 1 FROM memory_events WHERE task=? AND item_id=? AND id=?',
-                                  (task,item['item_id'],item['event_id'])).fetchone()
+            with _foreign_context(lambda: store.db(True)) as db:
+                live = _call_foreign(lambda: db.execute('SELECT 1 FROM memory_events WHERE task=? AND item_id=? AND id=?',
+                                  (task,item['item_id'],item['event_id'])).fetchone())
                 if not live:
                     continue
                 for n, ((a, b), vector) in enumerate(zip(spans, encoded)):
-                    db.execute('INSERT OR IGNORE INTO memory_vectors VALUES(?,?,?,?,?,?,?,?)',
+                    _call_foreign(lambda: db.execute('INSERT OR IGNORE INTO memory_vectors VALUES(?,?,?,?,?,?,?,?)',
                                (task, item['item_id'], item['event_id'], n, vectors.MODEL, a, b,
-                                __import__('sqlite3').Binary(vector)))
+                                __import__('sqlite3').Binary(vector))))
             done += 1
         return {'enabled': True, 'indexedItems': done, 'pendingItems': max(0, len(pending)-done)}
     except Exception as exc:
@@ -389,16 +391,16 @@ def _rows(db, task, at=None, known_at=None, before=None, after=None, shared=Fals
         raise ValueError('shared must be boolean')
     if at is None and known_at is None and before is None and after is None and not shared and not federated:
         return _indexing_core.get_cached_task_rows(db, task, RECALL_KINDS, snapshot_limit=5000)
-    own = ledger.snapshot(db, task, at, known_at, kinds=RECALL_KINDS, limit=5000, before=before, after=after, with_count=True)
+    own = _call_foreign(lambda: ledger.snapshot(db, task, at, known_at, kinds=RECALL_KINDS, limit=5000, before=before, after=after, with_count=True))
     result = [r for r in own['items'] if not (r['kind'] in ('experience', 'case') and r['source'].get('evidenceState') == 'needs_revision')]
     total = max(0, own['count'] - (len(own['items']) - len(result)))
     if shared:
-        project = db.execute('SELECT project FROM tasks WHERE id=?', (task,)).fetchone()
+        project = _call_foreign(lambda: db.execute('SELECT project FROM tasks WHERE id=?', (task,)).fetchone())
         if project:
-            others = db.execute('SELECT id FROM tasks WHERE project=? AND id<>? ORDER BY id LIMIT 100', (project['project'], task)).fetchall()
+            others = _call_foreign(lambda: db.execute('SELECT id FROM tasks WHERE project=? AND id<>? ORDER BY id LIMIT 100', (project['project'], task)).fetchall())
             for other in others:
-                page = ledger.snapshot(db, other['id'], at, known_at, kinds=['fact', 'experience', 'case'], limit=5000,
-                                       before=before, after=after, project_only=True, with_count=True)
+                page = _call_foreign(lambda: ledger.snapshot(db, other['id'], at, known_at, kinds=['fact', 'experience', 'case'], limit=5000,
+                                       before=before, after=after, project_only=True, with_count=True))
                 valid_items = [r for r in page['items'] if not (r['kind'] in ('experience', 'case') and r['source'].get('evidenceState') == 'needs_revision')]
                 total += max(0, page['count'] - (len(page['items']) - len(valid_items)))
                 for row in valid_items:
@@ -454,17 +456,17 @@ _MAX_TASK_VECTOR_CACHE = 32
 def _load_task_vectors(db, task_ids):
     """Load and cache all (item_id, event_id) -> [(start, vector_bytes)] for given tasks in a single SQL query per task."""
     try:
-        db_list = db.execute('PRAGMA database_list').fetchall()
+        db_list = _call_foreign(lambda: db.execute('PRAGMA database_list').fetchall())
         db_key = db_list[0][2] if db_list and len(db_list[0]) > 2 and db_list[0][2] else str(id(db))
     except Exception:
         db_key = str(id(db))
 
     result = {}
     for tid in set(task_ids):
-        stat = db.execute(
+        stat = _call_foreign(lambda: db.execute(
             'SELECT count(*), COALESCE(max(event_id), 0) FROM memory_vectors WHERE task=? AND model=?',
             (tid, vectors.MODEL),
-        ).fetchone()
+        ).fetchone())
         cnt = int(stat[0] or 0)
         max_ev = int(stat[1] or 0)
         if cnt == 0:
@@ -475,10 +477,10 @@ def _load_task_vectors(db, task_ids):
         if cached is not None:
             result[tid] = cached
             continue
-        rows_vec = db.execute(
+        rows_vec = _call_foreign(lambda: db.execute(
             'SELECT item_id, event_id, start, vector FROM memory_vectors WHERE task=? AND model=? ORDER BY item_id, event_id, chunk',
             (tid, vectors.MODEL),
-        ).fetchall()
+        ).fetchall())
         mapping = {}
         for rv in rows_vec:
             mapping.setdefault((rv['item_id'], rv['event_id']), []).append((int(rv['start']), bytes(rv['vector'])))
@@ -659,13 +661,13 @@ def _apply_sufficiency_check(db, task, items, primary_items, index_items, skill_
         return promotions
 
     placeholders = ','.join('?' for _ in seed_ids)
-    strong_edges = db.execute(
+    strong_edges = _call_foreign(lambda: db.execute(
         f'''SELECT source_id, target_id, relation, weight FROM memory_links
             WHERE task=? AND source_id IN ({placeholders})
               AND relation IN ('pitfall_of', 'explicit_link', 'supersedes')
             ORDER BY weight DESC LIMIT 20''',
         [task, *seed_ids],
-    ).fetchall()
+    ).fetchall())
     if not strong_edges:
         return promotions
 
@@ -729,10 +731,10 @@ def build_mem_scenes(db, task, active_items=None, active_skills=None):
     """Thematic episode clustering: group task memories and skills into coherent thematic scenes."""
     skills_ledger.ensure_schema(db)
     if active_items is None:
-        active_items = ledger.current(
+        active_items = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(ledger.FIELDS.values()) + ['fact', 'experience', 'case', 'hypothesis'],
-        )
+        ))
     if active_skills is None:
         active_skills = skills_ledger.snapshot_skills(db, task, include_inactive=False, limit=100)
 
@@ -786,11 +788,11 @@ def build_mem_scenes(db, task, active_items=None, active_skills=None):
     if not node_info:
         return []
 
-    edge_rows = db.execute(
+    edge_rows = _call_foreign(lambda: db.execute(
         '''SELECT source_id, target_id, relation, weight FROM memory_links
            WHERE task=? ORDER BY weight DESC, relation ASC''',
         (task,),
-    ).fetchall()
+    ).fetchall())
 
     parent = {nid: nid for nid in node_info}
     comp_size = {nid: 1 for nid in node_info}
@@ -923,12 +925,12 @@ def build_mem_tree(db, task, scene_list=None):
         'consolidated_into', 'supersedes', 'pitfall_of', 'skill_experience',
     )
     placeholders = ','.join('?' for _ in causal_rels)
-    causal_rows = db.execute(
+    causal_rows = _call_foreign(lambda: db.execute(
         f'''SELECT source_id, target_id, relation, weight FROM memory_links
             WHERE task=? AND relation IN ({placeholders})
             ORDER BY weight DESC, source_id ASC LIMIT 80''',
         [task, *causal_rels],
-    ).fetchall()
+    ).fetchall())
     causal_triples = []
     seen_triples = set()
     for r in causal_rows:
@@ -963,9 +965,9 @@ def build_mem_tree(db, task, scene_list=None):
 def scenes(store, task):
     """Return thematic episode clusters and 4-level domain hierarchy tree for a task."""
     ledger._identifier(task, 'task')
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         if _indexing_core.check_link_sync_needed(db, task, skills_ledger.ensure_schema):
-            with store.db(True) as wdb:
+            with _foreign_context(lambda: store.db(True)) as wdb:
                 skills_ledger.sync_task_links(wdb, task)
         scene_list = build_mem_scenes(db, task)
         mem_tree = build_mem_tree(db, task, scene_list=scene_list)
@@ -986,7 +988,7 @@ def _reconstruct_item_lineage(db, task, item_or_row):
     seen_ev = set()
     predecessor_ids = list(dict.fromkeys(sup_ids + cons_ids))[:6]
     for pid in predecessor_ids:
-        p_row = ledger.get_item(db, task, pid)
+        p_row = _call_foreign(lambda: ledger.get_item(db, task, pid))
         if p_row:
             ev_id = p_row.get('event_id', 0)
             if ev_id not in seen_ev:
@@ -1005,10 +1007,10 @@ def _reconstruct_item_lineage(db, task, item_or_row):
                 })
 
     if sup_ev_id and item_id:
-        ev_rows = db.execute(
+        ev_rows = _call_foreign(lambda: db.execute(
             'SELECT id, kind, operation, status, content, event_at FROM memory_events WHERE task=? AND item_id=? ORDER BY id ASC LIMIT 6',
             (task, item_id),
-        ).fetchall()
+        ).fetchall())
         for er in ev_rows[:-1]:
             if er['id'] not in seen_ev:
                 seen_ev.add(er['id'])
@@ -1632,7 +1634,7 @@ def _references(db, task, refs):
     for ref in refs:
         if not isinstance(ref, dict) or set(ref)-{'itemId', 'quote'}:
             raise ValueError('invalid source reference')
-        item = ledger.get_item(db, task, ref.get('itemId'))
+        item = _call_foreign(lambda: ledger.get_item(db, task, ref.get('itemId')))
         quote = ledger._text(ref.get('quote'), 'quote', 2000, empty=False)
         if not item or item['kind'] not in ('instruction', 'report') or quote not in item['content']:
             raise ValueError('source quote must match this task original instruction/report')
@@ -1656,10 +1658,10 @@ def _resolve_contradictions_and_supersessions(db, task, next_rev, operation, ent
     elif isinstance(raw_sup, list):
         explicit_sup = [str(x).strip() for x in raw_sup if str(x).strip()][:10]
 
-    active_candidates = ledger.current(
+    active_candidates = _call_foreign(lambda: ledger.current(
         db, task,
         kinds=list(CORE_KINDS) + ['fact', 'experience', 'case', 'hypothesis'],
-    )
+    ))
     new_entities = {
         skills_ledger._clean_token(x)
         for k in ('entities', 'aliases')
@@ -1719,12 +1721,12 @@ def _resolve_contradictions_and_supersessions(db, task, next_rev, operation, ent
             'supersededAt': round(now, 3),
             'supersessionMode': matched_mode,
         }
-        ledger.record(
+        _call_foreign(lambda: ledger.record(
             db, task, next_rev,
             'supersede:' + digest([operation, entry_idx, cid]),
             cand['kind'], cid, 'resolve' if cand['kind'] == 'issue' else 'retract', cand['content'], sup_source,
             valid_from=cand.get('valid_from'), valid_until=cand.get('valid_until'),
-        )
+        ))
         superseded_ids.append(cid)
 
     return superseded_ids
@@ -1732,10 +1734,10 @@ def _resolve_contradictions_and_supersessions(db, task, next_rev, operation, ent
 
 def _evolve_linked_boxes(db, task, item_id, kind, content, source):
     """Bidirectional Link Box Evolution: enrich linked neighbor items' contextual keywords and evolution notes."""
-    active_neighbors = ledger.current(
+    active_neighbors = _call_foreign(lambda: ledger.current(
         db, task,
         kinds=['fact', 'experience', 'case', 'hypothesis', 'decision', 'constraint'],
-    )
+    ))
     new_entities = {
         skills_ledger._clean_token(x)
         for k in ('entities', 'aliases')
@@ -1832,10 +1834,10 @@ def _evolve_linked_boxes(db, task, item_id, kind, content, source):
             'lastEvolvedBy': item_id,
         })
         nbr_src['boxEvolution'] = box
-        db.execute(
+        _call_foreign(lambda: db.execute(
             'UPDATE memory_items SET source=? WHERE task=? AND item_id=?',
             (json.dumps(nbr_src, ensure_ascii=False, sort_keys=True), task, nid),
-        )
+        ))
         evolved_ids.append(nid)
         if len(evolved_ids) >= 6:
             break
@@ -1850,18 +1852,18 @@ def learn(store, task, session, revision, operation, entries):
         raise ValueError('entries must contain 1 to 20 changes')
     payload = digest([session, revision, entries])
     staged_skills = []
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current or current['owner'] != session:
             raise ValueError('only the current responsible session can write memory')
-        prior = db.execute('SELECT * FROM memory_batches WHERE task=? AND operation=?', (task, operation)).fetchone()
+        prior = _call_foreign(lambda: db.execute('SELECT * FROM memory_batches WHERE task=? AND operation=?', (task, operation)).fetchone())
         if prior:
             if prior['digest'] != payload:
                 raise ValueError('operation changed; use a fresh operationId')
             return json.loads(prior['result'])
         if current['revision'] != revision:
             raise ValueError('memory revision changed; refresh before writing')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         changed, touched, skill_changes = [], set(), []
         for n, entry in enumerate(entries):
             allowed = {'id','kind','op','content','sourceRefs','certainty','validFrom','validUntil',
@@ -1887,7 +1889,7 @@ def learn(store, task, session, revision, operation, entries):
             else:
                 case_card = None
             item_id = entry.get('id') or kind+':'+digest([content, refs])[:24]
-            old = ledger.get_item(db, task, item_id)
+            old = _call_foreign(lambda: ledger.get_item(db, task, item_id))
             if old and old['kind'] != kind:
                 raise ValueError('kind conflict: use a distinct hypothesis item')
             if old and old['kind'] in ('experience', 'case') and old['source'].get('evidenceState') == 'user-confirmed' and not explicit:
@@ -1895,7 +1897,7 @@ def learn(store, task, session, revision, operation, entries):
             capture_mode = entry.get('captureMode', 'strict')
             if capture_mode not in ('strict', 'auto-draft'):
                 raise ValueError('captureMode must be strict or auto-draft')
-            git_branch = ledger._text(entry.get('gitBranch') or skills_ledger.detect_git_branch(store.root), 'gitBranch', 120)
+            git_branch = ledger._text(entry.get('gitBranch') or skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)), 'gitBranch', 120)
             source = {'kind':'agent-extraction','session':session,'operation':operation,'sourceRefs':refs,
                       'certainty':'explicit-user' if explicit else 'derived', 'requestedKind':requested_kind,
                       'captureMode':capture_mode,
@@ -1962,7 +1964,7 @@ def learn(store, task, session, revision, operation, entries):
                         source['foresight'] = inferred
                 if should_synthesize:
                     staged_skill = skills_ledger.stage_skill_from_experience(
-                        db, store.root, task, revision+1, 'skill-learn:'+digest([operation,n]),
+                        db, _call_foreign(lambda: store.root), task, revision+1, 'skill-learn:'+digest([operation,n]),
                         item_id, op, card, source, valid_from=start, valid_until=end,
                         skill_spec=skill_spec if isinstance(skill_spec, dict) else None,
                     )
@@ -1974,7 +1976,7 @@ def learn(store, task, session, revision, operation, entries):
                         source['skillStatus'] = sk['status']
             elif kind=='experience' and op in ('retract','resolve'):
                 staged_skill = skills_ledger.stage_skill_from_experience(
-                    db, store.root, task, revision+1, 'skill-learn:'+digest([operation,n]),
+                    db, _call_foreign(lambda: store.root), task, revision+1, 'skill-learn:'+digest([operation,n]),
                     item_id, op, None, source, valid_from=start, valid_until=end,
                 )
             elif kind=='case' and op not in ('retract','resolve'):
@@ -1984,7 +1986,7 @@ def learn(store, task, session, revision, operation, entries):
                     {'situation': case_card['situation'], 'steps': case_card['avoidance'],
                      'outcome': case_card['symptom'], 'conditions': case_card['conditions'],
                      'counterexamples': case_card.get('rootCause', '')},
-                    root=store.root,
+                    root=_call_foreign(lambda: store.root),
                 )
                 if start is None and end is None and entry.get('autoForesight') is not False:
                     inferred = infer_temporal_bounds(content, base_time=entry.get('foresightBaseTime'))
@@ -2012,8 +2014,8 @@ def learn(store, task, session, revision, operation, entries):
                 )
                 if superseded_items:
                     source['supersedesItemIds'] = superseded_items
-            ledger.record(db,task,revision+1,'learn:'+digest([operation,n]),kind,item_id,op,content,source,
-                          valid_from=start,valid_until=end)
+            _call_foreign(lambda: ledger.record(db,task,revision+1,'learn:'+digest([operation,n]),kind,item_id,op,content,source,
+                          valid_from=start,valid_until=end))
             evolved_boxes = []
             if op not in ('retract', 'resolve'):
                 evolved_boxes = _evolve_linked_boxes(db, task, item_id, kind, content, source)
@@ -2054,17 +2056,17 @@ def learn(store, task, session, revision, operation, entries):
                 touched.add(kind)
         body = current['body']
         for kind in touched:
-            total=db.execute("SELECT COALESCE(sum(length(content)+1),0) FROM memory_items WHERE task=? AND kind=? AND status='active' AND (valid_until IS NULL OR valid_until>?)",(task,kind,time.time())).fetchone()[0]
+            total=_call_foreign(lambda: db.execute("SELECT COALESCE(sum(length(content)+1),0) FROM memory_items WHERE task=? AND kind=? AND status='active' AND (valid_until IS NULL OR valid_until>?)",(task,kind,time.time())).fetchone())[0]
             if total>8001:raise ValueError('current and scheduled core memories exceed the 8000-character kind budget')
         for field, kind in ledger.FIELDS.items():
             if kind in touched:
-                combined = '\n'.join(r['content'] for r in ledger.current(db,task,[kind]))
+                combined = '\n'.join(r['content'] for r in _call_foreign(lambda: ledger.current(db,task,[kind])))
                 body[field] = ledger._text(combined, field, 8000)
                 body.setdefault('_manualFields',{})[field] = True
         skills_ledger.sync_task_links(db, task, force=True)
         _indexing_core.invalidate_task_caches(task, _TASK_INVERTED_INDEX)
-        db.execute('UPDATE tasks SET body=?,revision=revision+1,updated=? WHERE id=?',
-                   (json.dumps(body,ensure_ascii=False),time.time(),task))
+        _call_foreign(lambda: db.execute('UPDATE tasks SET body=?,revision=revision+1,updated=? WHERE id=?',
+                   (json.dumps(body,ensure_ascii=False),time.time(),task)))
         all_superseded = [s for ch in changed for s in ch.get('supersededItems', [])]
         all_evolved = [e for ch in changed for e in ch.get('evolvedBoxes', [])]
         result = {
@@ -2077,9 +2079,9 @@ def learn(store, task, session, revision, operation, entries):
         }
         if skill_changes:
             result['skills'] = skill_changes
-        db.execute('INSERT INTO memory_batches VALUES(?,?,?,?)',(task,operation,payload,json.dumps(result)))
+        _call_foreign(lambda: db.execute('INSERT INTO memory_batches VALUES(?,?,?,?)',(task,operation,payload,json.dumps(result))))
     for sk, events in staged_skills:
-        skills_ledger.materialize_skill(store.root, sk, events)
+        skills_ledger.materialize_skill(_call_foreign(lambda: store.root), sk, events)
     return result
 
 
@@ -2106,9 +2108,9 @@ def record_recall(store, task, session, request_id, query, retrieval):
                  indexItemsCount=len(retrieval.get('indexItems', [])),
                  indexSkillsCount=len(retrieval.get('indexSkills', [])),
                  meaning='selected for context, not proof the model used it')
-    with store.db(True) as db:
-        db.execute('INSERT OR IGNORE INTO memory_recalls VALUES(?,?,?,?,?,?,?,?)',
-            (key,task,session,request_id,digest(query),json.dumps(references),json.dumps(stats),time.time()))
+    with _foreign_context(lambda: store.db(True)) as db:
+        _call_foreign(lambda: db.execute('INSERT OR IGNORE INTO memory_recalls VALUES(?,?,?,?,?,?,?,?)',
+            (key,task,session,request_id,digest(query),json.dumps(references),json.dumps(stats),time.time())))
     return key
 
 
@@ -2117,11 +2119,11 @@ def feedback(store, task, session, operation, recall_id, item_id, outcome, note=
         raise ValueError('invalid feedback outcome')
     ledger._identifier(operation,'operation'); ledger._text(note,'note',2000)
     payload = digest([session,recall_id,item_id,outcome,note] if patch is None else [session,recall_id,item_id,outcome,note,patch])
-    with store.db(True) as db:
-        current=db.execute('SELECT owner,revision FROM tasks WHERE id=?',(task,)).fetchone()
+    with _foreign_context(lambda: store.db(True)) as db:
+        current=_call_foreign(lambda: db.execute('SELECT owner,revision FROM tasks WHERE id=?',(task,)).fetchone())
         if not current or current['owner']!=session:
             raise ValueError('responsible session required')
-        prior=db.execute('SELECT digest FROM memory_feedback WHERE task=? AND operation=?',(task,operation)).fetchone()
+        prior=_call_foreign(lambda: db.execute('SELECT digest FROM memory_feedback WHERE task=? AND operation=?',(task,operation)).fetchone())
         if prior:
             if prior['digest']!=payload: raise ValueError('feedback operation conflict')
             skill = skills_ledger.get_skill(db, task, item_id) if item_id else None
@@ -2133,7 +2135,7 @@ def feedback(store, task, session, operation, recall_id, item_id, outcome, note=
                     'skillPath': skill['skill_path'], 'fileSha256': skill['file_sha256'], 'stats': skill['stats'],
                 }
             return res
-        recalled=db.execute('SELECT item_refs FROM memory_recalls WHERE task=? AND id=?',(task,recall_id)).fetchone()
+        recalled=_call_foreign(lambda: db.execute('SELECT item_refs FROM memory_recalls WHERE task=? AND id=?',(task,recall_id)).fetchone())
         recalled_ids = set()
         if recalled:
             for v in json.loads(recalled['item_refs']):
@@ -2142,13 +2144,13 @@ def feedback(store, task, session, operation, recall_id, item_id, outcome, note=
                 if v.get('skillId'): recalled_ids.add(v['skillId'])
         if not recalled or (outcome!='missing' and item_id not in recalled_ids):
             raise ValueError('feedback must reference a recorded recall item')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         skill_update = skills_ledger.apply_feedback(
-            db, store.root, task, current['revision'], session, operation,
+            db, _call_foreign(lambda: store.root), task, current['revision'], session, operation,
             recall_id, item_id, outcome, note, patch=patch,
         )
-        db.execute('INSERT INTO memory_feedback VALUES(?,?,?,?,?,?,?,?,?)',
-                   (task,operation,payload,recall_id,item_id,outcome,note,session,time.time()))
+        _call_foreign(lambda: db.execute('INSERT INTO memory_feedback VALUES(?,?,?,?,?,?,?,?,?)',
+                   (task,operation,payload,recall_id,item_id,outcome,note,session,time.time())))
     result = {'ok':True,'replayed':False}
     if skill_update:
         result['skill'] = skill_update
@@ -2172,8 +2174,8 @@ def read_skill(store, task, skill_id):
 def cases(store, task, limit=25):
     ledger._identifier(task, 'task')
     limit = ledger._integer(limit, 'limit', 1, 200)
-    with store.db() as db:
-        rows = ledger.current(db, task, kinds=['case'])[:limit]
+    with _foreign_context(lambda: store.db()) as db:
+        rows = _call_foreign(lambda: ledger.current(db, task, kinds=['case']))[:limit]
         out = []
         for r in rows:
             pseudo = {
@@ -2191,16 +2193,16 @@ def cases(store, task, limit=25):
 
 def links(store, task, node_id=None, limit=100):
     ledger._identifier(task, 'task')
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         if _indexing_core.check_link_sync_needed(db, task, skills_ledger.ensure_schema):
-            with store.db(True) as wdb:
+            with _foreign_context(lambda: store.db(True)) as wdb:
                 skills_ledger.sync_task_links(wdb, task)
         edge_list = skills_ledger.get_links(db, task, node_id=node_id, limit=limit)
     return {'taskId': task, 'nodeId': node_id, 'links': edge_list}
 
 
 def stats(store, task):
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         metrics = skills_ledger.skill_metrics(db, task)
         return {
             'taskId': task,
@@ -2209,7 +2211,7 @@ def stats(store, task):
             'avgPromptChars': metrics['avgPromptChars'],
             'maxPromptChars': metrics['maxPromptChars'],
             'avgRetrievalElapsedMs': metrics['avgRetrievalElapsedMs'],
-            'feedback': dict(db.execute('SELECT outcome,count(*) FROM memory_feedback WHERE task=? GROUP BY outcome', (task,))),
+            'feedback': dict(_call_foreign(lambda: db.execute('SELECT outcome,count(*) FROM memory_feedback WHERE task=? GROUP BY outcome', (task,)))),
             'skills': metrics['skillsByStatus'],
             'skillsByEvidenceState': metrics['skillsByEvidenceState'],
             'staleSkillCount': metrics['staleSkillCount'],
@@ -2217,7 +2219,7 @@ def stats(store, task):
             'caseCount': metrics['caseCount'],
             'linkCount': metrics['linkCount'],
             'linksByRelation': metrics['linksByRelation'],
-            'skillEvents': db.execute('SELECT count(*) FROM memory_skill_events WHERE task=?', (task,)).fetchone()[0],
+            'skillEvents': _call_foreign(lambda: db.execute('SELECT count(*) FROM memory_skill_events WHERE task=?', (task,)).fetchone())[0],
             'totalSkillImpressions': metrics['totalSkillImpressions'],
             'overallAdoptionRate': metrics['overallAdoptionRate'],
             'overallHelpfulRate': metrics.get('overallHelpfulRate', 0.0),
@@ -2225,25 +2227,25 @@ def stats(store, task):
             'reuseIntensity': metrics.get('reuseIntensity', 0.0),
             'perSkill': metrics['perSkill'],
             'semantic': vectors.status(),
-            'settings': settings(store.root),
+            'settings': settings(_call_foreign(lambda: store.root)),
         }
 
 
 def import_messages(store, task, session, messages):
     if not isinstance(messages,list) or len(messages)>200:
         raise ValueError('backfill is limited to 200 linked-session messages')
-    with store.db(True) as db:
-        link=db.execute('SELECT role FROM sessions WHERE task=? AND session=?',(task,session)).fetchone()
+    with _foreign_context(lambda: store.db(True)) as db:
+        link=_call_foreign(lambda: db.execute('SELECT role FROM sessions WHERE task=? AND session=?',(task,session)).fetchone())
         if not link or link['role'] not in ('responsible','previous'):
             raise ValueError('only linked responsible/previous session transcripts can be imported')
-        revision=db.execute('SELECT revision FROM tasks WHERE id=?',(task,)).fetchone()['revision']
+        revision=_call_foreign(lambda: db.execute('SELECT revision FROM tasks WHERE id=?',(task,)).fetchone())['revision']
         count=0
         for message in messages:
             role=message.get('role'); content=message.get('text')
             if role not in ('user','assistant') or not isinstance(content,str) or not content.strip():continue
             if any('<' + tag in content for tag in ('memlet-context', LEGACY_CONTEXT_TAG)):continue
             identity='archive:'+digest([session,message.get('id') or '',role,content])[:40]
-            if ledger.get_item(db,task,identity):continue
+            if _call_foreign(lambda: ledger.get_item(db,task,identity)):continue
             raw_time=message.get('timestamp') or message.get('createdAt')
             if isinstance(raw_time,(int,float)) and not isinstance(raw_time,bool) and raw_time>1e11:raw_time/=1000
             try: event_at=timestamp(raw_time,'message time') if raw_time else 0
@@ -2251,10 +2253,10 @@ def import_messages(store, task, session, messages):
             source={'kind':'bounded-transcript-backfill','session':session,'messageId':str(message.get('id') or ''),
                     'originalSha256':hashlib.sha256(content.encode()).hexdigest(),'originalChars':len(content),
                     'contentTruncated':len(content)>100000,'verified':False,'timestampKnown':bool(event_at)}
-            ledger.record(db,task,revision+1,identity,'instruction' if role=='user' else 'report',
-                          identity,'assert',content[:100000],source,event_at)
+            _call_foreign(lambda: ledger.record(db,task,revision+1,identity,'instruction' if role=='user' else 'report',
+                          identity,'assert',content[:100000],source,event_at))
             count+=1
-        if count:db.execute('UPDATE tasks SET revision=revision+1,updated=? WHERE id=?',(time.time(),task))
+        if count:_call_foreign(lambda: db.execute('UPDATE tasks SET revision=revision+1,updated=? WHERE id=?',(time.time(),task)))
     return {'imported':count,'examined':len(messages),'bounded':True,'scope':'linked-session'}
 
 
@@ -2306,10 +2308,10 @@ def evaluate_admission_control(db, task, raw_text, detected_kind='hypothesis', c
             'admissionScore': 0.06,
         }
 
-    active_items = ledger.current(
+    active_items = _call_foreign(lambda: ledger.current(
         db, task,
         kinds=list(CORE_KINDS) + ['fact', 'experience', 'case', 'hypothesis'],
-    )
+    ))
     max_overlap = 0.0
     exact_dup = False
     matched_item_id = None
@@ -2467,18 +2469,18 @@ def auto_capture(store, task, session, payload):
     batch_key = 'auto:' + operation
     batch_digest = digest([session, payload])
 
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current or current['owner'] != session:
             raise ValueError('only the current responsible session can write memory')
-        prior = db.execute('SELECT * FROM memory_batches WHERE task=? AND operation=?', (task, batch_key)).fetchone()
+        prior = _call_foreign(lambda: db.execute('SELECT * FROM memory_batches WHERE task=? AND operation=?', (task, batch_key)).fetchone())
         if prior:
             if prior['digest'] != batch_digest:
                 raise ValueError('operation changed; use a fresh operationId')
             res = json.loads(prior['result'])
             res['replayed'] = True
             return res
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
 
     parts = []
     for k in ('text', 'observation', 'errorLog', 'content', 'command', 'situation', 'symptom', 'outcome',
@@ -2554,11 +2556,11 @@ def auto_capture(store, task, session, payload):
 
     reported_kind = 'prospective' if (prospective_cue and detected_kind == 'hypothesis' and downgraded_from is None) else detected_kind
 
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current or current['owner'] != session:
             raise ValueError('only the current responsible session can write memory')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         adm = evaluate_admission_control(
             db, task, raw_text, detected_kind=detected_kind, certainty='derived', payload=payload,
         )
@@ -2581,14 +2583,14 @@ def auto_capture(store, task, session, payload):
                 'skills': [],
                 'replayed': False,
             }
-            db.execute(
+            _call_foreign(lambda: db.execute(
                 'INSERT OR REPLACE INTO memory_batches VALUES(?,?,?,?)',
                 (task, batch_key, batch_digest, json.dumps(rejected_res, ensure_ascii=False)),
-            )
+            ))
             return rejected_res
 
         obs_id = 'report:capture-' + digest([session, operation, raw_text])[:24]
-        if not ledger.get_item(db, task, obs_id):
+        if not _call_foreign(lambda: ledger.get_item(db, task, obs_id)):
             obs_source = {
                 'kind': 'auto-captured-observation',
                 'session': session,
@@ -2599,8 +2601,8 @@ def auto_capture(store, task, session, payload):
                 'originalChars': len(raw_text),
                 'contentTruncated': False,
             }
-            ledger.record(db, task, current['revision'] + 1, obs_id, 'report', obs_id, 'assert', raw_text, obs_source, time.time())
-            db.execute('UPDATE tasks SET revision=revision+1, updated=? WHERE id=?', (time.time(), task))
+            _call_foreign(lambda: ledger.record(db, task, current['revision'] + 1, obs_id, 'report', obs_id, 'assert', raw_text, obs_source, time.time()))
+            _call_foreign(lambda: db.execute('UPDATE tasks SET revision=revision+1, updated=? WHERE id=?', (time.time(), task)))
             rev_for_learn = current['revision'] + 1
         else:
             rev_for_learn = current['revision']
@@ -2693,7 +2695,7 @@ def auto_capture(store, task, session, payload):
         }
         boundary_note = f"[대조 실패 경계] {contrastive_case['symptom'][:100]} -> {contrastive_case['avoidance'][-1][:120]}"
         staged_enriched = []
-        with store.db(True) as db:
+        with _foreign_context(lambda: store.db(True)) as db:
             now_ce = round(time.time(), 3)
             for sk in skills_ledger.snapshot_skills(db, task, include_inactive=False, limit=100):
                 sk_id = sk['skill_id']
@@ -2793,7 +2795,7 @@ def auto_capture(store, task, session, payload):
                             staged_enriched.append((updated_sk, ev_list))
                         enriched_skills.append(sk_id)
         for upd_sk, ev_list in staged_enriched:
-            skills_ledger.materialize_skill(store.root, upd_sk, ev_list)
+            skills_ledger.materialize_skill(_call_foreign(lambda: store.root), upd_sk, ev_list)
 
     result = {
         'ok': True,
@@ -2814,8 +2816,8 @@ def auto_capture(store, task, session, payload):
         'skills': learned.get('skills', []),
         'replayed': False,
     }
-    with store.db(True) as db:
-        db.execute('INSERT OR REPLACE INTO memory_batches VALUES(?,?,?,?)', (task, batch_key, batch_digest, json.dumps(result, ensure_ascii=False)))
+    with _foreign_context(lambda: store.db(True)) as db:
+        _call_foreign(lambda: db.execute('INSERT OR REPLACE INTO memory_batches VALUES(?,?,?,?)', (task, batch_key, batch_digest, json.dumps(result, ensure_ascii=False))))
     return result
 
 
@@ -2823,20 +2825,20 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
     """Background Lossless Consolidation: merge fragmented draft/hypothesis clusters into semantic summaries without touching CORE_KINDS or user-confirmed items (Identity Drift = 0.0)."""
     ledger._identifier(task, 'task')
     similarity_threshold = max(0.15, min(0.95, float(similarity_threshold or 0.35)))
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current:
             raise ValueError('업무를 찾지 못했어요.')
         eff_session = session or current['owner']
         if not dry_run:
             if not eff_session or current['owner'] != eff_session:
                 raise ValueError('only the current responsible session can consolidate memories')
-            store._check_input_lease(db, task)
+            _call_foreign(lambda: store._check_input_lease(db, task))
 
-        all_active = ledger.current(
+        all_active = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(CORE_KINDS) + ['fact', 'experience', 'case', 'hypothesis'],
-        )
+        ))
         protected_items = []
         candidates = []
         for r in all_active:
@@ -2959,12 +2961,12 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
                     'links': merged_links,
                     'consolidatedFrom': member_ids,
                     'consolidatedAt': now,
-                    'gitBranch': skills_ledger.detect_git_branch(store.root),
+                    'gitBranch': skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)),
                 }
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, task, next_rev, cons_op + ':assert',
                     'hypothesis', merged_id, 'assert', merged_content, merged_source, now,
-                )
+                ))
                 for m_row in member_rows:
                     m_id = m_row['item_id']
                     m_src = {
@@ -2972,11 +2974,11 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
                         'consolidatedInto': merged_id,
                         'consolidatedAt': now,
                     }
-                    ledger.record(
+                    _call_foreign(lambda: ledger.record(
                         db, task, next_rev, f"{cons_op}:retract:{m_id}",
                         m_row['kind'], m_id, 'retract', m_row['content'], m_src,
                         valid_from=m_row.get('valid_from'), valid_until=m_row.get('valid_until'),
-                    )
+                    ))
                     retracted_ids.append(m_id)
 
             consolidated_items.append({
@@ -2990,7 +2992,7 @@ def consolidate_memories(store, task, session=None, similarity_threshold=0.35, d
         if not dry_run and consolidated_items:
             skills_ledger.sync_task_links(db, task, force=True)
             _indexing_core.invalidate_task_caches(task, _TASK_INVERTED_INDEX)
-            db.execute('UPDATE tasks SET revision=revision+1, updated=? WHERE id=?', (now, task))
+            _call_foreign(lambda: db.execute('UPDATE tasks SET revision=revision+1, updated=? WHERE id=?', (now, task)))
             final_rev = next_rev
         else:
             final_rev = current['revision']
@@ -3028,8 +3030,8 @@ def sync_markdown(store, task, session=None, note_path=None, explicit_user=None)
                 if len(b_body) >= 4:
                     bullet_entries.append((b_kind, b_body))
             if bullet_entries:
-                with store.db(True) as db:
-                    curr = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+                with _foreign_context(lambda: store.db(True)) as db:
+                    curr = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
                     eff_sess = session or (curr['owner'] if curr else '')
                 for b_kind, b_body in bullet_entries[:10]:
                     cap_res = auto_capture(
@@ -3107,10 +3109,10 @@ def attribute_turn_trajectory(store, task, session, current_query, prior_primary
     now = round(time.time(), 3)
     turn_sig = f"{session}:{digest([q_text[:200], prior_turn_query[:200]])[:12]}"
 
-    with store.db(bool(persist and session)) as db:
+    with _foreign_context(lambda: store.db(bool(persist and session))) as db:
         if persist and session:
             ensure_schema(db)
-            t_row = db.execute('SELECT revision FROM tasks WHERE id=?', (task,)).fetchone()
+            t_row = _call_foreign(lambda: db.execute('SELECT revision FROM tasks WHERE id=?', (task,)).fetchone())
             curr_rev = int(t_row['revision'] or 0) if t_row else 0
         else:
             curr_rev = 0
@@ -3231,19 +3233,19 @@ def attribute_turn_trajectory(store, task, session, current_query, prior_primary
                         if updated_sk:
                             staged_traj_skills.append((updated_sk, ev_list))
                     else:
-                        db.execute(
+                        _call_foreign(lambda: db.execute(
                             'UPDATE memory_skills SET evidence_state=?, used_count=?, helpful_count=?, body=?, file_sha256=?, source=?, observed_at=? WHERE task=? AND skill_id=?',
                             (new_ev, new_used, new_helpful, rendered_body, body_sha, json.dumps(sk_src, ensure_ascii=False, sort_keys=True), now, task, sk_id),
-                        )
+                        ))
                         updated_sk = skills_ledger.get_skill(db, task, sk_id)
                         if updated_sk:
                             ev_list = skills_ledger.skill_events(db, task, sk_id, limit=30)
                             staged_traj_skills.append((updated_sk, ev_list))
                     fb_digest = digest([sk_id, turn_sig, 'used'])
-                    db.execute(
+                    _call_foreign(lambda: db.execute(
                         'INSERT OR IGNORE INTO memory_feedback VALUES(?,?,?,?,?,?,?,?,?)',
                         (task, fb_op, fb_digest, str(recall_id or 'implicit-turn'), sk_id, 'used', q_text[:160], session, now),
-                    )
+                    ))
                     credited_skills.append({'skillId': sk_id, 'evidenceState': new_ev, 'usedCount': new_used, 'replayed': False})
                 else:
                     old_ev = sk.get('evidence_state') or 'reported'
@@ -3251,19 +3253,19 @@ def attribute_turn_trajectory(store, task, session, current_query, prior_primary
                     new_ev = 'trial-used' if old_ev == 'reported' else old_ev
                     credited_skills.append({'skillId': sk_id, 'evidenceState': new_ev, 'usedCount': new_used, 'replayed': False})
             else:
-                it_row = ledger.get_item(db, task, clean_id)
+                it_row = _call_foreign(lambda: ledger.get_item(db, task, clean_id))
                 if it_row and (has_positive or has_directive or bool(q_words)):
                     credited_items.append(clean_id)
                     if persist and session:
                         fb_op = 'implicit-item-' + digest([task, session, clean_id, turn_sig])[:20]
                         fb_digest = digest([clean_id, turn_sig, 'used'])
-                        db.execute(
+                        _call_foreign(lambda: db.execute(
                             'INSERT OR IGNORE INTO memory_feedback VALUES(?,?,?,?,?,?,?,?,?)',
                             (task, fb_op, fb_digest, str(recall_id or 'implicit-turn'), clean_id, 'used', q_text[:160], session, now),
-                        )
+                        ))
 
     for upd_sk, ev_list in staged_traj_skills:
-        skills_ledger.materialize_skill(store.root, upd_sk, ev_list)
+        skills_ledger.materialize_skill(_call_foreign(lambda: store.root), upd_sk, ev_list)
 
     return {
         'attributed': bool(credited_skills or credited_items),
@@ -3320,14 +3322,14 @@ def preflight_check(store, task, plan='', files=None, action_type=None):
     prosp_reminders = []
     checklist = []
 
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         if _indexing_core.check_link_sync_needed(db, task, skills_ledger.ensure_schema):
-            with store.db(True) as wdb:
+            with _foreign_context(lambda: store.db(True)) as wdb:
                 skills_ledger.sync_task_links(wdb, task)
-        active_items = ledger.current(
+        active_items = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(CORE_KINDS) + ['fact', 'experience', 'case', 'hypothesis'],
-        )
+        ))
 
         # 1. Check active constraints & decisions for explicit prohibitions / boundary rules
         for r in active_items:
@@ -3411,10 +3413,10 @@ def preflight_check(store, task, plan='', files=None, action_type=None):
 
         # 3. Check hierarchical causal dependencies (`blocks`, `depends_on`, `mitigates`)
         triggered_ids = {c['item_id'] for c in triggered_cases} | {v['item_id'] for v in violated_constraints}
-        edge_rows = db.execute(
+        edge_rows = _call_foreign(lambda: db.execute(
             "SELECT source_id, target_id, relation, weight FROM memory_links WHERE task=? AND relation IN ('blocks','depends_on','mitigates','pitfall_of') ORDER BY weight DESC LIMIT 40",
             (task,),
-        ).fetchall()
+        ).fetchall())
         for er in edge_rows:
             s_id, t_id, rel = er['source_id'], er['target_id'], er['relation']
             if s_id in triggered_ids or t_id in triggered_ids or any(w in s_id.lower() or w in t_id.lower() for w in probe_words if len(w) >= 4):
@@ -3468,16 +3470,16 @@ def heal_skills(store, task, session=None, dry_run=False):
     Enforces strict owner/lease check on write.
     """
     ledger._identifier(task, 'task')
-    with store.db(not bool(dry_run)) as db:
+    with _foreign_context(lambda: store.db(not bool(dry_run))) as db:
         ensure_schema(db)
-        task_row = db.execute('SELECT owner FROM tasks WHERE id=?', (task,)).fetchone()
+        task_row = _call_foreign(lambda: db.execute('SELECT owner FROM tasks WHERE id=?', (task,)).fetchone())
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
         if not dry_run:
             if task_row['owner'] and session != task_row['owner']:
                 raise ValueError('only the current responsible session can heal skills')
-            store._check_input_lease(db, task)
-        res = skills_ledger.heal_compatible_skills(db, store.root, task, dry_run=bool(dry_run))
+            _call_foreign(lambda: store._check_input_lease(db, task))
+        res = skills_ledger.heal_compatible_skills(db, _call_foreign(lambda: store.root), task, dry_run=bool(dry_run))
     return {
         'ok': True,
         'taskId': task,
@@ -3509,11 +3511,11 @@ def build_subagent_capsule(store, task, plan='', files=None, worker='', budget=1
     budget = ledger._integer(budget, 'budget', 300, 12000)
     pf = preflight_check(store, task, plan=plan, files=files)
     probe_q = ' '.join([str(plan or '').strip(), *(pf.get('files') or [])]).strip() or task
-    with store.db() as db:
-        task_row = db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()
+    with _foreign_context(lambda: store.db()) as db:
+        task_row = _call_foreign(lambda: db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
-        ret = retrieve(db, task, query=probe_q, budget=min(2400, budget * 2), limit=4, root=store.root)
+        ret = retrieve(db, task, query=probe_q, budget=min(2400, budget * 2), limit=4, root=_call_foreign(lambda: store.root))
 
     top_skills = []
     for sk in (ret.get('primarySkills') or ret.get('skills', []))[:2]:
@@ -3651,13 +3653,13 @@ def build_turn_context(store, tid, sid, view, recall_id, force_full=False, persi
     curr_primary_ids = [s['skillId'] for s in skills if s.get('skillId')] + [r['item_id'] for r in excerpts if r.get('item_id')]
 
     prior_state = None
-    with store.db(True) as db:
+    with _foreign_context(lambda: store.db(True)) as db:
         skills_ledger.ensure_schema(db)
         if sid:
-            prior_state = db.execute(
+            prior_state = _call_foreign(lambda: db.execute(
                 'SELECT * FROM memory_session_state WHERE task=? AND session=?',
                 (tid, sid),
-            ).fetchone()
+            ).fetchone())
 
     trajectory_res = {'attributed': False, 'sentiment': 'neutral', 'creditedSkills': [], 'creditedItems': [], 'trajectoryWarning': None}
     eff_query = str(query or view.get('query') or '').strip()
@@ -3700,17 +3702,17 @@ def build_turn_context(store, tid, sid, view, recall_id, force_full=False, persi
             lines.append('추가 연관 목차(2단계 점진적 노출 · 필요 시 read/skill 조회): ' + json.dumps(progressive_index, ensure_ascii=False))
         lines += [
             'recallId: ' + recall_id + '; 검색 생략 ' + str(view['retrieval']['omitted']) + '건.',
-            tool_contract(store.root, tid, sid),
+            tool_contract(_call_foreign(lambda: store.root), tid, sid),
             '과거 답변이 부족하면 recall의 --before/--after/--at/--known-at 또는 backfill을 사용해요. '
             '실제로 쓴 근거·절차 스킬은 feedback으로 used/helpful/incorrect/missing을 남길 수 있어요.',
         ]
         context = '\n'.join(lines)
         if persist_state and sid:
-            with store.db(True) as db:
-                db.execute(
+            with _foreign_context(lambda: store.db(True)) as db:
+                _call_foreign(lambda: db.execute(
                     'INSERT OR REPLACE INTO memory_session_state (task, session, core_digest, delivered_ids, turn_count, updated_at, last_primary_ids, last_turn_query) VALUES(?,?,?,?,?,?,?,?)',
                     (tid, sid, core_invariant_digest, json.dumps(sorted(all_curr_keys)), 1, time.time(), json.dumps(curr_primary_ids), eff_query[:500]),
-                )
+                ))
         return context, {
             'deltaMode': False,
             'turnCount': 1,
@@ -3729,7 +3731,7 @@ def build_turn_context(store, tid, sid, view, recall_id, force_full=False, persi
     new_cases = [c for k, c in curr_case_map.items() if k not in prior_keys]
     retained_ids = sorted({k.split(':', 1)[-1].split('@', 1)[0] for k in (all_curr_keys & prior_keys)})
 
-    cli_cmd = 'python3 ' + shlex.quote(str(Path(store.root) / 'memory_cli.py')) + ' --task ' + shlex.quote(tid) + ' --session ' + shlex.quote(sid)
+    cli_cmd = 'python3 ' + shlex.quote(str(Path(_call_foreign(lambda: store.root)) / 'memory_cli.py')) + ' --task ' + shlex.quote(tid) + ' --session ' + shlex.quote(sid)
     lines = [
         f'Memlet 기억 자료예요(세션 델타 모드 · Turn {turn_num} · coreHash={core_invariant_digest[:8]}). 최신 사용자 입력과 원 실행·승인이 우선해요.',
         '현재 필수 조건(변경 없음 · 이전 턴 유지): ' + json.dumps({
@@ -3754,11 +3756,11 @@ def build_turn_context(store, tid, sid, view, recall_id, force_full=False, persi
 
     if persist_state and sid:
         merged_keys = sorted(prior_keys | all_curr_keys)
-        with store.db(True) as db:
-            db.execute(
+        with _foreign_context(lambda: store.db(True)) as db:
+            _call_foreign(lambda: db.execute(
                 'INSERT OR REPLACE INTO memory_session_state (task, session, core_digest, delivered_ids, turn_count, updated_at, last_primary_ids, last_turn_query) VALUES(?,?,?,?,?,?,?,?)',
                 (tid, sid, core_invariant_digest, json.dumps(merged_keys), turn_num, time.time(), json.dumps(curr_primary_ids), eff_query[:500]),
-            )
+            ))
     return context, {
         'deltaMode': True,
         'turnCount': turn_num,
@@ -3787,7 +3789,7 @@ def benchmark(store, task, budget=6000):
     """Run a deterministic quantitative v9.0.0 benchmark of token savings, recall@K/MRR, multi-intent facet recall, Prospective Memory trigger accuracy, Trajectory implicit attribution, Pre-Flight guardrail verification, evolutionary lineage reconstruction, Federated archetype transfer, and sub-5ms inverted engine latency."""
     ledger._identifier(task, 'task')
     budget = ledger._integer(budget, 'budget', 600, 100000)
-    sem_cfg = settings(store.root)
+    sem_cfg = settings(_call_foreign(lambda: store.root))
     if sem_cfg.get('semantic'):
         try:
             vectors._load()
@@ -3802,16 +3804,16 @@ def benchmark(store, task, budget=6000):
         '안드로메다 은하 중성자별 쌍성계 중력파 간섭계',
     ]
 
-    with store.db() as db:
-        task_row = db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()
+    with _foreign_context(lambda: store.db()) as db:
+        task_row = _call_foreign(lambda: db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
         skills_ledger.sync_task_links(db, task)
-        skills_ledger.detect_git_branch(store.root)
-        all_active = ledger.current(
+        skills_ledger.detect_git_branch(_call_foreign(lambda: store.root))
+        all_active = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(ledger.FIELDS.values()) + ['instruction', 'report', 'fact', 'experience', 'case', 'hypothesis'],
-        )
+        ))
         active_skills = skills_ledger.snapshot_skills(
             db, task, include_verified_candidates=True, include_inactive=False, limit=500,
         )
@@ -3860,11 +3862,11 @@ def benchmark(store, task, budget=6000):
             and len(r['content'].strip()) >= 8
         ][:12]
         case_rows = [r for r in recall_rows if r['kind'] == 'case'][:6]
-        edge_rows = db.execute(
+        edge_rows = _call_foreign(lambda: db.execute(
             '''SELECT source_id, target_id, relation, weight FROM memory_links
                WHERE task=? ORDER BY CASE WHEN relation IN ('pitfall_of','explicit_link','skill_experience','supersedes','consolidated_into','mitigates','verifies','implements','blocks','depends_on') THEN 0 ELSE 1 END, weight DESC LIMIT 40''',
             (task,),
-        ).fetchall()
+        ).fetchall())
 
         # Prepare multi-intent facet test queries (pairs of distinct targets joined by '그리고')
         multi_aspect_pairs = []
@@ -3921,7 +3923,7 @@ def benchmark(store, task, budget=6000):
             except Exception:
                 pass
 
-        rep_ret = retrieve(db, task, query=rep_query, budget=budget, limit=8, root=store.root)
+        rep_ret = retrieve(db, task, query=rep_query, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
 
         content_by_id = {r['item_id']: r['content'] for r in recall_rows}
         skill_body_by_id = {(s.get('skill_id') or s.get('skillId')): (s.get('body') or '') for s in active_skills}
@@ -3967,7 +3969,7 @@ def benchmark(store, task, budget=6000):
             if not q_str:
                 continue
             evaluated_queries += 1
-            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=store.root)
+            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
             latencies.append(float(ret.get('elapsedMs') or 0.0))
             sufficiency_count += len(ret.get('sufficiencyPromotions', []))
             diversity_scores.append(float(ret.get('stage1DiversityScore') or 1.0))
@@ -4027,7 +4029,7 @@ def benchmark(store, task, budget=6000):
         multi_aspect_eval = len(multi_aspect_pairs)
         multi_aspect_hits = 0
         for id_a, id_b, mq in multi_aspect_pairs:
-            mret = retrieve(db, task, query=mq, budget=budget, limit=8, root=store.root)
+            mret = retrieve(db, task, query=mq, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
             latencies.append(float(mret.get('elapsedMs') or 0.0))
             recalled_m = (
                 {x['item_id'] for x in mret['items']}
@@ -4060,7 +4062,7 @@ def benchmark(store, task, budget=6000):
                 if query_words:
                     seen_pairs.add((s_id, t_id))
                     assoc_eval += 1
-                    ret = retrieve(db, task, query=' '.join(query_words), budget=budget, limit=12, root=store.root)
+                    ret = retrieve(db, task, query=' '.join(query_words), budget=budget, limit=12, root=_call_foreign(lambda: store.root))
                     latencies.append(float(ret.get('elapsedMs') or 0.0))
                     recalled_all = (
                         {x['item_id'] for x in ret['items']}
@@ -4107,23 +4109,23 @@ def benchmark(store, task, budget=6000):
         case_hits = 0
         for c_row in case_rows:
             q_str = _distinctive_query_for_content(c_row['content'], doc_freq, max_terms=4)
-            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=store.root)
+            ret = retrieve(db, task, query=q_str, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
             latencies.append(float(ret.get('elapsedMs') or 0.0))
             if any(c['item_id'] == c_row['item_id'] for c in ret.get('cases', [])):
                 case_hits += 1
 
         # 5. Temporal Expiry Filter Accuracy (live timed rows + deterministic synthetic temporal check)
-        timed_rows = db.execute(
+        timed_rows = _call_foreign(lambda: db.execute(
             'SELECT item_id, kind, valid_until FROM memory_items WHERE task=? AND valid_until IS NOT NULL LIMIT 10',
             (task,),
-        ).fetchall()
+        ).fetchall())
         temporal_eval, temporal_hits, temporal_detail = _eval_core.evaluate_temporal_guard(db, task, timed_rows)
 
         # 6. v9.0.0 Grounded Abstention Gate Accuracy (Out-of-Domain Unanswerable Queries)
         abstention_eval = len(abstention_queries)
         abstention_hits = 0
         for aq in abstention_queries:
-            aret = retrieve(db, task, query=aq, budget=budget, limit=8, root=store.root)
+            aret = retrieve(db, task, query=aq, budget=budget, limit=8, root=_call_foreign(lambda: store.root))
             if aret.get('abstained') and not aret.get('primaryItems') and not aret.get('primarySkills'):
                 abstention_hits += 1
 
@@ -4318,7 +4320,7 @@ def benchmark(store, task, budget=6000):
             'identityDriftRate': prov_info['identityDriftRate'],
             'identityDriftScore': prov_info['identityDriftScore'],
             'coreEventOverwriteCount': prov_info['coreEventOverwriteCount'],
-            'gitBranch': skills_ledger.detect_git_branch(store.root),
+            'gitBranch': skills_ledger.detect_git_branch(_call_foreign(lambda: store.root)),
             'zeroExternalApiCost': True,
             'appendOnlyImmutableLedger': True,
             'fileHashStalenessGuard': True,
@@ -4345,17 +4347,17 @@ def inspector(store, task, budget=6000):
     ledger._identifier(task, 'task')
     budget = ledger._integer(budget, 'budget', 600, 100000)
     bench = benchmark(store, task, budget=budget)
-    with store.db() as db:
-        task_row = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db()) as db:
+        task_row = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
         if _indexing_core.check_link_sync_needed(db, task, skills_ledger.ensure_schema):
-            with store.db(True) as wdb:
+            with _foreign_context(lambda: store.db(True)) as wdb:
                 skills_ledger.sync_task_links(wdb, task)
-        active_items = ledger.current(
+        active_items = _call_foreign(lambda: ledger.current(
             db, task,
             kinds=list(ledger.FIELDS.values()) + ['fact', 'experience', 'case', 'hypothesis'],
-        )
+        ))
         all_skills = skills_ledger.snapshot_skills(db, task, include_inactive=True, limit=200)
         edge_list = skills_ledger.get_links(db, task, limit=200)
         scene_list = build_mem_scenes(db, task, active_items=active_items, active_skills=[s for s in all_skills if s.get('status') == 'active'])
@@ -4364,7 +4366,7 @@ def inspector(store, task, budget=6000):
     nodes = []
     alerts = []
     now = time.time()
-    cli_base = f"python3 {shlex.quote(str(Path(store.root) / 'memory_cli.py'))} --task {shlex.quote(task)}"
+    cli_base = f"python3 {shlex.quote(str(Path(_call_foreign(lambda: store.root)) / 'memory_cli.py'))} --task {shlex.quote(task)}"
 
     for r in active_items:
         src = r.get('source') or {}
@@ -4550,21 +4552,21 @@ def export_rules(store, task, targets=None, target_dir=None, write_files=False, 
     if not isinstance(targets, list) or not targets or set(targets) - set(_EXPORT_TARGET_FILES):
         raise ValueError('targets must be a subset of: ' + ', '.join(sorted(_EXPORT_TARGET_FILES)))
 
-    with store.db() as db:
-        task_row = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db()) as db:
+        task_row = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not task_row:
             raise ValueError('업무를 찾지 못했어요.')
         if _indexing_core.check_link_sync_needed(db, task, skills_ledger.ensure_schema):
-            with store.db(True) as wdb:
+            with _foreign_context(lambda: store.db(True)) as wdb:
                 skills_ledger.sync_task_links(wdb, task)
-        core = effective_fields({'current': ledger.current(db, task, list(ledger.FIELDS.values()))})
-        active_cases = ledger.current(db, task, kinds=['case'])[:10]
+        core = effective_fields({'current': _call_foreign(lambda: ledger.current(db, task, list(ledger.FIELDS.values())))})
+        active_cases = _call_foreign(lambda: ledger.current(db, task, kinds=['case']))[:10]
         active_skills = skills_ledger.snapshot_skills(db, task, include_inactive=False, limit=50)
 
     primary_skills = [s for s in active_skills if not s.get('stale')]
     stale_skills = [s for s in active_skills if s.get('stale')]
-    mcp_script = str((Path(store.root) / 'memlet_mcp.py').resolve())
-    cli_script = str((Path(store.root) / 'memory_cli.py').resolve())
+    mcp_script = str((Path(_call_foreign(lambda: store.root)) / 'memlet_mcp.py').resolve())
+    cli_script = str((Path(_call_foreign(lambda: store.root)) / 'memory_cli.py').resolve())
     owner = task_row['owner'] or 'standalone-owner'
 
     if lang == 'en':
@@ -4679,7 +4681,7 @@ def export_rules(store, task, targets=None, target_dir=None, write_files=False, 
                 'command': 'python3',
                 'args': [
                     mcp_script,
-                    '--root', str(Path(store.root).resolve()),
+                    '--root', str(Path(_call_foreign(lambda: store.root)).resolve()),
                     '--task', task,
                     '--session', owner,
                 ],
@@ -4738,16 +4740,16 @@ def export_rules(store, task, targets=None, target_dir=None, write_files=False, 
 def doctor(store):
     """v9.0.0 Cross-Platform Environment, SQLite WAL, & Embedding Model Health Doctor."""
     from memlet import paths as _paths_core
-    data_root = getattr(store, 'root', None)
-    db_path = getattr(store, 'db_path', None)
+    data_root = _call_foreign(lambda: getattr(store, 'root', None))
+    db_path = _call_foreign(lambda: getattr(store, 'db_path', None))
     return _paths_core.doctor_environment(data_root=data_root, db_path=db_path)
 
 
 def backup(store, dest_dir=None, include_models=False):
     """v9.0.0 Online SQLite WAL-safe Backup & Skill Directory Snapshot."""
     from memlet import paths as _paths_core
-    data_root = getattr(store, 'root', None)
-    db_path = getattr(store, 'db_path', None)
+    data_root = _call_foreign(lambda: getattr(store, 'root', None))
+    db_path = _call_foreign(lambda: getattr(store, 'db_path', None))
     return _paths_core.backup_data_root(
         data_root=data_root,
         dest_dir=dest_dir,
@@ -4759,8 +4761,8 @@ def backup(store, dest_dir=None, include_models=False):
 def restore(store, backup_dir):
     """v9.0.0 Restore SQLite DB & Materialized Skills from a Snapshot Backup."""
     from memlet import paths as _paths_core
-    data_root = getattr(store, 'root', None)
-    db_path = getattr(store, 'db_path', None)
+    data_root = _call_foreign(lambda: getattr(store, 'root', None))
+    db_path = _call_foreign(lambda: getattr(store, 'db_path', None))
     return _paths_core.restore_data_root(
         backup_dir=backup_dir,
         target_root=data_root,

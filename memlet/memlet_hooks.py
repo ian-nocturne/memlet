@@ -41,6 +41,9 @@ Runtime
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+from . import memlet_dream as md
+
 from .vocabulary import (HINT as TIER_HINT)
 from .vocabulary import APPROVED as TIER_APPROVED
 from .vocabulary import suggested_label
@@ -148,6 +151,8 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
             os.fsync(fh.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, str(path))
+        from memlet import memlet_dream as md
+        md._drop_read_caches()
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -231,6 +236,7 @@ def memlet_hook_event(hook: Any) -> Optional[str]:
 _LAUNCHER_ENV = ("PYTHONHOME", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
 
 
+@md.fresh_read
 def probe_command(prefix: str, cwd: Path) -> bool:
     """Run `<prefix> admin hook probe` the way Claude Code runs a hook (through /bin/sh, without this process's
     launcher variables) and check that it answers {"memletHook": HOOK_PROTOCOL}. Proves the quoting and the
@@ -246,6 +252,7 @@ def probe_command(prefix: str, cwd: Path) -> bool:
     return r.returncode == 0 and isinstance(doc, dict) and doc.get("memletHook") == HOOK_PROTOCOL
 
 
+@md.fresh_read
 def resolve_command(scope: str, root: Path, *, which: Callable[[str], Optional[str]] = shutil.which,
                     interpreter: Optional[str] = None, cli_path: Optional[str] = None) -> Dict[str, str]:
     """The command prefix written before `admin hook <event>`; every candidate is probed before it is chosen.
@@ -253,7 +260,7 @@ def resolve_command(scope: str, root: Path, *, which: Callable[[str], Optional[s
     project: always the portable `memlet` (the file is shared), which must be on PATH and support the hook entry.
     local: `memlet` when that works, otherwise an absolute interpreter and the absolute memory_cli.py, shell-quoted
     (this interpreter first, then `python3` from PATH)."""
-    exe = which("memlet")
+    exe = _call_foreign(lambda: which("memlet"))
     works = bool(exe) and probe_command("memlet", root)
     if scope == "project":
         if not exe:
@@ -270,7 +277,7 @@ def resolve_command(scope: str, root: Path, *, which: Callable[[str], Optional[s
     if not cli.is_absolute() or not cli.is_file():
         raise Refused(f"cannot find memory_cli.py at {cli}; put `memlet` on PATH and retry")
     candidates: List[str] = []
-    for c in ([interpreter] if interpreter else [sys.executable, which("python3")]):
+    for c in ([interpreter] if interpreter else [sys.executable, _call_foreign(lambda: which("python3"))]):
         if c and os.path.isabs(c) and c not in candidates:
             candidates.append(c)
     why = "memlet is not on PATH" if not exe else f"memlet on PATH ({exe}) does not answer the hook probe"
@@ -522,7 +529,9 @@ def _cas_write(path: Path, data: bytes, mode: int, expected: Optional[bytes], tx
                 os.replace(tmp, str(path))
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
-            txn.file(path, None, None, data)
+            from memlet import memlet_dream as md
+            md._drop_read_caches()
+            _call_foreign(lambda: txn.file(path, None, None, data))
             return
         recovery = path.with_name(f"{path.name}.memlet-recovery-{_utc_stamp()}")
         try:
@@ -541,7 +550,9 @@ def _cas_write(path: Path, data: bytes, mode: int, expected: Optional[bytes], tx
             raise Refused(f"{what} changed while Memlet was preparing the update; nothing was written to it, run the "
                           "command again")
         os.replace(tmp, str(path))
-        txn.file(path, expected, prior_mode, data)
+        from memlet import memlet_dream as md
+        md._drop_read_caches()
+        _call_foreign(lambda: txn.file(path, expected, prior_mode, data))
         late = _read_regular(recovery) if linked else expected
         if late != expected:  # rewritten in place between the check and the rename: their bytes win
             if _read_regular(path) == data:
@@ -573,7 +584,7 @@ def _cas_delete(path: Path, expected: bytes, txn: _Txn, what: str) -> None:
         if _read_regular(path) != expected or os.lstat(str(path)).st_ino != os.lstat(str(recovery)).st_ino:
             raise Refused(f"{what} changed while Memlet was preparing its removal; it was left as it is")
         os.unlink(str(path))
-        txn.file(path, expected, prior_mode, None)
+        _call_foreign(lambda: txn.file(path, expected, prior_mode, None))
         late = _read_regular(recovery)
         if late != expected:
             if not path.exists():
@@ -593,7 +604,7 @@ def _make_dirs(d: Path, txn: _Txn) -> None:
         cur = cur.parent
     for p in reversed(missing):
         p.mkdir()
-        txn.made_dir(p)
+        _call_foreign(lambda: txn.made_dir(p))
 
 
 def _writable(d: Path) -> Optional[str]:
@@ -720,6 +731,7 @@ def _drop_memlet_entries(hooks: Dict[str, Any], event: str, rec: Dict[str, Any])
     return removed
 
 
+@md.fresh_read
 def plan_claude(root: Path, scope: str, *, remove: bool, prefix: Optional[str],
                 cfg: Optional[Dict[str, Any]], events: Optional[Tuple[Tuple[str, str, int, Optional[str]], ...]] = None,
                 scoped: bool = False) -> Dict[str, Any]:
@@ -864,6 +876,7 @@ def needs_backup(before: Optional[bytes], cfg_rec: Dict[str, Any]) -> bool:
     return _sha(before) not in known
 
 
+@md.fresh_read
 def apply_claude(root: Path, scope: str, plan: Dict[str, Any], cfg_rec: Dict[str, Any],
                  txn: Optional[_Txn] = None) -> Dict[str, Any]:
     """Write the planned settings change (compare-and-swap against the planned bytes, see `_cas_write`). Returns
@@ -930,6 +943,7 @@ def _gitignore_notice(root: Path, rel: str) -> Optional[str]:
 # git hooks
 
 
+@md.fresh_read
 def git_hooks_dir(root: Path) -> Tuple[Optional[Path], Optional[str]]:
     """The directory git runs hooks from (`core.hooksPath` honoured), else (None, reason)."""
     if (_git(root, ["rev-parse", "--is-inside-work-tree"]) or "").strip() != "true":
@@ -991,6 +1005,7 @@ def _git_record_files(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return files if isinstance(files, dict) else {}
 
 
+@md.fresh_read
 def plan_git(root: Path, prefix: Optional[str], *, remove: bool, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hooks_dir, why = git_hooks_dir(root)
     plan: Dict[str, Any] = {"hooksDir": str(hooks_dir) if hooks_dir else None, "items": [], "notices": []}
@@ -1032,6 +1047,7 @@ def plan_git(root: Path, prefix: Optional[str], *, remove: bool, cfg: Optional[D
     return plan
 
 
+@md.fresh_read
 def apply_git(plan: Dict[str, Any], txn: Optional[_Txn] = None) -> List[Dict[str, str]]:
     txn = txn if txn is not None else _Txn()
     actions: List[Dict[str, str]] = []
@@ -1051,7 +1067,7 @@ def apply_git(plan: Dict[str, Any], txn: Optional[_Txn] = None) -> List[Dict[str
                 raise Refused(f"git hook {p} changed while Memlet was preparing it; left as it is")
             prior = _mode_of(p) or 0o644
             os.chmod(str(p), prior | 0o755)
-            txn.mode(p, prior, data)
+            _call_foreign(lambda: txn.mode(p, prior, data))
             actions.append({"op": "chmod", "path": str(p)})
         elif item["op"] == "delete":
             _cas_delete(p, item["before"], txn, f"git hook {p}")
@@ -1256,6 +1272,7 @@ def _preflight(root: Path, cplan: Dict[str, Any], gplan: Optional[Dict[str, Any]
     return problems
 
 
+@md.fresh_read
 def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                   dry_run: bool = False, which: Callable[[str], Optional[str]] = shutil.which,
                   interpreter: Optional[str] = None, cli_path: Optional[str] = None,
@@ -1394,20 +1411,22 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
 
             def track_init() -> None:  # whatever init wrote becomes part of this run's transaction
                 if not existed and memlet.is_dir() and not memlet.is_symlink():
-                    txn.made_tree(memlet, _tree_digest(memlet))
+                    _call_foreign(lambda: txn.made_tree(memlet, _tree_digest(memlet)))
                 elif existed:
                     after = _memlet_files(root)
                     for p in set(before) | set(after):
                         old, new_ = before.get(p, (None, None)), after.get(p, (None, None))
                         if old[0] != new_[0]:
-                            txn.file(p, old[0], old[1], new_[0])
+                            _call_foreign(lambda: txn.file(p, old[0], old[1], new_[0]))
 
             try:
-                init_rep = run_init()
+                init_rep = _call_foreign(lambda: run_init())
             finally:
+                md._drop_read_caches()
                 track_init()
             if not init_rep.get("ok"):
-                left = txn.rollback()
+                left = _call_foreign(lambda: txn.rollback())
+                md._drop_read_caches()
                 rep["init"] = init_rep
                 return fail(int(init_rep.get("exitCode") or 1), "init failed; no hook was installed"
                             + ("" if not left else "; left behind: " + "; ".join(left)))
@@ -1452,7 +1471,8 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
         elif not remove:
             raise Refused("no readable .memlet/config.json for the install record (run `memlet init` first)")
     except Exception as exc:  # any failure: undo this run's writes, then report (never a half-installed state)
-        left = txn.rollback()
+        left = _call_foreign(lambda: txn.rollback())
+        md._drop_read_caches()
         rep["leftBehind"] = left
         rep["actions"] = actions
         return fail(1, "hook installation failed and this run's changes were rolled back"
@@ -1462,6 +1482,7 @@ def hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", 
     return rep
 
 
+@md.fresh_read
 def init_hooks_command(repo_path=".", *, remove: bool = False, scope: str = "local", git_hooks: bool = False,
                        dry_run: bool = False, force: bool = False, output_format: str = "json",
                        **kw: Any) -> Dict[str, Any]:
@@ -1483,7 +1504,7 @@ def init_hooks_command(repo_path=".", *, remove: bool = False, scope: str = "loc
         hooks = hooks_command(repo_path, scope=scope, git_hooks=git_hooks, dry_run=True, **kw)
         if not hooks.get("ok"):
             return _hooks_failure(hooks, output_format)
-        run_init()
+        _call_foreign(lambda: run_init())
         if not holder["init"].get("ok"):
             return holder["init"]
     else:
@@ -1563,9 +1584,9 @@ def _read_payload(stdin: Any) -> Optional[Dict[str, Any]]:
     if stdin is None:
         return None
     with contextlib.suppress(Exception):
-        if stdin.isatty():
+        if _call_foreign(lambda: stdin.isatty()):
             return None
-    raw = stdin.read(MAX_STDIN_BYTES + 1)
+    raw = _call_foreign(lambda: stdin.read(MAX_STDIN_BYTES + 1))
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "surrogateescape")
     if not raw or len(raw) > MAX_STDIN_BYTES:
@@ -1582,6 +1603,7 @@ def _git_toplevel(d: Path) -> Optional[Path]:
     return Path(out.strip()).resolve() if out and out.strip() else None
 
 
+@md.fresh_read
 def find_root(payload: Dict[str, Any]) -> Optional[Path]:
     """`cwd` of the payload when it is inside a git work tree, else the process cwd; then the nearest directory (up
     to the work-tree top) holding a real `.memlet/` directory. None when there is none (nothing is created)."""
@@ -1692,26 +1714,33 @@ def _clean(text: Any, limit: int) -> str:
 
 
 def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    from memlet import memlet_bridge as mb
-    from memlet import memlet_wiki as mw
-    cap = mw.build_handover(root, output_format="json", write=False, budget=2000, mode="verified")
+    from memlet import memlet_dream as md
+    with md._enter_read_scope() as state:
+        return _session_start_scoped(root, payload, st, _read_state=state)
+
+
+def _session_start_scoped(root: Path, payload: Dict[str, Any], st: Dict[str, Any], *,
+                          _read_state: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    from memlet import memlet_bridge as mb, memlet_dream as md, memlet_wiki as mw
+    cap = mw.build_handover(root, output_format="json", write=False, budget=2000, mode="verified",
+                            _read_state=_read_state)
     active = [a for a in cap.get("activeConstraints") or [] if isinstance(a, dict)
               and not str(a.get("source", "")).startswith(mb.PROMOTED_PAGE + ":")]
     health = (cap.get("executionProof") or {}).get("anchorHealth") or {}
     stale = int(health.get("stale") or 0)
     reverify = int(health.get("compatible-unverified") or 0)
     omitted = int((cap.get("omitted") or {}).get("activeConstraints") or 0)
-    pend = mb.learn_pending(root, _record_review=False)
+    pend = mb.learn_pending(root, _record_review=False, _read_state=_read_state)
     pending: Optional[int] = None
     if isinstance(pend, dict) and pend.get("ok") and isinstance(pend.get("counts"), dict):
         pending = int(pend["counts"].get("pendingNodes") or 0)
     else:  # unknown is not zero: the count is left out, never printed as 0
         _log(root, "session-start", "pending lessons unavailable: queue not readable")
     from memlet.memlet_dreamcycle import dream_status
-    status_result = dream_status(root) if st.get("dream") else {}
+    status_result = dream_status(root, _read_state=_read_state) if st.get("dream") else {}
     waiting = status_result.get("waiting", 0)
     hints = status_result.get("counts", {}).get(TIER_HINT, 0)
-    approved = mb.dream_items(root)["counts"]["approved"]
+    approved = mb.dream_items(root, _read_state=_read_state)["counts"]["approved"]
     if not active and not stale and not reverify and not pending and not waiting and not hints and not approved:
         return None
     head = "Memlet verified rules (code anchors match; source cited):"
@@ -1730,15 +1759,31 @@ def _session_start(root: Path, payload: Dict[str, Any], st: Dict[str, Any]) -> O
 
     def render(n: int) -> str:
         body = items[:n] if items else ["- (none)"]
+        md._count_work("sessionStartItemRenders", len(body))
         more = len(items) - n + omitted if items else omitted
         tail = [f"- (+{more} more verified: `memlet handover`)"] if more > 0 else []
         return "\n".join([head] + body + tail + ["", status])
 
+    item_toks = [mw.estimate_tokens(it) for it in items]
+    md._count_work("sessionStartItemRenders", len(items))
+    body_toks = sum(item_toks)
+    fixed_toks = mw.estimate_tokens(head) + mw.estimate_tokens(status)
+    none_toks = mw.estimate_tokens("- (none)")
+
+    def _toks_at(n: int) -> int:
+        b = body_toks if items and n > 0 else (0 if items and n == 0 else none_toks)
+        if items and n == 0:
+            # render(0) when items is non-empty uses items[:0] == []
+            b = 0
+        more = len(items) - n + omitted if items else omitted
+        t = mw.estimate_tokens(f"- (+{more} more verified: `memlet handover`)") if more > 0 else 0
+        return fixed_toks + b + t
+
     n = len(items)
-    text = render(n)
-    while n > 0 and mw.estimate_tokens(text) > st["tokens"]:
+    while n > 0 and _toks_at(n) > st["tokens"]:
         n -= 1
-        text = render(n)
+        body_toks -= item_toks[n]
+    text = render(n)
     if mw.estimate_tokens(text) > st["tokens"]:
         return None  # even the counts do not fit the configured budget
     out: Dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
@@ -2145,7 +2190,8 @@ def _quote(text: Any) -> str:
 
 
 def _item_lines(item: Dict[str, Any], group: str) -> List[str]:
-    from memlet import memlet_bridge as mb
+    from memlet import memlet_bridge as mb, memlet_dream as md
+    md._count_work("hookItemLineRenders", 1)
     quotes = _quote_lines(item)
     roles = item.get("lineRoles") if isinstance(item.get("lineRoles"), list) else []
     if item.get("kind") == "rule":
@@ -2178,7 +2224,8 @@ def _pointer(item: Dict[str, Any]) -> str:
 
 
 def _fits(text: str, tokens: Optional[int], cap: int) -> bool:
-    from memlet import memlet_wiki as mw
+    from memlet import memlet_dream as md, memlet_wiki as mw
+    md._count_work("hookBlockFitChecks", 1)
     return len(text) <= cap and (tokens is None or mw.estimate_tokens(text) <= tokens)
 
 
@@ -2189,14 +2236,136 @@ def _render_block(head: List[str], entries: List[Tuple[Optional[str], str, Dict[
     as many whole items as possible remain), then the latest. A dropped approved
     prohibition or supersession keeps one fixed pointer line (its citations and `memlet recall`) when that fits;
     everything else left out is counted. (None, []) when not even head and tail fit."""
-    keep = list(range(len(entries)))
-    sizes = [len("\n".join(_item_lines(item, g))) for _s, g, item in entries]
+    from memlet import memlet_wiki as mw
 
-    def build(idx: List[int]) -> str:
-        out = list(head)
-        section = group = object()
-        for i in idx:
-            sec, g, item = entries[i]
+    n = len(entries)
+    rendered_lines = [_item_lines(item, g) for _s, g, item in entries]
+    sizes = [sum(len(ln) for ln in lines_i) + max(0, len(lines_i) - 1) for lines_i in rendered_lines]
+    pointer_lines = [_pointer(item) if g in _GUARD_GROUPS and item.get("kind") == "lesson" else None
+                     for _s, g, item in entries]
+    kept_mask = [True] * n
+    drop_seq = sorted(range(n), key=lambda i: (_TRIM_RANK[entries[i][1]], -sizes[i], -i))
+
+    est = mw.estimate_tokens
+    use_tok = tokens is not None
+    head_list = list(head)
+    tail_list = list(tail)
+
+    base_lines = len(head_list) + len(tail_list)
+    base_chars = sum(len(s) for s in head_list) + sum(len(s) for s in tail_list)
+    base_toks = (sum(est(s) for s in head_list) + sum(est(s) for s in tail_list)) if use_tok else 0
+
+    item_line_counts = [len(lines_i) for lines_i in rendered_lines]
+    item_char_sums = [sum(len(ln) for ln in lines_i) for lines_i in rendered_lines]
+    item_tok_sums = [sum(est(ln) for ln in lines_i) if use_tok else 0 for lines_i in rendered_lines]
+
+    ptr_char_lens = [len(p) if p is not None else 0 for p in pointer_lines]
+    ptr_tok_lens = [est(p) if (use_tok and p is not None) else 0 for p in pointer_lines]
+
+    sec_tok_cache: Dict[str, int] = {}
+    grp_tok_cache: Dict[str, int] = {}
+
+    def _hdr_contribution(prev_idx: int, idx: int) -> Tuple[int, int, int]:
+        sec, g, _ = entries[idx]
+        if prev_idx == -1:
+            need_sec = True
+            need_grp = True
+        else:
+            p_sec, p_g, _ = entries[prev_idx]
+            if sec != p_sec:
+                need_sec = True
+                need_grp = True
+            else:
+                need_sec = False
+                need_grp = (g != p_g)
+        lines_add = 0
+        chars_add = 0
+        toks_add = 0
+        if need_sec and sec:
+            lines_add += 1
+            chars_add += len(sec)
+            if use_tok:
+                st = sec_tok_cache.get(sec)
+                if st is None:
+                    st = est(sec)
+                    sec_tok_cache[sec] = st
+                toks_add += st
+        if need_grp:
+            gl = voc.HOOK_GROUP_LABELS[g]
+            lines_add += 1
+            chars_add += len(gl)
+            if use_tok:
+                gt = grp_tok_cache.get(g)
+                if gt is None:
+                    gt = est(gl)
+                    grp_tok_cache[g] = gt
+                toks_add += gt
+        return lines_add, chars_add, toks_add
+
+    prev_link = [i - 1 for i in range(n)]
+    next_link = [i + 1 if i + 1 < n else -1 for i in range(n)]
+
+    body_lines = 0
+    body_chars = 0
+    body_toks = 0
+    for i in range(n):
+        hl, hc, ht = _hdr_contribution(i - 1, i)
+        body_lines += hl + item_line_counts[i]
+        body_chars += hc + item_char_sums[i]
+        body_toks += ht + item_tok_sums[i]
+
+    dropped_count = 0
+    ptr_count = 0
+    ptr_chars = 0
+    ptr_toks = 0
+
+    def _within_limits() -> bool:
+        left = omitted + dropped_count - ptr_count
+        tot_lines = base_lines + body_lines + ptr_count + (1 if left > 0 else 0)
+        om_line = (voc.HOOK_OMITTED % left) if left > 0 else ""
+        tot_chars = base_chars + body_chars + ptr_chars + len(om_line) + (tot_lines - 1 if tot_lines > 0 else 0)
+        if tot_chars > cap:
+            return False
+        if use_tok:
+            tot_toks = base_toks + body_toks + ptr_toks + (est(om_line) if left > 0 else 0)
+            if tot_toks > tokens:
+                return False
+        return True
+
+    drop_pos = 0
+    while not _within_limits() and drop_pos < n:
+        idx = drop_seq[drop_pos]
+        drop_pos += 1
+        kept_mask[idx] = False
+        prv = prev_link[idx]
+        nxt = next_link[idx]
+        old_hl, old_hc, old_ht = _hdr_contribution(prv, idx)
+        if nxt != -1:
+            nxt_old_hl, nxt_old_hc, nxt_old_ht = _hdr_contribution(idx, nxt)
+            nxt_new_hl, nxt_new_hc, nxt_new_ht = _hdr_contribution(prv, nxt)
+            prev_link[nxt] = prv
+        else:
+            nxt_old_hl = nxt_old_hc = nxt_old_ht = 0
+            nxt_new_hl = nxt_new_hc = nxt_new_ht = 0
+        if prv != -1:
+            next_link[prv] = nxt
+        body_lines += nxt_new_hl - old_hl - nxt_old_hl - item_line_counts[idx]
+        body_chars += nxt_new_hc - old_hc - nxt_old_hc - item_char_sums[idx]
+        body_toks += nxt_new_ht - old_ht - nxt_old_ht - item_tok_sums[idx]
+        dropped_count += 1
+        if pointer_lines[idx] is not None:
+            ptr_count += 1
+            ptr_chars += ptr_char_lens[idx]
+            ptr_toks += ptr_tok_lens[idx]
+
+    out = list(head_list)
+    section = group = object()
+    pointers: List[str] = []
+    keep: List[int] = []
+    for i in range(n):
+        if kept_mask[i]:
+            keep.append(i)
+            sec, g, _item = entries[i]
             if sec != section:
                 section, group = sec, object()
                 if sec:
@@ -2204,23 +2373,18 @@ def _render_block(head: List[str], entries: List[Tuple[Optional[str], str, Dict[
             if g != group:
                 group = g
                 out.append(voc.HOOK_GROUP_LABELS[g])
-            out.extend(_item_lines(item, g))
-        dropped = [i for i in range(len(entries)) if i not in idx]
-        pointers = [_pointer(entries[i][2]) for i in dropped
-                    if entries[i][1] in _GUARD_GROUPS and entries[i][2].get("kind") == "lesson"]
-        left = omitted + len(dropped) - len(pointers)
-        out.extend(pointers)
-        if left > 0:
-            out.append(voc.HOOK_OMITTED % left)
-        return "\n".join(out + list(tail))
+            out.extend(rendered_lines[i])
+        elif pointer_lines[i] is not None:
+            pointers.append(pointer_lines[i])
+    left = omitted + dropped_count - len(pointers)
+    out.extend(pointers)
+    if left > 0:
+        out.append(voc.HOOK_OMITTED % left)
+    text = "\n".join(out + tail_list)
 
-    text = build(keep)
-    while not _fits(text, tokens, cap) and keep:
-        keep.remove(min(keep, key=lambda i: (_TRIM_RANK[entries[i][1]], -sizes[i], -i)))
-        text = build(keep)
     if not _fits(text, tokens, cap):  # the pointer lines themselves did not fit: count everything instead
-        text = "\n".join(list(head) + [voc.HOOK_OMITTED % (omitted + len(entries))] + list(tail)) if entries else \
-            "\n".join(list(head) + list(tail))
+        text = "\n".join(head_list + [voc.HOOK_OMITTED % (omitted + n)] + tail_list) if entries else \
+            "\n".join(head_list + tail_list)
         return (text, []) if _fits(text, tokens, cap) else (None, [])
     return text, keep
 
@@ -2876,6 +3040,7 @@ def _dispatch(event: str, root: Path, payload: Dict[str, Any], st: Dict[str, Any
     return _git_check(root, event)
 
 
+@md.fresh_read
 def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: Any = None,
              hard_exit: bool = True) -> int:
     """Always returns 0. Writes one JSON object to stdout (Claude Code events) or warning lines to stderr (git
@@ -2885,8 +3050,8 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
     event = argv[0] if argv and isinstance(argv[0], str) else ""
     if event == "probe" and len(argv) == 1:
         with contextlib.suppress(Exception):
-            out.write(json.dumps({"memletHook": HOOK_PROTOCOL}) + "\n")
-            out.flush()
+            _call_foreign(lambda: out.write(json.dumps({"memletHook": HOOK_PROTOCOL}) + "\n"))
+            _call_foreign(lambda: out.flush())
         return 0
     if os.environ.get("MEMLET_DREAMING") == "1":
         return 0
@@ -2932,12 +3097,12 @@ def run_hook(argv: List[str], *, stdin: Any = None, stdout: Any = None, stderr: 
         return 0
     with contextlib.suppress(Exception):
         if isinstance(result, _Plain):
-            out.write(str(result) + "\n")
-            out.flush()
+            _call_foreign(lambda: out.write(str(result) + "\n"))
+            _call_foreign(lambda: out.flush())
         elif isinstance(result, str):
-            err.write(result)
-            err.flush()
+            _call_foreign(lambda: err.write(result))
+            _call_foreign(lambda: err.flush())
         else:
-            out.write(json.dumps(result, ensure_ascii=False) + "\n")
-            out.flush()
+            _call_foreign(lambda: out.write(json.dumps(result, ensure_ascii=False) + "\n"))
+            _call_foreign(lambda: out.flush())
     return 0

@@ -12,6 +12,8 @@ Nothing here is imported unless the packages are installed; a file whose tree ha
 (Memlet then uses the lexical scanner). Set `MEMLET_EXACT_PARSERS=0` to turn the auto-loading off.
 """
 
+from .memlet_dream import call_foreign as _call_foreign
+
 import hashlib
 import importlib
 import importlib.util
@@ -61,9 +63,9 @@ class TreeSitterProvider:
     languages = ("typescript", "javascript")
 
     def __init__(self, ts, tst, tsj, versions: Dict[str, Optional[str]]) -> None:
-        self._langs = {"ts": ts.Language(tst.language_typescript()), "tsx": ts.Language(tst.language_tsx()),
-                       "js": ts.Language(tsj.language())}
-        self._parser_cls = ts.Parser
+        self._langs = {"ts": _call_foreign(lambda: ts.Language(tst.language_typescript())), "tsx": _call_foreign(lambda: ts.Language(tst.language_tsx())),
+                       "js": _call_foreign(lambda: ts.Language(tsj.language()))}
+        self._parser_cls = _call_foreign(lambda: ts.Parser)
         raw = (f"tree-sitter-v1.core-{versions['tree-sitter']}.ts-{versions['tree-sitter-typescript']}"
                f".js-{versions['tree-sitter-javascript']}")
         self.basis = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:120]
@@ -74,6 +76,10 @@ class TreeSitterProvider:
         return self._parser_cls(self._langs[key])
 
     def fingerprint(self, path: str, text: str) -> Optional[Dict[str, Dict[str, str]]]:
+        # The injected parser and every node it returns are foreign objects.
+        return _call_foreign(lambda: self._fingerprint(path, text))
+
+    def _fingerprint(self, path: str, text: str) -> Optional[Dict[str, Dict[str, str]]]:
         src = text.encode("utf-8")
         tree = self._parser(path).parse(src)
         root = tree.root_node

@@ -12,6 +12,9 @@ matters, and `formatted` (or `_cli_text`) for the text rendering. Use `add_forma
 tell an explicit `--format` from the default and switch to text on a terminal.
 """
 
+from memlet.memlet_dream import call_foreign as _call_foreign
+
+
 import argparse
 import importlib
 import importlib.util
@@ -31,7 +34,7 @@ def add_format_option(parser, choices=("json", "markdown"), default="json", help
     kwargs = {"action": _Format, "default": default, "choices": list(choices)}
     if help is not None:
         kwargs["help"] = help
-    parser.add_argument("--format", **kwargs)
+    _call_foreign(lambda: parser.add_argument("--format", **kwargs))
 
 
 def load() -> List[Any]:
@@ -47,7 +50,7 @@ def load() -> List[Any]:
 def commands(plugins: List[Any]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for plugin in plugins:
-        for name, meta in (getattr(plugin, "COMMANDS", None) or {}).items():
+        for name, meta in (_call_foreign(lambda: getattr(plugin, "COMMANDS", None)) or {}).items():
             if name in out:
                 raise ValueError("CLI plug-in command defined twice: " + name)
             out[name] = dict(meta, _plugin=plugin)
@@ -56,6 +59,6 @@ def commands(plugins: List[Any]) -> Dict[str, Dict[str, Any]]:
 
 def dispatch(plugins: List[Any], args) -> Optional[Dict[str, Any]]:
     for plugin in plugins:
-        if getattr(args, "action", None) in (getattr(plugin, "COMMANDS", None) or {}):
-            return plugin.dispatch(args)
+        if getattr(args, "action", None) in (_call_foreign(lambda: getattr(plugin, "COMMANDS", None)) or {}):
+            return _call_foreign(lambda: plugin.dispatch(args))
     return None

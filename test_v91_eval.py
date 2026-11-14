@@ -506,6 +506,16 @@ class EvalTests(unittest.TestCase):
             with self.assertRaises(ValueError): ev._validate_questions([q],m)
 
     def test_cli_injected_vendor_markdown_input_errors(self):
+        with patch.dict(os.environ):
+            os.environ.pop('MEMLET_LOCK_DIR', None)
+            self._assert_cli_injected_vendor_markdown_input_errors(None)
+
+    def test_cli_injected_vendor_restores_existing_lock_dir(self):
+        original_lock_dir = str(self.root / 'caller-locks')
+        with patch.dict(os.environ, {'MEMLET_LOCK_DIR': original_lock_dir}):
+            self._assert_cli_injected_vendor_markdown_input_errors(original_lock_dir)
+
+    def _assert_cli_injected_vendor_markdown_input_errors(self, original_lock_dir):
         import argparse
         from memlet import cli_eval
         parser=argparse.ArgumentParser(); cli_eval.register(parser.add_subparsers())
@@ -522,7 +532,10 @@ class EvalTests(unittest.TestCase):
         with patch.object(sys,'argv',['memlet','admin','eval','report','--run','r','--repo',str(self.root),'--format','markdown']), contextlib.redirect_stdout(output):
             self.assertEqual(0,memory_cli.cli())
         self.assertTrue(output.getvalue().startswith('Protocol: prospective'))
-        self.assertEqual(os.environ.get('MEMLET_LOCK_DIR'), None)
+        if original_lock_dir is None:
+            self.assertEqual(os.environ.get('MEMLET_LOCK_DIR'), None)
+        else:
+            self.assertEqual(os.environ.get('MEMLET_LOCK_DIR'), original_lock_dir)
         (self.root/'sessions/bad.jsonl').write_text('\n[1,2]\n')
         r=cli(['init','--run','bad','--sessions','sessions','--dream-until','2026-01-02'])
         self.assertEqual(2,r['exitCode']); self.assertIn('objects',r['error'])

@@ -17,6 +17,8 @@ structured JSON, human-readable Markdown, or GitHub Code Scanning SARIF v2.1.0.
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 from pathlib import Path
 from .vocabulary import suggested_label
 
@@ -196,8 +198,22 @@ class SpanMatch:
         return self._start, self._end
 
 
+def _blank_lines(m: Any) -> str:
+    """Keep source line numbers when removing a generated block."""
+    return "\n" * m.group(0).count("\n")
+
+
+def _redact_block_lines(m: Any) -> str:
+    return "\n".join("[REDACTED_SECRET_BLOCK]" for _ in m.group(0).splitlines())
+
+
 def _expand(repl: Any, m: Any) -> str:
-    return repl(m) if callable(repl) else repl
+    # Exact identities: these replacements are Memlet code, not caller callbacks.
+    if repl is _blank_lines:
+        return _blank_lines(m)
+    if repl is _redact_block_lines:
+        return _redact_block_lines(m)
+    return _call_foreign(lambda: repl(m)) if callable(repl) else repl
 
 
 class _LinearPattern:
@@ -393,13 +409,23 @@ def run_tail_finder(prefix: "re.Pattern[str]", cls_star: "re.Pattern[str]", min_
     return factory
 
 
+def _foreign_finder(factory):
+    """Only caller-supplied finders cross the boundary; pattern tables are ours."""
+    def make(text):
+        find = _call_foreign(factory, text)
+        return lambda pos: _call_foreign(find, pos)
+    return make
+
+
 class LinearAlternation(_LinearPattern):
     """Matches of `alt_1|alt_2|...` with `re` semantics (leftmost start wins; at one start the earlier alternative
     wins), one finder per alternative (or per group of alternatives that are safe together). Finders return their own
     leftmost `(start, end)` at or after `pos` and are called with non-decreasing `pos`."""
 
-    def __init__(self, pattern: str, finders: List[Any], flags: int = 0) -> None:
-        self.pattern, self.flags, self._factories = pattern, flags, list(finders)
+    def __init__(self, pattern: str, finders: List[Any], flags: int = 0, *, _owned=False) -> None:
+        self.pattern, self.flags = pattern, flags
+        self._factories = (list(finders) if _owned else
+                           [_foreign_finder(f) for f in _call_foreign(lambda: list(finders))])
 
     def _spans(self, text: str, pos: int = 0):
         finders = [f(text) for f in self._factories]
@@ -1218,7 +1244,7 @@ def audit_repository(
                 break
             # Strip HTML comments <!-- ... --> while preserving exact line numbers (linear in the text)
             clean_doc_text = HTML_COMMENT_RE.sub(
-                lambda m: "\n" * m.group(0).count("\n"),
+                _blank_lines,
                 raw_doc_text,
             )
             lines = clean_doc_text.splitlines()
@@ -1922,13 +1948,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     import sys
 
     parser = argparse.ArgumentParser(prog="memlet check", description="Memlet Check · Procedure & Instruction Auditor")
-    parser.add_argument("repo_positional", nargs="?", default=None, help="Target repository path")
-    parser.add_argument("--repo-path", default=None, help="Target repository path")
-    parser.add_argument("--base", default=None, help="Git base ref for blast-radius diff")
-    parser.add_argument("--head", default="HEAD", help="Git head ref for blast-radius diff")
-    parser.add_argument("--format", default="json", choices=["json", "markdown", "sarif"], help="Output format")
-    parser.add_argument("--exit-zero", action="store_true", help="Always return exit code 0 even when errors are found")
-    args = parser.parse_args(argv)
+    _call_foreign(lambda: parser.add_argument("repo_positional", nargs="?", default=None, help="Target repository path"))
+    _call_foreign(lambda: parser.add_argument("--repo-path", default=None, help="Target repository path"))
+    _call_foreign(lambda: parser.add_argument("--base", default=None, help="Git base ref for blast-radius diff"))
+    _call_foreign(lambda: parser.add_argument("--head", default="HEAD", help="Git head ref for blast-radius diff"))
+    _call_foreign(lambda: parser.add_argument("--format", default="json", choices=["json", "markdown", "sarif"], help="Output format"))
+    _call_foreign(lambda: parser.add_argument("--exit-zero", action="store_true", help="Always return exit code 0 even when errors are found"))
+    args = _call_foreign(lambda: parser.parse_args(argv))
 
     target = args.repo_path or args.repo_positional or "."
     res = audit_repository(target, base_ref=args.base, head_ref=args.head, output_format=args.format)

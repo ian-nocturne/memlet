@@ -4,6 +4,8 @@
 Can be plugged into Claude Code, Codex, Cursor, Windsurf, or any MCP-compatible IDE/agent in 1 minute
 without requiring an external web server.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import argparse
 import json
 import os
@@ -434,16 +436,16 @@ class MemletMCPServer:
         self.default_session = default_session
         self.standalone = standalone
         if self.standalone:
-            t = self.store.ensure_standalone_task(self.default_task, session=self.default_session)
+            t = _call_foreign(lambda: self.store.ensure_standalone_task(self.default_task, session=self.default_session))
             if not self.default_session:
                 self.default_session = t['owner']
 
     def _resolve_task_and_session(self, args):
         task_id = (args or {}).get('task') or self.default_task
         if self.standalone:
-            task = self.store.ensure_standalone_task(task_id, session=self.default_session or 'standalone-owner')
+            task = _call_foreign(lambda: self.store.ensure_standalone_task(task_id, session=self.default_session or 'standalone-owner'))
         else:
-            task = self.store.get(task_id)
+            task = _call_foreign(lambda: self.store.get(task_id))
         session = (args or {}).get('session') or self.default_session or task['owner']
         return task, session
 
@@ -529,14 +531,14 @@ class MemletMCPServer:
         tid = task['id']
 
         if name == 'memlet_store_brief':
-            res = self.store.memory(tid, include_retrieval=False)
-            with self.store.db() as db:
+            res = _call_foreign(lambda: self.store.memory(tid, include_retrieval=False))
+            with _foreign_context(lambda: self.store.db()) as db:
                 originals = [
                     work_memory._public(r)
-                    for r in db.execute(
+                    for r in _call_foreign(lambda: list(db.execute(
                         "SELECT * FROM memory_items WHERE task=? AND kind IN ('instruction','report') ORDER BY event_id DESC LIMIT 10",
                         (tid,),
-                    )
+                    )))
                 ]
             res['originals'] = [
                 {'id': r['item_id'], 'kind': r['kind'], 'excerpt': r['content'][:2000], 'totalChars': len(r['content']), 'source': r['source']}
@@ -546,7 +548,7 @@ class MemletMCPServer:
             return res
 
         if name == 'memlet_store_recall':
-            res = self.store.memory(
+            res = _call_foreign(lambda: self.store.memory(
                 tid,
                 args.get('query', ''),
                 int(args.get('budget', 6000)),
@@ -554,7 +556,7 @@ class MemletMCPServer:
                 known_at=args.get('knownAt'),
                 shared=bool(args.get('shared', False)),
                 federated=bool(args.get('federated', False)),
-            )
+            ))
             res['recallId'] = memory.record_recall(self.store, tid, session, 'mcp:' + str(time.time_ns()), args.get('query', ''), res['retrieval'])
             return res
 
@@ -570,13 +572,13 @@ class MemletMCPServer:
         if name == 'memlet_store_skills':
             if args.get('skillId'):
                 return memory.read_skill(self.store, tid, args['skillId'])
-            return self.store.skills(
+            return _call_foreign(lambda: self.store.skills(
                 tid,
                 args.get('query', ''),
                 include_inactive=bool(args.get('includeInactive', False)),
                 shared=bool(args.get('shared', False)),
                 federated=bool(args.get('federated', False)),
-            )
+            ))
 
         if name == 'memlet_store_skill_manage':
             return memory.manage_skill(self.store, tid, session, int(args['revision']), args['operationId'], args['spec'])
@@ -801,13 +803,13 @@ def _default_mcp_root():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', default=_default_mcp_root())
-    parser.add_argument('--task', default=None)
-    parser.add_argument('--session', default='standalone-owner')
-    parser.add_argument('--strict-task', action='store_true', help='Require existing task instead of auto-bootstrapping')
-    parser.add_argument('--print-mcp-config', action='store_true', help='Print ready-to-paste MCP server JSON config and exit')
-    parser.add_argument('--self-test', action='store_true', help='Run built-in protocol smoke test and exit')
-    args = parser.parse_args()
+    _call_foreign(lambda: parser.add_argument('--root', default=_default_mcp_root()))
+    _call_foreign(lambda: parser.add_argument('--task', default=None))
+    _call_foreign(lambda: parser.add_argument('--session', default='standalone-owner'))
+    _call_foreign(lambda: parser.add_argument('--strict-task', action='store_true', help='Require existing task instead of auto-bootstrapping'))
+    _call_foreign(lambda: parser.add_argument('--print-mcp-config', action='store_true', help='Print ready-to-paste MCP server JSON config and exit'))
+    _call_foreign(lambda: parser.add_argument('--self-test', action='store_true', help='Run built-in protocol smoke test and exit'))
+    args = _call_foreign(lambda: parser.parse_args())
 
     server = MemletMCPServer(
         args.root,

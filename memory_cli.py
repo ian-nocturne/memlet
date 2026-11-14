@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Cross-platform local memory tool for the already-authorized task owner."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import argparse
 import json
 import os
@@ -80,13 +82,13 @@ def schema():
 def read_item(store, task, item_id, offset=0, size=6000):
     work_memory._integer(offset,'offset',0,100000)
     work_memory._integer(size,'size',1,20000)
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         item=work_memory.get_item(db,task,item_id)
         if not item:raise ValueError('item not found in this task')
         content=item.pop('content')
         item_links=memory.skills_ledger.node_wiki_links(db,task,item_id,limit=12)
-        events=[work_memory._public(r) for r in db.execute(
-            'SELECT * FROM memory_events WHERE task=? AND item_id=? ORDER BY id DESC LIMIT 50',(task,item_id))]
+        events=[work_memory._public(r) for r in _call_foreign(lambda: list(db.execute(
+            'SELECT * FROM memory_events WHERE task=? AND item_id=? ORDER BY id DESC LIMIT 50',(task,item_id))))]
     item.update(content=content[offset:offset+size],offset=offset,totalChars=len(content),
                 nextOffset=offset+size if offset+size<len(content) else None,
                 links=item_links,
@@ -104,12 +106,12 @@ def _allowed_transcript_roots():
 
 def backfill(store, task, session, end_byte=None):
     """Read only a recorded transcript of this task's responsible/previous session."""
-    with store.db() as db:
-        link=db.execute('SELECT role FROM sessions WHERE task=? AND session=?',(task,session)).fetchone()
+    with _foreign_context(lambda: store.db()) as db:
+        link=_call_foreign(lambda: db.execute('SELECT role FROM sessions WHERE task=? AND session=?',(task,session)).fetchone())
         if not link or link['role'] not in ('responsible','previous'):
             raise ValueError('linked responsible/previous session required')
         refs=[]
-        for row in db.execute('SELECT source FROM memory_events WHERE task=? ORDER BY id DESC',(task,)):
+        for row in _call_foreign(lambda: list(db.execute('SELECT source FROM memory_events WHERE task=? ORDER BY id DESC',(task,)))):
             source=json.loads(row['source'])
             if source.get('session')==session and source.get('reference'):
                 refs.append(source['reference'])
@@ -270,7 +272,7 @@ def _add_global_options(parser, *, defaults=False):
         else:
             kwargs['metavar'] = name.upper()
             kwargs['action'] = _ExplicitValue
-        parser.add_argument(flag, **kwargs)
+        _call_foreign(lambda: parser.add_argument(flag, **kwargs))
 
 
 _PLUGINS = None
@@ -289,7 +291,7 @@ def _register_plugins(sub):
         if name in sub.choices:
             raise ValueError('CLI plug-in command collides with a built-in command: ' + name)
     for plugin in _PLUGINS:
-        plugin.register(sub)
+        _call_foreign(lambda: plugin.register(sub))
 
 
 def _product_commands():
@@ -326,11 +328,11 @@ def _configure_help(parser, sub):
         for action in dream_parser._actions:
             if action.dest in ('_global_root', '_global_task', '_global_session', '_global_standalone'):
                 action.help = argparse.SUPPRESS
-    admin = sub.add_parser('admin', help='Advanced and legacy commands.',
+    admin = _call_foreign(lambda: sub.add_parser('admin', help='Advanced and legacy commands.',
                            allow_abbrev=False,
                            formatter_class=argparse.RawDescriptionHelpFormatter,
                            description='Advanced and legacy Memlet commands.',
-                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in _admin_groups()) + '\n\n' + plugin_help)
+                           epilog='\n\n'.join(label + ':\n  ' + names for label, names in _admin_groups()) + '\n\n' + plugin_help))
     _add_global_options(admin)
     _reserve_legacy_prefixes(admin)
     admin.set_defaults(_admin=True)
@@ -338,7 +340,7 @@ def _configure_help(parser, sub):
     # These are the very same parsers and handlers, including hidden experiments.
     nested.choices.update(commands)
     sub.metavar = '{' + ','.join(list(_product_commands()) + ['admin']) + '}'
-    sub._choices_actions = [sub._ChoicesPseudoAction(name, (), description)
+    sub._choices_actions = [_call_foreign(lambda: sub._ChoicesPseudoAction(name, (), description))
                            for name, description in list(_product_commands().items()) +
                            [('admin', 'Advanced and legacy commands.')]]
     parser.epilog = 'For advanced and legacy commands, run: memlet admin --help\n' + plugin_help
@@ -428,7 +430,7 @@ def _route_new(args):
             store = _open_store(args)
             task = args.task or _standalone_task_id()
             if args.standalone:
-                store.ensure_standalone_task(task, session=args.session or 'standalone-owner')
+                _call_foreign(lambda: store.ensure_standalone_task(task, session=args.session or 'standalone-owner'))
                 if not args.task:
                     notice = legacy_standalone_notice(store, task)
                     if notice:
@@ -527,7 +529,7 @@ def _validate_modes(args, parser):
 
     def reject(mode, flags):
         if flags:
-            parser.error(mode + ' does not support ' + ', '.join(flags))
+            _call_foreign(lambda: parser.error(mode + ' does not support ' + ', '.join(flags)))
 
     store_flags = ['--' + name for name in ('root', 'task', 'session') if given('_global_' + name)]
     if args.standalone:
@@ -547,28 +549,28 @@ def _validate_modes(args, parser):
         flags = ['--' + name for name in ('repo', 'vendor', 'by', 'reason') if given(name) and name not in allowed]
         reject('learn ' + mode, flags + (store_flags if mode != '--file' else []))
         if (args.reconsider or args.refresh_citations) and not args.approve:
-            parser.error("--reconsider and --refresh-citations require --approve")
+            _call_foreign(lambda: parser.error("--reconsider and --refresh-citations require --approve"))
         if args.path is not None and not (args.approve or args.paths):
-            parser.error("--path requires --approve or --paths")
+            _call_foreign(lambda: parser.error("--path requires --approve or --paths"))
         if args.paths and not args.path:
-            parser.error("--paths requires --path FILE")
+            _call_foreign(lambda: parser.error("--paths requires --path FILE"))
         from memlet.vocabulary import MERGE_REASONS
         if args.same and not args.merge:
-            parser.error(MERGE_REASONS['same-without-merge'])
+            _call_foreign(lambda: parser.error(MERGE_REASONS['same-without-merge']))
         if args.merge and not args.same:
-            parser.error(MERGE_REASONS['same-required'])
+            _call_foreign(lambda: parser.error(MERGE_REASONS['same-required']))
         if (args.merge or args.unmerge) and not args.by.strip():
-            parser.error(MERGE_REASONS['by-required'])
+            _call_foreign(lambda: parser.error(MERGE_REASONS['by-required']))
         if (args.approve or args.reject or args.paths) and not args.by.strip():
-            parser.error('learn --approve/--reject requires --by NAME')
+            _call_foreign(lambda: parser.error('learn --approve/--reject requires --by NAME'))
     if args.action == 'init':
         new_flags = ['--' + name for name in ('jit', 'guard', 'capsule') if getattr(args, name)]
         if new_flags and not args.hooks:  # 9.2 opt-ins install something: --hooks-remove takes none of them
-            parser.error(', '.join(new_flags) + ' requires --hooks')
+            _call_foreign(lambda: parser.error(', '.join(new_flags) + ' requires --hooks'))
         if not (args.hooks or args.hooks_remove):
             flags = (['--hooks-scope'] if args.hooks_scope else []) + (['--git-hooks'] if args.git_hooks else []) + (['--dream'] if args.dream else [])
             if flags:
-                parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove')
+                _call_foreign(lambda: parser.error(', '.join(flags) + ' requires --hooks or --hooks-remove'))
         elif args.hooks_remove and args.force:
             reject('init --hooks-remove', ['--force'])
     if args.action in ('check', 'audit'):
@@ -583,7 +585,7 @@ def _validate_modes(args, parser):
                 flags.append('--format sarif (choose json or markdown)')
             reject('check ' + mode, flags + store_flags)
         elif args.dry_run:
-            parser.error('--dry-run requires --accept or --repin-legacy-ts')
+            _call_foreign(lambda: parser.error('--dry-run requires --accept or --repin-legacy-ts'))
 
 
 def main():
@@ -610,8 +612,8 @@ def main():
                     selected.add(parsed[0].dest)
         if 'same' in selected and 'merge' not in selected:
             from memlet.vocabulary import MERGE_REASONS
-            parser.error(MERGE_REASONS['same-without-merge'])
-    args = parser.parse_args(argv)
+            _call_foreign(lambda: parser.error(MERGE_REASONS['same-without-merge']))
+    args = _call_foreign(lambda: parser.parse_args(argv))
     for name in ('root', 'task', 'session', 'standalone'):
         if not hasattr(args, name):
             setattr(args, name, getattr(args, '_global_' + name))
@@ -634,105 +636,105 @@ def _build_parser():
     # a child's legacy --s as ambiguous between --session and --standalone.
     parser=argparse.ArgumentParser(prog=_program_name(),description='Memlet: local repository memory.',allow_abbrev=False)
     from memlet import VERSION
-    parser.add_argument('--version',action='version',version=VERSION)
+    _call_foreign(lambda: parser.add_argument('--version',action='version',version=VERSION))
     _add_global_options(parser, defaults=True)
     _reserve_legacy_prefixes(parser)
-    sub=parser.add_subparsers(dest='action',required=True,action=_InvokedSubParsers)
-    sub.add_parser('schema'); sub.add_parser('brief'); sub.add_parser('stats'); sub.add_parser('scenes'); sub.add_parser('doctor')
-    bak_p=sub.add_parser('backup');bak_p.add_argument('--dest-dir',default=None);bak_p.add_argument('--include-models',action='store_true')
-    res_p=sub.add_parser('restore');res_p.add_argument('--backup-dir',required=True)
-    rb_p=sub.add_parser('repo-benchmark');rb_p.add_argument('--work-dir',default=None)
-    aud_p=sub.add_parser('audit',aliases=['check']);aud_p.add_argument('repo_positional',nargs='?',default=None);aud_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
+    sub=_call_foreign(lambda: parser.add_subparsers(dest='action',required=True,action=_InvokedSubParsers))
+    _call_foreign(lambda: sub.add_parser('schema')); _call_foreign(lambda: sub.add_parser('brief')); _call_foreign(lambda: sub.add_parser('stats')); _call_foreign(lambda: sub.add_parser('scenes')); _call_foreign(lambda: sub.add_parser('doctor'))
+    bak_p=_call_foreign(lambda: sub.add_parser('backup'));bak_p.add_argument('--dest-dir',default=None);bak_p.add_argument('--include-models',action='store_true')
+    res_p=_call_foreign(lambda: sub.add_parser('restore'));res_p.add_argument('--backup-dir',required=True)
+    rb_p=_call_foreign(lambda: sub.add_parser('repo-benchmark'));rb_p.add_argument('--work-dir',default=None)
+    aud_p=_call_foreign(lambda: sub.add_parser('audit',aliases=['check']));aud_p.add_argument('repo_positional',nargs='?',default=None);aud_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     aud_p.add_argument('--base',action=_ExplicitValue,default=None);aud_p.add_argument('--head',action=_ExplicitValue,default='HEAD');aud_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown','sarif']);aud_p.add_argument('--exit-zero',action='store_true')
-    init_p=sub.add_parser('init',help='Zero-daemon onboarding: create .memlet/config.json and .memlet/wiki/INDEX.md (never reads .env)')
+    init_p=_call_foreign(lambda: sub.add_parser('init',help='Zero-daemon onboarding: create .memlet/config.json and .memlet/wiki/INDEX.md (never reads .env)'))
     init_p.add_argument('repo_positional',nargs='?',default=None);init_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     init_p.add_argument('--dry-run',action='store_true');init_p.add_argument('--force',action='store_true',help='Regenerate INDEX.md and re-pin anchors')
     init_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    wiki_p=sub.add_parser('wiki',help='Check AST anchors in .memlet/wiki/*.md (active / compatible-unverified / stale)')
+    wiki_p=_call_foreign(lambda: sub.add_parser('wiki',help='Check AST anchors in .memlet/wiki/*.md (active / compatible-unverified / stale)'))
     wiki_p.add_argument('repo_positional',nargs='?',default=None);wiki_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     wiki_p.add_argument('--dry-run',action='store_true');wiki_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    imp_rules_p=sub.add_parser('import',help='Import rules from CLAUDE.md / AGENTS.md / .cursorrules / .ai-memory / .claude-mem and tag each with its live AST status')
+    imp_rules_p=_call_foreign(lambda: sub.add_parser('import',help='Import rules from CLAUDE.md / AGENTS.md / .cursorrules / .ai-memory / .claude-mem and tag each with its live AST status'))
     imp_rules_p.add_argument('repo_positional',nargs='?',default=None);imp_rules_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     imp_rules_p.add_argument('--from',dest='source',default='auto',choices=['auto','claude-md','cursorrules','ai-memory','claude-mem'])
     imp_rules_p.add_argument('--dry-run',action='store_true');imp_rules_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    slim_p=sub.add_parser('slim-plan',help='Propose a slimmer AGENTS.md by moving (never rewriting) older directives into an indexed log; writes only to --out, with a preservation proof')
+    slim_p=_call_foreign(lambda: sub.add_parser('slim-plan',help='Propose a slimmer AGENTS.md by moving (never rewriting) older directives into an indexed log; writes only to --out, with a preservation proof'))
     slim_p.add_argument('repo_positional',nargs='?',default=None);slim_p.add_argument('--out',required=True)
     slim_p.add_argument('--keep-recent',type=int,default=2);slim_p.add_argument('--split-rules',action='store_true')
-    dream_b=sub.add_parser('dream-build',help='Build a PENDING approval queue from session logs and optional candidates (no model call)')
+    dream_b=_call_foreign(lambda: sub.add_parser('dream-build',help='Build a PENDING approval queue from session logs and optional candidates (no model call)'))
     dream_b.add_argument('--candidates',default=None,help='Optional path to raw candidate JSON; if omitted, deterministically extracts candidates from --snapshot')
     dream_b.add_argument('--snapshot',required=True,help='Path to a .log/.jsonl transcript, log directory, or JSON snapshot map')
     dream_b.add_argument('--out-json',required=True,help='Output path for the PENDING approval queue JSON')
     dream_b.add_argument('--out-db',default=None,help='Optional SQLite DB path to write ontology_nodes, ontology_edges, and dream_runs')
     dream_b.add_argument('--vendor',default='autonomous-deterministic',help='Extractor vendor tag')
-    dream_p=sub.add_parser('dream-recall',help='1-hop ontology subgraph recall (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS) from a verified Dream queue JSON (no model call)')
+    dream_p=_call_foreign(lambda: sub.add_parser('dream-recall',help='1-hop ontology subgraph recall (GOVERNS/SUPERSEDES/RESOLVES/BLOCKS) from a verified Dream queue JSON (no model call)'))
     dream_p.add_argument('--graph',required=True,help='Path to Dream ontology JSON')
     dream_p.add_argument('--query',nargs='*',default='',help='Task or question query (supports unquoted multi-word queries)')
     dream_p.add_argument('--budget','--max-tokens',dest='budget',type=int,default=1500,help='Maximum token budget (default 1500)')
     dream_p.add_argument('--snapshot',default=None,help='Optional log directory or JSON snapshot map to verify pins before recall')
     dream_p.add_argument('--out-md',default=None,help='Optional path to write the Markdown approval queue capsule')
     dream_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'],help='Stdout format (json or markdown)')
-    rctx_p=sub.add_parser('rule-context',help='T0 safety core (verbatim quotes) + T1 rule index from the verified INDEX-RULES.md (no model call)')
+    rctx_p=_call_foreign(lambda: sub.add_parser('rule-context',help='T0 safety core (verbatim quotes) + T1 rule index from the verified INDEX-RULES.md (no model call)'))
     rctx_p.add_argument('repo_positional',nargs='?',default=None)
     rctx_p.add_argument('--core-budget',type=int,default=600);rctx_p.add_argument('--index-budget',type=int,default=600)
     rctx_p.add_argument('--auto',action='store_true',help='Return the whole instructions when they fit --threshold tokens, else the tiered context');rctx_p.add_argument('--threshold',type=int,default=8000)
-    rrec_p=sub.add_parser('rule-recall',help='T2: rules most relevant to a task, quoted verbatim from the instructions (deterministic BM25, no model call)')
+    rrec_p=_call_foreign(lambda: sub.add_parser('rule-recall',help='T2: rules most relevant to a task, quoted verbatim from the instructions (deterministic BM25, no model call)'))
     rrec_p.add_argument('query_or_repo',nargs='?',default=None);rrec_p.add_argument('legacy_query',nargs='?',default=None)
     rrec_p.add_argument('--repo',default=None)
     rrec_p.epilog='Use rule-recall "<query>" [--repo DIR] or rule-recall <existing-dir> "<query>"; a lone directory is ambiguous and requires a query.'
     rrec_p.add_argument('--k',type=int,default=3);rrec_p.add_argument('--safety',action='store_true',help='Add up to 4 importance-1 rules not already shown (not a guarantee of full coverage)')
-    index_p=sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)')
+    index_p=_call_foreign(lambda: sub.add_parser('index-build',help='Build .memlet/wiki/INDEX-RULES.md: LLM picks and names rules (never rewrites them), each pinned to its source lines (claude subscription CLI, offline, only when you run it)'))
     index_p.add_argument('repo_positional',nargs='?',default=None)
     index_p.add_argument('--via',default='claude',choices=['claude'])
-    brief_p=sub.add_parser('brief-build',help='EXPERIMENTAL (meaning is not verified; calls the claude CLI, a model call): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified')
+    brief_p=_call_foreign(lambda: sub.add_parser('brief-build',help='EXPERIMENTAL (meaning is not verified; calls the claude CLI, a model call): build .memlet/wiki/BRIEF.md, an LLM-rewritten rule brief pinned to cited lines; meaning is NOT verified'))
     brief_p.description='EXPERIMENTAL: failed its faithfulness evaluation; meaning is NOT verified.'
     brief_p.add_argument('repo_positional',nargs='?',default=None)
     brief_p.add_argument('--via',default='claude',choices=['claude'],help='Runner: claude only (tool-free, claude.ai subscription verified before the call; refuses API-key auth)')
-    hand_p=sub.add_parser('handover',help='Checksummed, budgeted handover capsule: constraints with matching pins; stale anchors quarantined')
+    hand_p=_call_foreign(lambda: sub.add_parser('handover',help='Checksummed, budgeted handover capsule: constraints with matching pins; stale anchors quarantined'))
     hand_p.add_argument('repo_positional',nargs='?',default=None);hand_p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
     hand_p.add_argument('--next-step',default=None);hand_p.add_argument('--rejected',action='append',default=[],help='Rejected approach / dead-end (repeatable)')
     hand_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown']);hand_p.add_argument('--write',action='store_true',help='Write .memlet/wiki/HANDOVER.md and record a handover ledger event')
     hand_p.add_argument('--mode',default=None,choices=['verified','digest','brief','index'],metavar='{verified,index}',help='verified (default): code-anchored rules; index: verbatim key rules and topic index')
     hand_p.add_argument('--budget',default=None,help='Token budget: a number (clamped to 500-2000) or auto (~12%% of the instruction text); default from .memlet/config.json handover.tokenBudget, else 500')
-    cmp_p=sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet')
+    cmp_p=_call_foreign(lambda: sub.add_parser('compare-bench',aliases=['benchmark-compare'],help='Reproducible refactoring & handover benchmark: Raw Markdown vs Unverified Wiki vs Memlet'))
     cmp_p.add_argument('repo_positional',nargs='?',default=None);cmp_p.add_argument('--format',action=_OutputFormat,default='json',choices=['json','markdown'])
-    heal_p=sub.add_parser('heal-skills');heal_p.add_argument('--dry-run',action='store_true')
-    ver_p=sub.add_parser('verify-skill');ver_p.add_argument('--id',required=True);ver_p.add_argument('--command',default=None)
+    heal_p=_call_foreign(lambda: sub.add_parser('heal-skills'));heal_p.add_argument('--dry-run',action='store_true')
+    ver_p=_call_foreign(lambda: sub.add_parser('verify-skill'));ver_p.add_argument('--id',required=True);ver_p.add_argument('--command',default=None)
     ver_p.add_argument('--proof-file',default=None);ver_p.add_argument('--operation-id',default='');ver_p.add_argument('--timeout',type=float,default=15.0)
-    pf_p=sub.add_parser('preflight');pf_p.add_argument('--plan',default='');pf_p.add_argument('--files',default='');pf_p.add_argument('--action-type',default='')
-    caps_p=sub.add_parser('capsule');caps_p.add_argument('--plan',default='');caps_p.add_argument('--files',default='');caps_p.add_argument('--worker',default='');caps_p.add_argument('--budget',type=int,default=1200)
-    cons_p=sub.add_parser('consolidate');cons_p.add_argument('--threshold',type=float,default=0.35);cons_p.add_argument('--dry-run',action='store_true')
-    sync_md_p=sub.add_parser('sync-md');sync_md_p.add_argument('--note-path',default=None);sync_md_p.add_argument('--explicit-user',action='store_true')
-    bench_p=sub.add_parser('benchmark',help='Without --task: refactoring & handover comparison benchmark; with --task: memory store benchmark')
+    pf_p=_call_foreign(lambda: sub.add_parser('preflight'));pf_p.add_argument('--plan',default='');pf_p.add_argument('--files',default='');pf_p.add_argument('--action-type',default='')
+    caps_p=_call_foreign(lambda: sub.add_parser('capsule'));caps_p.add_argument('--plan',default='');caps_p.add_argument('--files',default='');caps_p.add_argument('--worker',default='');caps_p.add_argument('--budget',type=int,default=1200)
+    cons_p=_call_foreign(lambda: sub.add_parser('consolidate'));cons_p.add_argument('--threshold',type=float,default=0.35);cons_p.add_argument('--dry-run',action='store_true')
+    sync_md_p=_call_foreign(lambda: sub.add_parser('sync-md'));sync_md_p.add_argument('--note-path',default=None);sync_md_p.add_argument('--explicit-user',action='store_true')
+    bench_p=_call_foreign(lambda: sub.add_parser('benchmark',help='Without --task: refactoring & handover comparison benchmark; with --task: memory store benchmark'))
     bench_p.add_argument('repo_positional',nargs='?',default=None);bench_p.add_argument('--budget',type=int,default=6000)
     bench_p.add_argument('--format',action=_OutputFormat,default=None,choices=['json','markdown'])
-    insp_p=sub.add_parser('inspector',help='Without --task: same HTML report as `ui`; with --task: task-memory inspector');insp_p.add_argument('--budget',type=int,default=6000)
-    ui_p=sub.add_parser('ui',help='Memlet Inspector: self-contained HTML report (AST health, benchmark, handover)')
+    insp_p=_call_foreign(lambda: sub.add_parser('inspector',help='Without --task: same HTML report as `ui`; with --task: task-memory inspector'));insp_p.add_argument('--budget',type=int,default=6000)
+    ui_p=_call_foreign(lambda: sub.add_parser('ui',help='Memlet Inspector: self-contained HTML report (AST health, benchmark, handover)'))
     for p in (insp_p,ui_p):
         p.add_argument('repo_positional',nargs='?',default=None);p.add_argument('--repo-path','--repo',dest='repo_path',default=None)
         p.add_argument('--output','--out',dest='output',default=None,help='HTML output file');p.add_argument('--output-dir',default=None)
-    exp_p=sub.add_parser('export');exp_p.add_argument('--targets',default='claude,agents,cursor,windsurf,mcp')
+    exp_p=_call_foreign(lambda: sub.add_parser('export'));exp_p.add_argument('--targets',default='claude,agents,cursor,windsurf,mcp')
     exp_p.add_argument('--target-dir',default=None);exp_p.add_argument('--write',action='store_true');exp_p.add_argument('--lang',default='ko')
-    cap_p=sub.add_parser('capture');cap_p.add_argument('--file',default=None);cap_p.add_argument('--text',default=None)
+    cap_p=_call_foreign(lambda: sub.add_parser('capture'));cap_p.add_argument('--file',default=None);cap_p.add_argument('--text',default=None)
     cap_p.add_argument('--kind',default='auto');cap_p.add_argument('--command',default='');cap_p.add_argument('--operation-id',default='')
-    recall=sub.add_parser('recall');recall.add_argument('--query',action=_ExplicitValue,default='');recall.add_argument('--at');recall.add_argument('--known-at')
+    recall=_call_foreign(lambda: sub.add_parser('recall'));recall.add_argument('--query',action=_ExplicitValue,default='');recall.add_argument('--at');recall.add_argument('--known-at')
     recall.add_argument('--before');recall.add_argument('--after');recall.add_argument('--shared',action='store_true');recall.add_argument('--federated',action='store_true')
     recall.add_argument('--budget',type=int,default=None)
-    read=sub.add_parser('read');read.add_argument('--id',required=True);read.add_argument('--offset',type=int,default=0);read.add_argument('--size',type=int,default=6000)
-    skills_p=sub.add_parser('skills');skills_p.add_argument('--query',default='');skills_p.add_argument('--include-inactive',action='store_true')
+    read=_call_foreign(lambda: sub.add_parser('read'));read.add_argument('--id',required=True);read.add_argument('--offset',type=int,default=0);read.add_argument('--size',type=int,default=6000)
+    skills_p=_call_foreign(lambda: sub.add_parser('skills'));skills_p.add_argument('--query',default='');skills_p.add_argument('--include-inactive',action='store_true')
     skills_p.add_argument('--at');skills_p.add_argument('--known-at');skills_p.add_argument('--before');skills_p.add_argument('--after')
     skills_p.add_argument('--shared',action='store_true');skills_p.add_argument('--federated',action='store_true');skills_p.add_argument('--limit',type=int,default=50);skills_p.add_argument('--budget',type=int,default=2400)
-    skill_p=sub.add_parser('skill');skill_p.add_argument('--id',required=True)
-    cases_p=sub.add_parser('cases');cases_p.add_argument('--limit',type=int,default=25)
-    links_p=sub.add_parser('links');links_p.add_argument('--id',default=None);links_p.add_argument('--limit',type=int,default=100)
+    skill_p=_call_foreign(lambda: sub.add_parser('skill'));skill_p.add_argument('--id',required=True)
+    cases_p=_call_foreign(lambda: sub.add_parser('cases'));cases_p.add_argument('--limit',type=int,default=25)
+    links_p=_call_foreign(lambda: sub.add_parser('links'));links_p.add_argument('--id',default=None);links_p.add_argument('--limit',type=int,default=100)
     for name in ('feedback','skill-manage'):
-        sub.add_parser(name).add_argument('--file',required=True)
-    learn=sub.add_parser('learn')
+        _call_foreign(lambda: sub.add_parser(name).add_argument('--file',required=True))
+    learn=_call_foreign(lambda: sub.add_parser('learn'))
     learn.__class__ = _LearnParser
     learn_mode=learn.add_mutually_exclusive_group(required=True)
     learn_mode.add_argument('--file',help='Existing memory-store learning request JSON')
-    sub.add_parser('skill-sync')
-    idx=sub.add_parser('index');idx.add_argument('--limit',type=int,default=200)
-    imp=sub.add_parser('backfill');imp.add_argument('--source-session',required=True);imp.add_argument('--end-byte',type=int)
+    _call_foreign(lambda: sub.add_parser('skill-sync'))
+    idx=_call_foreign(lambda: sub.add_parser('index'));idx.add_argument('--limit',type=int,default=200)
+    imp=_call_foreign(lambda: sub.add_parser('backfill'));imp.add_argument('--source-session',required=True);imp.add_argument('--end-byte',type=int)
     # Freeze legacy option spellings before any router-only options are added.
     for child in set(sub.choices.values()):
         _reserve_legacy_prefixes(child)
@@ -752,7 +754,7 @@ def _build_parser():
     aud_p.add_argument('--dry-run',action='store_true',help='Preview supported anchor updates')
     dream_p.add_argument('--allow-unverified',action='store_true',help='Allow recall without a snapshot, labelled UNVERIFIED')
     for name in ('dream-pending','dream-approve','dream-reject'):
-        p=sub.add_parser(name)
+        p=_call_foreign(lambda: sub.add_parser(name))
         p.add_argument('--graph',required=True,help='Path to the Dream approval queue JSON')
         if name!='dream-pending':
             p.add_argument('ids',nargs='+',metavar='ID')
@@ -861,14 +863,14 @@ def _main(args, parser):
         repo=args.repo or '.'
         if args.legacy_query is not None:
             if not query or not Path(query).is_dir():
-                parser.error('The first of two positionals must be an existing directory. '+usage)
+                _call_foreign(lambda: parser.error('The first of two positionals must be an existing directory. '+usage))
             if args.repo is not None and Path(query).resolve()!=Path(args.repo).resolve():
-                parser.error('Positional repository conflicts with --repo. '+usage)
+                _call_foreign(lambda: parser.error('Positional repository conflicts with --repo. '+usage))
             repo,query=query,args.legacy_query
         elif query and Path(query).is_dir():
-            parser.error('A lone directory is ambiguous; supply a query. '+usage)
+            _call_foreign(lambda: parser.error('A lone directory is ambiguous; supply a query. '+usage))
         if not query or not query.strip():
-            parser.error('A rule query is required. '+usage)
+            _call_foreign(lambda: parser.error('A rule query is required. '+usage))
         return recall(repo,query,k=args.k,safety=args.safety)
     if args.action=='index-build':
         from memlet.memlet_index import build_index
@@ -910,31 +912,31 @@ def _main(args, parser):
             raise ValueError('task is required (--task <taskId>)')
     if args.standalone:
         args.session=args.session or 'standalone-owner'
-        task=store.ensure_standalone_task(args.task,session=args.session)
+        task=_call_foreign(lambda: store.ensure_standalone_task(args.task,session=args.session))
     else:
-        task=store.get(args.task)
+        task=_call_foreign(lambda: store.get(args.task))
     if uses_default_task:
         notice=legacy_standalone_notice(store,args.task)
         if notice:print(notice,file=sys.stderr)
     if args.action=='brief':
-        result=store.memory(args.task,include_retrieval=False)
-        with store.db() as db:
-            originals=[work_memory._public(r) for r in db.execute(
-                "SELECT * FROM memory_items WHERE task=? AND kind IN ('instruction','report') ORDER BY event_id DESC LIMIT 10",(args.task,))]
+        result=_call_foreign(lambda: store.memory(args.task,include_retrieval=False))
+        with _foreign_context(lambda: store.db()) as db:
+            originals=[work_memory._public(r) for r in _call_foreign(lambda: list(db.execute(
+                "SELECT * FROM memory_items WHERE task=? AND kind IN ('instruction','report') ORDER BY event_id DESC LIMIT 10",(args.task,))))]
         result['originals']=[{'id':r['item_id'],'kind':r['kind'],'excerpt':r['content'][:2000],
                               'totalChars':len(r['content']),'source':r['source']} for r in originals]
         result.update(owner=task['owner'],project=task['project'],note='Use read for exact source quotes beyond the excerpt.')
         return result
     if args.action=='recall':
-        result=store.memory(args.task,args.query,args.budget,at=args.at,known_at=args.known_at,
-                            before=args.before,after=args.after,shared=args.shared,federated=args.federated)
+        result=_call_foreign(lambda: store.memory(args.task,args.query,args.budget,at=args.at,known_at=args.known_at,
+                            before=args.before,after=args.after,shared=args.shared,federated=args.federated))
         result['recallId']=memory.record_recall(store,args.task,args.session,'cli:'+str(time.time_ns()),args.query,result['retrieval'])
         return result
     if args.action=='read':return read_item(store,args.task,args.id,args.offset,args.size)
     if args.action=='skills':
-        return store.skills(args.task,args.query,include_inactive=args.include_inactive,
+        return _call_foreign(lambda: store.skills(args.task,args.query,include_inactive=args.include_inactive,
                             at=args.at,known_at=args.known_at,before=args.before,after=args.after,
-                            shared=args.shared,federated=args.federated,limit=args.limit,budget=args.budget)
+                            shared=args.shared,federated=args.federated,limit=args.limit,budget=args.budget))
     if args.action=='skill':
         return memory.read_skill(store,args.task,args.id)
     if args.action=='cases':

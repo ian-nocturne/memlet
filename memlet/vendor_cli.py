@@ -4,6 +4,8 @@ Codex exec (even read-only) still offers file/shell tools. agy plan/sandbox is n
 no-tools. Their installed help was inspected for 9.1; both fail closed. Adding a
 vendor requires an audited no-tools mode, not a prompt asking it to behave.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import contextlib
 import json
 import os
@@ -215,7 +217,7 @@ def run_vendor(vendor, prompt, *, stdin_text="", timeout=120, max_output_bytes=2
         return dict(result, error="vendor authentication exhausted timeout")
     try:
         if runner is not None:  # explicit test seam, never exposed through CLI/config/MCP
-            text = runner(vendor, prompt, stdin_text=stdin_text, model=model, timeout=timeout)
+            text = _call_foreign(lambda: runner(vendor, prompt, stdin_text=stdin_text, model=model, timeout=timeout))
             rc = 0
         else:
             with tempfile.TemporaryDirectory(prefix="memlet-vendor-") as empty:

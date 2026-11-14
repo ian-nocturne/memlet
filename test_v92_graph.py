@@ -282,7 +282,7 @@ class GraphTests(fixtures.Scratch):
 
     def assert_reader_agreement(self, repo, target):
         with mb._lesson_path_projection(repo, None) as context:
-            approved = {i['id']: dict(i, paths=context['paths'].get(i['id'], [])) for i in mb.dream_items(repo)['items']}
+            approved = {i['id']: dict(i, paths=context['paths'].get(i['id'], [])) for i in mb.dream_items(repo, _path_context=context)['items']}
         built = graph.build_graph(repo)
         self.assertTrue(built['ok'], built)
         projected = {i['id']: i for i in built['nodes'] if i.get('recordType') == 'item' and i['tier'] == 'approved'}
@@ -431,7 +431,7 @@ class GraphTests(fixtures.Scratch):
         for state in ('approved', 'hint', 'pending', 'rejected', 'edge-rejected', 'vetoed'):
             repo, nodes = self.fixture(state)
             with mb._lesson_path_projection(repo, None) as context:
-                read = mb.dream_items(repo, tiers=('approved', 'hint'))['items']
+                read = mb.dream_items(repo, tiers=('approved', 'hint'), _path_context=context)['items']
                 attachments = dict(context['paths'])
             built = graph.build_graph(repo)
             self.assertTrue(built['ok'], built)

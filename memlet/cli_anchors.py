@@ -8,6 +8,9 @@
 No subcommand calls a model or the network; only `accept` and `drop` write, and only inside `.memlet/`.
 """
 
+from memlet.memlet_dream import call_foreign as _call_foreign
+
+
 from typing import Any, Dict
 
 from memlet import cli_plugins
@@ -20,7 +23,7 @@ COMMANDS = {"anchors": {"help": "Suggest code anchors for rules that mention cod
 
 def register(sub) -> None:
     import argparse
-    p = sub.add_parser("anchors", prog="memlet admin anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
+    p = _call_foreign(lambda: sub.add_parser("anchors", prog="memlet admin anchors", help=COMMANDS["anchors"]["help"], formatter_class=argparse.RawDescriptionHelpFormatter,
                        description="Rules that mention code in backticks or as name() but carry no `path::symbol` "
                                    "anchor can be anchored without editing your files. Suggestions are proposals for "
                                    f"you to check: {FILE_SYMBOL} (the rule names the file, which has one definition) or "
@@ -29,29 +32,29 @@ def register(sub) -> None:
                        epilog="A path in a rule is read from the repository root and from the instruction file's "
                               "folder; when both exist the mention is ambiguous. Write a leading `/` (`/src/auth.py`) "
                               "to mean the repository root only.\n\n"
-                              + INTEGRITY_NOTICE)
-    nested = p.add_subparsers(dest="anchors_command", metavar="{suggest,accept,list,drop}")
-    nested.required = True
-    s = nested.add_parser("suggest", help="List rules that could be anchored (read-only).")
-    s.add_argument("--repo", default=".", help="Repository path (default: current directory)")
-    s.add_argument("--limit", type=int, default=200, help="At most this many suggestions and ambiguous entries")
+                              + INTEGRITY_NOTICE))
+    nested = _call_foreign(lambda: p.add_subparsers(dest="anchors_command", metavar="{suggest,accept,list,drop}"))
+    _call_foreign(setattr, nested, "required", True)
+    s = _call_foreign(lambda: nested.add_parser("suggest", help="List rules that could be anchored (read-only)."))
+    _call_foreign(lambda: s.add_argument("--repo", default=".", help="Repository path (default: current directory)"))
+    _call_foreign(lambda: s.add_argument("--limit", type=int, default=200, help="At most this many suggestions and ambiguous entries"))
     cli_plugins.add_format_option(s)
-    a = nested.add_parser("accept", help=f"Accept suggestions by id (any level), or every {FILE_SYMBOL} suggestion with "
-                                         "--all-unique.")
-    a.add_argument("ids", nargs="*", metavar="ID")
-    a.add_argument("--all-unique", action="store_true",
+    a = _call_foreign(lambda: nested.add_parser("accept", help=f"Accept suggestions by id (any level), or every {FILE_SYMBOL} suggestion with "
+                                         "--all-unique."))
+    _call_foreign(lambda: a.add_argument("ids", nargs="*", metavar="ID"))
+    _call_foreign(lambda: a.add_argument("--all-unique", action="store_true",
                    help=f"Accept every current {FILE_SYMBOL} suggestion (the rule names the file). {SINGLE_DEFINITION_FOUND} "
-                        "suggestions are never accepted in bulk: check each and accept it by id")
-    a.add_argument("--dry-run", action="store_true", help="Show what would be accepted; write nothing")
-    a.add_argument("--repo", default=".")
+                        "suggestions are never accepted in bulk: check each and accept it by id"))
+    _call_foreign(lambda: a.add_argument("--dry-run", action="store_true", help="Show what would be accepted; write nothing"))
+    _call_foreign(lambda: a.add_argument("--repo", default="."))
     cli_plugins.add_format_option(a)
-    lst = nested.add_parser("list", help="Accepted sidecar anchors and whether they still attach.")
-    lst.add_argument("--repo", default=".")
+    lst = _call_foreign(lambda: nested.add_parser("list", help="Accepted sidecar anchors and whether they still attach."))
+    _call_foreign(lambda: lst.add_argument("--repo", default="."))
     cli_plugins.add_format_option(lst)
-    d = nested.add_parser("drop", help="Remove accepted sidecar anchors by id.")
-    d.add_argument("ids", nargs="*", metavar="ID")
-    d.add_argument("--dry-run", action="store_true")
-    d.add_argument("--repo", default=".")
+    d = _call_foreign(lambda: nested.add_parser("drop", help="Remove accepted sidecar anchors by id."))
+    _call_foreign(lambda: d.add_argument("ids", nargs="*", metavar="ID"))
+    _call_foreign(lambda: d.add_argument("--dry-run", action="store_true"))
+    _call_foreign(lambda: d.add_argument("--repo", default="."))
     cli_plugins.add_format_option(d)
 
 

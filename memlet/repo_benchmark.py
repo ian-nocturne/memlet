@@ -7,6 +7,8 @@ Evaluates agent memory and procedural skill engines across 4 realistic repositor
 - Epoch 4 (v4_reverification_and_isolation): Execution-backed skill verification (pass & fail -> pitfall case) + Multi-DB isolation.
 """
 from __future__ import annotations
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 from pathlib import Path
 import shutil
 import tempfile
@@ -154,13 +156,13 @@ def _write_epoch3_breaking_evolution(files: Dict[str, Path]) -> None:
 
 
 def _seed_benchmark_task(store: StandaloneStore, task_id: str, owner: str) -> Dict[str, Any]:
-    store.ensure_task(
+    _call_foreign(lambda: store.ensure_task(
         task_id,
         title="Payment & Webhook Service Evolution",
         owner=owner,
         project="bench-proj",
         goal="Maintain payment_gateway.py, webhook_router.py, db_migrator.py, and auth_token.py safely across API versions.",
-    )
+    ))
     src_text = (
         "결제·웹훅·마이그레이션·인증 모듈 표준 절차 및 주의사항: "
         "1) payment_gateway.py의 charge_customer(user_id, amount_cents, currency='KRW') 호출 전 정수 센트 단위를 검증하고 부동소수점(float) 금액 전달을 금지한다. "
@@ -168,12 +170,12 @@ def _seed_benchmark_task(store: StandaloneStore, task_id: str, owner: str) -> Di
         "3) db_migrator.py의 run_migration(target_rev, dry_run=True)은 프로덕션 반영 전 dry_run=True로 먼저 점검하고 활성 락을 확인한다. "
         "4) auth_token.py의 verify_jwt(token_str, audience='api')는 alg=none 토큰을 즉시 차단한다."
     )
-    with store.db(True) as db:
-        ledger.record(
+    with _foreign_context(lambda: store.db(True)) as db:
+        _call_foreign(lambda: ledger.record(
             db, task_id, 1, "seed-inst-1", "instruction", "input:seed-1", "assert",
             src_text, {"kind": "user-instruction", "session": owner, "certainty": "explicit-user"}, time.time(),
-        )
-        t_row = db.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone()
+        ))
+        t_row = _call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone())
         rev = int(t_row["revision"])
 
     entries = [
@@ -371,7 +373,7 @@ def _evaluate_system(
     # Build static AGENTS.md snapshot at Epoch 1 (for static_agents_md baseline)
     static_export = memory.export_rules(store, task_id, targets=["agents"], write_files=False)
     static_agents_text = static_export["exports"]["agents"]["content"]
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         epoch1_skills_dump = "\n\n".join(
             s["body"] for s in skills_ledger.snapshot_skills(db, task_id, include_inactive=False)
         )
@@ -418,9 +420,9 @@ def _evaluate_system(
             ]
             surfaced_cases = ["case:pitfall-float-currency", "case:pitfall-jwt-none-alg"]
         elif system_id == "vanilla_bm25":
-            with store.db() as db:
+            with _foreign_context(lambda: store.db()) as db:
                 all_skills = skills_ledger.snapshot_skills(db, task_id, include_inactive=False)
-                all_items = ledger.current(db, task_id, kinds=["fact", "experience", "case", "constraint"])
+                all_items = _call_foreign(lambda: ledger.current(db, task_id, kinds=["fact", "experience", "case", "constraint"]))
             q_words = set(ledger._normalize(query + " " + target_file).split())
             scored_sk = []
             for sk in all_skills:
@@ -439,7 +441,7 @@ def _evaluate_system(
         else:
             # Memlet v9.0.0 or one of the 4 ablations
             use_session = "" if system_id == "ablation_no_delta_prompting" else session_id
-            view = store.memory(task_id, query=query, budget=4000)
+            view = _call_foreign(lambda: store.memory(task_id, query=query, budget=4000))
             prompt_text, pkt = memory.build_turn_context(
                 store,
                 task_id,
@@ -459,7 +461,7 @@ def _evaluate_system(
                 )
             elif system_id == "ablation_no_ast_guard":
                 # Without AST guard, even stale/broken or compatible-unverified skills matching the query get injected into Tier-1
-                with store.db() as db:
+                with _foreign_context(lambda: store.db()) as db:
                     raw_skills = skills_ledger.snapshot_skills(db, task_id, include_inactive=False)
                 q_w = set(ledger._normalize(query + " " + target_file).split())
                 scored_raw = []
@@ -563,7 +565,7 @@ def _evaluate_system(
     ]
     # Governance Trap 1: Directive turn ("제안대로 모두 진행해줘") after draft skill
     verification_trap_opportunities += 1
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         draft_skills = [
             s for s in skills_ledger.snapshot_skills(db, task_id, include_inactive=False)
             if s["evidence_state"] == "reported"
@@ -579,7 +581,7 @@ def _evaluate_system(
         # Simulate pre-v9.0.0 behavior where 2 implicit turns with directive promoted to feedback-verified
         false_verifications += 1
     else:
-        with store.db() as db:
+        with _foreign_context(lambda: store.db()) as db:
             sk_after_dir = skills_ledger.get_skill(db, task_id, draft_id)
             if sk_after_dir and sk_after_dir["evidence_state"] == "feedback-verified":
                 false_verifications += 1
@@ -601,7 +603,7 @@ def _evaluate_system(
     if system_id in ("static_agents_md", "vanilla_bm25", "ablation_no_ast_guard", "ablation_no_execution_verification_gate"):
         false_verifications += 1
     else:
-        with store.db() as db:
+        with _foreign_context(lambda: store.db()) as db:
             sk_pay_v2 = skills_ledger.get_skill(db, task_id, "skill:payment-charge-flow")
             if sk_pay_v2 and sk_pay_v2["evidence_state"] == "feedback-verified":
                 false_verifications += 1
@@ -697,7 +699,7 @@ def _evaluate_system(
 
     # Governance Trap 3: Unverified disk edit of SKILL.md without `explicit_user=True`
     verification_trap_opportunities += 1
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         wh_sk = skills_ledger.get_skill(db, task_id, "skill:webhook-dispatch-flow")
     if wh_sk and Path(wh_sk["skill_path"]).is_file():
         p_wh = Path(wh_sk["skill_path"])
@@ -712,7 +714,7 @@ def _evaluate_system(
         if system_id == "ablation_no_execution_verification_gate":
             false_verifications += 1
         else:
-            with store.db() as db:
+            with _foreign_context(lambda: store.db()) as db:
                 wh_after = skills_ledger.get_skill(db, task_id, "skill:webhook-dispatch-flow")
                 if wh_after and wh_after["evidence_state"] in ("user-confirmed", "feedback-verified"):
                     false_verifications += 1
@@ -735,13 +737,13 @@ def _evaluate_system(
     # EPOCH 4: v4 Skill Update + Execution Verification Pass/Fail + Multi-DB Isolation
     # =========================================================================
     # Register a new v4 skill for the updated `payment_gateway.py` and verify it via real command execution!
-    with store.db(True) as db:
-        ledger.record(
+    with _foreign_context(lambda: store.db(True)) as db:
+        _call_foreign(lambda: ledger.record(
             db, task_id, 10, "seed-inst-v4", "instruction", "input:seed-v4", "assert",
             "v4 결제 인터페이스는 charge_customer(account_uuid, money_obj, *, idempotency_key) 키워드 인자를 필수로 사용한다.",
             {"kind": "user-instruction", "session": owner, "certainty": "explicit-user"}, time.time(),
-        )
-        rev_v4 = int(db.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone()["revision"])
+        ))
+        rev_v4 = int(_call_foreign(lambda: db.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone())["revision"])
     memory.learn(
         store,
         task_id,

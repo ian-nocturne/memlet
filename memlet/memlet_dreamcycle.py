@@ -205,6 +205,7 @@ def _prune_host_runs(root):
         total -= size
 
 
+@md.fresh_read
 def dream_ingest(repo, transcript_path, *, dry_run=False):
     """Snapshot only. Same bounded visible-message reader/masking/path policy as learn."""
     try:
@@ -367,9 +368,11 @@ def _next(root, run_id, batch_tokens, *, lane="host", snapshot_override=None, sk
     base = {"ok": True, "runId": run_id, "batchTokens": batch_tokens, "totalBatches": len(plan),
             "candidateSchema": copy.deepcopy(CANDIDATE_SCHEMA), "prompt": PROPOSE_PROMPT,
             "plan": plan, "starts": starts, "lane": lane}
+    completed_set = set(state.get("completed", []))
+    skip_set = set(skip_batches)
     for i, spec in enumerate(plan):
         bid = _hash([run_id, i, spec])[:24]
-        if (bid not in state.get("completed", []) and bid not in skip_batches
+        if (bid not in completed_set and bid not in skip_set
                 and (requested_batch is None or bid == requested_batch)):
             rows = _plan_rows(snapshot, spec, batch_tokens)
             data = _snapshot_text(rows)
@@ -390,9 +393,10 @@ def _complete_batch(root, current, state):
     snapshot, _ = mb._load_snapshot(root)
     # Advance only across contiguous completed ranges, so a later successful
     # batch cannot erase a failed earlier batch from the next explicit run.
+    completed_set = set(state.get("completed", []))
     for index, spec in enumerate(state["plan"]):
         bid = _hash([state["runId"], index, spec])[:24]
-        if bid not in state.get("completed", []):
+        if bid not in completed_set:
             continue
         for f, first, last in spec["ranges"]:
             session = sessions["sessions"].setdefault(f, {"lines": len(snapshot[f]), "dreamed": 0})
@@ -401,6 +405,7 @@ def _complete_batch(root, current, state):
     _write(root, progress_rel, sessions)
 
 
+@md.fresh_read
 def dream_next(repo, *, run_id=None, batch_tokens=6000):
     """Read-only deterministic next batch. State is committed only by submit/run."""
     try:
@@ -566,13 +571,13 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                     spans += [edge[k] for k in ("src_span", "target_span") if k in edge]
                 for span in spans:
                     parsed = md.parse_span(span)
-                    if not parsed or not md.resolve_pin(snapshot, span, max_lines=4):
+                    if not parsed or not md._resolve_pin(snapshot, span, max_lines=4):
                         raise ValueError("unpinnable citation")
                     if not all((parsed[0], n) in allowed for n in range(parsed[1], parsed[2] + 1)):
                         raise ValueError("citation outside supplied batch")
                 # An omitted edge source has always meant the canonical first cited line.
                 # Keep that default stable without rewriting the node's semantic primary pin.
-                canonical = _pin_lines([md.resolve_pin(snapshot, span, max_lines=4) for span in clean["src_spans"]])[0]
+                canonical = _pin_lines([md._resolve_pin(snapshot, span, max_lines=4) for span in clean["src_spans"]])[0]
                 for edge in clean["edges"]:
                     edge.setdefault("src_span", "%s:%d" % canonical[:2])
                 clean["lesson_id"] = "DRM-" + _hash([clean, lane])[:16]
@@ -584,21 +589,21 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                 for node in graph["nodes"]:
                     known = {p["span"] for p in node["allPins"]}
                     for span in spans:
-                        pin = md.resolve_pin(snapshot, span, max_lines=4)
+                        pin = md._resolve_pin(snapshot, span, max_lines=4)
                         if pin["span"] not in known:
                             node["allPins"].append(pin)
                             known.add(pin["span"])
                     cited = _pin_lines(node["allPins"])
                     primary = node["primaryPin"]
                     covered = {(f, n) for f, n, _ in _pin_lines([primary])}
-                    node["allPins"] = [primary] + [md.resolve_pin(snapshot, "%s:%d" % (f, n))
+                    node["allPins"] = [primary] + [md._resolve_pin(snapshot, "%s:%d" % (f, n))
                                                    for f, n, _ in cited if (f, n) not in covered]
                     node["timestamp"] = md.extract_line_timestamp(node["primaryPin"]["quoteText"])
                 # Preserve endpoint identity even for non-SUPERSEDES edges.
                 for node in graph["nodes"]:
                     for edge, source in zip(node["edges"], clean["edges"]):
                         if source.get("target_span"):
-                            edge["citedTargetPin"] = md.resolve_pin(snapshot, source["target_span"], max_lines=4)
+                            edge["citedTargetPin"] = md._resolve_pin(snapshot, source["target_span"], max_lines=4)
                 check = md.verify_ontology_contract(graph, snapshot)
                 if not check["ok"]:
                     raise ValueError("candidate_ontology_invalid")
@@ -636,7 +641,7 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
                 target = node
                 added.append(node["id"])
             record = _receipt(proposer, node, run_id, launched)
-            record["citations"] = [md.resolve_pin(snapshot, "%s:%d" % (f, n))
+            record["citations"] = [md._resolve_pin(snapshot, "%s:%d" % (f, n))
                                    for f, n, _ in _pin_lines(node["allPins"])]
             seal_receipt(record)
             records = target.setdefault("proposers", [])
@@ -674,6 +679,7 @@ def _submit(repo, run_id, batch_id, candidates, proposer, launched=None, batch=N
         return result
 
 
+@md.fresh_read
 def dream_submit(repo, run_id, batch_id, candidates, *, proposer):
     """Untrusted submission. A vendor name alone never creates a launch receipt."""
     try:
@@ -831,6 +837,7 @@ def _save_answer(directory, vendor, model, kind, data, answer, expected):
         stream.write(raw)
 
 
+@md.fresh_read
 def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=None, dry_run=False, transcript=None, save_fixture=None):
     started = time.monotonic()
     report = {"ok": True, "calls": 0, "batches": 0, "failedBatches": 0, "droppedOutput": 0,
@@ -964,9 +971,10 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
             report["plannedExistingVerificationCalls"] = min(len(existing), MAX_CALLS)
             state = _read(root, state_rel, {})
             report["retryFailedBatches"] = []
+            completed_set = set(state.get("completed", []))
             for i, spec in enumerate(first["plan"]):
                 bid = _hash([run_id, i, spec])[:24]
-                if bid in state.get("completed", []):
+                if bid in completed_set:
                     continue
                 if report["batches"] >= max_batches or len(report["prompts"]) + len(vendors) > MAX_CALLS:
                     break
@@ -1092,11 +1100,12 @@ def dream_run(repo, *, via=("claude",), verify_with=None, max_batches=4, runner=
     return report
 
 
-def dream_status(repo):
+@md.fresh_read
+def dream_status(repo, *, _read_state=None):
     try:
         root, _ = _repo(repo)
         sessions = _read(root, STATE_REL, {"sessions": {}})["sessions"]
-        tiers = mb.dream_items(root, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING))
+        tiers = mb.dream_items(root, tiers=(TIER_APPROVED, TIER_HINT, TIER_PENDING), _read_state=_read_state)
         runs = []
         if (root / RUNS_REL).is_dir():
             for p in sorted((root / RUNS_REL).glob("*.json")):
@@ -1117,6 +1126,7 @@ def dream_status(repo):
         return mb._fail(str(exc), 2)
 
 
+@md.fresh_read
 def dream_skip_failed(repo, batch_id, *, dry_run=False):
     """Explicit, recorded completion with rejections; never launches a model."""
     try:

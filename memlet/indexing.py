@@ -1,4 +1,6 @@
 """True O(postings) inverted index, active row snapshot cache, and O(N*k) incremental link graph."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 from collections import Counter
 import math
 import re
@@ -41,7 +43,7 @@ class SparseCountsProxy:
 
 def db_identity_key(db) -> str:
     try:
-        db_list = db.execute("PRAGMA database_list").fetchall()
+        db_list = _call_foreign(lambda: db.execute("PRAGMA database_list").fetchall())
         if db_list and len(db_list[0]) > 2 and db_list[0][2]:
             return str(db_list[0][2])
     except Exception:
@@ -69,16 +71,16 @@ def invalidate_task_caches(task: str = None, inverted_cache: dict = None):
 
 def _fast_task_event_sig(db, task: str):
     """O(log N) top-of-index lookup using idx_memory_events_task_observed instead of scanning all task rows."""
-    top_ev = db.execute(
+    top_ev = _call_foreign(lambda: db.execute(
         "SELECT id, observed_at FROM memory_events WHERE task=? ORDER BY observed_at DESC, id DESC LIMIT 1",
         (task,),
-    ).fetchone()
+    ).fetchone())
     if top_ev is not None:
         return int(top_ev[0] or 0), round(float(top_ev[1] or 0.0), 4)
-    stat = db.execute(
+    stat = _call_foreign(lambda: db.execute(
         "SELECT COALESCE(max(event_id), 0), COALESCE(max(observed_at), 0.0) FROM memory_items WHERE task=? AND status='active'",
         (task,),
-    ).fetchone()
+    ).fetchone())
     return int(stat[0] or 0), round(float(stat[1] or 0.0), 4)
 
 
@@ -103,10 +105,10 @@ def get_cached_task_rows(db, task: str, recall_kinds, snapshot_limit: int = 5000
 
     # Fetch without current-time valid_from/valid_until SQL filter if we want to inspect temporal bounds,
     # or use ledger.snapshot with higher limit (25,000 instead of 5,000).
-    own = ledger.snapshot(
+    own = _call_foreign(lambda: ledger.snapshot(
         db, task, None, None, kinds=recall_kinds, limit=snapshot_limit,
         before=None, after=None, with_count=True,
-    )
+    ))
     result = [
         r for r in own["items"]
         if not (r["kind"] in ("experience", "case") and r["source"].get("evidenceState") == "needs_revision")
@@ -119,11 +121,11 @@ def get_cached_task_rows(db, task: str, recall_kinds, snapshot_limit: int = 5000
     )
     # Check if there are any future-scheduled active items in DB that could become valid later
     if not has_temporal:
-        fut = db.execute(
+        fut = _call_foreign(lambda: db.execute(
             "SELECT 1 FROM memory_items WHERE task=? AND status='active' "
             "AND (valid_until IS NOT NULL OR (valid_from IS NOT NULL AND valid_from > event_at + 0.001)) LIMIT 1",
             (task,),
-        ).fetchone()
+        ).fetchone())
         has_temporal = bool(fut)
 
     if not has_temporal:
@@ -204,7 +206,7 @@ def build_or_get_lexical_index(rows, task: str, cached_doc_tokens_fn, cache_dict
 
     for idx, r in enumerate(rows):
         item_index_by_id.setdefault(r.get("item_id", ""), []).append(idx)
-        full_c, length, norm_t = cached_doc_tokens_fn(r["content"])
+        full_c, length, norm_t = _call_foreign(lambda: cached_doc_tokens_fn(r["content"]))
         total_len += length
         norm_texts.append(norm_t)
         src_i = r.get("source") or {}
@@ -387,7 +389,7 @@ def score_lexical_postings(rows, lex_index, normalized, terms, pairs, qwords, fa
     anchors = {}
     for i in eval_indices:
         full_c, _, norm_i, _ = doc_entries[i]
-        base, anchor = fast_lexical_fn(full_c, norm_i, normalized, terms, pairs)
+        base, anchor = _call_foreign(lambda: fast_lexical_fn(full_c, norm_i, normalized, terms, pairs))
         bm25 = doc_bm25_exact.get(i, 0.0)
         if base or bm25:
             lexical[i] = bm25 + base / 20.0
@@ -432,20 +434,20 @@ def check_link_sync_needed(db, task: str, ensure_schema_fn=None):
     Otherwise returns `(need_sync, cached_result, sig)` for `sync_task_links`.
     """
     if ensure_schema_fn is not None:
-        ensure_schema_fn(db)
+        _call_foreign(lambda: ensure_schema_fn(db))
     db_key = db_identity_key(db)
     ckey = (db_key, task)
     cached = _LINK_SYNC_STATE_CACHE.get(ckey)
 
     # Fast O(log N) top-of-index check when we already have a cached link state
     ev_id, ev_obs = _fast_task_event_sig(db, task)
-    sk_top = db.execute(
+    sk_top = _call_foreign(lambda: db.execute(
         "SELECT id, observed_at FROM memory_skill_events WHERE task=? ORDER BY observed_at DESC, id DESC LIMIT 1",
         (task,),
-    ).fetchone()
+    ).fetchone())
     sk_id = int(sk_top[0] or 0) if sk_top is not None else 0
     sk_obs = round(float(sk_top[1] or 0.0), 3) if sk_top is not None else 0.0
-    has_any_link = db.execute("SELECT 1 FROM memory_links WHERE task=? LIMIT 1", (task,)).fetchone() is not None
+    has_any_link = _call_foreign(lambda: db.execute("SELECT 1 FROM memory_links WHERE task=? LIMIT 1", (task,)).fetchone()) is not None
     sig = (ev_id, round(ev_obs, 3), sk_id, sk_obs)
 
     expected_links = int((cached[1] or {}).get("directedLinks") or 0) if cached is not None else -1
@@ -475,13 +477,13 @@ def build_shared_edges_inverted(nodes: dict, node_ids: list, add_pair_fn, max_bu
                 b = nodes[b_id]
                 shared_files = sorted(a["files"] & b["files"])
                 if shared_files:
-                    add_pair_fn(a_id, b_id, "shared_file", 0.85, ",".join(shared_files[:5]))
+                    _call_foreign(lambda: add_pair_fn(a_id, b_id, "shared_file", 0.85, ",".join(shared_files[:5])))
                 shared_entities = sorted(a["entities"] & b["entities"])
                 if shared_entities:
-                    add_pair_fn(a_id, b_id, "shared_entity", 0.75, ",".join(shared_entities[:5]))
+                    _call_foreign(lambda: add_pair_fn(a_id, b_id, "shared_entity", 0.75, ",".join(shared_entities[:5])))
                 shared_sources = sorted(a["sourceRefs"] & b["sourceRefs"])
                 if shared_sources:
-                    add_pair_fn(a_id, b_id, "shared_source", 0.80, ",".join(shared_sources[:5]))
+                    _call_foreign(lambda: add_pair_fn(a_id, b_id, "shared_source", 0.80, ",".join(shared_sources[:5])))
         return
 
     # For large tasks (N > 60), use inverted buckets to avoid O(N^2) explosion
@@ -514,4 +516,4 @@ def build_shared_edges_inverted(nodes: dict, node_ids: list, add_pair_fn, max_bu
                         if len(tlist) < 5:
                             tlist.append(tok)
         for (a_id, b_id), tlist in pair_tokens.items():
-            add_pair_fn(a_id, b_id, relation, weight, ",".join(sorted(tlist)[:5]))
+            _call_foreign(lambda: add_pair_fn(a_id, b_id, relation, weight, ",".join(sorted(tlist)[:5])))

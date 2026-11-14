@@ -399,6 +399,7 @@ def _int_token_cost(n: int) -> int:
     return -(-len(str(n)) // 4)
 
 
+@md.fresh_read
 def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5000) -> Dict[str, Any]:
     """Build the Agent Skill (`SKILL.md`) in memory without writing to disk."""
     if not valid_skill_name(name):
@@ -454,7 +455,7 @@ def build_skill(repo_path=".", *, name="memlet-lessons", max_lines=500, budget=5
         }
 
     with mb._lesson_path_projection(root, None) as path_context:
-        read = mb.dream_items(root, tiers=(v.APPROVED,))
+        read = mb.dream_items(root, tiers=(v.APPROVED,), _path_context=path_context)
         attached_map = dict(path_context.get("paths") or {})
         att_meta = mb.attachment_metadata(path_context)
 
@@ -938,6 +939,7 @@ def _ensure_skill_dirs(base_dir: Path, name: str) -> Path:
     return skill_dir
 
 
+@md.fresh_read
 def write_skill(repo_path=".", *, out=None, name="memlet-lessons", max_lines=500, budget=5000, force=False):
     """Serialize build through rename with the repository's existing write lock."""
     root = _resolve_memlet_repo(repo_path)
@@ -1069,6 +1071,7 @@ def _resolve_memlet_repo(repo_path: Optional[Any] = None) -> Optional[Path]:
     return root
 
 
+@md.fresh_read
 def check_skill(path, *, repo_path=None, max_lines=500, budget=5000) -> Dict[str, Any]:
     """Check whether a written SKILL.md is `current`, `edited`, `stale: written by Memlet X`,
     `stale: lessons or code changed`, `no repository to compare with`, `not written by Memlet`,

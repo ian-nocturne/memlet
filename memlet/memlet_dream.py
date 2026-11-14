@@ -16,17 +16,19 @@ Design invariants:
 from __future__ import annotations
 
 import contextlib
+import contextvars
+from collections.abc import Iterator as InputIterator
 import datetime
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PurePath, PosixPath, WindowsPath, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from memlet.memlet_wiki import estimate_tokens
 from .vocabulary import APPROVED, PENDING as REVIEW_PENDING, REJECTED as REJECTED_DECISION
 
 DREAM_ONTOLOGY_SCHEMA = "memlet.dream_ontology.v1"
@@ -43,6 +45,231 @@ STATUS_KINDS = ("active_lesson", "superseded_rule", "open_trap")
 # `PENDING` is the default for every node/edge written by `run_dream_build`; only an explicit human
 # decision via `approve_queue_items` / `reject_queue_items` moves an item out of it.
 PENDING = "PENDING"
+
+from ._read_context import (
+    DREAM_READ as _ACTIVE_DREAM_READ, WIKI_READ as _ACTIVE_WIKI_READ,
+    INSTALLED_READ as _INSTALLED_READ, WORK_COUNTERS as _ACTIVE_COUNTERS,
+    TRUST_PROJECTIONS as _TRUST_PROJECTIONS,
+)
+
+_WORK_COUNTER_KEYS = (
+    "foreignCallsWithEvidence",
+    "supersessionCandidateVisits",
+    "recallSectionItemVisits",
+    "recallSupersedesNodeScans",
+    "ontologySecretScans",
+    "pinMaskOps",
+    "configPinValidations",
+    "anchorRuleLookups",
+    "sidecarIndexLoads",
+    "handoverItemRenders",
+    "bridgeQuoteClassifications",
+    "basenameWalkFiles",
+    "sessionStartItemRenders",
+    "queueDiskLoads",
+    "snapshotDiskLoads",
+    "itemPinVerifications",
+    "approvedViewDeepCopiedItems",
+    "secretPredicateCalls",
+    "hookItemLineRenders",
+    "hookBlockFitChecks",
+)
+
+class _ReadState:
+    """Memoized evidence for a synchronous read, or an explicitly held snapshot."""
+
+    def __init__(self) -> None:
+        self._buckets: Dict[str, Any] = {}
+
+    def bucket(self, name: str, factory=dict):
+        if name not in self._buckets:
+            self._buckets[name] = factory()
+        return self._buckets[name]
+
+
+def _active_read_state() -> Optional[_ReadState]:
+    return _ACTIVE_DREAM_READ.get()
+
+
+def _read_cache(name: str, factory=dict, state: Optional[Any] = None):
+    """Use the caller's explicit snapshot, the current read, or a throwaway cache."""
+    st = state if state is not None else _active_read_state()
+    return st.bucket(name, factory) if st is not None else factory()
+
+
+def _read_context_vars():
+    return (_ACTIVE_DREAM_READ, _ACTIVE_WIKI_READ, _INSTALLED_READ,
+            _ACTIVE_COUNTERS, _TRUST_PROJECTIONS)
+
+
+@contextlib.contextmanager
+def _suspend_read_state():
+    """Only Memlet's synchronous stack may see its ambient read evidence."""
+    state = _active_read_state()
+    if state is not None and any(state._buckets.values()):
+        _count_work("foreignCallsWithEvidence")
+    tokens = [(var, var.set(None)) for var in _read_context_vars()]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+        _forget_current_evidence()
+
+
+def call_foreign(fn, *args, **kwargs):
+    """Call caller-supplied code with no read state, including on exceptional exit.
+
+    Use a lambda for object methods so attribute lookup also occurs while suspended.
+    A lazy foreign result must be consumed through this boundary as well.
+    """
+    with _suspend_read_state():
+        return fn(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _foreign_context(factory):
+    """Suspend around construction, entry and exit of an injected context manager."""
+    manager = call_foreign(factory)
+    value = call_foreign(lambda: manager.__enter__())
+    try:
+        yield value
+    except BaseException:
+        import sys
+        info = sys.exc_info()
+        if not call_foreign(lambda: manager.__exit__(*info)):
+            raise
+    else:
+        call_foreign(lambda: manager.__exit__(None, None, None))
+
+
+def _forget_current_evidence() -> None:
+    """Discard only the evidence installed by Memlet, never a caller's snapshot."""
+    state = _INSTALLED_READ.get()
+    if state is not None:
+        state._buckets.clear()
+
+
+def _drop_read_caches() -> None:
+    """Own writes invalidate the evidence on this synchronous stack."""
+    _forget_current_evidence()
+
+
+def _count_work(key: str, amount: int = 1) -> None:
+    counters = _ACTIVE_COUNTERS.get()
+    if counters is not None:
+        counters[key] = counters.get(key, 0) + amount
+
+
+@contextlib.contextmanager
+def work_counters(counters: Optional[Dict[str, int]]):
+    if counters is None:
+        yield None
+        return
+    for k in _WORK_COUNTER_KEYS:
+        counters.setdefault(k, 0)
+    token = _ACTIVE_COUNTERS.set(counters)
+    try:
+        yield counters
+    finally:
+        with contextlib.suppress(ValueError):
+            _ACTIVE_COUNTERS.reset(token)
+
+
+@contextlib.contextmanager
+def _enter_read_scope(handed_state: Optional[Any] = None):
+    """Install state for one synchronous read and remove it on exit.
+
+    Every top-level read starts fresh; nested Memlet code shares its evidence.
+    Calls into foreign code suspend all state. A read overlapping another thread's
+    or process's write may see either side; the next read sees the completed write.
+    An explicitly handed state belongs to its caller and remains that snapshot.
+    Library arguments are plain data: path-like and iterable arguments are read
+    once before installing state (also suspended on nested entry). Nested graphs,
+    configs, payloads and explicit contexts use concrete built-in containers;
+    arbitrary executable data protocols are outside this library contract.
+    These scope managers are private: manually yielding control inside one is not
+    a supported public read boundary.
+    """
+    state = handed_state if handed_state is not None else _active_read_state()
+    installed = None
+    if state is None:
+        state = _ReadState()
+        installed = _INSTALLED_READ.set(state)
+    tok_dream = _ACTIVE_DREAM_READ.set(state)
+    tok_wiki = _ACTIVE_WIKI_READ.set(state)
+    try:
+        yield state
+    finally:
+        _ACTIVE_WIKI_READ.reset(tok_wiki)
+        _ACTIVE_DREAM_READ.reset(tok_dream)
+        if installed is not None:
+            _INSTALLED_READ.reset(installed)
+
+
+# Exact types only: deciding whether entry needs a boundary must not run protocols.
+_PLAIN_ARGUMENT_TYPES = frozenset({type(None), bool, int, float, str, bytes, Path,
+                                  PosixPath, WindowsPath, PurePath, PurePosixPath, PureWindowsPath,
+                                  list, tuple, dict, set, frozenset})
+_INTERFACE_ARGUMENTS = frozenset({
+    "stdin", "stdout", "stderr", "runner", "clock", "_clock", "which", "run_init",
+    "cmd", "store", "txn", "provider", "db", "context_builder", "reference_validator",
+    "cached_doc_tokens_fn", "fast_lexical_fn", "ensure_schema_fn", "add_pair_fn",
+    "plugins", "sub", "parser", "root_or_store", "hub", "registry", "controls",
+    "flow", "catalog", "prefs", "repl", "finders", "ts", "tsj", "tst",
+    # These explicit state/context arguments are snapshots, not input collections.
+    "context", "_path_context", "_graph", "_read_state", "_index", "_counters", "work",
+})
+
+
+def _materialise_read_argument(value):
+    """Best effort only: the reader owns validation and its error contract."""
+    try:
+        if isinstance(value, InputIterator):
+            return list(value)
+        if isinstance(value, os.PathLike):
+            return Path(os.fspath(value))
+        return list(value)
+    except Exception:
+        return value
+
+
+def _normalise_read_arguments(bound):
+    """Only non-concrete input protocols need suspension, including nested calls."""
+    for name, value in bound.arguments.items():
+        if type(value) not in _PLAIN_ARGUMENT_TYPES and name not in _INTERFACE_ARGUMENTS:
+            bound.arguments[name] = call_foreign(_materialise_read_argument, value)
+    return bound
+
+
+def fresh_read(fn):
+    """Run an eager Memlet reader in a scope; never hold state across deferred work."""
+    import functools
+    import inspect
+    from collections.abc import Iterator
+    if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn) or inspect.iscoroutinefunction(fn):
+        raise TypeError("fresh_read requires a synchronous, materialised reader")
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = _normalise_read_arguments(signature.bind(*args, **kwargs))
+        handed = bound.arguments.get("_read_state")
+        with work_counters(bound.arguments.get("_counters")), _enter_read_scope(handed) as state:
+            if "_read_state" in signature.parameters:
+                bound.arguments["_read_state"] = state
+            result = fn(*bound.args, **bound.kwargs)
+            if isinstance(result, Iterator) or inspect.isawaitable(result) or callable(result):
+                raise TypeError("fresh_read readers must return materialised results")
+            return result
+
+    wrapper._is_fresh_read = True
+    return wrapper
+
+
+def estimate_tokens(text: str) -> int:
+    from memlet import memlet_wiki as _mw
+    return _mw.estimate_tokens(text)
 REJECTED = "REJECTED"
 VERDICTS = (
     "SUPPORTED",
@@ -227,6 +454,7 @@ def has_unmasked_secret_or_canary(text: str) -> bool:
     """Return True if any canary substring or secret pattern remains unmasked in `text`."""
     if not text:
         return False
+    _count_work("secretPredicateCalls", 1)
     for c in CANARY_SECRETS:
         if c in text:
             return True
@@ -302,14 +530,14 @@ def parse_span(span_str: str) -> Optional[Tuple[str, int, int]]:
     return file_id, start, end
 
 
-def resolve_pin(
+_CACHE_MISS = object()
+
+
+def _resolve_pin(
     snapshot_files: Dict[str, List[str]],
     span_str: str,
     max_lines: int = 4,
 ) -> Optional[Dict[str, Any]]:
-    """Deterministically resolve a `file_id:start-end` span against `snapshot_files` (`{file_id: [lines]}`).
-    Returns None if file_id or line numbers are out of range or exceed `max_lines`.
-    """
     if not isinstance(snapshot_files, dict) or not isinstance(span_str, str):
         return None
     parsed = parse_span(span_str)
@@ -321,14 +549,20 @@ def resolve_pin(
     lines = snapshot_files.get(file_id)
     if not lines or end > len(lines):
         return None
-    raw_slice = [ln.rstrip("\r\n") for ln in lines[start - 1 : end]]
+    canonical_span = f"{file_id}:{start}-{end}" if end > start else f"{file_id}:{start}"
+    raw_slice = tuple(ln.rstrip("\r\n") for ln in lines[start - 1 : end])
+    cache_key = (canonical_span, raw_slice)
+    cached = _read_cache("pins").get(cache_key, _CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        return None if cached is None else dict(cached, quoteLines=list(cached["quoteLines"]))
+    _count_work("pinMaskOps", 1 + len(raw_slice))
     joined = mask_secrets("\n".join(raw_slice))
     masked_slice = [mask_secrets(ln) for ln in joined.split("\n")]
     joined = "\n".join(masked_slice)
     if not joined.strip():
+        _read_cache("pins")[cache_key] = None
         return None
-    canonical_span = f"{file_id}:{start}-{end}" if end > start else f"{file_id}:{start}"
-    return {
+    out = {
         "span": canonical_span,
         "fileId": file_id,
         "startLine": start,
@@ -337,6 +571,20 @@ def resolve_pin(
         "quoteText": joined,
         "sha256": sha256_hex(joined),
     }
+    _read_cache("pins")[cache_key] = out
+    return dict(out, quoteLines=list(masked_slice))
+
+
+@fresh_read
+def resolve_pin(
+    snapshot_files: Dict[str, List[str]],
+    span_str: str,
+    max_lines: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """Deterministically resolve a `file_id:start-end` span against `snapshot_files` (`{file_id: [lines]}`).
+    Returns None if file_id or line numbers are out of range or exceed `max_lines`.
+    """
+    return _resolve_pin(snapshot_files, span_str, max_lines=max_lines)
 
 
 def extract_line_timestamp(text: str) -> str:
@@ -428,6 +676,7 @@ def _claimed(val: Any) -> Optional[str]:
     return s or None
 
 
+@fresh_read
 def dream_pin_and_validate(
     candidates: Sequence[Dict[str, Any]],
     snapshot_files: Dict[str, List[str]],
@@ -483,7 +732,7 @@ def dream_pin_and_validate(
 
         resolved_pins = []
         for sp in raw_spans[:3]:
-            p = resolve_pin(snapshot_files, str(sp), max_lines=4)
+            p = _resolve_pin(snapshot_files, str(sp), max_lines=4)
             if p:
                 resolved_pins.append(p)
         if not resolved_pins:
@@ -501,7 +750,7 @@ def dream_pin_and_validate(
         if status_kind == "superseded_rule" or cand.get("superseded_by_src"):
             status_kind = "superseded_rule"
             sup_span = str(cand.get("superseded_by_src") or "")
-            sup_pin = resolve_pin(snapshot_files, sup_span, max_lines=4)
+            sup_pin = _resolve_pin(snapshot_files, sup_span, max_lines=4)
             if not sup_pin:
                 dropped.append({"lesson_id": lid, "reason": "missing_superseded_by_pin"})
                 continue
@@ -548,7 +797,7 @@ def dream_pin_and_validate(
             if not target_label:
                 continue
             if re_obj.get("src_span"):
-                e_src_pin = resolve_pin(snapshot_files, str(re_obj.get("src_span")), max_lines=4)
+                e_src_pin = _resolve_pin(snapshot_files, str(re_obj.get("src_span")), max_lines=4)
                 if not e_src_pin:
                     continue
             else:
@@ -563,7 +812,7 @@ def dream_pin_and_validate(
                 if status_kind == "superseded_rule":
                     continue
                 t_span = str(re_obj.get("target_span") or "")
-                t_pin = resolve_pin(snapshot_files, t_span, max_lines=4)
+                t_pin = _resolve_pin(snapshot_files, t_span, max_lines=4)
                 if not t_pin:
                     dropped.append({"lesson_id": lid, "reason": "supersedes_missing_target_pin"})
                     edge_aborted = True
@@ -750,7 +999,7 @@ def _verify_pin_dict(pin: Any, snapshot_files: Dict[str, List[str]], label: str)
     if not isinstance(pin, dict):
         return f"{label}:not_dict"
     span = str(pin.get("span") or "")
-    chk = resolve_pin(snapshot_files, span, max_lines=4)
+    chk = _resolve_pin(snapshot_files, span, max_lines=4)
     if not chk:
         return f"{label}:unresolvable_span:{span}"
     if (
@@ -767,7 +1016,15 @@ def _verify_pin_dict(pin: Any, snapshot_files: Dict[str, List[str]], label: str)
     return None
 
 
+@fresh_read
 def verify_ontology_contract(
+    graph: Dict[str, Any],
+    snapshot_files: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    return _verify_ontology_contract(graph, snapshot_files)
+
+
+def _verify_ontology_contract(
     graph: Dict[str, Any],
     snapshot_files: Dict[str, List[str]],
 ) -> Dict[str, Any]:
@@ -794,7 +1051,12 @@ def verify_ontology_contract(
     if graph.get("schema") != DREAM_ONTOLOGY_SCHEMA:
         pin_mismatches.append(f"invalid_schema:{graph.get('schema')}")
 
+    seen_strings: Set[str] = set()
     for s_val in _iter_strings(graph):
+        if not s_val or s_val in seen_strings:
+            continue
+        seen_strings.add(s_val)
+        _count_work("ontologySecretScans", 1)
         if has_unmasked_secret_or_canary(s_val):
             canary_leaks.append("graph_string_contains_secret_or_canary")
             break
@@ -980,8 +1242,11 @@ def _check_graph_safe_structure(graph: Dict[str, Any]) -> None:
     if not isinstance(graph.get("nodes", []), list) or not isinstance(graph.get("edges", []), list):
         raise ValueError("Ontology graph nodes and edges must be lists.")
     for s_val in _iter_strings(graph):
+        if not s_val or s_val in _read_cache("safe_strings", set):
+            continue
         if has_unmasked_secret_or_canary(s_val):
             raise ValueError("Refusing to process ontology graph containing unmasked secret or canary.")
+        _read_cache("safe_strings", set).add(s_val)
     if _has_cycle(graph.get("edges") or []):
         raise ValueError("Refusing to process ontology graph with a SUPERSEDES cycle.")
 
@@ -1036,6 +1301,7 @@ def _assert_db_replaceable(db_path: Path, new_sha: str, replaces_sha: Optional[s
     )
 
 
+@fresh_read
 def write_ontology_sqlite(
     db_path: Path,
     graph: Dict[str, Any],
@@ -1063,6 +1329,7 @@ def write_ontology_sqlite(
             conn.execute("ROLLBACK")
             raise
         conn.execute("COMMIT")
+    _drop_read_caches()
 
 
 def _write_ontology_rows(conn: sqlite3.Connection, graph: Dict[str, Any]) -> str:
@@ -1250,12 +1517,16 @@ def _query_terms(text: str, with_stems: bool = False) -> Set[str]:
     return out
 
 
+@fresh_read
 def format_flat_memory(
     graph: Dict[str, Any],
     budget_tokens: int = 1500,
     snapshot_files: Optional[Dict[str, List[str]]] = None,
     require_approval: bool = True,
     allow_unverified: bool = False,
+    *,
+    _counters: Optional[Dict[str, int]] = None,
+    _read_state: Optional[Any] = None,
 ) -> str:
     """Format a flat importance-ordered list of approved lessons without 1-hop ontology edge grouping.
     Includes replacement pins on superseded rules so flat readers see active replacement evidence.
@@ -1266,6 +1537,23 @@ def format_flat_memory(
     header (never the "Approved Lessons" header). Output never exceeds `budget_tokens` (empty if the
     header alone does not fit).
     """
+    with work_counters(_counters), _enter_read_scope(_read_state):
+        return _format_flat_memory_inner(
+            graph,
+            budget_tokens=budget_tokens,
+            snapshot_files=snapshot_files,
+            require_approval=require_approval,
+            allow_unverified=allow_unverified,
+        )
+
+
+def _format_flat_memory_inner(
+    graph: Dict[str, Any],
+    budget_tokens: int = 1500,
+    snapshot_files: Optional[Dict[str, List[str]]] = None,
+    require_approval: bool = True,
+    allow_unverified: bool = False,
+) -> str:
     budget = _validate_budget(budget_tokens)
     _check_graph_safe_structure(graph)
     if snapshot_files is None and not allow_unverified:
@@ -1280,7 +1568,7 @@ def format_flat_memory(
             raise ValueError(f"Ontology contract verification failed: {ver}")
     if snapshot_files is not None and any("merge" in n for n in graph.get("nodes", [])):
         from .memlet_bridge import _merge_nodes, dream_tiers, merge_state
-        nodes = _merge_nodes(graph, dream_tiers(graph, snapshot=snapshot_files, config={}), snapshot_files)
+        nodes = _merge_nodes(graph, dream_tiers(graph, snapshot=snapshot_files, config={}, _read_state=_active_read_state()), snapshot_files)
         hidden = {i for i, n in nodes.items() if merge_state(n, nodes)["state"] == "merged"}
         graph = dict(graph, nodes=[n for n in graph.get("nodes", []) if n.get("id") not in hidden])
     if require_approval:
@@ -1308,7 +1596,8 @@ def format_flat_memory(
     if snapshot_files is None:
         lines.append(UNVERIFIED_LABEL.rstrip("\n"))
     lines.append("")
-    if estimate_tokens("\n".join(lines)) > budget:
+    flat_tokens = estimate_tokens("\n".join(lines))
+    if flat_tokens > budget:
         return ""
     for n in nodes:
         pp = n.get("primaryPin") if isinstance(n.get("primaryPin"), dict) else {}
@@ -1343,11 +1632,20 @@ def format_flat_memory(
             entry = entry.split("\n", 1)[0] + "\n" + "\n".join(
                 "  > " + safe_lesson_display(_LINE_PREFIX_RE.sub("", p["quote"], count=1).strip(), limit=_FLAT_QUOTE_CHARS)
                 + " [" + p["span"] + "]" for p in lesson_lines(n))
-        candidate = "\n".join(lines + [entry])
-        if estimate_tokens(candidate) > budget:
+        entry_tokens = estimate_tokens(entry)
+        if flat_tokens + entry_tokens > budget:
             break
+        flat_tokens += entry_tokens
         lines.append(entry)
     return "\n".join(lines)
+
+
+_RECALL_SEC_HEADINGS = {
+    "blocks": "## 1. Hard Bans (`BLOCKS`)",
+    "resolves": "## 2. Workarounds (`RESOLVES`)",
+    "governs": "## 3. Scope Rules (`GOVERNS`)",
+    "supersedes": "## 4. Superseded Quarantine (`SUPERSEDES`)",
+}
 
 
 def _assemble_sections(
@@ -1357,6 +1655,7 @@ def _assemble_sections(
     sec_governs: List[str],
     sec_supersedes: List[str],
 ) -> str:
+    _count_work("recallSectionItemVisits", len(sec_blocks) + len(sec_resolves) + len(sec_governs) + len(sec_supersedes))
     parts = [header.rstrip()]
     if sec_blocks:
         parts.append("\n## 1. Hard Bans (`BLOCKS`)\n" + "\n".join(sec_blocks))
@@ -1413,6 +1712,7 @@ def _no_snapshot_result(budget: int) -> Dict[str, Any]:
     }
 
 
+@fresh_read
 def recall_subgraph(
     graph: Dict[str, Any],
     query_text: str = "",
@@ -1422,6 +1722,9 @@ def recall_subgraph(
     require_approval: bool = True,
     allow_unverified: bool = False,
     verification_notice: str = "",
+    *,
+    _counters: Optional[Dict[str, int]] = None,
+    _read_state: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """1-hop ontology subgraph recall with deterministic `SUPERSEDES` quarantine and typed sections
     (`GOVERNS`, `RESOLVES`, `BLOCKS`, plus explicit `SUPERSEDES` lineage warnings).
@@ -1435,6 +1738,29 @@ def recall_subgraph(
     `tokenEstimate <= tokenBudget` always holds; a budget too small for the empty capsule returns
     `ok=False`, `budgetTooSmall=True`, `minimumBudget` and an empty `formatted`.
     """
+    with work_counters(_counters), _enter_read_scope(_read_state):
+        return _recall_subgraph_inner(
+            graph,
+            query_text=query_text,
+            budget_tokens=budget_tokens,
+            snapshot_files=snapshot_files,
+            unverified_label=unverified_label,
+            require_approval=require_approval,
+            allow_unverified=allow_unverified,
+            verification_notice=verification_notice,
+        )
+
+
+def _recall_subgraph_inner(
+    graph: Dict[str, Any],
+    query_text: str = "",
+    budget_tokens: int = 1500,
+    snapshot_files: Optional[Dict[str, List[str]]] = None,
+    unverified_label: bool = False,
+    require_approval: bool = True,
+    allow_unverified: bool = False,
+    verification_notice: str = "",
+) -> Dict[str, Any]:
     budget = _validate_budget(budget_tokens)
     _check_graph_safe_structure(graph)
     if snapshot_files is None and not allow_unverified:
@@ -1459,7 +1785,7 @@ def recall_subgraph(
         view = _quote_integrity_view(graph)  # raw mode: an edited stored quote is still never shown
     if snapshot_files is not None and any("merge" in n for n in graph.get("nodes", [])):
         from .memlet_bridge import _merge_nodes, dream_tiers, merge_state
-        nodes = _merge_nodes(graph, dream_tiers(graph, snapshot=snapshot_files, config={}), snapshot_files)
+        nodes = _merge_nodes(graph, dream_tiers(graph, snapshot=snapshot_files, config={}, _read_state=_active_read_state()), snapshot_files)
         hidden = {i for i, n in nodes.items() if merge_state(n, nodes)["state"] == "merged"}
         view = dict(view, nodes=[n for n in view.get("nodes", []) if n.get("id") not in hidden],
                     edges=[e for e in view.get("edges", []) if e.get("fromId") not in hidden and e.get("toId") not in hidden])
@@ -1525,6 +1851,15 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         cand_edges_by_idx[idx] = s_edges
         all_cand_surv_edges.extend(s_edges)
 
+    surv_sup_by_target: Dict[str, List[Dict[str, Any]]] = {}
+    for e in all_cand_surv_edges:
+        if e.get("edgeType") == "SUPERSEDES" and isinstance(e.get("srcPin"), dict):
+            e_raw_to = str(e.get("toId") or "")
+            e_san_to = sanitize_node_id(e.get("toId"), "")
+            surv_sup_by_target.setdefault(e_raw_to, []).append(e)
+            if e_san_to != e_raw_to:
+                surv_sup_by_target.setdefault(e_san_to, []).append(e)
+
     nodes: List[Dict[str, Any]] = []
     surviving_edges: List[Dict[str, Any]] = []
     node_surv_edges: Dict[str, List[Dict[str, Any]]] = {}
@@ -1532,6 +1867,9 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
     kept_san_ids: Set[str] = set()
     seen_display_ids: Set[str] = set()
     duplicate_ids: List[str] = []
+    nodes_by_id_key: Dict[str, List[Dict[str, Any]]] = {}
+    nodes_by_pp_sha: Dict[str, List[Dict[str, Any]]] = {}
+    nodes_by_pp_span: Dict[str, List[Dict[str, Any]]] = {}
 
     for idx, n in cand_nodes:
         raw_lid = str(n.get("id") or "")
@@ -1546,13 +1884,11 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             or sp_node is not None
         )
         if is_declared_sup:
-            has_surv_bound_sup = any(
-                e.get("edgeType") == "SUPERSEDES"
-                and (str(e.get("toId") or "") in (raw_lid, base_lid) or sanitize_node_id(e.get("toId"), "") == base_lid)
-                and isinstance(e.get("srcPin"), dict)
-                and (sp_node is None or e.get("srcPin") == sp_node)
-                for e in all_cand_surv_edges
+            cand_sup_edges = surv_sup_by_target.get(raw_lid, []) + (
+                surv_sup_by_target.get(base_lid, []) if base_lid != raw_lid else []
             )
+            _count_work("recallSupersedesNodeScans", 1 + len(cand_sup_edges))
+            has_surv_bound_sup = any(sp_node is None or e.get("srcPin") == sp_node for e in cand_sup_edges)
             if not has_surv_bound_sup:
                 continue
         disp_lid = base_lid
@@ -1568,11 +1904,22 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         n_copy["_base_lid"] = base_lid
         n_copy["_disp_lid"] = disp_lid
         nodes.append(n_copy)
+        nodes_by_id_key.setdefault(raw_lid, []).append(n_copy)
+        if base_lid != raw_lid:
+            nodes_by_id_key.setdefault(base_lid, []).append(n_copy)
+        pp_copy = n_copy.get("primaryPin") if isinstance(n_copy.get("primaryPin"), dict) else {}
+        c_sha_key = str(pp_copy.get("sha256") or "")
+        c_span_key = str(pp_copy.get("span") or "")
+        if c_sha_key:
+            nodes_by_pp_sha.setdefault(c_sha_key, []).append(n_copy)
+        if c_span_key:
+            nodes_by_pp_span.setdefault(c_span_key, []).append(n_copy)
         node_surv_edges_by_idx[idx] = s_edges
         node_surv_edges[raw_lid] = s_edges
         node_surv_edges[base_lid] = s_edges
         surviving_edges.extend(s_edges)
 
+    duplicate_ids_set: Set[str] = set(duplicate_ids)
     # Identify superseded node IDs and pin-aware per-node superseding edges (Leftover 3: isolates duplicate IDs by pin)
     superseded_ids: Set[str] = set()
     superseded_indices: Set[int] = set()
@@ -1589,12 +1936,15 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             tp_span = str(tp.get("span") or "") if tp else ""
             tp_sha = str(tp.get("sha256") or "") if tp else ""
             matched_any = False
-            for n_item in nodes:
+            cand_target_nodes = list(nodes_by_id_key.get(raw_tid, ()))
+            if san_tid != raw_tid:
+                seen_n_idx = {int(x.get("_idx", -1)) for x in cand_target_nodes}
+                for x in nodes_by_id_key.get(san_tid, ()):
+                    if int(x.get("_idx", -1)) not in seen_n_idx:
+                        cand_target_nodes.append(x)
+            _count_work("recallSupersedesNodeScans", 1 + len(cand_target_nodes))
+            for n_item in cand_target_nodes:
                 n_idx = int(n_item.get("_idx", -1))
-                n_raw = str(n_item.get("id") or "")
-                n_base = str(n_item.get("_base_lid") or "")
-                if n_raw not in (raw_tid, san_tid) and n_base not in (raw_tid, san_tid):
-                    continue
                 pp_n = n_item.get("primaryPin") if isinstance(n_item.get("primaryPin"), dict) else {}
                 n_span = str(pp_n.get("span") or "")
                 n_sha = str(pp_n.get("sha256") or "")
@@ -1613,7 +1963,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
                         superseded_ids.add(k_id)
             else:
                 # Only mark global ID superseded if non-duplicate
-                if san_tid not in duplicate_ids and raw_tid not in duplicate_ids:
+                if san_tid not in duplicate_ids_set and raw_tid not in duplicate_ids_set:
                     for k_id in (raw_tid, san_tid):
                         if k_id:
                             superseded_ids.add(k_id)
@@ -1778,9 +2128,12 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
             return finish(combined, max_len + 4)
         return finish(cleaned, max_len)
 
-    replacement_projection = supersession_projection(graph)
+    sup_index = _supersession_index(graph)
+    replacement_projection = supersession_projection(graph, _index=sup_index)
+    sec_heading_tokens = {k: estimate_tokens(v) for k, v in _RECALL_SEC_HEADINGS.items()}
+    running_tokens = min_needed
     for n in ranked:
-        projected = supersession_display_node(n, graph, replacement_projection)
+        projected = supersession_display_node(n, graph, replacement_projection, _index=sup_index)
         n_idx = int(n.get("_idx", -1))
         base_lid = str(n.get("_base_lid") or sanitize_node_id(n.get("id"), "L-000"))
         lid = str(n.get("_disp_lid") or base_lid)
@@ -1788,7 +2141,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
         sp = n.get("supersededByPin") if isinstance(n.get("supersededByPin"), dict) else None
         bound_sup_edge = sup_edge_by_idx.get(n_idx) or (
             (sup_edge_by_target.get(base_lid) or sup_edge_by_target.get(str(n.get("id") or "")))
-            if base_lid not in duplicate_ids
+            if base_lid not in duplicate_ids_set
             else None
         )
         if not sp and isinstance(bound_sup_edge, dict):
@@ -1842,25 +2195,36 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
                 e_sp_sha = str(e_sp.get("sha256") or "")
                 if not raw_from_id.upper().endswith(":NEWER"):
                     san_from = sanitize_node_id(raw_from_id, "")
-                    for cand_src in nodes:
-                        c_idx = int(cand_src.get("_idx", -1))
+                    pin_cands: List[Dict[str, Any]] = []
+                    if e_sp_sha:
+                        pin_cands.extend(nodes_by_pp_sha.get(e_sp_sha, ()))
+                    if e_sp_span:
+                        seen_c = {int(x.get("_idx", -1)) for x in pin_cands}
+                        for x in nodes_by_pp_span.get(e_sp_span, ()):
+                            if int(x.get("_idx", -1)) not in seen_c:
+                                pin_cands.append(x)
+                    pin_cands.sort(key=lambda x: int(x.get("_idx", -1)))
+                    _count_work("recallSupersedesNodeScans", 1 + len(pin_cands))
+                    for cand_src in pin_cands:
                         c_raw = str(cand_src.get("id") or "")
                         c_base = str(cand_src.get("_base_lid") or "")
-                        c_pp = cand_src.get("primaryPin") if isinstance(cand_src.get("primaryPin"), dict) else {}
-                        c_span = str(c_pp.get("span") or "")
-                        c_sha = str(c_pp.get("sha256") or "")
-                        if (e_sp_sha and c_sha and e_sp_sha == c_sha) or (e_sp_span and c_span and e_sp_span == c_span):
-                            if not san_from or c_raw in (raw_from_id, san_from) or c_base in (raw_from_id, san_from):
-                                src_node_idx = c_idx
-                                break
-                    if src_node_idx is None and san_from and san_from not in duplicate_ids:
-                        for cand_src in nodes:
-                            if str(cand_src.get("_base_lid") or "") == san_from or str(cand_src.get("id") or "") in (raw_from_id, san_from):
-                                src_node_idx = int(cand_src.get("_idx", -1))
-                                break
+                        if not san_from or c_raw in (raw_from_id, san_from) or c_base in (raw_from_id, san_from):
+                            src_node_idx = int(cand_src.get("_idx", -1))
+                            break
+                    if src_node_idx is None and san_from and san_from not in duplicate_ids_set:
+                        id_cands = list(nodes_by_id_key.get(san_from, ()))
+                        if raw_from_id != san_from:
+                            seen_c = {int(x.get("_idx", -1)) for x in id_cands}
+                            for x in nodes_by_id_key.get(raw_from_id, ()):
+                                if int(x.get("_idx", -1)) not in seen_c:
+                                    id_cands.append(x)
+                        id_cands.sort(key=lambda x: int(x.get("_idx", -1)))
+                        _count_work("recallSupersedesNodeScans", 1 + len(id_cands))
+                        if id_cands:
+                            src_node_idx = int(id_cands[0].get("_idx", -1))
                     if src_node_idx is None:
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
-                    elif src_node_idx in superseded_indices or (san_from not in duplicate_ids and san_from in superseded_ids):
+                    elif src_node_idx in superseded_indices or (san_from not in duplicate_ids_set and san_from in superseded_ids):
                         repl_label = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
             display = dict(n, supersededByPin=sp, statusKind="superseded_rule")
             if projected.get("_lineReplacements"):
@@ -1895,11 +2259,11 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
                 source_mark = ("; " + ", ".join(sorted(set(types))) + " source") if types else ""
                 item += "\n  > " + _window_quote(part["quote"], is_replacement=False) + " [" + part["span"] + source_mark + "]"
         bucket_idx = len(bucket)
-        bucket.append(item)
-        cand_formatted = _assemble_sections(header, sec_blocks, sec_resolves, sec_governs, sec_supersedes)
-        if estimate_tokens(cand_formatted) > budget_tokens:
-            bucket.pop()
+        added_tokens = estimate_tokens(item) + (sec_heading_tokens[b_kind] if bucket_idx == 0 else 0)
+        if running_tokens + added_tokens > budget_tokens:
             break
+        running_tokens += added_tokens
+        bucket.append(item)
         included_ids.append(lid)
         included_order.append((b_kind, bucket_idx, lid, n_idx))
         if b_kind == "supersedes":
@@ -1956,6 +2320,7 @@ def _recall_core(graph: Dict[str, Any], query_text: str, budget_tokens: int, hea
     }
 
 
+@fresh_read
 def build_cortex_lineage_payload(
     graph: Dict[str, Any],
     subgraph_info: Optional[Dict[str, Any]] = None,
@@ -2326,6 +2691,7 @@ def memlet_echo(text):
     return any(marker in text for marker in v.HOOK_OWN_TEXT_MARKERS)
 
 
+@fresh_read
 def read_jsonl_transcript(path: Any, *, max_line_chars: Optional[int] = None,
                           max_text_chars: Optional[int] = None) -> Tuple[List[str], Dict[str, int]]:
     """Read a Claude Code / Codex CLI `.jsonl` session transcript into pin-addressable lines.
@@ -2424,11 +2790,13 @@ def _read_bounded_text(f: Path, limit: int, label: str) -> str:
     return text
 
 
+@fresh_read
 def load_snapshot(snapshot_path: Any) -> Dict[str, List[str]]:
     """Load a session snapshot from a directory of `.log`/`.jsonl` files, one `.jsonl` transcript, or a JSON snapshot map."""
     return load_snapshot_with_report(snapshot_path)[0]
 
 
+@fresh_read
 def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
     """Like `load_snapshot`, plus a report of transcript files read and malformed/non-message lines skipped.
 
@@ -2447,6 +2815,7 @@ def load_snapshot_with_report(snapshot_path: Any) -> Tuple[Dict[str, List[str]],
     }
     if not p.exists():
         raise FileNotFoundError(f"Snapshot path does not exist: {p}")
+    _count_work("snapshotDiskLoads", 1)
 
     def _add_jsonl(target: Dict[str, List[str]], key: str, f: Path) -> None:
         lines, st = read_jsonl_transcript(f)
@@ -2732,6 +3101,7 @@ def _atomic_write_file(target: Path, content: str) -> int:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, str(target))
+        _drop_read_caches()
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -2755,6 +3125,7 @@ def _mark_pending(graph: Dict[str, Any]) -> None:
             e["edgeVerdict"] = PENDING
 
 
+@fresh_read
 def run_dream_build(
     snapshot_path: str,
     candidates_path: Optional[str] = None,
@@ -2880,13 +3251,21 @@ def _utc_now_iso() -> str:
 
 
 def _valid_utc_stamp(value: Any) -> bool:
-    if not isinstance(value, str) or not _UTC_STAMP_RE.match(value):
+    if not isinstance(value, str):
+        return False
+    cached = _read_cache("utc_stamps").get(value, _CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        return cached
+    if not _UTC_STAMP_RE.match(value):
+        _read_cache("utc_stamps")[value] = False
         return False
     try:
         datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        ok = True
     except ValueError:
-        return False
-    return True
+        ok = False
+    _read_cache("utc_stamps")[value] = ok
+    return ok
 
 
 def _display_snapshot_line(line):
@@ -2973,6 +3352,7 @@ def _load_queue(queue_path: Any) -> Tuple[Path, Dict[str, Any]]:
     q = q.resolve()
     if not q.is_file():
         raise FileNotFoundError(f"Dream queue file not found: {q}")
+    _count_work("queueDiskLoads", 1)
     graph = json.loads(_read_bounded_text(q, QUEUE_MAX_BYTES, "Dream queue"))
     if not isinstance(graph, dict) or graph.get("schema") != DREAM_ONTOLOGY_SCHEMA:
         raise ValueError(f"Not a {DREAM_ONTOLOGY_SCHEMA} queue: {q}")
@@ -3079,6 +3459,7 @@ def queue_lock(queue_path: Any, timeout: Optional[float] = None) -> Iterator[Pat
                     time.sleep(0.02)
         depth[key] = 1
         try:
+            _forget_current_evidence()
             yield lock_path
         finally:
             depth[key] = 0
@@ -3177,6 +3558,7 @@ def item_quotes_consistent(item: Any, kind: str, *, lenient: bool = False) -> bo
 
 
 def _verify_item_pins(item: Dict[str, Any], kind: str, snap: Dict[str, List[str]]) -> Optional[str]:
+    _count_work("itemPinVerifications", 1)
     if kind == "node":
         err = _verify_pin_dict(item.get("primaryPin"), snap, "primaryPin")
         if err:
@@ -3196,7 +3578,7 @@ def _verify_item_pins(item: Dict[str, Any], kind: str, snap: Dict[str, List[str]
     return None
 
 
-def citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> Dict[str, Any]:
+def _citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> Dict[str, Any]:
     """Read-only review state: a failed citation makes only its item pending."""
     import copy
     view = copy.deepcopy(graph)
@@ -3218,7 +3600,13 @@ def citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) 
     return view
 
 
-def citation_failures(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> List[Dict[str, str]]:
+@fresh_read
+def citation_review_view(graph: Dict[str, Any], snapshot: Dict[str, List[str]], *, _read_state: Optional[Any] = None) -> Dict[str, Any]:
+    return _citation_review_view(graph, snapshot)
+
+
+@fresh_read
+def citation_failures(graph: Dict[str, Any], snapshot: Dict[str, List[str]], *, _read_state: Optional[Any] = None) -> List[Dict[str, str]]:
     """Report every node excluded because its own citation or an owned edge cannot be verified."""
     failures = []
     for n in graph.get("nodes") or []:
@@ -3239,9 +3627,10 @@ def citation_failure_notice(failures: List[Dict[str, str]]) -> str:
             ", ".join(f["id"] for f in failures) + ". See `memlet learn --pending` for reasons and fresh review.")
 
 
-def citation_verified_graph(graph: Dict[str, Any], snapshot: Dict[str, List[str]]) -> Dict[str, Any]:
+@fresh_read
+def citation_verified_graph(graph: Dict[str, Any], snapshot: Dict[str, List[str]], *, _read_state: Optional[Any] = None) -> Dict[str, Any]:
     """Remove only unverifiable items before the complete structural/ontology check."""
-    view = citation_review_view(graph, snapshot)
+    view = _citation_review_view(graph, snapshot)
     view["nodes"] = [n for n in view.get("nodes", []) if not n.get("citationReason")
                      and _verify_item_pins(n, "node", snapshot) is None]
     ids = {n.get("id") for n in view["nodes"]}
@@ -3294,17 +3683,52 @@ def superseded_lesson(node):
             or any(e.get("edgeType") == "SUPERSEDES" and e.get("toId") == node.get("id") for e in node.get("edges", []) if isinstance(e, dict)))
 
 
-def _supersession_pair(node, approved_graph):
+class _SupersessionIndex:
+    """Per-read index over an approved graph's nodes and valid SUPERSEDES edges."""
+
+    __slots__ = ("node_ids", "first_node_by_id", "incoming_by_target", "valid_sup_targets",
+                 "node_len", "edge_len", "projection")
+
+    def __init__(self, approved_graph: Dict[str, Any]):
+        nodes = approved_graph.get("nodes", [])
+        edges = approved_graph.get("edges", [])
+        self.node_len = len(nodes)
+        self.edge_len = len(edges)
+        self.node_ids: Set[Any] = set()
+        self.first_node_by_id: Dict[Any, Dict[str, Any]] = {}
+        for n in nodes:
+            if isinstance(n, dict):
+                nid = n.get("id")
+                self.node_ids.add(nid)
+                self.first_node_by_id.setdefault(nid, n)
+        self.incoming_by_target: Dict[Tuple[Any, Any], List[Dict[str, Any]]] = {}
+        self.valid_sup_targets: Set[Any] = set()
+        _count_work("supersessionCandidateVisits", len(edges))
+        for e in edges:
+            if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID":
+                tid = e.get("toId")
+                self.valid_sup_targets.add(tid)
+                tp = e.get("targetPin")
+                if isinstance(tp, dict):
+                    self.incoming_by_target.setdefault((tid, tp.get("sha256")), []).append(e)
+        self.projection: Optional[Tuple[Dict[Any, Set[str]], Dict[str, Set[str]]]] = None
+
+
+def _supersession_index(approved_graph: Dict[str, Any]) -> _SupersessionIndex:
+    return _SupersessionIndex(approved_graph)
+
+
+def _supersession_pair(node, approved_graph, _index: Optional[_SupersessionIndex] = None):
     """Project incoming approved SUPERSEDES edges without changing any stored node/digest."""
+    idx = _index if _index is not None else _supersession_index(approved_graph)
     pin = node.get("primaryPin") if isinstance(node.get("primaryPin"), dict) else {}
-    incoming = [e for e in approved_graph.get("edges", []) if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES"
-                and e.get("edgeVerdict") == "VALID" and e.get("toId") == node.get("id")
-                and isinstance(e.get("targetPin"), dict) and e["targetPin"].get("sha256") == pin.get("sha256")]
+    incoming = idx.incoming_by_target.get((node.get("id"), pin.get("sha256")), ())
+    _count_work("supersessionCandidateVisits", 1 + len(incoming))
     if not incoming:
         # An active source can carry the old target inline rather than as a separate node.
         outgoing = [e for e in node.get("edges", []) if isinstance(e, dict) and e.get("edgeType") == "SUPERSEDES"
                     and isinstance(e.get("targetPin"), dict) and isinstance(e.get("srcPin"), dict)
-                    and e.get("toId") not in {n.get("id") for n in approved_graph.get("nodes", [])}]
+                    and e.get("toId") not in idx.node_ids]
         if not outgoing:
             return node
         edge = outgoing[0]
@@ -3317,9 +3741,8 @@ def _supersession_pair(node, approved_graph):
         display["edges"].append(edge)
     source = str(edge.get("fromId") or "")
     if not source.endswith(":NEWER"):
-        source_node = next((n for n in approved_graph.get("nodes", []) if n.get("id") == source), None)
-        source_replaced = any(e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID"
-                              and e.get("toId") == source for e in approved_graph.get("edges", []))
+        source_node = idx.first_node_by_id.get(source)
+        source_replaced = source in idx.valid_sup_targets
         if source_node is None or source_node.get("verdict") != "SUPPORTED" or source_replaced:
             display["replacementLabel"] = "SOURCE_SUPERSEDED_OR_DROPPED — RE-VERIFY"
     return display
@@ -3351,24 +3774,45 @@ def replaced_line_index(items):
     return citations, texts
 
 
-def supersession_projection(approved_graph):
-    pairs = [dict(lesson_display_fields(_supersession_pair(n, approved_graph)), id=n["id"], tier="approved")
-             for n in approved_graph.get("nodes", []) if isinstance(n, dict) and n.get("id")]
-    return replaced_line_index(pairs)
+def _supersession_projection(approved_graph, *, _index: Optional[_SupersessionIndex] = None,
+                             _counters: Optional[Dict[str, int]] = None):
+    with work_counters(_counters):
+        idx = _index if _index is not None else _supersession_index(approved_graph)
+        if idx.projection is not None:
+            return idx.projection
+        pairs = [dict(lesson_display_fields(_supersession_pair(n, approved_graph, _index=idx)), id=n["id"], tier="approved")
+                 for n in approved_graph.get("nodes", []) if isinstance(n, dict) and n.get("id")]
+        idx.projection = replaced_line_index(pairs)
+        return idx.projection
 
 
-def supersession_display_node(node, approved_graph, projection=None):
+@fresh_read
+def supersession_projection(approved_graph, *, _index: Optional[_SupersessionIndex] = None,
+                            _counters: Optional[Dict[str, int]] = None, _read_state: Optional[Any] = None):
+    return _supersession_projection(approved_graph, _index=_index, _counters=_counters)
+
+
+def _supersession_display_node(node, approved_graph, projection=None, *, _index: Optional[_SupersessionIndex] = None,
+                               _counters: Optional[Dict[str, int]] = None):
     """Apply the global replacement index without changing stored approval evidence."""
-    display = _supersession_pair(node, approved_graph)
-    citations, texts = projection if projection is not None else supersession_projection(approved_graph)
-    fields = lesson_display_fields(display)
-    replacements = {}
-    for role, quote, cite in zip(fields.get("lineRoles", ["current"] * len(fields.get("quoteLines", []))),
-                                 fields.get("quoteLines", []), fields.get("cites", [])):
-        ids = citations.get(citation_key(cite), set()) | texts.get(normalised_quote(quote), set())
-        if role != "replaced" and ids:
-            replacements[cite["span"]] = sorted(ids)
-    return dict(display, _lineReplacements=replacements) if replacements else display
+    with work_counters(_counters):
+        idx = _index if _index is not None else _supersession_index(approved_graph)
+        display = _supersession_pair(node, approved_graph, _index=idx)
+        citations, texts = projection if projection is not None else _supersession_projection(approved_graph, _index=idx)
+        fields = lesson_display_fields(display)
+        replacements = {}
+        for role, quote, cite in zip(fields.get("lineRoles", ["current"] * len(fields.get("quoteLines", []))),
+                                     fields.get("quoteLines", []), fields.get("cites", [])):
+            ids = citations.get(citation_key(cite), set()) | texts.get(normalised_quote(quote), set())
+            if role != "replaced" and ids:
+                replacements[cite["span"]] = sorted(ids)
+        return dict(display, _lineReplacements=replacements) if replacements else display
+
+
+@fresh_read
+def supersession_display_node(node, approved_graph, projection=None, *, _index: Optional[_SupersessionIndex] = None,
+                              _counters: Optional[Dict[str, int]] = None, _read_state: Optional[Any] = None):
+    return _supersession_display_node(node, approved_graph, projection=projection, _index=_index, _counters=_counters)
 
 
 def lesson_text(node):
@@ -3433,7 +3877,12 @@ def category_label(category: Any) -> str:
 CITATION_REVIEWS_FILE = "CITATION-REVIEWS.json"
 
 
-def citation_review(item, kind, snapshot):
+@fresh_read
+def citation_review(item, kind, snapshot, *, _read_state: Optional[Any] = None):
+    return _citation_review(item, kind, snapshot)
+
+
+def _citation_review(item, kind, snapshot):
     pins = _item_pins(item, kind)
     edges = item.get("edges", []) if kind == "node" else [item]
     for edge in edges:
@@ -3451,7 +3900,7 @@ def citation_review(item, kind, snapshot):
     rows = []
     from .memlet_bridge import safe_lesson_display
     for (file, number), old in sorted(stored.items()):
-        pin = resolve_pin(snapshot, "%s:%s" % (file, number))
+        pin = _resolve_pin(snapshot, "%s:%s" % (file, number))
         raw = pin["quoteText"] if pin else None
         rows.append({"file": file, "start": number, "end": number, "span": "%s:%s" % (file, number),
                      "quote": safe_lesson_display(_LINE_PREFIX_RE.sub("", raw, count=1)) if raw is not None else "(unavailable)",
@@ -3475,6 +3924,7 @@ def _citation_reviews(queue):
     return path, json.loads(text) if text else {}
 
 
+@fresh_read
 def record_citation_reviews(queue, result):
     reviewed = {i.get("id", i.get("edgeId")): i["reviewDigest"]
                 for i in result["pendingNodes"] + result["pendingEdges"]
@@ -3486,6 +3936,7 @@ def record_citation_reviews(queue, result):
             _atomic_write_bytes(path, (json.dumps(saved, sort_keys=True) + "\n").encode())
 
 
+@fresh_read
 def list_pending(queue: Any, snapshot_files=None) -> Dict[str, Any]:
     """List nodes and edges of a Dream queue (path or loaded dict) that have no valid human decision.
     An approval whose digest no longer matches the item counts as pending."""
@@ -3644,7 +4095,9 @@ def _commit_queue_and_db(
                     json_path.unlink()
                 else:
                     _atomic_write_bytes(json_path, old_bytes)
+                _drop_read_caches()
                 raise
+        _drop_read_caches()
     except BaseException:
         if conn is not None and conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -3667,12 +4120,14 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, str(target))
+        _drop_read_caches()
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
 
 
+@fresh_read
 def queue_db_in_sync(queue_path: Any, db_path: Any) -> bool:
     """True when the SQLite DB holds exactly the graph currently stored in the queue JSON."""
     _q, graph = _load_queue(queue_path)
@@ -3814,12 +4269,12 @@ def _decide_locked(
         names = ("primaryPin", "supersededByPin") if kind == "node" else ("srcPin", "targetPin", "citedTargetPin")
         for key in names:
             old = item.get(key)
-            new = resolve_pin(snap or {}, old.get("span", "")) if isinstance(old, dict) else None
+            new = _resolve_pin(snap or {}, old.get("span", "")) if isinstance(old, dict) else None
             if new:
                 item[key] = new
         if kind == "node":
             item["title"] = safe_truncate_masked(_LINE_PREFIX_RE.sub("", str((item.get("primaryPin") or {}).get("quoteText", "")), count=1).strip(), LESSON_TEXT_MAX_CHARS)
-            item["allPins"] = [resolve_pin(snap or {}, p.get("span", "")) or p for p in item.get("allPins", [])]
+            item["allPins"] = [_resolve_pin(snap or {}, p.get("span", "")) or p for p in item.get("allPins", [])]
         item.pop("approval", None)
 
     for item_id in ordered_ids:
@@ -3986,6 +4441,7 @@ def merge_approval_digest(node):
     return node_approval_digest(content)
 
 
+@fresh_read
 def write_merge_decisions(queue_path, graph, ids, who, *, keep=None, db_path=None):
     """Atomic queue write, with repairable advisory history under the queue lock."""
     from .memlet_bridge import _decision_event_write, decision_events
@@ -4038,6 +4494,7 @@ def write_merge_decisions(queue_path, graph, ids, who, *, keep=None, db_path=Non
     return dict(ok=not errors, applied=applied, unchanged=unchanged, repaired=repaired, eventErrors=errors)
 
 
+@fresh_read
 def approve_queue_items(
     queue_path: Any,
     ids: Sequence[str],
@@ -4064,6 +4521,7 @@ def approve_queue_items(
                                reconsider=reconsider, refresh_citations=refresh_citations, paths=paths)
 
 
+@fresh_read
 def reject_queue_items(
     queue_path: Any,
     ids: Sequence[str],
@@ -4095,12 +4553,40 @@ def _quote_integrity_view(graph: Dict[str, Any]) -> Dict[str, Any]:
     return g
 
 
-def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
+def _shallow_graph_for_approval(graph: Dict[str, Any]) -> Dict[str, Any]:
+    g = dict(graph)
+    if isinstance(g.get("nodes"), list):
+        nodes_copy = []
+        for n in g["nodes"]:
+            if isinstance(n, dict):
+                nc = dict(n)
+                if isinstance(nc.get("edges"), list):
+                    nc["edges"] = [dict(e) if isinstance(e, dict) else e for e in nc["edges"]]
+                nodes_copy.append(nc)
+            else:
+                nodes_copy.append(n)
+        g["nodes"] = nodes_copy
+    if isinstance(g.get("edges"), list):
+        g["edges"] = [dict(e) if isinstance(e, dict) else e for e in g["edges"]]
+    return g
+
+
+@fresh_read
+def approved_view(graph: Dict[str, Any], *, _copy: bool = True, _read_state: Optional[Any] = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    return _approved_view(graph, _copy=_copy)
+
+
+def _approved_view(graph: Dict[str, Any], *, _copy: bool = True) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Copy of `graph` in which only items with a valid, digest-matching human approval keep a recallable
     verdict (recomputed, never read from the file); everything else is forced to PENDING or REJECTED."""
     import copy
 
-    g = copy.deepcopy(graph)
+    if _copy and isinstance(graph, dict):
+        _count_work(
+            "approvedViewDeepCopiedItems",
+            len(graph.get("nodes") or []) + len(graph.get("edges") or []),
+        )
+    g = copy.deepcopy(graph) if _copy else _shallow_graph_for_approval(graph)
     stats = {"pendingNodes": 0, "rejectedNodes": 0, "pendingEdges": 0, "rejectedEdges": 0}
     for n in g.get("nodes") or []:
         if not isinstance(n, dict):
@@ -4137,6 +4623,7 @@ def approved_view(graph: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
     return g, stats
 
 
+@fresh_read
 def run_dream_recall(
     graph_path: str,
     snapshot_path: Optional[str] = None,
@@ -4146,6 +4633,11 @@ def run_dream_recall(
     out_md: Optional[str] = None,
     allow_unverified: bool = False,
     require_approval: bool = True,
+    *,
+    _counters: Optional[Dict[str, int]] = None,
+    _read_state: Optional[Any] = None,
+    _graph: Optional[Dict[str, Any]] = None,
+    _snapshot: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Execute `dream-recall`: load the queue, re-verify every pin against the snapshot, recall the 1-hop
     capsule from human-approved items only (via `recall_subgraph`), and optionally write `--out-md`.
@@ -4158,17 +4650,54 @@ def run_dream_recall(
       never pass either way.
     - Approval is an integrity check, not a signature: see `APPROVAL_BOUNDARY` (also in the result).
     """
+    with work_counters(_counters), _enter_read_scope(_read_state) as state:
+        return _run_dream_recall_inner(
+            graph_path=graph_path,
+            snapshot_path=snapshot_path,
+            query_text=query_text,
+            budget_tokens=budget_tokens,
+            out_md_path=out_md_path,
+            out_md=out_md,
+            allow_unverified=allow_unverified,
+            require_approval=require_approval,
+            _read_state=state,
+            _graph=_graph,
+            _snapshot=_snapshot,
+        )
+
+
+def _run_dream_recall_inner(
+    graph_path: str,
+    snapshot_path: Optional[str] = None,
+    query_text: str = "",
+    budget_tokens: int = 1500,
+    out_md_path: Optional[str] = None,
+    out_md: Optional[str] = None,
+    allow_unverified: bool = False,
+    require_approval: bool = True,
+    *,
+    _read_state: Optional[Any] = None,
+    _graph: Optional[Dict[str, Any]] = None,
+    _snapshot: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
     g_path = Path(graph_path).expanduser().resolve()
-    if not g_path.is_file():
-        raise FileNotFoundError(f"Dream ontology graph file not found: {g_path}")
-    graph = json.loads(_read_bounded_text(g_path, QUEUE_MAX_BYTES, "Dream ontology graph"))
+    if _graph is not None:
+        graph = _shallow_graph_for_approval(_graph)
+    else:
+        if not g_path.is_file():
+            raise FileNotFoundError(f"Dream ontology graph file not found: {g_path}")
+        _count_work("queueDiskLoads", 1)
+        graph = json.loads(_read_bounded_text(g_path, QUEUE_MAX_BYTES, "Dream ontology graph"))
     if not isinstance(graph, dict):
         raise ValueError("Dream ontology graph must be a JSON object.")
     _check_graph_safe_structure(graph)
-    snap, snap_source = _locate_snapshot(graph, snapshot_path)
-    failures = citation_failures(graph, snap) if snap is not None else []
+    if _snapshot is not None:
+        snap, snap_source = _snapshot, "explicit"
+    else:
+        snap, snap_source = _locate_snapshot(graph, snapshot_path)
+    failures = citation_failures(graph, snap, _read_state=_read_state) if snap is not None else []
     if snap is not None:
-        graph = citation_verified_graph(graph, snap)
+        graph = citation_verified_graph(graph, snap, _read_state=_read_state)
     res = recall_subgraph(
         graph,
         query_text=query_text,
@@ -4176,6 +4705,7 @@ def run_dream_recall(
         snapshot_files=snap,
         require_approval=require_approval,
         allow_unverified=allow_unverified,
+        _read_state=_read_state,
         verification_notice=citation_failure_notice(failures),
     )
     if failures:
@@ -4196,6 +4726,7 @@ def run_dream_recall(
     return res
 
 
+@fresh_read
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
     import sys

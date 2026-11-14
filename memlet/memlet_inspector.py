@@ -14,6 +14,9 @@ Nothing here writes to the inspected repository except the exported HTML file it
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign
+
+
 import argparse
 import contextlib
 import hashlib
@@ -858,9 +861,9 @@ def export_inspector_html(repo_path: str = ".", output_path: Optional[str] = Non
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="memlet ui", description="Memlet Inspector (self-contained HTML).")
-    parser.add_argument("path", nargs="?", default=".")
-    parser.add_argument("--output", "-o", default=None, help="HTML output path (default: .memlet/inspector.html)")
-    args = parser.parse_args(argv)
+    _call_foreign(lambda: parser.add_argument("path", nargs="?", default="."))
+    _call_foreign(lambda: parser.add_argument("--output", "-o", default=None, help="HTML output path (default: .memlet/inspector.html)"))
+    args = _call_foreign(lambda: parser.parse_args(argv))
     result = export_inspector_html(args.path, args.output)
     result.pop("html", None)
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -1,4 +1,6 @@
 """Honest metric calculation, provenance integrity verification, and identity drift auditing."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import hashlib
 import time
 import work_memory as ledger
@@ -41,10 +43,10 @@ def verify_live_provenance_and_drift(db, task: str, all_active: list, core_kinds
     consolidated_mem_count = 0
     prospective_item_count = 0
 
-    ev_rows = db.execute(
+    ev_rows = _call_foreign(lambda: db.execute(
         "SELECT id, item_id, kind, operation, status, content, source FROM memory_events WHERE task=? ORDER BY id ASC",
         (task,),
-    ).fetchall()
+    ).fetchall())
     event_by_id = {int(er["id"]): er for er in ev_rows if er["id"] is not None}
 
     for r in learned_rows:
@@ -78,7 +80,7 @@ def verify_live_provenance_and_drift(db, task: str, all_active: list, core_kinds
                     if ev_row is not None and ev_row["item_id"] == ref_id:
                         raw_content = ev_row["content"] or ""
                 else:
-                    orig = by_id.get(ref_id) or ledger.get_item(db, task, ref_id)
+                    orig = by_id.get(ref_id) or _call_foreign(lambda: ledger.get_item(db, task, ref_id))
                     if orig is not None:
                         raw_content = orig.get("content") or ""
                 if raw_content is None:
@@ -170,8 +172,8 @@ def evaluate_temporal_guard(db, task: str, timed_rows: list):
     live_hits = 0
     for tr in timed_rows:
         vu = float(tr["valid_until"])
-        before_snap = ledger.snapshot(db, task, at=vu - 1.0, kinds=[tr["kind"]], limit=500)
-        after_snap = ledger.snapshot(db, task, at=vu + 1.0, kinds=[tr["kind"]], limit=500)
+        before_snap = _call_foreign(lambda: ledger.snapshot(db, task, at=vu - 1.0, kinds=[tr["kind"]], limit=500))
+        after_snap = _call_foreign(lambda: ledger.snapshot(db, task, at=vu + 1.0, kinds=[tr["kind"]], limit=500))
         in_before = any(x["item_id"] == tr["item_id"] for x in before_snap)
         in_after = any(x["item_id"] == tr["item_id"] for x in after_snap)
         live_eval += 1

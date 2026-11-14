@@ -31,10 +31,13 @@ starts a daemon, calls a network or LLM, or opens `.env*` files or other secret 
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 from .vocabulary import (HINT as TIER_HINT, REJECTED as TIER_REJECTED)
 from .vocabulary import suggested_label
 
 import contextlib
+import contextvars
 import fnmatch
 import hashlib
 import json
@@ -50,9 +53,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .audit import (BACKTICK_FILE_RE, EXCLUDED_DIRS, EXPLICIT_ANCHOR_RE, IGNORED_FILE_TOKENS, LazyBlockPattern, SpanMatch,
-                    audit_repository, iter_explicit_anchors)
+                    audit_repository, iter_explicit_anchors, _blank_lines)
 from .code_anchors import (NEW_PIN, PYTHON_HASH_BASIS, TS_LEXICAL_BASIS, exact_symbol_fingerprints, extract_file_symbol_hashes,
                            extract_file_symbol_signatures, previous_python_symbol_hashes)
+from .memlet_dream import fresh_read
 
 MEMLET_VERSION = "9.4.0"
 CONFIG_SCHEMA_VERSION = 1
@@ -103,6 +107,7 @@ _SCRATCH_DIRS = {"_workspace", "worktrees", ".worktrees"}
 _NESTED_MAX_DIRS = 3  # nested instruction files at most 3 directories below the root
 
 
+@fresh_read
 def slim_output_files(root: Path) -> List[str]:
     """`management/agent-*.md` files that `memlet slim-plan` produced (exact name + its generated first line), so rules
     it moved out of AGENTS.md stay indexed, recalled and handed over. Any other `management/agent-*.md` is ignored."""
@@ -228,6 +233,7 @@ def _git_head(root: Path) -> Optional[str]:
     return sha if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha) else None
 
 
+@fresh_read
 def discover_instruction_files(root: Path, exclude_snapshots: bool = False) -> List[str]:
     """Return sorted repo-relative paths of agent instruction files (never `.env*`).
 
@@ -399,6 +405,7 @@ def read_regular_bytes(p: Path, limit: int = MAX_TEXT_READ_BYTES, *, prefix=Fals
     return b"".join(chunks)
 
 
+@fresh_read
 def read_managed_text(root: Path, rel: str, limit: int = MAX_TEXT_READ_BYTES) -> Optional[str]:
     """`read_regular_text` of a Memlet-managed file, None when it is missing, unsafe, unreadable or over `limit`."""
     if managed_path_problem(root, rel):
@@ -406,7 +413,12 @@ def read_managed_text(root: Path, rel: str, limit: int = MAX_TEXT_READ_BYTES) ->
     return read_regular_text(root / rel, limit)
 
 
+@fresh_read
 def read_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    return _read_config(root)
+
+
+def _read_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """(`.memlet/config.json` as an object, error). (None, None) when it does not exist. Never follows a symlink,
     never blocks on a FIFO, never reads more than MAX_CONFIG_BYTES."""
     problem = managed_path_problem(root, CONFIG_PATH)
@@ -460,6 +472,8 @@ def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool 
         fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), new_mode)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+        from . import memlet_dream as md
+        md._drop_read_caches()
         return len(data)
     try:
         mode = stat.S_IMODE(os.lstat(str(target)).st_mode)
@@ -484,6 +498,8 @@ def write_managed_bytes(root: Path, rel: str, data: bytes, *, create_only: bool 
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    from . import memlet_dream as md
+    md._drop_read_caches()
     return len(data)
 
 
@@ -521,6 +537,7 @@ def connect_managed_sqlite(root: Path, rel: str, *, readonly: bool = False, **kw
     return sqlite3.connect(str(path), **kw)
 
 
+@fresh_read
 def iter_wiki_pages(root: Path) -> List[Tuple[str, str]]:
     """(repo-relative path, text) of the Markdown pages under `.memlet/wiki/`, in path order, each passing the
     containment rule. Bounded: at most MAX_WIKI_PAGES pages, MAX_WIKI_PAGE_BYTES per page (a larger page is skipped)
@@ -548,6 +565,7 @@ def iter_wiki_pages(root: Path) -> List[Tuple[str, str]]:
     return out
 
 
+@fresh_read
 def trusted_wiki_pages(root: Path) -> List[Tuple[str, str]]:
     """`iter_wiki_pages` for readers that present rules or pins as verified (handover, changed-file check): the
     Memlet-owned promoted Dream page is left out entirely (rules and pins) unless it is exactly what Memlet last
@@ -563,12 +581,17 @@ def trusted_wiki_pages(root: Path) -> List[Tuple[str, str]]:
     return out
 
 
+@contextlib.contextmanager
 def memlet_write_lock(root: Path):
     """The one lock every writer of Memlet's wiki state takes (config pins, wiki pages, the promoted Dream page and
     the ledger): the Dream queue lock, so anchor accept, init / wiki / import / handover --write and Dream
     promotion are serialised against each other. Re-entrant within a thread."""
     from memlet import memlet_dream as md
-    return md.queue_lock(root / MEMLET_DIR / "dream" / "APPROVAL-QUEUE.json")
+    with md.queue_lock(root / MEMLET_DIR / "dream" / "APPROVAL-QUEUE.json") as lk:
+        try:
+            yield lk
+        finally:
+            md._drop_read_caches()
 
 
 def _read_text(p: Path, limit: int = MAX_TEXT_READ_BYTES) -> str:
@@ -596,13 +619,16 @@ def _extract_anchors(text: str, source: str) -> List[Dict[str, Any]]:
 
 def _merge_anchors(raw: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    source_sets: Dict[Tuple[str, str], set] = {}
     for a in raw:
         key = (a["path"], a["symbol"])
         entry = merged.setdefault(key, {"path": a["path"], "symbol": a["symbol"], "pin": None, "sources": []})
+        seen = source_sets.setdefault(key, set())
         loc = f"{a['source']}:{a['line']}"
         if a["pin"] and entry["pin"] is None:
             entry["pin"] = a["pin"]
-        if not a["pin"] and loc not in entry["sources"]:
+        if not a["pin"] and loc not in seen:
+            seen.add(loc)
             entry["sources"].append(loc)
     return [merged[k] for k in sorted(merged)]
 
@@ -615,10 +641,11 @@ def _req_sig_hash(sig: Dict[str, Any]) -> Optional[str]:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:_HASH_LEN]
 
 
+@fresh_read
 def exact_parser_opt_in(root: Path) -> List[str]:
     """Exact parsers this repository opted into for NEW TS/JS pins: `.memlet/config.json` `anchors.exactParsers`
     (e.g. ["tree-sitter"]). Empty by default; installing a parser package alone never changes how anything is pinned."""
-    cfg, _err = read_config(root)
+    cfg, _err = _read_config(root)
     anchors = cfg.get("anchors") if isinstance(cfg, dict) else None
     names = anchors.get("exactParsers") if isinstance(anchors, dict) else None
     return [n for n in names if isinstance(n, str) and n][:8] if isinstance(names, list) else []
@@ -692,7 +719,8 @@ def _same_hash(a: Optional[str], b: Optional[str]) -> bool:
     return n >= 6 and a[:n] == b[:n]
 
 
-def classify_anchor(root: Path, anchor: Dict[str, Any]) -> Dict[str, Any]:
+@fresh_read
+def classify_anchor(root: Path, anchor: Dict[str, Any], *, _read_state: Optional[Any] = None) -> Dict[str, Any]:
     pin = anchor.get("pin")
     # a stored pin is checked under its own basis (None = a legacy pin); no pin at all is NEW_PIN
     cur = _current_fingerprint(root, anchor["path"], anchor["symbol"], basis=pin.get("basis") if pin else NEW_PIN)
@@ -853,7 +881,7 @@ def _with_page_header(text: str, counts: Dict[str, int]) -> str:
     """Replace the page status header in place, or insert it after the `# Title` line (else at the top)."""
     block = _page_header(counts) + "\n"
     if _PAGE_STATUS_RE.search(text):
-        return _PAGE_STATUS_RE.sub(lambda _m: block, text, count=1)
+        return _PAGE_STATUS_RE.sub(block, text, count=1)
     first, _, rest = text.partition("\n")
     if first.startswith("# "):
         return first + "\n" + block + rest
@@ -887,6 +915,8 @@ def _record_page(conn: sqlite3.Connection, page: str, sha: str, event_type: str,
         "INSERT INTO wiki_events (page, content_sha256, event_type, recorded_at) VALUES (?, ?, ?, ?)",
         (page, sha, event_type, now),
     )
+    from . import memlet_dream as md
+    md._drop_read_caches()
 
 
 def _sync_snapshots(conn: sqlite3.Connection, classified: List[Dict[str, Any]], now: str) -> bool:
@@ -901,6 +931,9 @@ def _sync_snapshots(conn: sqlite3.Connection, classified: List[Dict[str, Any]], 
         if existing.get(c["anchor"]) != row:
             conn.execute("INSERT OR REPLACE INTO anchor_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (c["anchor"], *row, now))
             changed = True
+    if changed:
+        from . import memlet_dream as md
+        md._drop_read_caches()
     return changed
 
 
@@ -914,12 +947,32 @@ def _read_ledger_hashes(ledger: Path) -> Dict[str, str]:
         return {}
 
 
+from ._read_context import WIKI_READ as _ACTIVE_WIKI_READ
+
+
+def _active_wiki_read_state() -> Optional[Dict[str, Any]]:
+    return _ACTIVE_WIKI_READ.get()
+
+
+@contextlib.contextmanager
+def _wiki_read_scope(handed_state: Optional[Any] = None):
+    from . import memlet_dream as md
+    with md._enter_read_scope(handed_state) as state:
+        yield state
+
+
+def _count_wiki_work(key: str, amount: int = 1) -> None:
+    from .memlet_dream import _count_work
+    _count_work(key, amount)
+
+
 def _validated_config_pins(config):
     """Return usable pins and diagnostics for hand-edited config entries."""
     entries = config.get("pinnedAnchors", {})
     if not isinstance(entries, dict):
         return {}, [{"anchor": None, "reason": "pinnedAnchors_must_be_object"}]
     pins, skipped = {}, []
+    _count_wiki_work("configPinValidations", len(entries))
     for key, pin in entries.items():
         valid = isinstance(key, str) and "::" in key and isinstance(pin, dict)
         valid = valid and isinstance(pin.get("astHash"), str) and bool(re.fullmatch(r"[0-9a-f]{6,64}", pin["astHash"]))
@@ -936,8 +989,15 @@ def _validated_config_pins(config):
 
 
 def _load_config_pins(root: Path) -> Dict[str, Any]:
-    config, _err = read_config(root)
-    return _validated_config_pins(config)[0] if isinstance(config, dict) else {}
+    from . import memlet_dream as md
+    rkey = Path(root).resolve()
+    cached = md._read_cache("config_pins", state=_ACTIVE_WIKI_READ.get()).get(rkey)
+    if cached is not None:
+        return cached
+    config, _err = _read_config(root)
+    pins = _validated_config_pins(config)[0] if isinstance(config, dict) else {}
+    md._read_cache("config_pins", state=_ACTIVE_WIKI_READ.get())[rkey] = pins
+    return pins
 
 
 def _format_markdown(title: str, report: Dict[str, Any]) -> str:
@@ -1020,6 +1080,7 @@ def _guarded(command: str, root: Path, dry_run: bool, output_format: str, paths:
         return _refused(command, root, str(exc), dry_run, output_format)
 
 
+@fresh_read
 def init_project(repo_path=".", *, dry_run: bool = False, force: bool = False, output_format: str = "json") -> Dict[str, Any]:
     """`memlet init`: onboard a repo into `.memlet/` (read-only when `dry_run`). Refused (ok false, nothing written)
     when `.memlet`, its config, wiki, index or ledger is a symlink or not a regular file / real directory."""
@@ -1227,6 +1288,7 @@ def _anchor_suggestion_hint(root: Path) -> Optional[Dict[str, Any]]:
     return {"rules": n, "command": "memlet admin anchors suggest"} if n else None
 
 
+@fresh_read
 def repin_legacy_ts_anchors(repo_path=".", *, dry_run: bool = False) -> Dict[str, Any]:
     """Explicitly re-pin only legacy TS/JS baselines; versioned stale pins stay untouched.
 
@@ -1239,7 +1301,7 @@ def repin_legacy_ts_anchors(repo_path=".", *, dry_run: bool = False) -> Dict[str
 
 def _repin_legacy_ts(root: Path, dry_run: bool) -> Dict[str, Any]:
     config_path = root / CONFIG_PATH
-    config, err = read_config(root)
+    config, err = _read_config(root)
     if err:
         raise ValueError(f"memlet config must be a JSON object ({err})")
     if config is None:
@@ -1307,6 +1369,7 @@ def _repin_legacy_ts(root: Path, dry_run: bool) -> Dict[str, Any]:
             "baselineNotice": "Current TS/JS code becomes a new lexical baseline; rule meaning is not verified."}
 
 
+@fresh_read
 def wiki_status(repo_path=".", *, dry_run: bool = False, output_format: str = "json") -> Dict[str, Any]:
     """`memlet wiki`: re-check AST anchors in `.memlet/wiki/*.md`, refresh the INDEX status block and
     per-page status headers, and sync human page edits into `.memlet/ledger.sqlite3`."""
@@ -1352,7 +1415,7 @@ def _wiki_status(root: Path, *, dry_run: bool, output_format: str) -> Dict[str, 
     if initialized and INDEX_PATH in texts:
         old = texts[INDEX_PATH]
         block = _status_block(classified, summary)
-        new = _STATUS_BLOCK_RE.sub(lambda _m: block, old) if _STATUS_BLOCK_RE.search(old) else old.rstrip("\n") + "\n\n" + block + "\n"
+        new = _STATUS_BLOCK_RE.sub(block, old) if _STATUS_BLOCK_RE.search(old) else old.rstrip("\n") + "\n\n" + block + "\n"
         new = _migrate_legacy_comments(root, new)
         if new == old:
             actions.append({"op": "unchanged", "path": INDEX_PATH})
@@ -1387,7 +1450,7 @@ def _wiki_status(root: Path, *, dry_run: bool, output_format: str) -> Dict[str, 
 
     config_path = root / CONFIG_PATH
     if initialized and config_path.is_file() and not managed_path_problem(root, CONFIG_PATH):
-        config, _cfg_err = read_config(root)
+        config, _cfg_err = _read_config(root)
         pins = config.get("pinnedAnchors") if isinstance(config, dict) else None
         migrated = False
         for key, cp in list(pins.items()) if isinstance(pins, dict) else []:
@@ -1554,6 +1617,7 @@ def _memory_dir_files(root: Path, dirname: str) -> List[str]:
     return out
 
 
+@fresh_read
 def import_source_files(root: Path, source: str = "auto") -> List[str]:
     """Repo-relative files `memlet import --from <source>` reads (never `.env*`)."""
     source = (source or "auto").lower()
@@ -1657,11 +1721,35 @@ def _rules_from_files(root: Path, files: Iterable[str]) -> List[Dict[str, Any]]:
     return rules
 
 
+def _load_sidecar_index(root: Path, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from . import memlet_dream as md
+    rkey = Path(root).resolve() if config is None else None
+    if rkey is not None:
+        cached = md._read_cache("sidecar_index", state=_ACTIVE_WIKI_READ.get()).get(rkey)
+        if cached is not None:
+            return cached
+    _count_wiki_work("sidecarIndexLoads", 1)
+    from .memlet_anchors import sidecar_index
+    idx = sidecar_index(Path(root), config)
+    if rkey is not None:
+        md._read_cache("sidecar_index", state=_ACTIVE_WIKI_READ.get())[rkey] = idx
+    return idx
+
+
 def _attach_sidecar(root: Path, rules: List[Dict[str, Any]]) -> None:
     """Accepted sidecar anchors (`memlet admin anchors accept`) become references of the rules they belong to, so
     every reader checks them exactly like a written `path::symbol` (see `memlet_anchors`)."""
-    from .memlet_anchors import attach_sidecar_refs
-    attach_sidecar_refs(root, rules)
+    if not rules:
+        return
+    idx = _load_sidecar_index(root)
+    if not idx["attached"]:
+        return
+    from .memlet_anchors import _attach, _written_anchor_refs
+    for r in rules:
+        entries = idx["byLocation"].get((r.get("source"), r.get("line")))
+        if not entries or r.get("ruleSha256") != entries[0]["ruleSha256"] or _written_anchor_refs(r):
+            continue
+        _attach(Path(root), r, entries)
 
 
 def _unsafe_rel(path: str) -> bool:
@@ -1697,39 +1785,54 @@ def _classify_path(root: Path, path: str) -> Dict[str, Any]:
 def _config_pins(root: Path) -> Dict[str, Dict[str, Optional[str]]]:
     """Recorded baselines from `.memlet/config.json`: `pinnedAnchors`, then (lowest precedence) the pins of attached
     sidecar anchors, so a written pin of the same anchor always governs."""
-    config, _err = read_config(root)
+    from . import memlet_dream as md
+    config, _err = _read_config(root)
     pins = {}
+    rkey = Path(root).resolve()
     if not isinstance(config, dict):
+        md._read_cache("config_pins", state=_ACTIVE_WIKI_READ.get())[rkey] = {}
         return pins
-    for key, cp in _validated_config_pins(config)[0].items():
+    validated = _validated_config_pins(config)[0]
+    md._read_cache("config_pins", state=_ACTIVE_WIKI_READ.get())[rkey] = validated
+    for key, cp in validated.items():
         if isinstance(cp, dict) and cp.get("astHash"):
             pins[key] = {"ast": cp["astHash"], "sig": cp.get("sigHash"), "req": cp.get("reqSigHash"), "basis": cp.get("hashBasis")}
     if config.get("sidecarAnchors"):
-        from .memlet_anchors import sidecar_index
-        for key, pin in sidecar_index(root, config)["pins"].items():
+        side = _load_sidecar_index(root) if _active_wiki_read_state() is not None else _load_sidecar_index(root, config)
+        for key, pin in side["pins"].items():
             pins.setdefault(key, dict(pin))
     return pins
 
 
 def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[str, Any]],
-                  pin_source: str = "config") -> List[Dict[str, Any]]:
+                  pin_source: str = "config", *, _read_state: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Classify each referenced anchor once and tag every rule with its worst anchor state.
 
     Observing a symbol does not establish a baseline; only stored pins are compared. Accepted sidecar anchors are
     attached first; an anchor that only sidecar entries supply is marked `suggested: true`."""
+    with _wiki_read_scope(_read_state) as state:
+        return _verify_rules_inner(root, rules, pins, pin_source=pin_source, _read_state=state)
+
+
+def _verify_rules_inner(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[str, Any]],
+                        pin_source: str = "config", *, _read_state: Optional[Any] = None) -> List[Dict[str, Any]]:
+    if _read_state is None:
+        _read_state = _active_wiki_read_state()
     _attach_sidecar(root, rules)
     from .memlet_bridge import enrich_promoted_rules
-    enrich_promoted_rules(root, rules)
+    enrich_promoted_rules(root, rules, _read_state=_read_state)
     cache: Dict[str, Dict[str, Any]] = {}
+    source_sets: Dict[str, set] = {}
     for r in rules:
         keys: List[str] = []
+        keys_seen: set = set()
         for raw_path, symbol in r["refs"]:
             path = _resolve_ref_path(root, r["source"], raw_path)
             key = f"{path}::{symbol}" if symbol else path
             if key not in cache:
                 if symbol:
                     pin, src = pins.get(key), pin_source
-                    entry = classify_anchor(root, {"path": path, "symbol": symbol, "pin": pin})
+                    entry = classify_anchor(root, {"path": path, "symbol": symbol, "pin": pin}, _read_state=_read_state)
                     if entry["reason"] == "legacy_ast_hash_match":
                         pin = {"ast": entry["currentAstHash"], "sig": entry["currentSigHash"], "req": entry["currentReqSigHash"], "basis": entry["currentHashBasis"]}
                     entry.update(pin=pin, pinSource=src if pin else None)
@@ -1737,10 +1840,13 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
                     entry = _classify_path(root, path)
                 entry["sources"] = []
                 cache[key] = entry
+                source_sets[key] = set()
             loc = f"{r['source']}:{r['line']}"
-            if loc not in cache[key]["sources"]:
+            if loc not in source_sets[key]:
+                source_sets[key].add(loc)
                 cache[key]["sources"].append(loc)
-            if key not in keys:
+            if key not in keys_seen:
+                keys_seen.add(key)
                 keys.append(key)
         states = {cache[k]["status"] for k in keys}
         r["anchors"] = keys
@@ -1760,7 +1866,8 @@ def _verify_rules(root: Path, rules: List[Dict[str, Any]], pins: Dict[str, Dict[
     return [cache[k] for k in sorted(cache)]
 
 
-def rule_anchor_pins(root: Path) -> Dict[str, Dict[str, Any]]:
+@fresh_read
+def rule_anchor_pins(root: Path, *, _read_state: Optional[Any] = None) -> Dict[str, Dict[str, Any]]:
     """The same baseline precedence for handover, recall and checks: wiki pins override config."""
     pins = _config_pins(root)
     page_pins = {}
@@ -1772,33 +1879,46 @@ def rule_anchor_pins(root: Path) -> Dict[str, Dict[str, Any]]:
     return pins
 
 
-def classify_rule_quotes(root: Path, entries: List[Dict[str, Any]]) -> None:
+@fresh_read
+def classify_rule_quotes(root: Path, entries: List[Dict[str, Any]], *,
+                         _counters: Optional[Dict[str, int]] = None,
+                         _read_state: Optional[Any] = None) -> None:
     """Tag every quoted span using handover's classifier, without re-pinning anything."""
-    pins = rule_anchor_pins(root)
-    rules = []
-    from .memlet_anchors import attach_sidecar_to_span
-    for e in entries:
-        cite = e.get("id", e.get("source", ""))
-        source, sep, span = cite.rpartition(":")
-        if not sep:
-            source, span = cite, ""
-        refs = []
-        for r in _extract_rules(e.get("quote", ""), source):
-            refs.extend(r["refs"])
-        rule = {"source": source, "line": 1, "text": e.get("quote", ""), "refs": refs}
-        m = re.fullmatch(r"(\d{1,7})(?:-(\d{1,7}))?", span)
-        if m:  # the quoted span `file:first-last`: sidecar anchors of rules inside it (verified against the file)
-            attach_sidecar_to_span(root, rule, source, int(m.group(1)), int(m.group(2) or m.group(1)))
-        rules.append(rule)
-    anchors = _verify_rules(root, rules, pins, pin_source="pinned")
-    by_key = {a["anchor"]: a for a in anchors}
-    for e, r in zip(entries, rules):
-        e["anchorStatus"] = r["status"]
-        e["anchors"] = [dict({"anchor": k, "status": by_key[k]["status"], "reason": by_key[k]["reason"]},
-                             **({"suggested": True, "sidecarId": (r.get("sidecarIds") or {}).get(k)}
-                                if k in (r.get("suggestedAnchors") or []) else {}))
-                        for k in r["anchors"]]
-        e["anchorReason"] = "; ".join(dict.fromkeys(a["reason"] for a in e["anchors"])) or "no_code_anchor"
+    from .memlet_dream import work_counters
+    with work_counters(_counters), _wiki_read_scope(_read_state) as state:
+        _count_wiki_work("bridgeQuoteClassifications", 1)
+        pins = rule_anchor_pins(root, _read_state=state)
+        rules = []
+        side = _load_sidecar_index(root) if entries else {"attached": [], "byLocation": {}}
+        from .memlet_anchors import _attach, _written_anchor, _written_anchor_refs
+        for e in entries:
+            cite = e.get("id", e.get("source", ""))
+            source, sep, span = cite.rpartition(":")
+            if not sep:
+                source, span = cite, ""
+            q_rules = _extract_rules(e.get("quote", ""), source)
+            refs = [ref for r in q_rules for ref in r["refs"]]
+            rule = {"source": source, "line": 1, "text": e.get("quote", ""), "refs": refs}
+            m = re.fullmatch(r"(\d{1,7})(?:-(\d{1,7}))?", span)
+            if m and side["attached"] and not _written_anchor_refs(rule):
+                first, last = int(m.group(1)), int(m.group(2) or m.group(1))
+                for qr in q_rules:
+                    line = first + qr["line"] - 1
+                    if line > last:
+                        break
+                    loc_entries = side["byLocation"].get((source, line))
+                    if loc_entries and loc_entries[0]["ruleSha256"] == qr["ruleSha256"] and not _written_anchor(qr):
+                        _attach(Path(root), rule, loc_entries)
+            rules.append(rule)
+        anchors = _verify_rules(root, rules, pins, pin_source="pinned", _read_state=state)
+        by_key = {a["anchor"]: a for a in anchors}
+        for e, r in zip(entries, rules):
+            e["anchorStatus"] = r["status"]
+            e["anchors"] = [dict({"anchor": k, "status": by_key[k]["status"], "reason": by_key[k]["reason"]},
+                                 **({"suggested": True, "sidecarId": (r.get("sidecarIds") or {}).get(k)}
+                                    if k in (r.get("suggestedAnchors") or []) else {}))
+                            for k in r["anchors"]]
+            e["anchorReason"] = "; ".join(dict.fromkeys(a["reason"] for a in e["anchors"])) or "no_code_anchor"
 
 
 def _suggested_fields(rule, key=None):
@@ -1810,9 +1930,22 @@ def _suggested_fields(rule, key=None):
             "sidecarId": ids.get(key or keys[0])}
 
 
+def _index_rules_by_anchor(rules: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    by_anchor: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rules:
+        for ak in r.get("anchors", ()):
+            by_anchor.setdefault(ak, []).append(r)
+    return by_anchor
+
+
 def _anchor_rule_rows(rules, key):
-    return [{"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "source": f"{r['source']}:{r['line']}",
-             **_suggested_fields(r, key)} for r in rules if key in r.get("anchors", [])]
+    rows = []
+    for r in rules:
+        _count_wiki_work("anchorRuleLookups", 1)
+        if key in r.get("anchors", []):
+            rows.append({"rule": _clip(r["text"], _HANDOVER_TEXT_LIMIT), "source": f"{r['source']}:{r['line']}",
+                         **_suggested_fields(r, key)})
+    return rows
 
 
 def _anchor_lines(items):
@@ -1826,46 +1959,51 @@ def _anchor_lines(items):
     return lines
 
 
-def pinned_anchor_report(root: Path) -> Dict[str, Any]:
+@fresh_read
+def pinned_anchor_report(root: Path, *, _counters: Optional[Dict[str, int]] = None,
+                         _read_state: Optional[Any] = None) -> Dict[str, Any]:
     """Read-only current classification of all recorded pins and discovered symbol anchors."""
-    pins = rule_anchor_pins(root)
-    raw, rules = [], []
-    for rel, text in list(_source_texts(root, discover_instruction_files(root))) + list(trusted_wiki_pages(root)):
-        raw.extend(_extract_anchors(text, rel))
-        if not _is_generated_page(rel, text):
-            rules.extend(_extract_rules(_STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text)), rel))
-    _verify_rules(root, rules, pins, pin_source="pinned")
-    merged = {f"{a['path']}::{a['symbol']}": a for a in _merge_anchors(raw)}
-    for key, pin in pins.items():
-        if "::" in key:
-            path, symbol = key.rsplit("::", 1)
-            merged.setdefault(key, {"path": path, "symbol": symbol, "sources": []})["pin"] = pin
-    from .memlet_anchors import sidecar_index
-    side = sidecar_index(root)
-    side_sources: Dict[str, List[str]] = {}
-    side_ids: Dict[str, List[str]] = {}
-    for e in side["attached"]:  # an accepted sidecar anchor is reported at its rule, like a written anchor
-        side_sources.setdefault(e["anchor"], []).append(f"{e['source']}:{e['currentLine']}")
-        side_ids.setdefault(e["anchor"], []).append(e["id"])
-    anchors = []
-    for k in sorted(merged):
-        a = classify_anchor(root, merged[k])
-        if k in side_sources:
-            written = bool(a["sources"])
-            a["sources"] = a["sources"] + [s for s in side_sources[k] if s not in a["sources"]]
-            a["sidecarIds"] = sorted(side_ids[k])
-            a["rules"] = _anchor_rule_rows(rules, k)
-            if not written:
-                a["suggested"] = True
-        anchors.append(a)
-    counts = {state: sum(a["status"] == state for a in anchors) for state in ANCHOR_STATES}
-    counts["total"] = len(anchors)
-    report = {"summary": counts, "anchors": anchors}
-    if side["attached"] or side["detached"]:  # additive, only once sidecar anchors exist
-        report["sidecar"] = {"attached": len(side["attached"]),
-                             "detached": [{k: e.get(k) for k in ("id", "source", "anchor", "state", "reason")}
-                                          for e in side["detached"]]}
-    return report
+    from .memlet_dream import work_counters
+    with work_counters(_counters), _wiki_read_scope(_read_state) as state:
+        pins = rule_anchor_pins(root, _read_state=state)
+        raw, rules = [], []
+        for rel, text in list(_source_texts(root, discover_instruction_files(root))) + list(trusted_wiki_pages(root)):
+            raw.extend(_extract_anchors(text, rel))
+            if not _is_generated_page(rel, text):
+                rules.extend(_extract_rules(_STATUS_BLOCK_RE.sub(_blank_lines, _PAGE_STATUS_RE.sub(_blank_lines, text)), rel))
+        _verify_rules(root, rules, pins, pin_source="pinned", _read_state=state)
+        merged = {f"{a['path']}::{a['symbol']}": a for a in _merge_anchors(raw)}
+        for key, pin in pins.items():
+            if "::" in key:
+                path, symbol = key.rsplit("::", 1)
+                merged.setdefault(key, {"path": path, "symbol": symbol, "sources": []})["pin"] = pin
+        side = _load_sidecar_index(root)
+        side_sources: Dict[str, List[str]] = {}
+        side_ids: Dict[str, List[str]] = {}
+        for e in side["attached"]:  # an accepted sidecar anchor is reported at its rule, like a written anchor
+            side_sources.setdefault(e["anchor"], []).append(f"{e['source']}:{e['currentLine']}")
+            side_ids.setdefault(e["anchor"], []).append(e["id"])
+        rules_by_anchor = _index_rules_by_anchor(rules) if side_sources else {}
+        anchors = []
+        for k in sorted(merged):
+            a = classify_anchor(root, merged[k], _read_state=state)
+            if k in side_sources:
+                written = bool(a["sources"])
+                existing_sources = set(a["sources"])
+                a["sources"] = a["sources"] + [s for s in side_sources[k] if s not in existing_sources]
+                a["sidecarIds"] = sorted(side_ids[k])
+                a["rules"] = _anchor_rule_rows(rules_by_anchor.get(k, ()), k)
+                if not written:
+                    a["suggested"] = True
+            anchors.append(a)
+        counts = {state: sum(a["status"] == state for a in anchors) for state in ANCHOR_STATES}
+        counts["total"] = len(anchors)
+        report = {"summary": counts, "anchors": anchors}
+        if side["attached"] or side["detached"]:  # additive, only once sidecar anchors exist
+            report["sidecar"] = {"attached": len(side["attached"]),
+                                 "detached": [{k: e.get(k) for k in ("id", "source", "anchor", "state", "reason")}
+                                              for e in side["detached"]]}
+        return report
 
 
 def _public_anchor(a: Dict[str, Any]) -> Dict[str, Any]:
@@ -1938,6 +2076,7 @@ def _escape_cell(text: str, limit: int = 100) -> str:
     return text.replace("|", "\\|")
 
 
+@fresh_read
 def import_rules(repo_path=".", *, source: str = "auto", dry_run: bool = False, output_format: str = "json") -> Dict[str, Any]:
     """`memlet import`: import rules from `CLAUDE.md` / `AGENTS.md` / `.cursorrules` / `.cursor/rules/*.mdc` /
     `.ai-memory/**/*.md` / `.claude-mem/**/*.md` and audit every code anchor they mention right away."""
@@ -1981,7 +2120,7 @@ def _import_rules(root: Path, source: str, dry_run: bool, output_format: str) ->
     cfg_path = root / CONFIG_PATH
     config: Any = None
     if cfg_path.is_file():
-        config, cfg_err = read_config(root)
+        config, cfg_err = _read_config(root)
         if cfg_err:
             config = False  # unreadable config is left alone
     if config is False:
@@ -2146,7 +2285,7 @@ class _DigestSourceTailPattern:
         m = self.search(text)  # the match runs to the end of the text, so there is at most one
         if m is None:
             return text
-        return text[:m.start()] + (repl(m) if callable(repl) else repl) + text[m.end():]
+        return text[:m.start()] + (_call_foreign(lambda: repl(m)) if callable(repl) else repl) + text[m.end():]
 
 
 _DIGEST_SOURCE_TAIL_RE = _DigestSourceTailPattern()
@@ -2258,11 +2397,6 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _blank_lines(m: "re.Match[str]") -> str:
-    """Replace a generated block with blank lines so rule line numbers stay accurate."""
-    return "\n" * m.group(0).count("\n")
-
-
 def _git_modified_count(root: Path) -> Optional[int]:
     """Working-tree entries from `git status --porcelain`, ignoring Memlet's own `.memlet/` files."""
     try:
@@ -2281,7 +2415,48 @@ def _git_modified_count(root: Path) -> Optional[int]:
     return count
 
 
+_HANDOVER_ITEM_KEYS = (
+    "activeConstraints", "approvedLessons", "hints", "lexicalConstraints",
+    "quotedRules", "ruleIndex", "staleIndex", "briefRules", "staleBrief",
+    "projectRules", "pathExistsAnchors", "unpinnedAnchors", "reverifyBeforeUse",
+    "quarantinedStaleAnchors", "rejectedApproaches",
+)
+
+
+def _handover_item_text(key: str, a: Dict[str, Any]) -> str:
+    _count_wiki_work("handoverItemRenders", 1)
+    if key == "activeConstraints":
+        if a.get("quoteLines"):
+            from .memlet_bridge import _lesson_quote_block
+            return f"- {suggested_label(a)}(`{a['source']}`)\n" + _lesson_quote_block(a)
+        return (f"- {suggested_label(a)}{a['rule']} (`{a['source']}`"
+                + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
+    if key in ("approvedLessons", "hints"):
+        return a["text"]
+    if key in ("lexicalConstraints", "briefRules"):
+        return f"- {suggested_label(a)}{a['rule']} (`{a['source']}`)"
+    if key == "quotedRules":
+        return "\n".join([f"- [{a['topic']}] `{a['source']}`:"] + [f"  > {q}" for q in a["quote"].splitlines()])
+    if key == "ruleIndex":
+        return f"- {a['topic']} → `{a['source']}`"
+    if key == "projectRules":
+        return (f"- {suggested_label(a)}{a['rule']} (`{a['source']}`"
+                + (f"; path not found: {', '.join(a['pathNotFound'])}" if a.get("pathNotFound") else "")
+                + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
+    if key in ("pathExistsAnchors", "unpinnedAnchors"):
+        if "rule" in a:
+            return (f"- {suggested_label(a)}{a['rule']} (`{a['source']}`; {a['reason']}"
+                    + ("; TRUNCATED — read the source line before acting" if a.get("truncated") else "") + ")")
+        return f"- `{a['anchor']}`: {a['reason']}"
+    if key in ("reverifyBeforeUse", "quarantinedStaleAnchors"):
+        return "\n".join(_anchor_lines([a]))
+    if key == "rejectedApproaches":
+        return f"- {a['approach']}"
+    return ""
+
+
 def _render_handover(c: Dict[str, Any], signature: str) -> str:
+    _count_wiki_work("handoverItemRenders", sum(len(c.get(k) or ()) for k in _HANDOVER_ITEM_KEYS))
     proof = c["executionProof"]
     health = proof["anchorHealth"]
     modified = proof["modifiedFilesCount"]
@@ -2406,13 +2581,14 @@ def _render_handover(c: Dict[str, Any], signature: str) -> str:
     return body.replace(_MARKDOWN_CHECKSUM_PLACEHOLDER, checksum, 1)
 
 
+@fresh_read
 def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
     """(token budget, where it came from). Order: explicit argument > config.json `handover.tokenBudget` > default.
 
     A number is clamped to [HANDOVER_BUDGET_MIN, HANDOVER_BUDGET_MAX]; `auto` scales with the instruction text."""
     source = "argument"
     if budget is None:
-        cfg, _err = read_config(root)  # regular file, size-capped, never a FIFO or a symlink
+        cfg, _err = _read_config(root)  # regular file, size-capped, never a FIFO or a symlink
         hand = cfg.get("handover") if isinstance(cfg, dict) else None
         budget = hand.get("tokenBudget") if isinstance(hand, dict) else None
         source = "config"
@@ -2431,10 +2607,11 @@ def resolve_handover_budget(root: Path, budget=None) -> Tuple[int, str]:
     return max(HANDOVER_BUDGET_MIN, min(HANDOVER_BUDGET_MAX, n)), source
 
 
+@fresh_read
 def resolve_handover_mode(root: Path, mode=None) -> str:
     """Explicit argument > config.json `handover.mode` > `verified`. Unknown values fall back to `verified`."""
     if mode is None:
-        cfg, _err = read_config(root)
+        cfg, _err = _read_config(root)
         hand = cfg.get("handover") if isinstance(cfg, dict) else None
         mode = hand.get("mode") if isinstance(hand, dict) else None
     mode = str(mode or "verified").strip().lower()
@@ -2556,6 +2733,7 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
     `suggestedAnchors`, anchor items supplied only by sidecar entries carry `suggested: true`. Adds keys only when
     sidecar anchors are involved, so capsules without them are byte-identical."""
     by_src = {f"{r['source']}:{r['line']}": r for r in constraints if r.get("suggestedAnchors")}
+    rules_by_anchor: Optional[Dict[str, List[Dict[str, Any]]]] = None
     for items in lists.values():
         for item in items:
             r = by_src.get(item.get("source"))
@@ -2563,7 +2741,9 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
                 item["suggestedAnchors"] = [_bounded_anchor(k) for k in r["suggestedAnchors"]]
                 item["sidecarIds"] = [r["sidecarIds"][k] for k in r["suggestedAnchors"] if k in (r.get("sidecarIds") or {})]
             elif "reason" in item and "anchor" in item and (by_key.get(item["anchor"]) or {}).get("sidecarIds"):
-                rows = _anchor_rule_rows(constraints, item["anchor"])
+                if rules_by_anchor is None:
+                    rules_by_anchor = _index_rules_by_anchor(constraints)
+                rows = _anchor_rule_rows(rules_by_anchor.get(item["anchor"], ()), item["anchor"])
                 if rows and all(row.get("suggested") for row in rows):
                     item["suggested"] = True
                 item["sidecarIds"] = sorted({sid for row in rows for sid in row.get("sidecarIds", {}).values()})
@@ -2571,10 +2751,12 @@ def _mark_suggested_items(lists: Dict[str, List[Dict[str, Any]]], constraints: L
                     item["rules"] = rows
 
 
+@fresh_read
 def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: Optional[Iterable[str]] = None,
-                   output_format: str = "json", write: bool = False, budget=None, mode=None, _lesson_items=None) -> Dict[str, Any]:
+                   output_format: str = "json", write: bool = False, budget=None, mode=None, _lesson_items=None,
+                   _counters: Optional[Dict[str, int]] = None, _read_state: Optional[Any] = None) -> Dict[str, Any]:
     options = dict(next_step=next_step, rejected=rejected, output_format=output_format,
-                   budget=budget, mode=mode, _lesson_items=_lesson_items)
+                   budget=budget, mode=mode, _lesson_items=_lesson_items, _counters=_counters, _read_state=_read_state)
     if not write:
         return _build_handover(repo_path, **options)
     root = _resolve_root(repo_path)
@@ -2592,7 +2774,16 @@ def build_handover(repo_path=".", *, next_step: Optional[str] = None, rejected: 
 
 
 def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_format="json", write=False,
-                    budget=None, mode=None, _lesson_items=None):
+                    budget=None, mode=None, _lesson_items=None, _counters=None, _read_state=None):
+    from .memlet_dream import work_counters, _enter_read_scope
+    with work_counters(_counters), _enter_read_scope(_read_state) as state:
+        return _build_handover_scoped(repo_path, next_step=next_step, rejected=rejected, output_format=output_format,
+                                      write=write, budget=budget, mode=mode, _lesson_items=_lesson_items,
+                                      _read_state=state)
+
+
+def _build_handover_scoped(repo_path=".", *, next_step=None, rejected=None, output_format="json", write=False,
+                           budget=None, mode=None, _lesson_items=None, _read_state=None):
     """`memlet handover`: deterministic, checksummed (<500 token) Memlet handover capsule.
 
     Only rules whose anchors are all `active` are carried as constraints; `stale` anchors are quarantined
@@ -2619,7 +2810,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
             page_rules = _extract_rules(body, rel)
             if rel == DREAM_PROMOTED_PAGE:  # promoted Dream lessons travel only while approval and citation verify
                 from memlet.memlet_bridge import promoted_rule_entries
-                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
+                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
                 page_rules = [r for r in page_rules if r["line"] in live]
             rules.extend(page_rules)
     dead_ends = [r for r in rules if _DEAD_END_HEADING_RE.search(r["section"])]
@@ -2633,7 +2824,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
         constraints.append(r)
     pins = _config_pins(root)
     pins.update(page_pins)
-    anchors = _verify_rules(root, constraints, pins, pin_source="pinned")
+    anchors = _verify_rules(root, constraints, pins, pin_source="pinned", _read_state=_read_state)
     by_key = {a["anchor"]: a for a in anchors}
     def _active(r):
         if not digest:
@@ -2673,7 +2864,7 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
     }
     _mark_suggested_items(lists, constraints, by_key)
     from memlet.memlet_bridge import dream_items, render_capsule_lesson, _load_queue
-    lesson_read = dream_items(root, tiers=("approved", TIER_HINT)) if _lesson_items is None else {"items": _lesson_items}
+    lesson_read = dream_items(root, tiers=("approved", TIER_HINT), _read_state=_read_state) if _lesson_items is None else {"items": _lesson_items}
     lesson_items = lesson_read.get("items", [])
     attachment = {k: lesson_read[k] for k in ("attachmentIncomplete", "attachmentReason") if k in lesson_read}
     # Metadata only: eligibility remains exclusively the verified tier provider's decision.
@@ -2788,29 +2979,152 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
         drop_order = ("reverifyBeforeUse", "activeConstraints", "rejectedApproaches", "quarantinedStaleAnchors")
     drop_order = ("hints", "approvedLessons", "lexicalConstraints", "pathExistsAnchors", "unpinnedAnchors") + drop_order
     floors = {"quarantinedStaleAnchors": min(_HANDOVER_QUARANTINE_FLOOR, caps["quarantinedStaleAnchors"])}
-    while True:
-        capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
-                   "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
-        capsule.update(attachment)
-        if replacement_notices:
-            capsule["replacedRuleNotices"] = replacement_notices
-        if any(capped.values()):
-            capsule["listCapOmitted"] = {k: {"count": v, "cap": caps[k]} for k, v in capped.items() if v}
-        if digest:
-            capsule["mode"] = "digest"
+    list_cap_omitted = {k: {"count": v, "cap": caps[k]} for k, v in capped.items() if v} if any(capped.values()) else None
+    index_src = ({k: index_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if index_meta else None) if index else None
+    index_outdated = bool(index and index_meta and (index_meta.get("staleness") or {}).get("stale"))
+    brief_src = ({k: brief_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if brief_meta else None) if brief else None
+
+    health = proof["anchorHealth"]
+    modified = proof["modifiedFilesCount"]
+    static_lines = [
+        "## Memlet Handover Capsule",
+        f"- Repo head: `{head or 'n/a'}`",
+        f"- Checksum: `{_MARKDOWN_CHECKSUM_PLACEHOLDER}` (integrity, not authentication)",
+        f"- Authority: {AUTHORITY_BOUNDARY}",
+        "### Active constraints (anchored symbols unchanged since pinning)",
+        "### Quarantined stale anchors (not handed over)",
+        "### Rejected approaches (do not retry)",
+        "### Execution proof",
+        f"- Modified files: {'n/a' if modified is None else modified} · anchors: {health['active']} active · "
+        f"{health['compatible-unverified']} compatible-unverified · {health['stale']} stale",
+        f"- Rules blocked as stale: {proof['staleRulesBlocked']} · unanchored rules not carried: {proof['unanchoredRulesOmitted']}",
+        "### Next action",
+        f"- {next_action or '(not specified)'}",
+    ]
+    if attachment.get("attachmentIncomplete"):
+        from .vocabulary import ATTACHMENT_INCOMPLETE
+        static_lines.append("- " + ATTACHMENT_INCOMPLETE)
+    if replacement_notices:
+        static_lines.extend("- " + notice for notice in replacement_notices)
+    for key, value in sorted((list_cap_omitted or {}).items()):
+        static_lines.append("- Omitted over the %d-item cap: %s %d" % (value["cap"], key, value["count"]))
+    if index:
+        isrc = index_src or {}
+        static_lines.append("### Key rules (quoted verbatim from the instruction files; source unchanged since the index was built)")
+        static_lines.append(
+            "### Rule index — BEFORE acting on any of these topics, read the cited lines "
+            f"(topics chosen by {isrc.get('via') or 'n/a'} at {isrc.get('builtAt') or 'n/a'}; not listing a rule here does "
+            "not mean it does not exist)"
+        )
+        if index_outdated:
+            static_lines.append("- WARNING: instructions changed after indexing; re-run `memlet index-build`")
+    if brief:
+        bsrc = brief_src or {}
+        static_lines.append(
+            f"### Project brief (LLM-written by {bsrc.get('via') or 'n/a'} at {bsrc.get('builtAt') or 'n/a'}; cited "
+            "instruction text unchanged since then — meaning and code behaviour are NOT verified; follow unless current "
+            "instructions say otherwise)"
+        )
+    if digest:
+        static_lines.append("### Project rules (from instructions; not code-anchored — follow unless current instructions say otherwise)")
+    static_tokens = sum(estimate_tokens(ln) for ln in static_lines)
+    none_tokens = estimate_tokens("- (none)")
+    approved_head_tokens = estimate_tokens("### Approved lessons (human-approved; citations re-verified in .memlet/dream/snapshot/)")
+    lex_head_tokens = estimate_tokens("### TS/JS constraints (lexical hash match only; re-check before use)")
+    reverify_head_tokens = estimate_tokens("### Re-verify before use (compatible-unverified)")
+    obs_head_tokens = {
+        "pathExistsAnchors": estimate_tokens("### Paths exist (not verified)"),
+        "unpinnedAnchors": estimate_tokens("### Unpinned symbols (not verified)"),
+    }
+
+    item_tokens: Dict[str, List[int]] = {}
+    list_token_sums: Dict[str, int] = {}
+    for k, items_k in lists.items():
+        if k in ("staleIndex", "staleBrief"):
+            item_tokens[k] = []
+            list_token_sums[k] = 0
+        else:
+            toks = [estimate_tokens(_handover_item_text(k, a)) for a in items_k]
+            item_tokens[k] = toks
+            list_token_sums[k] = sum(toks)
+
+    def _current_tokens() -> int:
+        tot = static_tokens + sum(list_token_sums.values())
+        if not lists["activeConstraints"]:
+            tot += none_tokens
+        if lists.get("approvedLessons"):
+            tot += approved_head_tokens
+        if lists.get("hints"):
+            from memlet.memlet_bridge import hint_label
+            from .vocabulary import HINT_HELP
+            tot += estimate_tokens("### " + hint_label(lists["hints"])) + estimate_tokens(HINT_HELP)
+            if not lists.get("approvedLessons"):
+                tot += estimate_tokens("Citations: .memlet/dream/snapshot/")
+        if lists.get("lexicalConstraints"):
+            tot += lex_head_tokens
         if index:
-            capsule["mode"] = "index"
-            capsule["indexSource"] = ({k: index_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if index_meta
-                                      else None)
-            if index_meta and (index_meta.get("staleness") or {}).get("stale"):
-                capsule["indexOutdated"] = True  # additive, only when stale: unchanged capsules stay byte-identical
+            if not lists.get("quotedRules"):
+                tot += estimate_tokens("- (none — run `memlet index-build` to create the index)" if not index_src else "- (none fit the budget)")
+            if not lists.get("ruleIndex"):
+                tot += none_tokens
+            if omitted.get("ruleIndex"):
+                tot += estimate_tokens(
+                    f"- {omitted['ruleIndex']} more index entr(y/ies) omitted for the token budget; read the "
+                    "project instructions for anything not listed here"
+                )
+            held = (len(lists.get("staleIndex") or []) + omitted.get("staleIndex", 0)
+                    + (list_cap_omitted or {}).get("staleIndex", {}).get("count", 0))
+            if held:
+                tot += estimate_tokens(
+                    f"- WARNING: {held} indexed rule(s) changed since the index was built (re-read before relying on "
+                    "them): " + "; ".join(f"{a['topic']} `{a['source']}`" for a in (lists.get("staleIndex") or []))
+                )
         if brief:
-            capsule["mode"] = "brief"
-            capsule["briefSource"] = ({k: brief_meta.get(k) for k in ("via", "builtAt", "inputSha256")} if brief_meta
-                                      else None)
-        signature = handover_signature(capsule)
-        markdown = _render_handover(capsule, signature)
-        tokens = estimate_tokens(markdown)
+            if not lists.get("briefRules"):
+                tot += estimate_tokens("- (none — run `memlet brief-build` to create one)")
+            if omitted.get("briefRules"):
+                tot += estimate_tokens(
+                    f"- {omitted['briefRules']} lower-priority brief line(s) omitted for the token budget; read the "
+                    "project instructions for anything not listed here"
+                )
+            held = (len(lists.get("staleBrief") or []) + omitted.get("staleBrief", 0)
+                    + (list_cap_omitted or {}).get("staleBrief", {}).get("count", 0))
+            if held:
+                tot += estimate_tokens(
+                    f"- WARNING: {held} brief line(s) held back because their cited instructions changed: "
+                    + "; ".join(f"`{a['source']}`" for a in (lists.get("staleBrief") or [])) + " — re-read those lines"
+                )
+        if digest:
+            if not lists.get("projectRules"):
+                tot += none_tokens
+            if omitted.get("projectRules"):
+                tot += estimate_tokens(
+                    f"- {omitted['projectRules']} lower-priority rule(s) omitted for the token budget; read the "
+                    "project instructions for anything not listed here"
+                )
+        for okey in ("pathExistsAnchors", "unpinnedAnchors"):
+            if lists.get(okey):
+                tot += obs_head_tokens[okey]
+        if lists["reverifyBeforeUse"]:
+            tot += reverify_head_tokens
+        if not lists["quarantinedStaleAnchors"]:
+            tot += none_tokens
+        hidden_stale = (omitted.get("quarantinedStaleAnchors", 0)
+                        + (list_cap_omitted or {}).get("quarantinedStaleAnchors", {}).get("count", 0))
+        if hidden_stale:
+            tot += estimate_tokens(
+                f"- WARNING: {hidden_stale} more stale anchor(s) are quarantined but not listed here; do not follow any "
+                "rule whose anchor is not in the active list (run `memlet wiki` for the full list)"
+            )
+        if not lists["rejectedApproaches"]:
+            tot += none_tokens
+        dropped = {k: v for k, v in omitted.items() if v}
+        if dropped:
+            tot += estimate_tokens("- Omitted for token budget: " + ", ".join(f"{k} {v}" for k, v in sorted(dropped.items())))
+        return tot
+
+    while True:
+        tokens = _current_tokens()
         victim = next((k for k in drop_order if len(lists[k]) > floors.get(k, 0)), None)
         if digest and victim in ("projectRules", "activeConstraints"):
             ranked = [k for k in ("projectRules", "activeConstraints") if lists[k]]
@@ -2825,9 +3139,36 @@ def _build_handover(repo_path=".", *, next_step=None, rejected=None, output_form
             break
         if index and victim == "quotedRules":  # never lose a top rule: keep it reachable as an index entry
             demoted = lists[victim][-1]
-            lists["ruleIndex"] = [{"topic": demoted["topic"], "source": demoted["source"]}] + lists["ruleIndex"]
+            new_ri = {"topic": demoted["topic"], "source": demoted["source"]}
+            t_ri = estimate_tokens(_handover_item_text("ruleIndex", new_ri))
+            lists["ruleIndex"] = [new_ri] + lists["ruleIndex"]
+            item_tokens["ruleIndex"] = [t_ri] + item_tokens["ruleIndex"]
+            list_token_sums["ruleIndex"] += t_ri
+        if item_tokens.get(victim):
+            list_token_sums[victim] -= item_tokens[victim].pop()
         lists[victim] = lists[victim][:-1]
         omitted[victim] += 1
+
+    capsule = {"schema": HANDOVER_SCHEMA, "repoHead": head, **lists, "executionProof": proof,
+               "nextAction": next_action, "authorityBoundary": AUTHORITY_BOUNDARY, "omitted": dict(omitted)}
+    capsule.update(attachment)
+    if replacement_notices:
+        capsule["replacedRuleNotices"] = replacement_notices
+    if list_cap_omitted:
+        capsule["listCapOmitted"] = list_cap_omitted
+    if digest:
+        capsule["mode"] = "digest"
+    if index:
+        capsule["mode"] = "index"
+        capsule["indexSource"] = index_src
+        if index_outdated:
+            capsule["indexOutdated"] = True  # additive, only when stale: unchanged capsules stay byte-identical
+    if brief:
+        capsule["mode"] = "brief"
+        capsule["briefSource"] = brief_src
+    signature = handover_signature(capsule)
+    markdown = _render_handover(capsule, signature)
+    tokens = estimate_tokens(markdown)
 
     actions: List[Dict[str, str]] = []
     write_refused: Optional[str] = None
@@ -3059,6 +3400,7 @@ def _score_mode(mode: str, sc: Dict[str, Any], result: Dict[str, Any]) -> Dict[s
     return score
 
 
+@fresh_read
 def run_refactoring_comparison_benchmark(output_format: str = "json") -> Dict[str, Any]:
     """Replay 4 refactoring scenarios in a temp dir and score raw Markdown, an unverified wiki, and Memlet.
 
@@ -3079,7 +3421,7 @@ def run_refactoring_comparison_benchmark(output_format: str = "json") -> Dict[st
             _apply_files(root, sc["after"])
             for mode, runner in runners.items():
                 started = time.perf_counter()
-                result = runner(root, sc)
+                result = _call_foreign(lambda: runner(root, sc))
                 elapsed[mode] += (time.perf_counter() - started) * 1000
                 scores[mode].append(_score_mode(mode, sc, result))
 

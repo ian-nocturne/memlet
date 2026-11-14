@@ -179,3 +179,47 @@ class OneProcessAnswersLikeAFreshOne(_tidy_tests.Base):
         self.same(repo, 'after rejecting the kept lesson')
         self.assertTrue(_mb.learn_unmerge(repo, [b], approver='Robin')['ok'])
         self.same(repo, 'after the unmerge')
+
+    def test_public_readers_ignore_ambient_read_state_after_external_change(self):
+        repo = self.make_repo()
+        a = self.learn(repo, 'mon.log', '2026-11-02T10:00:00Z [user] ' + self.A)[0]
+        b = self.learn(repo, 'wed.log', '2026-11-04T10:00:00Z [user] ' + self.B)[0]
+        self.assertTrue(_mb.learn_approve(repo, [a, b], approver='Robin')['ok'])
+        self.assertTrue(_mb.learn_merge(repo, a, [b], approver='Robin')['ok'])
+        callback_ran = []
+        callback_err = []
+
+        class _ExternalMutationStore:
+            def memory(store_self, *_a, **_kw):
+                try:
+                    reject_code = (
+                        "import sys; sys.path.insert(0, sys.argv[1]); "
+                        "from memlet import memlet_bridge as mb; "
+                        "res = mb.learn_reject(sys.argv[2], [sys.argv[3]], approver='Robin', reason='out-of-process'); "
+                        "assert res['ok'], res"
+                    )
+                    out = _subprocess.run(
+                        [_sys.executable, '-B', '-c', reject_code, str(_HERE), str(repo), a],
+                        capture_output=True,
+                        text=True,
+                        env=dict(_os.environ),
+                        cwd=str(repo),
+                        timeout=120,
+                    )
+                    self.assertEqual(0, out.returncode, out.stderr[-2000:])
+                    after = self.here(repo)
+                    self.assertNotIn(a, [i[0] for i in after['items']])
+                    self.same(repo, 'inside unified_recall store callback after external child-process reject')
+                    callback_ran.append(True)
+                except BaseException as exc:
+                    callback_err.append(exc)
+                    raise
+                return {"retrieval": {"items": []}}
+
+        res = _mb.unified_recall(
+            repo, "refund retry wrapper", budget=4000, store=_ExternalMutationStore(), task="t1"
+        )
+        if callback_err:
+            raise callback_err[0]
+        self.assertTrue(res['ok'], res)
+        self.assertEqual([True], callback_ran)

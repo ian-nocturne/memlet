@@ -11,6 +11,7 @@ Safety contract (same as the rest of the inspector):
 """
 
 from __future__ import annotations
+from . import memlet_dream as md
 
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import copy
@@ -226,6 +227,7 @@ def _hero(ws: Dict[str, Any], wid: str) -> str:
 # Tab
 
 
+@md.fresh_read
 def tab_cortex(payload: Dict[str, Any]) -> str:
     parts = []
     for wid, ws in payload["workspaces"].items():

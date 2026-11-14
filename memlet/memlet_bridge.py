@@ -24,6 +24,8 @@ and `formatted` holds a Markdown rendering.
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING, REJECTED as TIER_REJECTED)
 from .vocabulary import (suggested_label, HINT_LABEL, HINT_HELP, MODEL_AGREEMENT, VENDOR_AGREEMENT,
                          VETO_PREFIX, VETO_TEMPLATE, VERDICT_HELP, TIERS, SAME_VENDOR_REVIEW,
@@ -146,26 +148,70 @@ def _gitignore_notice(root: Path) -> Optional[str]:
             "text. Add `.memlet/` to `.gitignore` (Memlet does not edit it for you).")
 
 
+def _snapshot_digest(snap_files: Optional[Dict[str, List[str]]]) -> Optional[str]:
+    if snap_files is None:
+        return None
+    h = hashlib.sha256()
+    for k in sorted(snap_files):
+        h.update(k.encode("utf-8", "surrogateescape") + b"\0")
+        for ln in snap_files[k]:
+            h.update(ln.encode("utf-8", "surrogateescape") + b"\n")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def _load_queue(root: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     """(graph or None, reason). Refuses a symlinked queue (raises ValueError through `memlet_dream._load_queue`)."""
+    rkey = Path(root).resolve()
+    val = md._read_cache("loaded_queues").get(rkey, md._CACHE_MISS)
+    if val is not md._CACHE_MISS:
+        if isinstance(val, Exception):
+            raise val
+        cached_graph, cached_why = val
+        return (md._shallow_graph_for_approval(cached_graph) if cached_graph is not None else None, cached_why)
     q = root / QUEUE_REL
     if not q.exists() and not q.is_symlink():
-        return None, "no Dream queue (.memlet/dream/APPROVAL-QUEUE.json); run `learn` first"
-    _q, graph = md._load_queue(q)
-    return graph, ""
+        out = (None, "no Dream queue (.memlet/dream/APPROVAL-QUEUE.json); run `learn` first")
+        md._read_cache("loaded_queues")[rkey] = out
+        md._read_cache("queue_digests")[rkey] = "absent"
+        return out
+    try:
+        _q, graph = md._load_queue(q)
+    except (OSError, ValueError) as exc:
+        md._read_cache("loaded_queues")[rkey] = exc
+        raise
+    if md._active_read_state() is not None:
+        md._read_cache("loaded_queues")[rkey] = (graph, "")
+        md._read_cache("queue_digests")[rkey] = md.graph_sha256(graph)
+        return (md._shallow_graph_for_approval(graph), "")
+    return (graph, "")
 
 
 def _load_snapshot(root: Path) -> Tuple[Optional[Dict[str, List[str]]], str]:
     """The bridge's fixed in-repo snapshot (`.memlet/dream/snapshot/`), never a path read from the queue."""
+    rkey = Path(root).resolve()
+    cached = md._read_cache("loaded_snapshots").get(rkey, md._CACHE_MISS)
+    if cached is not md._CACHE_MISS:
+        cached_snap, cached_why = cached
+        if cached_snap is None:
+            return None, cached_why
+        return {k: list(v) for k, v in cached_snap.items()}, cached_why
     snap = root / SNAPSHOT_REL
     if _symlinked(root, (SNAPSHOT_REL,)):
-        return None, "refusing symlinked snapshot directory"
-    if not snap.is_dir():
-        return None, "no transcript snapshot (.memlet/dream/snapshot/)"
-    try:
-        return md.load_snapshot(snap), ""
-    except (OSError, ValueError) as exc:
-        return None, f"snapshot unreadable: {exc}"
+        out = (None, "refusing symlinked snapshot directory")
+    elif not snap.is_dir():
+        out = (None, "no transcript snapshot (.memlet/dream/snapshot/)")
+    else:
+        try:
+            out = (md.load_snapshot(snap), "")
+        except (OSError, ValueError) as exc:
+            out = (None, f"snapshot unreadable: {exc}")
+    if md._active_read_state() is not None:
+        md._read_cache("loaded_snapshots")[rkey] = out
+        md._read_cache("snapshot_digests")[rkey] = _snapshot_digest(out[0]) or ("err:" + out[1])
+        if out[0] is not None:
+            return {k: list(v) for k, v in out[0].items()}, out[1]
+    return out
 
 
 def _node_edges_verify(node: Dict[str, Any], snap: Dict[str, List[str]]) -> Optional[str]:
@@ -395,6 +441,7 @@ def agent_transcript_roots() -> Tuple[Path, ...]:
     return tuple(roots)
 
 
+@md.fresh_read
 def transcript_symlink_problem(path: Any) -> Optional[str]:
     """Why a transcript path must be refused because of symbolic links, or None.
 
@@ -420,6 +467,7 @@ def transcript_symlink_problem(path: Any) -> Optional[str]:
     return "a symlink in the transcript path leads outside the known agent transcript folders"
 
 
+@md.fresh_read
 def learn_from_transcript(repo_path=".", transcript_path=None, *, vendor="autonomous-deterministic") -> Dict[str, Any]:
     """Build or extend the PENDING queue `.memlet/dream/APPROVAL-QUEUE.json` (+ `ontology.sqlite3`) from a `.jsonl`
     / `.log` transcript or a directory of them. Nothing is approved; existing approvals are kept untouched."""
@@ -500,7 +548,7 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
         kept = []
         for candidate in cands:
             spans = candidate.get("src_spans", [])
-            pins = [md.resolve_pin(snap, span) for span in spans]
+            pins = [md._resolve_pin(snap, span) for span in spans]
             quote = "\n".join(md._LINE_PREFIX_RE.sub("", p["quoteText"], count=1).strip() for p in pins if p)
             if candidate["lesson_id"] not in old_ids and quote in approved_quotes:
                 echo_count += 1
@@ -516,7 +564,7 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
     for node in built.get("nodes", []):
         node["proposers"] = [{"vendor": "keyword", "origin": "untrusted", "isolation": "none"}]
     merged, info = _merge(old, built, snap, snap_dir)
-    ver = md.verify_ontology_contract(merged, snap)
+    ver = md._verify_ontology_contract(merged, snap)
     if not ver["ok"]:
         return _fail("merged Dream queue failed the ontology contract; nothing was written",
                      1, contractVerification=ver)
@@ -574,7 +622,7 @@ def _learn_locked(root: Path, files: List[Path], skipped: Dict[str, Any], vendor
 
 # A projection shares this context through existing reader APIs without global
 # caches or monkeypatching. Nested/concurrent projections restore their own state.
-_lesson_path_active = contextvars.ContextVar("lesson_path_active", default=None)
+from ._read_context import TRUST_PROJECTIONS as _ACTIVE_TRUST_PROJ_SINK
 
 
 class _LessonPathContext(dict):
@@ -591,20 +639,22 @@ class _LessonPathContext(dict):
         super().update(values)
 
 
+def _active_lesson_path_context(root: Path) -> Optional[_LessonPathContext]:
+    return md._read_cache("lesson_path_contexts").get(root)
+
+
 @contextlib.contextmanager
 def _lesson_path_projection(root, work):
-    context = _LessonPathContext(root, work)
-    token = _lesson_path_active.set(context)
-    try:
-        yield context
-    finally:
-        _lesson_path_active.reset(token)
+    """A call-local output accumulator, passed explicitly; never a read memo."""
+    with md._enter_read_scope():
+        yield _LessonPathContext(mw._resolve_root(root), work)
 
 
 def _lesson_path_available(context):
     return not context.get("work") or context["work"].available()
 
 
+@md.fresh_read
 def valid_lesson_path(root, path, *, context=None):
     """Exact, contained regular file; an attachment names a location, not content identity.
 
@@ -613,8 +663,8 @@ def valid_lesson_path(root, path, *, context=None):
     """
     root = Path(root)
     if context is None:
-        active = _lesson_path_active.get()
-        context = active if active is not None and active["root"] == root else _LessonPathContext(root)
+        active = _active_lesson_path_context(root)
+        context = active if active is not None else _LessonPathContext(root)
     if not _lesson_path_available(context):
         return False
     if not isinstance(path, str):
@@ -679,19 +729,20 @@ def _attachment_result(result, context):
 
 
 def _attachment_reader(fn):
-    # Nested readers reuse a single listing without leaking across calls.
     import functools
     @functools.wraps(fn)
     def read(repo_path=".", *args, **kwargs):
+        state = md._active_read_state()
         try:
             root = mw._resolve_root(repo_path)
         except ValueError:
             return fn(repo_path, *args, **kwargs)
-        active = _lesson_path_active.get()
-        if active is not None and active["root"] == root:
+        if "_read_state" in fn.__code__.co_varnames:
+            kwargs = dict(kwargs, _read_state=state)
+        if kwargs.get("_path_context") is not None:
             return fn(repo_path, *args, **kwargs)
         with _lesson_path_projection(root, None) as context:
-            result = fn(repo_path, *args, **kwargs)
+            result = fn(repo_path, *args, **dict(kwargs, _path_context=context))
             if context.get("attachmentIncomplete"):
                 _attachment_result(result, context)
                 if "formatted" in result and "tokenBudget" not in result:
@@ -700,15 +751,19 @@ def _attachment_reader(fn):
     return read
 
 
-def lesson_path_context(repo_path=".", *, remaining=None):
+@md.fresh_read
+def lesson_path_context(repo_path=".", *, remaining=None, _read_state=None, context=None):
     """One bounded tracked-file lookup and one set of evidence reads per projection.
 
+    A held context is the caller's snapshot, even after the read or a later write.
     An invalid/unreadable git work tree fails closed for automatic attachments.
     """
     root = mw._resolve_root(repo_path)
-    context = _lesson_path_active.get()
-    if context is None or context["root"] != root:
-        context = _LessonPathContext(root)
+    if context is None:
+        context = _active_lesson_path_context(root)
+        if context is None:
+            context = _LessonPathContext(root)
+            md._read_cache("lesson_path_contexts")[root] = context
     if context["initialized"]:
         return context
     context["initialized"] = True
@@ -786,13 +841,14 @@ def _lesson_path_candidates(text):
     return _lesson_path_tokens(text)[1]
 
 
+@md.fresh_read
 def literal_lesson_paths(root, scope, text, *, context=None):
     """Extract whole path tokens from text; Git requires tracked files.
 
     ``scope`` is retained for caller compatibility but never attaches a path: it
     is only a display label and recall filter term, regardless of proposer/tier.
     """
-    context = lesson_path_context(root) if context is None else context
+    context = lesson_path_context(root, _read_state=md._active_read_state()) if context is None else context
     root = context["root"]
     if not _lesson_path_available(context):
         return []
@@ -844,7 +900,7 @@ def _lesson_literal_paths(node, root, context):
                     for number in range(parsed[1], parsed[2] + 1):
                         span = "%s:%d" % (parsed[0], number)
                         if span not in replaced:
-                            evidence.append((md.resolve_pin(context["snapshot"], span), "current"))
+                            evidence.append((md._resolve_pin(context["snapshot"], span), "current"))
     seen = set()
     for cite, role in evidence:
         if not _lesson_path_available(context):
@@ -855,7 +911,7 @@ def _lesson_literal_paths(node, root, context):
         seen.add(identity)
         if len(paths) >= 8:
             break
-        pin = md.resolve_pin(context["snapshot"] or {}, cite["span"])
+        pin = md._resolve_pin(context["snapshot"] or {}, cite["span"])
         if not pin or pin.get("sha256") != cite.get("sha256"):
             continue
         for line in str(pin.get("quoteText", "")).split("\n"):
@@ -865,11 +921,12 @@ def _lesson_literal_paths(node, root, context):
     return paths[:8]
 
 
+@md.fresh_read
 def lesson_paths(node, repo_path=".", *, context=None):
     """Human-attached locations: approved tier, exact existing file; tracking is optional."""
     if not node.get("approvedPaths") or md.approval_state(node, "node") != TIER_APPROVED:
         return []
-    context = lesson_path_context(repo_path) if context is None else context
+    context = lesson_path_context(repo_path, _read_state=md._active_read_state()) if context is None else context
     if not context["loaded"]:
         snapshot, _ = _load_snapshot(context["root"])
         config, _ = _load_config(context["root"])
@@ -877,7 +934,7 @@ def lesson_paths(node, repo_path=".", *, context=None):
         if context.get("work"):
             context["work"].count("queueReads")
         context.update(loaded=True, snapshot=snapshot, config=tier_config(graph or {}, config),
-                       trust=dream_tiers(graph or {}, snapshot=snapshot, config=config))
+                       trust=dream_tiers(graph or {}, snapshot=snapshot, config=config, _read_state=md._active_read_state()))
     state = context["trust"].get(node["id"])
     if state is None:
         state = {"tier": TIER_PENDING}
@@ -900,6 +957,7 @@ def _decision_event_write(root, events):
             conn.executemany("INSERT INTO dream_decision_events (at,item_id,kind,decision,by,digest,paths) VALUES (?,?,?,?,?,?,?)", events)
     finally:
         conn.close()
+    md._drop_read_caches()
 
 
 class DecisionEvents(list):
@@ -910,6 +968,7 @@ class DecisionEvents(list):
         self.truncated = truncated
 
 
+@md.fresh_read
 def decision_events(repo_path=".", item_id=None):
     """Bounded advisory history in stable sequence order; absent/unreadable means unknown."""
     try:
@@ -947,8 +1006,15 @@ def _learn_commands_repo(text, root):
     return re.sub(r"`(memlet learn [^`]+)`", lambda m: "`" + m[1] + suffix + "`", text) if suffix else text
 
 
-def learn_pending(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
+@md.fresh_read
+def learn_pending(repo_path=".", *, _record_review=True, _counters: Optional[Dict[str, int]] = None,
+                  _read_state: Optional[Any] = None) -> Dict[str, Any]:
     """Nodes and edges of `.memlet/dream/APPROVAL-QUEUE.json` with no valid human decision (stale approvals included)."""
+    with md.work_counters(_counters), md._enter_read_scope(_read_state):
+        return _learn_pending_scoped(repo_path, _record_review=_record_review)
+
+
+def _learn_pending_scoped(repo_path=".", *, _record_review=True) -> Dict[str, Any]:
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
@@ -1173,12 +1239,14 @@ def _decide(repo_path, ids, approver, decision: str, reason: str = "", *, recons
     return out
 
 
+@md.fresh_read
 def learn_approve(repo_path=".", ids=(), *, approver="", reconsider=False, refresh_citations=False, paths=None) -> Dict[str, Any]:
     """The only path out of PENDING: `memlet_dream.approve_queue_items` with the snapshot and DB passed explicitly
     (pins re-verified, approval bound to a content digest), then `promote_approved`."""
     return _decide(repo_path, ids, approver, md.APPROVED, reconsider=reconsider, refresh_citations=refresh_citations, paths=paths)
 
 
+@md.fresh_read
 def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
     """Replace attachments by a fresh approval; only a currently approved lesson qualifies."""
     try:
@@ -1204,11 +1272,13 @@ def learn_paths(repo_path=".", ids=(), *, approver="", paths=None):
         return _fail(str(exc), 2)
 
 
+@md.fresh_read
 def learn_reject(repo_path=".", ids=(), *, approver="", reason="") -> Dict[str, Any]:
     """`memlet_dream.reject_queue_items` (rejected items are never recalled), then `promote_approved`."""
     return _decide(repo_path, ids, approver, md.REJECTED_DECISION, reason=reason)
 
 
+@md.fresh_read
 def merge_path_repair(root, keep, lost, context, who="NAME", extra=(), *, approve=False):
     """One attachment union and the existing eight-file/approved-tier limits."""
     import shlex
@@ -1307,11 +1377,13 @@ def _merge_decide(repo_path, ids, approver, *, keep=None):
         return _fail(str(exc), 1)
 
 
+@md.fresh_read
 def learn_merge(repo_path=".", keep="", same=(), *, approver=""):
     """A person records that members say the same thing as the kept lesson."""
     return _merge_decide(repo_path, same, approver, keep=keep)
 
 
+@md.fresh_read
 def learn_unmerge(repo_path=".", ids=(), *, approver=""):
     """Remove merge records, including lapsed ones, in one atomic batch."""
     return _merge_decide(repo_path, ids, approver)
@@ -1332,8 +1404,44 @@ def _defuse(text: str, limit: int = 160) -> str:
     return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
 
 
+def _build_basename_candidates(root: Path) -> Dict[str, List[str]]:
+    raw_by_name: Dict[str, List[str]] = {}
+    seen = 0
+    for cur, dirs, files in os.walk(root):
+        rel_parts = Path(cur).relative_to(root).parts
+        if rel_parts and (Path(cur) / ".git").exists():
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(d for d in dirs if d not in mw.EXCLUDED_DIRS and d != mw.MEMLET_DIR and d not in mw._SCRATCH_DIRS)
+        seen += len(files)
+        md._count_work("basenameWalkFiles", len(files))
+        for fname in files:
+            raw_by_name.setdefault(fname, []).append(cur)
+        if seen > _MAX_BASENAME_WALK:
+            break
+    return raw_by_name
+
+
 def _find_by_basename(root: Path, name: str) -> List[str]:
     """Repo-relative files named `name` (bounded, pruned walk; never into .memlet, excluded or nested-repo dirs)."""
+    if md._active_read_state() is not None:
+        rkey = Path(root).resolve()
+        entry = md._read_cache("basename_index").get(rkey)
+        if entry is None:
+            raw_cands = _build_basename_candidates(root)
+            entry = {"raw": raw_cands, "resolved": {}}
+            md._read_cache("basename_index")[rkey] = entry
+        if name in entry["resolved"]:
+            return list(entry["resolved"][name])
+        out_cached: List[str] = []
+        for cur in entry["raw"].get(name, ()):
+            p = Path(cur) / name
+            if p.is_file() and not p.is_symlink():
+                out_cached.append(mw._rel(root, p))
+                if len(out_cached) > 1:
+                    break
+        entry["resolved"][name] = out_cached
+        return list(out_cached)
     out: List[str] = []
     seen = 0
     for cur, dirs, files in os.walk(root):
@@ -1343,6 +1451,7 @@ def _find_by_basename(root: Path, name: str) -> List[str]:
             continue
         dirs[:] = sorted(d for d in dirs if d not in mw.EXCLUDED_DIRS and d != mw.MEMLET_DIR and d not in mw._SCRATCH_DIRS)
         seen += len(files)
+        md._count_work("basenameWalkFiles", len(files))
         if name in files:
             p = Path(cur) / name
             if p.is_file() and not p.is_symlink():
@@ -1570,10 +1679,11 @@ def render_approved_lesson(item):
             + _lesson_quote_block(item))
 
 
-def enrich_promoted_rules(root, rules):
+@md.fresh_read
+def enrich_promoted_rules(root, rules, *, _read_state=None):
     if not any(r["source"] == PROMOTED_PAGE for r in rules):
         return
-    entries = {e["source"]: e for e in promoted_rule_entries(root)[0]}
+    entries = {e["source"]: e for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
     for r in rules:
         e = entries.get("%s:%s" % (r["source"], r["line"]))
         if e and e.get("quoteLines"):
@@ -1598,6 +1708,7 @@ def _render_rule(node: Dict[str, Any], anchor: Optional[Tuple[str, Dict[str, Any
     return body, lines
 
 
+@md.fresh_read
 def promote_approved(repo_path=".") -> Dict[str, Any]:
     """Write approved, pin-verified Dream lessons as rules into `.memlet/wiki/dream-approved.md`. Idempotent; removes
     rules whose approval or citation no longer verifies. Runs under
@@ -1701,10 +1812,24 @@ def _promote_locked(root: Path) -> Dict[str, Any]:
             "rules": rules_out, "op": op, "notes": notes, "formatted": "\n".join(lines) + "\n"}
 
 
-def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+@md.fresh_read
+def promoted_rule_entries(root: Path, *, _counters: Optional[Dict[str, int]] = None,
+                          _read_state: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """(fresh, stale) rule-index-shaped entries for `memlet_recall`: a promoted rule is fresh only while its line is
     exactly the text Memlet renders from the approved Dream item, that item is still approved for the same content
     (approval digest), and its citations verify against the snapshot. Re-checked on every call; no model call."""
+    state = md._active_read_state()
+    rkey = Path(root).resolve()
+    cached = md._read_cache("promoted_entries", state=state).get(rkey)
+    if cached is not None:
+        cached_fresh, cached_stale = cached
+        return [dict(e) for e in cached_fresh], [dict(e) for e in cached_stale]
+    fresh, stale = _promoted_rule_entries_scoped(root, _read_state=state)
+    md._read_cache("promoted_entries", state=state)[rkey] = ([dict(e) for e in fresh], [dict(e) for e in stale])
+    return fresh, stale
+
+
+def _promoted_rule_entries_scoped(root: Path, *, _read_state: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     page = root / PROMOTED_PAGE
     if _symlinked(root, (PROMOTED_PAGE,)) or not page.is_file():
         return [], []
@@ -1726,10 +1851,10 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
         graph = None
     snap, _why = _load_snapshot(root)
     by_id = {str(n.get("id")): n for n in (graph or {}).get("nodes") or [] if isinstance(n, dict)}
-    view_by_id = {str(n.get("id")): n for n in (md.approved_view(graph)[0].get("nodes") or [])} if graph else {}
-    merges = merge_view(root, context=dict(graph=graph, snapshot=snap)) if any("merge" in n for n in by_id.values()) else {"states": {}}
+    view_by_id = {str(n.get("id")): n for n in (md._approved_view(graph, _copy=False)[0].get("nodes") or [])} if graph else {}
+    merges = merge_view(root, context=dict(graph=graph, snapshot=snap), _read_state=_read_state) if any("merge" in n for n in by_id.values()) else {"states": {}}
     hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
-    quarantined = {i["id"] for i in dream_items(root, _graph=graph)["items"] if i.get("quarantined")}
+    quarantined = {i["id"] for i in dream_items(root, _graph=graph, _read_state=_read_state)["items"] if i.get("quarantined")}
     fresh, stale = [], []
     for r in rules:
         node = by_id.get(r["id"])
@@ -1757,7 +1882,7 @@ def promoted_rule_entries(root: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
 # unified recall
 
 
-def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], List[str]]:
+def _rules_items(root: Path, query: str, *, _read_state: Optional[Any] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], List[str]]:
     """({"rules": query matches, "safety": always-on importance-1 rules}, their sources, notices).
     With a rule index: BM25 over its verified entries. Without one: the deterministic parsed fallback
     (`memlet_recall.parsed_rule_entries`), labelled as such and never presented as reviewed; it has no safety list."""
@@ -1765,7 +1890,7 @@ def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]
     from memlet.memlet_index import INDEX_PAGE
     mode = "index" if (root / INDEX_PAGE).is_file() else "parsed"
     # promoted Dream lessons are shown once, in the `dream` section, with their transcript citation
-    promoted = [e["source"] for e in promoted_rule_entries(root)[0]]
+    promoted = [e["source"] for e in promoted_rule_entries(root, _read_state=_read_state)[0]]
     res, picked = mr.recall_items(root, query, k=mr.MAX_K, safety=(mode == "index"), exclude=promoted,
                                   fallback=True)
     notices = []
@@ -1799,7 +1924,7 @@ def _rules_items(root: Path, query: str) -> Tuple[Dict[str, List[Dict[str, Any]]
                  "staleRules": {"available": True, "reason": "anchored code changed"}}, notices
 
 
-def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+def _dream_items(root: Path, query: str, *, _read_state: Optional[Any] = None, _path_context=None) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
     bad = _symlinked(root, (QUEUE_REL, SNAPSHOT_REL))
     if bad:
         return [], {"available": False, "reason": _refusing(bad)}, []
@@ -1810,14 +1935,20 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
     if not snap.is_dir():
         return [], {"available": False, "reason": "no transcript snapshot to verify Dream pins; nothing returned"}, []
     try:
-        _q, graph = md._load_queue(q)
-        shared = dream_items(root, query=query)
+        graph, _qwhy = _load_queue(root)
+        if graph is None:
+            return [], {"available": False, "reason": "no Dream queue (.memlet/dream/APPROVAL-QUEUE.json)"}, []
+        snap_files, snap_why = _load_snapshot(root)
+        if snap_files is None:
+            raise ValueError(snap_why)
+        shared = dream_items(root, query=query, _read_state=_read_state, _path_context=_path_context)
         shared_ids = {i["id"] for i in shared["items"]}
         mixed = any(n.get("id") in shared_ids and any(md.approval_state(e, "edge") != TIER_APPROVED for e in n.get("edges", [])) for n in graph.get("nodes", []))
         if mixed:
             res = {"ok": True, "includedNodeIds": sorted(shared_ids), "pinVerification": "verified", "unverifiableItems": []}
         else:
-            res = md.run_dream_recall(str(q), snapshot_path=str(snap), query_text=query, budget_tokens=100000)
+            res = md.run_dream_recall(str(q), snapshot_path=str(snap), query_text=query, budget_tokens=100000,
+                                      _read_state=_read_state, _graph=graph, _snapshot=snap_files)
     except (OSError, ValueError) as exc:
         return [], {"available": False, "reason": f"Dream snapshot or queue does not verify; nothing returned ({exc})"[:300]}, []
     if not res.get("ok"):
@@ -1825,8 +1956,8 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
     read_graph = graph
     if mixed:
         read_graph = copy.deepcopy(graph)
-        read_graph["nodes"] = [_approved_projection(n, md.load_snapshot(snap)) if n.get("id") in shared_ids else n for n in graph["nodes"]]
-    view, stats = md.approved_view(md.citation_review_view(read_graph, md.load_snapshot(snap)))
+        read_graph["nodes"] = [_approved_projection(n, snap_files) if n.get("id") in shared_ids else n for n in graph["nodes"]]
+    view, stats = md._approved_view(md._citation_review_view(read_graph, snap_files), _copy=False)
     by_id = {md.sanitize_node_id(n.get("id"), ""): n for n in view.get("nodes") or [] if isinstance(n, dict)}
     items = []
     for nid in res.get("includedNodeIds") or []:
@@ -1842,7 +1973,7 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
                       "title": n.get("title"), "quote": lesson_text(n), "source": source, "text": text, **_lesson_fields(n)})
         if items[-1].get("quoteLines"):
             items[-1]["text"] = f"- [{nid}] ({md.category_label(n.get('category'))}) {label}\n" + _lesson_quote_block(items[-1])
-    states = {it["id"]: it for it in dream_items(root)["items"]}
+    states = {it["id"]: it for it in dream_items(root, _read_state=_read_state)["items"]}
     present = {i["id"] for i in items}
     for nid, state in states.items():
         if nid not in present and any(md.approval_state(e, "edge") != TIER_APPROVED for e in by_id.get(nid, {}).get("edges", [])):
@@ -1854,7 +1985,7 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
         item.update(states[item["id"]])
         item["quote"] = item["text"]
         item["text"] = render_recall_lesson(item)
-    promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root)[0]}
+    promoted_by_id = {e["dreamId"]: e for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
     entries = []
     for it in items:
         entry = promoted_by_id.get(it["id"])
@@ -1866,13 +1997,13 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
                 quote += f" (`{resolved[0]}::{resolved[1]}`)"
             entry = {"quote": quote, "source": PROMOTED_PAGE + ":1"}
         entries.append(dict(entry))
-    mw.classify_rule_quotes(root, entries)
+    mw.classify_rule_quotes(root, entries, _read_state=_read_state)
     for item, entry in zip(items, entries):
         for key in ("anchorStatus", "anchorReason", "anchors"):
             item[key] = entry[key]
         item["text"] += f" [{entry['anchorStatus']}: {entry['anchorReason']}]"
     rules = mw._rules_from_files(root, mw.import_source_files(root, "auto"))
-    mw._verify_rules(root, rules, mw._config_pins(root), pin_source="pinned")
+    mw._verify_rules(root, rules, mw._config_pins(root), pin_source="pinned", _read_state=_read_state)
     notices = replaced_rule_notices(root, rules, list(states.values()))
     failures = res.get("unverifiableItems", [])
     if failures:
@@ -1883,6 +2014,7 @@ def _dream_items(root: Path, query: str) -> Tuple[List[Dict[str, Any]], Dict[str
                    "unverifiableNodeIds": [f["id"] for f in failures], "unverifiableItems": failures}, notices
 
 
+@md.fresh_read
 def replaced_rule_notices(root, rules, approved):
     from .handover_bridge import _rule_text
     texts = md.replaced_line_index(approved)[1]
@@ -1902,7 +2034,7 @@ def _memory_items(store: Any, task: Any, query: str) -> Tuple[List[Dict[str, Any
     if store is None or not task:
         return [], {"available": False, "reason": "memory store recall needs both a store and a task"}
     try:
-        if not hasattr(store, "memory"):
+        if not _call_foreign(lambda: hasattr(store, "memory")):
             p = Path(str(store)).expanduser()
             from .compatibility import LEGACY_DATABASE_FILENAME
             dbs = ("memlet.sqlite3", LEGACY_DATABASE_FILENAME, "work.sqlite3", "work_tasks.sqlite3")
@@ -1910,7 +2042,7 @@ def _memory_items(store: Any, task: Any, query: str) -> Tuple[List[Dict[str, Any
                 return [], {"available": False, "reason": f"memory store not found: {p}"}
             from memlet.standalone import StandaloneStore
             store = StandaloneStore(p)
-        res = store.memory(str(task), query or "", 6000)
+        res = _call_foreign(lambda: store.memory(str(task), query or "", 6000))
     except Exception as exc:  # the store raises plain ValueError/sqlite errors with localized text
         return [], {"available": False, "reason": f"memory store recall failed: {type(exc).__name__}: {exc}"[:300]}
     items = []
@@ -1959,11 +2091,22 @@ def _render_recall(chosen: Dict[str, List[Dict[str, Any]]], footer: Optional[str
     return "\n".join(lines) + "\n"
 
 
+@md.fresh_read
 @_attachment_reader
 def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=None,
-                   include=("rules", "dream", "memory"), files=None) -> Dict[str, Any]:
+                   include=("rules", "dream", "memory"), files=None,
+                   _counters: Optional[Dict[str, int]] = None,
+                   _read_state: Optional[Any] = None, _path_context=None) -> Dict[str, Any]:
     """One budgeted response from three stores (no model call). The budget is split evenly across the sections that
     have candidates; whatever a section leaves unused flows to the others. `tokenEstimate <= tokenBudget` always."""
+    with md.work_counters(_counters), md._enter_read_scope(_read_state) as state:
+        return _unified_recall_scoped(repo_path, query, budget=budget, store=store, task=task,
+                                      include=include, files=files, _read_state=state, _path_context=_path_context)
+
+
+def _unified_recall_scoped(repo_path=".", query="", *, budget=1200, store=None, task=None,
+                           include=("rules", "dream", "memory"), files=None,
+                           _read_state: Optional[Any] = None, _path_context=None) -> Dict[str, Any]:
     try:
         root = mw._resolve_root(repo_path)
     except ValueError as exc:
@@ -1987,7 +2130,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
     rules_mode = "index"
     if "rules" in wanted:
         try:
-            got, srcs, extra = _rules_items(root, query)
+            got, srcs, extra = _rules_items(root, query, _read_state=_read_state)
             cands["rules"], cands["safety"] = got["rules"], got["safety"]
             sources["rules"], sources["safety"] = srcs["rules"], srcs["safety"]
             cands["staleRules"], sources["staleRules"] = got["staleRules"], srcs["staleRules"]
@@ -2003,10 +2146,10 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
             sources["rules"] = {"available": False, "reason": f"rule recall failed: {exc}"}
             sources["safety"] = {"available": False, "reason": f"rule recall failed: {exc}"}
     if "dream" in wanted:
-        cands["dream"], sources["dream"], extra = _dream_items(root, query)
+        cands["dream"], sources["dream"], extra = _dream_items(root, query, _read_state=_read_state, _path_context=_path_context)
         notices += extra
         if files is not None:
-            selection = dream_items(root, files=files)
+            selection = dream_items(root, files=files, _read_state=_read_state, _path_context=_path_context)
             notices.extend(n for n in selection["notices"] if n.startswith("outside repository"))
             selected = {it["id"] for it in selection["items"]}
             cands["dream"] = [it for it in cands["dream"] if it["id"] in selected]
@@ -2016,7 +2159,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
         if stale_dream:
             sources["staleRules"] = {"available": True, "reason": "anchored code changed"}
     if "hints" in wanted:
-        hints = dream_items(root, tiers=(TIER_HINT,), query=query, files=files)
+        hints = dream_items(root, tiers=(TIER_HINT,), query=query, files=files, _read_state=_read_state, _path_context=_path_context)
         sources["hints"] = {"available": hints["ok"], "reason": "", "label": hint_label(hints["items"])}
         for hint in hints["items"]:
             citation = hint["cites"][0]
@@ -2034,7 +2177,7 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
     failures = sources["dream"].get("unverifiableItems", [])
     verification_notice = "\n- ".join([n for n in [md.citation_failure_notice(failures)] if n]
                                        + [n for n in notices if n.startswith("Rule ") and "is replaced by lesson" in n])
-    attachment = attachment_metadata(_lesson_path_active.get() or {})
+    attachment = attachment_metadata(_path_context or {})
     if attachment:
         verification_notice = "\n- ".join(filter(None, (verification_notice, attachment["attachmentReason"])))
     fixed_heading = _render_recall({}, None, rules_mode, verification_notice)
@@ -2075,12 +2218,15 @@ def unified_recall(repo_path=".", query="", *, budget=1200, store=None, task=Non
                         nxt[s] += 1
                         progress = True
     # Hints use only the remainder after every verified candidate has been served.
-    if all(len(chosen[s]) == len(cands[s]) for s in _SECTIONS if s != "hints"):
+    if all(len(chosen[s]) == len(cands[s]) for s in _SECTIONS if s != "hints") and cands["hints"]:
+        running_recall_tokens = est(_render_recall(chosen, None, rules_mode, verification_notice))
+        hints_head_tokens = est("### " + hint_label(cands["hints"]) + "\n" + HINT_HELP)
         for hint in cands["hints"]:
-            chosen["hints"].append(hint)
-            if est(_render_recall(chosen, None, rules_mode, verification_notice)) > budget:
-                chosen["hints"].pop()
+            add_tokens = est(hint["text"]) + (hints_head_tokens if not chosen["hints"] else 0)
+            if running_recall_tokens + add_tokens > budget:
                 break
+            running_recall_tokens += add_tokens
+            chosen["hints"].append(hint)
             order.append("hints")
     text = _render_recall(chosen, footer, rules_mode, verification_notice)
     if est(text) > budget:
@@ -2124,9 +2270,23 @@ def _wiki_pages(root: Path) -> Dict[str, str]:
 
 
 def _load_config(root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    return mw.read_config(root)
+    if md._active_read_state() is not None:
+        rkey = Path(root).resolve()
+        cached = md._read_cache("loaded_configs").get(rkey, md._CACHE_MISS)
+        if cached is not md._CACHE_MISS:
+            cfg, err = cached
+            return (copy.deepcopy(cfg) if cfg is not None else None, err)
+        cfg, err = mw._read_config(root)
+        md._read_cache("loaded_configs")[rkey] = (cfg, err)
+        md._read_cache("config_digests")[rkey] = (
+            hashlib.sha256(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            if isinstance(cfg, dict) else f"err:{err}"
+        )
+        return (copy.deepcopy(cfg) if cfg is not None else None, err)
+    return mw._read_config(root)
 
 
+@md.fresh_read
 def accept_anchor(repo_path=".", anchors=(), *, dry_run=False) -> Dict[str, Any]:
     """Re-pin exactly the named `path::symbol` anchors to their current hashes (config.json and every wiki page pin
     of that anchor); every other pin is left as it is. Unknown anchors are errors."""
@@ -2245,6 +2405,7 @@ def _git_z(root: Path, args: List[str]) -> Tuple[Optional[List[str]], str]:
     return [t for t in r.stdout.decode("utf-8", "surrogateescape").split("\0")], ""
 
 
+@md.fresh_read
 def normalise_lesson_files(root, files):
     """Exact spelling; resolve absolute ancestors without changing the leaf spelling."""
     root = Path(root).resolve()
@@ -2354,8 +2515,9 @@ def _cheap_rule_sources(root: Path, cfg: Optional[Dict[str, Any]], changed: Iter
     return sorted(found)
 
 
+@md.fresh_read
 @_attachment_reader
-def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
+def changed_check(repo_path=".", *, base=None, files=None, _read_state: Optional[Any] = None, _path_context=None) -> Dict[str, Any]:
     """Fast hook check: classify only the anchors / referenced paths of rules that touch the changed files (`files`,
     else `git diff --name-status <base or HEAD>` with both rename ends, plus untracked files). Memlet's own generated
     state is ignored (`ignoredFiles`); a deleted instruction file is listed in `removedInstructionFiles`.
@@ -2389,7 +2551,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
             body = mw._STATUS_BLOCK_RE.sub(mw._blank_lines, mw._PAGE_STATUS_RE.sub(mw._blank_lines, text))
             page_rules = mw._extract_rules(body, rel)
             if rel == PROMOTED_PAGE:  # same rule as handover: only lessons that still verify are rules
-                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root)[0]}
+                live = {int(e["source"].rsplit(":", 1)[1]) for e in promoted_rule_entries(root, _read_state=_read_state)[0]}
                 page_rules = [r for r in page_rules if r["line"] in live]
             rules.extend(page_rules)
     mw._attach_sidecar(root, rules)  # wiki rules must acquire accepted anchors BEFORE path filtering
@@ -2422,7 +2584,7 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
                                     "rule": rule_text, **lesson_fields, "source": f"{r['source']}:{r['line']}",
                                     **mw._suggested_fields(r, worst)})
     if not changed and (root / mw.CONFIG_PATH).is_file():
-        res["pinnedAnchors"] = mw.pinned_anchor_report(root)
+        res["pinnedAnchors"] = mw.pinned_anchor_report(root, _read_state=_read_state)
         shown = {a["anchor"] for a in res["affected"]}
         for a in res["pinnedAnchors"]["anchors"]:
             if not changed and a["pinned"] and a["status"] == "stale" and a["anchor"] not in shown:
@@ -2434,10 +2596,10 @@ def changed_check(repo_path=".", *, base=None, files=None) -> Dict[str, Any]:
     from .memlet_dreamcycle import _canonical_path
     requested = {_canonical_path(f) for f in changed}
     attached_files = set(normalise_lesson_files(root, files if files is not None else changed)[0])
-    path_context = lesson_path_context(root)
+    path_context = lesson_path_context(root, _read_state=_read_state, context=_path_context)
     def matched_lessons(tier):
         rows = []
-        for item in dream_items(root, tiers=(tier,))["items"]:
+        for item in dream_items(root, _read_state=_read_state, tiers=(tier,), _path_context=path_context)["items"]:
             scope, text = item["scope"], item["text"]
             scope_path = _canonical_path(scope.split("::", 1)[0])
             scope_match = any(f == scope_path or (scope.endswith(("/", "\\")) and
@@ -2483,7 +2645,7 @@ _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|.)
 
 
 def unsafe_contributed_string(value):
-    return bool(_UNSAFE_STRING.search(value)) or any(_hidden_character(c) for c in value)
+    return bool(_UNSAFE_STRING.search(value)) or (not value.isascii() and any(_hidden_character(c) for c in value))
 
 
 def _tag_character(c):
@@ -2502,14 +2664,21 @@ def _format_character(c):
 
 
 def hidden_hint_blocked(text):
+    if text.isascii():
+        return False
     return any(_tag_character(c) for c in text) or sum(_format_character(c) for c in text) > 3
 
 
 def safe_lesson_display(text, limit=None):
     # Render only: never rewrite the stored quote or its hash.
-    text = str(text).replace("⟶", "→")
-    hidden = any(_hidden_character(c) for c in text)
-    text = "".join(c for c in text if not _hidden_character(c))
+    text = str(text)
+    if not text.isascii():
+        text = text.replace("⟶", "→")
+        hidden = any(_hidden_character(c) for c in text)
+        if hidden:
+            text = "".join(c for c in text if not _hidden_character(c))
+    else:
+        hidden = False
     text = _ANSI.sub(" ", text)
     text = _UNSAFE_STRING.sub(" ", text)
     text = text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
@@ -2557,15 +2726,38 @@ def dream_settings(config):
     return hints, agreement, notices
 
 
-def _approved_node(node, snapshot):
-    view, _ = md.approved_view({"nodes": [node], "edges": copy.deepcopy(node.get("edges", []))})
+
+
+
+def _approved_node(node, snapshot, *, _preverified_proj=None):
+    raw_edges = [dict(e) for e in (node.get("edges") or []) if isinstance(e, dict)]
+    view, _ = md._approved_view({"nodes": [node], "edges": raw_edges}, _copy=False)
     n = view["nodes"][0]
     edges = n.get("edges", [])
-    return (n.get("verdict") in ("SUPPORTED", "ALREADY_SUPERSEDED")
-            and bool(_approved_projection(n, snapshot)["edges"])
-            and (not md.superseded_lesson(n) or any(e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID" for e in edges))
-            and not any(e.get("edgeVerdict") == md.REJECTED for e in edges)
-            and not _node_edges_verify(_approved_projection(node, snapshot), snapshot))
+    if n.get("verdict") not in ("SUPPORTED", "ALREADY_SUPERSEDED"):
+        return False
+    if any(e.get("edgeVerdict") == md.REJECTED for e in edges):
+        return False
+    if md.superseded_lesson(n) and not any(e.get("edgeType") == "SUPERSEDES" and e.get("edgeVerdict") == "VALID" for e in edges):
+        return False
+    if _preverified_proj is not None:
+        valid_eids = {e.get("edgeId") for e in edges if e.get("edgeVerdict") == "VALID"}
+        pre_edges = [e for e in _preverified_proj.get("edges", ()) if e.get("edgeId") in valid_eids]
+        if pre_edges and len(pre_edges) == len(valid_eids):
+            sink = _ACTIVE_TRUST_PROJ_SINK.get()
+            if sink is not None:
+                sink.append((_preverified_proj, pre_edges, valid_eids))
+            return True
+        proj_n = _approved_projection(n, snapshot)
+        if not proj_n["edges"]:
+            return False
+        sink = _ACTIVE_TRUST_PROJ_SINK.get()
+        if sink is not None:
+            sink.append((_preverified_proj, proj_n["edges"], valid_eids))
+        return True
+    if not _approved_projection(n, snapshot)["edges"]:
+        return False
+    return not _node_edges_verify(_approved_projection(node, snapshot), snapshot)
 
 
 def _compute_tier(node, *, snapshot, config):
@@ -2577,13 +2769,21 @@ def _compute_tier(node, *, snapshot, config):
     if decision == TIER_REJECTED or node.get("verdict") == md.REJECTED:
         return TIER_REJECTED
     try:
-        if not isinstance(snapshot, dict) or _node_edges_verify(_approved_projection(node, snapshot) if decision == TIER_APPROVED else node, snapshot):
+        if not isinstance(snapshot, dict):
             return TIER_PENDING
+        if decision == TIER_APPROVED:
+            proj_approved = _approved_projection(node, snapshot)
+            if md._verify_item_pins(proj_approved, "node", snapshot):
+                return TIER_PENDING
+        else:
+            proj_approved = None
+            if _node_edges_verify(node, snapshot):
+                return TIER_PENDING
         edges = node.get("edges", [])
         if any(md.approval_state(e, "edge") == TIER_REJECTED or e.get("edgeVerdict") == md.REJECTED for e in edges):
             return TIER_PENDING
         if decision == TIER_APPROVED:
-            return TIER_APPROVED if _approved_node(node, snapshot) else TIER_PENDING
+            return TIER_APPROVED if _approved_node(node, snapshot, _preverified_proj=proj_approved) else TIER_PENDING
         if not dream_settings(config)[0]:
             return TIER_PENDING
         if md.lesson_quote_digest(node) in config.get("_dreamRejectedQuoteHashes", ()):
@@ -2609,7 +2809,7 @@ def _compute_tier(node, *, snapshot, config):
 
 
 def tier_config(graph, config):
-    config = copy.deepcopy(config or {})
+    config = dict(config or {})
     config["_dreamRejectedQuoteHashes"] = {md.lesson_quote_digest(n)
         for n in (graph or {}).get("nodes", []) if isinstance(n, dict)
         and (md.approval_state(n, "node") == TIER_REJECTED or n.get("verdict") == md.REJECTED
@@ -2618,8 +2818,13 @@ def tier_config(graph, config):
     return config
 
 
+@md.fresh_read
 def item_trust(node, *, snapshot, config):
     """The sole tier/basis/label computation; callers share a graph-bound config."""
+    return _item_trust(node, snapshot=snapshot, config=config)
+
+
+def _item_trust(node, *, snapshot, config):
     from memlet.memlet_dreamcycle import trusted_record
     tier = _compute_tier(node, snapshot=snapshot, config=config)
     basis = _agreement_basis(node or {}, config)
@@ -2637,6 +2842,7 @@ def item_trust(node, *, snapshot, config):
     return {"tier": tier, "agreementBasis": basis, "agreementLabel": label}
 
 
+@md.fresh_read
 def item_tier(node, *, snapshot, config):
     return item_trust(node, snapshot=snapshot, config=config)["tier"]
 
@@ -2647,19 +2853,40 @@ def _approved_projection(node, snapshot):
                 and md._verify_item_pins(e, "edge", snapshot or {}) is None])
 
 
-def dream_tiers(graph, *, snapshot, config):
-    config = tier_config(graph, config)
-    approved_graph = md.approved_view(graph or {})[0]
-    result = {}
-    for node in (graph or {}).get("nodes", []):
-        if not isinstance(node, dict):
-            continue
-        state = item_trust(node, snapshot=snapshot, config=config)
-        display_node = md._supersession_pair(_approved_projection(node, snapshot), approved_graph)
-        if state["tier"] == TIER_APPROVED and _node_edges_verify(display_node, snapshot or {}):
-            state["tier"] = TIER_PENDING
-        result[str(node["id"])] = state
-    return result
+@md.fresh_read
+def dream_tiers(graph, *, snapshot, config, _counters: Optional[Dict[str, int]] = None,
+                _read_state: Optional[Any] = None, _out_projections: Optional[Dict[str, Dict[str, Any]]] = None):
+    with md.work_counters(_counters), md._enter_read_scope(_read_state):
+        config = tier_config(graph, config)
+        approved_graph = md._approved_view(graph or {}, _copy=False)[0]
+        sup_index = md._supersession_index(approved_graph)
+        result = {}
+        seen_ids = set()
+        dup_ids = set()
+        for node in (graph or {}).get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            nid = str(node["id"])
+            if nid in seen_ids:
+                dup_ids.add(nid)
+                if _out_projections is not None:
+                    _out_projections.pop(nid, None)
+            else:
+                seen_ids.add(nid)
+            proj_box: List[Any] = []
+            tok_sink = _ACTIVE_TRUST_PROJ_SINK.set(proj_box)
+            try:
+                state = item_trust(node, snapshot=snapshot, config=config)
+            finally:
+                _ACTIVE_TRUST_PROJ_SINK.reset(tok_sink)
+            proj = proj_box[0][0] if proj_box else _approved_projection(node, snapshot)
+            if _out_projections is not None and nid not in dup_ids and proj_box:
+                _out_projections[nid] = proj_box[0]
+            display_node = md._supersession_pair(proj, approved_graph, _index=sup_index)
+            if state["tier"] == TIER_APPROVED and display_node is not proj and _node_edges_verify(display_node, snapshot or {}):
+                state["tier"] = TIER_PENDING
+            result[nid] = state
+        return result
 
 
 def _merge_nodes(graph, trust, snapshot=None):
@@ -2763,12 +2990,13 @@ def _merge_context(repo_path, context=None):
     if "config" not in context:
         context["config"] = _load_config(root)[0]
     if "trust" not in context or context.get("loaded") is False:
-        context["trust"] = dream_tiers(context["graph"], snapshot=context["snapshot"], config=context["config"])
+        context["trust"] = dream_tiers(context["graph"], snapshot=context["snapshot"], config=context["config"], _read_state=md._active_read_state())
     context["loaded"] = True
     return root, context
 
 
-def merge_view(repo_path=".", *, context=None):
+@md.fresh_read
+def merge_view(repo_path=".", *, context=None, _read_state=None):
     """Read-only merge states using the same current tiers as dream_items."""
     try:
         _root, context = _merge_context(repo_path, context)
@@ -2787,14 +3015,15 @@ def merge_view(repo_path=".", *, context=None):
         return {"ok": False, "states": {}, "members": {}, "error": str(exc)}
 
 
-def merge_blockers(repo_path=".", keep="", same=(), *, context=None):
+@md.fresh_read
+def merge_blockers(repo_path=".", keep="", same=(), *, context=None, _read_state=None):
     """Read-only, whole-batch eligibility and lost reach; never changes a tier."""
     wanted = _ids(same)
     keep = str(keep or "").strip()
     try:
         root, context = _merge_context(repo_path, context)
         graph, trust, snapshot = context["graph"], context["trust"], context["snapshot"]
-        view = merge_view(root, context=context)
+        view = merge_view(root, context=context, _read_state=md._active_read_state())
         nodes = context["mergeNodes"]
         if not view["ok"]:
             raise ValueError(view["error"])
@@ -2803,7 +3032,7 @@ def merge_blockers(repo_path=".", keep="", same=(), *, context=None):
             return (n or {}).get("_mergeRelations", set())
         path_context = context if isinstance(context, _LessonPathContext) else context.get("pathContext")
         if path_context is None:
-            path_context = lesson_path_context(root)
+            path_context = lesson_path_context(root, _read_state=md._active_read_state())
             context["pathContext"] = path_context
         path_context.update(loaded=True, snapshot=snapshot, config=context["config"], trust=trust)
         def reach(n):
@@ -2870,13 +3099,57 @@ def hint_item_label(item):
     return item.get("label") or item.get("agreementLabel") or (MODEL_AGREEMENT if item.get("agreementBasis") == "model" else VENDOR_AGREEMENT)
 
 
-def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None, include_merged=False):
+@md.fresh_read
+def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None, include_merged=False,
+                _counters: Optional[Dict[str, int]] = None, _read_state: Optional[Any] = None, _path_context=None):
     """Fixed in-repo snapshot, per-item rehash, disjoint tiers; rejected items never leave.
 
     File-filtered hints use current literal citations only. Their optional
     ``paths`` field is display-only, never approval or guard authority. Calls
     without ``files`` retain the legacy hint output without a paths field.
     """
+    with md.work_counters(_counters), md._enter_read_scope(_read_state) as state:
+        return _dream_items_reader(repo_path, tiers=tiers, query=query, files=files, _graph=_graph,
+                                   include_merged=include_merged, _read_state=state, _path_context=_path_context)
+
+
+def _dream_items_reader(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None,
+                        include_merged=False, _read_state: Optional[Any] = None, _path_context=None):
+    read_state = _read_state if _read_state is not None else md._active_read_state()
+    if (read_state is not None and _graph is None and files is None and query == ""
+            and type(tiers) in (list, tuple, set, frozenset)
+            and all(type(tier) is str for tier in tiers)):
+        try:
+            rkey = mw._resolve_root(repo_path)
+        except Exception:
+            rkey = None
+        if rkey is not None and _path_context is None:
+            q_dig = md._read_cache("queue_digests", state=read_state).get(rkey)
+            s_dig = md._read_cache("snapshot_digests", state=read_state).get(rkey)
+            c_dig = md._read_cache("config_digests", state=read_state).get(rkey)
+            if q_dig is not None and s_dig is not None and c_dig is not None:
+                ckey = (rkey, q_dig, s_dig, c_dig, tuple(tiers), bool(include_merged))
+                cached_res = md._read_cache("dream_items_cache", state=read_state).get(ckey)
+                if cached_res is not None:
+                    return copy.deepcopy(cached_res)
+            res_computed = _dream_items_reader_uncached(
+                repo_path, tiers=tiers, query=query, files=files, _graph=_graph, include_merged=include_merged, _path_context=_path_context
+            )
+            q_dig = md._read_cache("queue_digests", state=read_state).get(rkey)
+            s_dig = md._read_cache("snapshot_digests", state=read_state).get(rkey)
+            c_dig = md._read_cache("config_digests", state=read_state).get(rkey)
+            if q_dig is not None and s_dig is not None and c_dig is not None:
+                md._read_cache("dream_items_cache", state=read_state)[
+                    (rkey, q_dig, s_dig, c_dig, tuple(tiers), bool(include_merged))
+                ] = res_computed
+            return copy.deepcopy(res_computed)
+    res_computed = _dream_items_reader_uncached(
+        repo_path, tiers=tiers, query=query, files=files, _graph=_graph, include_merged=include_merged, _path_context=_path_context
+    )
+    return res_computed
+
+
+def _dream_items_reader_uncached(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, _graph=None, include_merged=False, _path_context=None):
     from memlet.memlet_dreamcycle import evidence_pins, _canonical_path
     counts = {TIER_APPROVED: 0, TIER_HINT: 0, TIER_PENDING: 0}
     try:
@@ -2890,19 +3163,30 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
         if graph is None:
             return {"ok": True, "items": [], "counts": counts, "notices": [why] + dream_settings(config)[2]}
         config = tier_config(graph, config)
-        trust = dream_tiers(graph, snapshot=snapshot, config=config)
-        merges = (merge_view(root, context=dict(graph=graph, snapshot=snapshot, config=config, trust=trust))
+        verified_projs: Dict[str, Dict[str, Any]] = {}
+        trust = dream_tiers(graph, snapshot=snapshot, config=config, _read_state=md._active_read_state(), _out_projections=verified_projs)
+        merges = (merge_view(root, context=dict(graph=graph, snapshot=snapshot, config=config, trust=trust), _read_state=md._active_read_state())
                   if any("merge" in n for n in graph.get("nodes", [])) else {"states": {}, "members": {}})
         hidden = {i for i, st in merges["states"].items() if st["state"] == "merged"}
-        approved_graph = md.approved_view(graph)[0]
+        approved_graph = md._approved_view(graph, _copy=False)[0]
         approved_graph = dict(approved_graph, nodes=[n for n in approved_graph.get("nodes", [])
                               if trust.get(str(n.get("id")), {}).get("tier") == TIER_APPROVED and (include_merged or n.get("id") not in hidden)])
         live_ids = {n["id"] for n in approved_graph["nodes"]}
         approved_graph["edges"] = [e for e in approved_graph.get("edges", [])
                                    if e.get("fromId") in live_ids or e.get("toId") in live_ids]
-        approved_graph["nodes"] = [_approved_projection(n, snapshot) for n in approved_graph["nodes"]]
-        projection = md.supersession_projection(approved_graph)
-        path_context = lesson_path_context(root)
+        def _reuse_node_proj(n_view):
+            entry = verified_projs.get(str(n_view.get("id")))
+            if entry is not None:
+                _raw_p, v_edges, single_valid_eids = entry
+                full_valid_eids = {e.get("edgeId") for e in n_view.get("edges", ()) if md.approval_state(e, "edge") == TIER_APPROVED and e.get("edgeVerdict") == "VALID"}
+                if full_valid_eids == single_valid_eids:
+                    v_by_eid = {e.get("edgeId"): e for e in v_edges}
+                    return dict(n_view, edges=[e for e in n_view.get("edges", ()) if e.get("edgeId") in v_by_eid])
+            return _approved_projection(n_view, snapshot)
+        approved_graph["nodes"] = [_reuse_node_proj(n) for n in approved_graph["nodes"]]
+        sup_index = md._supersession_index(approved_graph)
+        projection = md._supersession_projection(approved_graph, _index=sup_index)
+        path_context = lesson_path_context(root, _read_state=md._active_read_state(), context=_path_context)
         path_context.update(loaded=True, snapshot=snapshot, config=config, trust=trust)
         items, notices = [], dream_settings(config)[2]
         query_terms = md._query_terms(str(query))
@@ -2926,7 +3210,9 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             counts[tier] += 1
             if tier not in tiers:
                 continue
-            display_node = md.supersession_display_node(_approved_projection(node, snapshot) if tier == TIER_APPROVED else node, approved_graph, projection)
+            verified_entry = verified_projs.get(str(node["id"])) if tier == TIER_APPROVED else None
+            verified_proj = verified_entry[0] if verified_entry is not None else None
+            display_node = md._supersession_display_node((verified_proj if verified_proj is not None else _approved_projection(node, snapshot)) if tier == TIER_APPROVED else node, approved_graph, projection, _index=sup_index)
             text = lesson_text(display_node)
             scope = safe_lesson_display(node.get("scopeTag") or "")
             if query_terms and not query_terms & md._query_terms(text + " " + scope):
@@ -2970,9 +3256,9 @@ def dream_items(repo_path=".", *, tiers=(TIER_APPROVED,), query="", files=None, 
             fields = _lesson_fields(display_node)
             if fields:
                 # Display hashes are per-line projections of stored pins, never fresh trust baselines.
-                pins_verify = snapshot is not None and _node_edges_verify(display_node, snapshot) is None
+                pins_verify = True if (verified_proj is not None and display_node is verified_proj) else (snapshot is not None and _node_edges_verify(display_node, snapshot) is None)
                 fields["cites"] = [dict(c, verified=bool(pins_verify and
-                    (md.resolve_pin(snapshot, c["span"]) or {}).get("sha256") == c["sha256"])) for c in fields["cites"]]
+                    (md._resolve_pin(snapshot, c["span"]) or {}).get("sha256") == c["sha256"])) for c in fields["cites"]]
                 it.update(fields)
             it.update(item_state)
             if merges["members"].get(node["id"]):

@@ -11,6 +11,8 @@ it does not construct the project graph. Bounds deliberately fail closed when a
 complete supersession view cannot be obtained. Citation nodes are lesson nodes
 with recordType='citation'; parent lessons retain the queue's stable ids.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import contextlib
 import copy
 import datetime
@@ -87,7 +89,7 @@ class _Work:
     """Hook-only limits; incomplete groups are explicit even when nothing fits."""
     def __init__(self, bounded=False, clock=None, counters=None):
         self.bounded = bounded
-        self.clock = clock or _monotonic
+        self.clock = _monotonic if clock is None else lambda: _call_foreign(clock)
         self.deadline = self.clock() + MAX_NEIGHBOR_SECONDS if bounded else None
         self.counters = counters
         self.parse_start = ca._PYTHON_BINDING_PARSE_COUNT
@@ -198,7 +200,7 @@ class _History:
             return
         try:
             with contextlib.closing(mw.connect_managed_sqlite(root, mw.LEDGER_PATH, readonly=True)) as db:
-                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                tables = {r[0] for r in list(db.execute("SELECT name FROM sqlite_master WHERE type='table'"))}
                 if "dream_decision_events" in tables:
                     rows = mb.decision_events(root)
                     if getattr(rows, "truncated", False):
@@ -551,16 +553,16 @@ def _rule_files(root, rule):
     return {mw._resolve_ref_path(root, rule["source"], path) for path, _ in rule["refs"]}
 
 
-def _fresh_classification(root, rules, pins, work):
+def _fresh_classification(root, rules, pins, work, *, _read_state=None):
     paths = {str(root / path) for r in rules for path in _rule_files(root, r)}
-    # 9.1 extractors contain stat-keyed caches. Do not treat those as proof:
-    # discard entries for the selected files before calling the single classifier.
-    for cache in (ca._FILE_HASH_AST_CACHE, ca._FILE_SIGNATURE_CACHE):
+    # Discard the selected files from this read's extractor buckets before
+    # calling the single classifier; no extractor evidence survives the read.
+    for cache in (md._read_cache("source_file_hash_ast"), md._read_cache("source_file_signatures")):
         for key in list(cache):
             if key[0] in paths:
                 cache.pop(key, None)
     if not work.bounded:
-        classified = mw._verify_rules(root, rules, pins, pin_source="pinned")
+        classified = mw._verify_rules(root, rules, pins, pin_source="pinned", _read_state=_read_state)
         work.count("anchorsClassified", len(classified))
         return classified
     completed, anchors, consumed = [], {}, 0
@@ -670,15 +672,15 @@ def _slice(graph, path, ident, work=None):
 
 def _project(root, as_of, *, path=None, symbol=None, ident=None, queue=None, work=None):
     work = work or _Work()
-    with mb._lesson_path_projection(root, work) as context:
+    with md.work_counters(work.counters), md._enter_read_scope(md._active_read_state()) as read_state, mb._lesson_path_projection(root, work) as context:
         return _project_context(root, as_of, path=path, symbol=symbol, ident=ident,
-                                queue=queue, work=work, path_context=context)
+                                queue=queue, work=work, path_context=context, _read_state=read_state)
 
 
-def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_context):
+def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_context, _read_state=None):
     queue = _queue(root, work) if queue is None else queue
     history = _History(root, work, graph=queue)
-    config, error = mw.read_config(root)
+    config, error = mw._read_config(root)
     config = config or {}
     graph = history.replay(queue, as_of)
     work.known_ids.update({n["id"]: "lesson" for n in queue.get("nodes", [])})
@@ -695,7 +697,7 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
     if not work.available():
         graph = dict(graph, nodes=[], edges=[])
     work.count("lessonCandidatesValidated", len(graph.get("nodes", [])))
-    read = (mb.dream_items(root, tiers=(APPROVED,) if as_of else (APPROVED, HINT), _graph=graph)
+    read = (mb.dream_items(root, tiers=(APPROVED,) if as_of else (APPROVED, HINT), _graph=graph, _read_state=_read_state, _path_context=path_context)
             if work.available() else dict(ok=True, items=[], notices=[]))
     if not read["ok"]:
         raise ValueError(v.GRAPH_EVIDENCE_ERROR)
@@ -725,7 +727,7 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
         # Matching replaced instruction rules are needed for a lesson-id query.
         old = md.replaced_line_index(read["items"])[1]
         rules = [r for r in rules if md.normalised_quote(_rule_text(r, texts) or "") in old]
-    anchors = {a["anchor"]: a for a in _fresh_classification(root, rules, pins, work)}
+    anchors = {a["anchor"]: a for a in _fresh_classification(root, rules, pins, work, _read_state=_read_state)}
     nodes, edges, attachments = {}, [], {}
     replaced_projection = md.replaced_line_index(read["items"])[1]
     lesson_times = {i["id"]: history.interval(raw[i["id"]], "node", as_of)[0] for i in read["items"]}
@@ -870,11 +872,11 @@ def _project_context(root, as_of, *, path, symbol, ident, queue, work, path_cont
             since = history.anchor_time({}, key, config, pins[key], as_of)
             if as_of and not _before(since, as_of):
                 continue
-            for cache in (ca._FILE_HASH_AST_CACHE, ca._FILE_SIGNATURE_CACHE):
+            for cache in (md._read_cache("source_file_hash_ast"), md._read_cache("source_file_signatures")):
                 for cached in list(cache):
                     if cached[0] == str(root / rel):
                         cache.pop(cached, None)
-            anchor = mw.classify_anchor(root, dict(path=rel, symbol=name, pin=pins[key]))
+            anchor = mw.classify_anchor(root, dict(path=rel, symbol=name, pin=pins[key]), _read_state=md._active_read_state())
             work.count("anchorsClassified")
             if as_of and anchor["status"] != "active":
                 continue
@@ -908,6 +910,7 @@ def _refusal(exc):
     return v.GRAPH_UNAVAILABLE
 
 
+@md.fresh_read
 def build_graph(repo_path=".", *, as_of=None, _counters=None):
     work = _Work(counters=_counters)
     try:
@@ -984,6 +987,7 @@ def _trim(groups, budget, incomplete=()):
     return omitted, rendered
 
 
+@md.fresh_read
 def neighbors(repo_path=".", target="", *, tiers=(APPROVED,), budget=600, as_of=None,
               _clock=None, _counters=None):
     work = _Work(bounded=True, clock=_clock, counters=_counters)

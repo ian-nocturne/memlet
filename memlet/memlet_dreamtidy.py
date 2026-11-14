@@ -7,6 +7,8 @@ retires, approves or changes any lesson, and no lesson text or model prose is ev
 
 from __future__ import annotations
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 import copy
 import json
 import os
@@ -471,6 +473,7 @@ def _load_repository_lessons(root: Path) -> Dict[str, Any]:
     }
 
 
+@md.fresh_read
 def load_lessons_by_id(repo_path: Any = ".") -> Dict[str, Dict[str, Any]]:
     root = mw._resolve_root(repo_path)
     return _load_repository_lessons(root)["lessonsById"]
@@ -1062,6 +1065,7 @@ def _reason_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+@md.fresh_read
 def dream_tidy_run(
     repo: Any = ".",
     *,
@@ -1074,8 +1078,8 @@ def dream_tidy_run(
     save_fixture: Optional[Any] = None,
     clock: Optional[Callable[[], float]] = None,
 ) -> Dict[str, Any]:
-    now_fn = clock or time.monotonic
-    started = now_fn()
+    now_fn = time.monotonic if clock is None else clock
+    started = _call_foreign(lambda: now_fn())
     report: Dict[str, Any] = {
         "ok": True,
         "tidy": True,
@@ -1182,7 +1186,7 @@ def dream_tidy_run(
                     checked = vc.check_vendor(
                         vendor_name,
                         config=config,
-                        timeout=max(0.01, MAX_WALL_SECONDS - (now_fn() - started)),
+                        timeout=max(0.01, MAX_WALL_SECONDS - (_call_foreign(lambda: now_fn()) - started)),
                     )
                     if not checked["ok"]:
                         raise ValueError(checked["reason"])
@@ -1260,7 +1264,7 @@ def dream_tidy_run(
         report["runId"] = run_id
 
         def budget() -> bool:
-            if report["calls"] >= MAX_CALLS or now_fn() - started >= MAX_WALL_SECONDS:
+            if report["calls"] >= MAX_CALLS or _call_foreign(lambda: now_fn()) - started >= MAX_WALL_SECONDS:
                 report["budgetStopped"] = True
                 return False
             return True
@@ -1283,7 +1287,7 @@ def dream_tidy_run(
                 prompt,
                 stdin_text=data,
                 model=model_name,
-                timeout=min(120.0, max(0.01, MAX_WALL_SECONDS - (now_fn() - started))),
+                timeout=min(120.0, max(0.01, MAX_WALL_SECONDS - (_call_foreign(lambda: now_fn()) - started))),
                 runner=runner,
                 config=config,
             )
@@ -1701,7 +1705,7 @@ def dream_tidy_run(
             report["notices"].append("fixture capture failed: " + str(exc))
 
     report["droppedGroupCounts"] = _reason_counts(report["droppedGroups"])
-    report["wallSeconds"] = round(now_fn() - started, 3)
+    report["wallSeconds"] = round(_call_foreign(lambda: now_fn()) - started, 3)
     report["ok"] = not report["errors"]
     report["exitCode"] = 0 if report["ok"] else 2
     if not report["ok"]:
@@ -1711,6 +1715,7 @@ def dream_tidy_run(
     return report
 
 
+@md.fresh_read
 def dream_tidy_dismiss(repo: Any = ".", proposal_ids: Sequence[str] = ()) -> Dict[str, Any]:
     """Record one or more proposal ids in `tidy-proposals.json`'s `dismissed` list. Never launches a model."""
     try:
@@ -1781,6 +1786,7 @@ def dream_tidy_dismiss(repo: Any = ".", proposal_ids: Sequence[str] = ()) -> Dic
         return dict(mb._fail(str(exc), 2), tidy=True)
 
 
+@md.fresh_read
 def dream_tidy_status(repo: Any = ".") -> Dict[str, Any]:
     """Read-only status of `dream --tidy`: open/disputed/stale/merged/dismissed counts, dropped groups and failed batches."""
     try:
@@ -1894,6 +1900,8 @@ def dream_tidy_status(repo: Any = ".") -> Dict[str, Any]:
 
 
 def _safe_tidy_section(fn: Callable[..., Optional[Dict[str, Any]]]) -> Callable[..., Optional[Dict[str, Any]]]:
+    import functools
+    @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         try:
             return fn(*args, **kwargs)
@@ -1903,6 +1911,7 @@ def _safe_tidy_section(fn: Callable[..., Optional[Dict[str, Any]]]) -> Callable[
     return wrapper
 
 
+@md.fresh_read
 @_safe_tidy_section
 def tidy_report_section(
     root: Path,
@@ -1911,9 +1920,10 @@ def tidy_report_section(
     nodes: Dict[str, Dict[str, Any]],
     merge: Dict[str, Any],
     merge_ok: bool,
-    cmd: Callable[[Sequence[str], Sequence[Tuple[str, Any]]], Optional[str]],
+    cmd: Optional[Callable[[Sequence[str], Sequence[Tuple[str, Any]]], Optional[str]]],
     duplicate_ids: Iterable[str] = (),
     wording_groups: Optional[Sequence[Set[str]]] = None,
+    _repo_arg=None,
 ) -> Optional[Dict[str, Any]]:
     """Read `tidy-proposals.json` (if present) and project `modelSaysSame` for `memlet admin tidy`.
 
@@ -1932,6 +1942,11 @@ def tidy_report_section(
             "notices": [loaded_store["notice"]],
             "blockersFailed": False,
         }
+
+    def render_command(words, options):
+        if cmd is None:
+            return mt.command(words, options, repo=_repo_arg)
+        return _call_foreign(lambda: cmd(words, options))
 
     lessons_by_id = lessons_by_id_from_loaded(lessons, nodes, merge, duplicate_ids=duplicate_ids)
     active_wording = (
@@ -1976,7 +1991,7 @@ def tidy_report_section(
         else:
             overlap_label = None
 
-        dismiss_cmd = cmd(["dream", "--tidy", "--dismiss", prop["id"]], [])
+        dismiss_cmd = render_command(["dream", "--tidy", "--dismiss", prop["id"]], [])
         entry: Dict[str, Any] = {
             "id": prop["id"],
             "keep": keep,
@@ -1996,7 +2011,7 @@ def tidy_report_section(
             entry["wordingOverlap"] = overlap_ids
             entry["wordingOverlapLabel"] = overlap_label
         if merge_ok:
-            mt._with_command(entry, cmd(["learn"], [("--merge", keep), ("--same", same), ("--by", "NAME")]))
+            mt._with_command(entry, render_command(["learn"], [("--merge", keep), ("--same", same), ("--by", "NAME")]))
             if failed_one or checked is None:
                 blockers_failed = True
                 mt._with_command(entry, None, v.TIDY_BLOCKERS_FAILED)
@@ -2018,7 +2033,7 @@ def tidy_report_section(
                 lost = list(dict.fromkeys(p for paths in checked["lostFiles"].values() for p in paths))
                 wanted = list(dict.fromkeys(list(lessons[keep]["item"].get("approvalPaths") or []) + lost))
                 if entry.get("command") and lost and lessons[keep]["tier"] == APPROVED and len(wanted) <= 8:
-                    paths_cmd = cmd(["learn"], [("--paths", keep), ("--by", "NAME")] + [("--path", p) for p in wanted])
+                    paths_cmd = render_command(["learn"], [("--paths", keep), ("--by", "NAME")] + [("--path", p) for p in wanted])
                     if paths_cmd is not None:
                         entry["pathsCommand"] = paths_cmd
         else:

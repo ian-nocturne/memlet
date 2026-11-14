@@ -1,4 +1,7 @@
 """Explicit Dream CLI; importing/registering never launches a vendor."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign
+
 from . import vocabulary as v
 from .vocabulary import (APPROVED as TIER_APPROVED, HINT as TIER_HINT, PENDING as TIER_PENDING)
 import argparse
@@ -11,26 +14,26 @@ COMMANDS = {"dream": {"help": "Propose cited lessons with an explicit vendor, or
 
 def register(sub):
     from memlet.memlet_dreamcycle import TRUST_BOUNDARY
-    parser = sub.add_parser(
+    parser = _call_foreign(lambda: sub.add_parser(
         "dream",
         help=COMMANDS["dream"]["help"],
         description=COMMANDS["dream"]["help"] + "; with --tidy, ask a model which shown lessons say the same thing.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Dream cycle: " + TRUST_BOUNDARY + "\n\nWith --tidy: " + v.DREAM_TIDY_TRUST_NOTICE,
-    )
-    parser.add_argument("repo", nargs="?", default=None, help=v.DREAM_REPO_HELP)
-    parser.add_argument("--repo", dest="repo_opt", default=None, metavar="PATH", help=v.DREAM_REPO_HELP)
-    parser.add_argument("--tidy", action="store_true", help=v.DREAM_TIDY_HELP)
-    parser.add_argument("--again", action="store_true", help=v.DREAM_TIDY_AGAIN_HELP)
-    parser.add_argument("--via", help=v.DREAM_VIA_HELP)
-    parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help=v.DREAM_VERIFY_WITH_HELP)
-    parser.add_argument("--transcript", help="Native session transcript to snapshot and examine (dream cycle only)")
-    parser.add_argument("--save-fixture", metavar="DIR", help="Explicitly save masked model answers outside .memlet (never overwrite)")
-    parser.add_argument("--max-batches", type=int, default=None, help=v.DREAM_MAX_BATCHES_HELP)
-    parser.add_argument("--dry-run", action="store_true", help="Show planned calls and prompts without calling a vendor or writing")
-    parser.add_argument("--status", action="store_true", help="Show waiting sessions and failed batches, or proposal status with --tidy")
-    parser.add_argument("--dismiss", nargs="+", action="extend", metavar="PROPOSAL_ID", help=v.DREAM_TIDY_DISMISS_HELP)
-    parser.add_argument("--skip-failed", metavar="BATCH_ID", help="Record a failed batch as completed-with-rejections; no model call")
+    ))
+    _call_foreign(lambda: parser.add_argument("repo", nargs="?", default=None, help=v.DREAM_REPO_HELP))
+    _call_foreign(lambda: parser.add_argument("--repo", dest="repo_opt", default=None, metavar="PATH", help=v.DREAM_REPO_HELP))
+    _call_foreign(lambda: parser.add_argument("--tidy", action="store_true", help=v.DREAM_TIDY_HELP))
+    _call_foreign(lambda: parser.add_argument("--again", action="store_true", help=v.DREAM_TIDY_AGAIN_HELP))
+    _call_foreign(lambda: parser.add_argument("--via", help=v.DREAM_VIA_HELP))
+    _call_foreign(lambda: parser.add_argument("--verify-with", choices=("claude", "codex", "gemini"), help=v.DREAM_VERIFY_WITH_HELP))
+    _call_foreign(lambda: parser.add_argument("--transcript", help="Native session transcript to snapshot and examine (dream cycle only)"))
+    _call_foreign(lambda: parser.add_argument("--save-fixture", metavar="DIR", help="Explicitly save masked model answers outside .memlet (never overwrite)"))
+    _call_foreign(lambda: parser.add_argument("--max-batches", type=int, default=None, help=v.DREAM_MAX_BATCHES_HELP))
+    _call_foreign(lambda: parser.add_argument("--dry-run", action="store_true", help="Show planned calls and prompts without calling a vendor or writing"))
+    _call_foreign(lambda: parser.add_argument("--status", action="store_true", help="Show waiting sessions and failed batches, or proposal status with --tidy"))
+    _call_foreign(lambda: parser.add_argument("--dismiss", nargs="+", action="extend", metavar="PROPOSAL_ID", help=v.DREAM_TIDY_DISMISS_HELP))
+    _call_foreign(lambda: parser.add_argument("--skip-failed", metavar="BATCH_ID", help="Record a failed batch as completed-with-rejections; no model call"))
     add_format_option(parser, help="Output format (default: markdown on a terminal, json when piped)")
 
 

@@ -1,4 +1,7 @@
 """`memlet admin tidy`: a read-only report of lessons a person might merge, retire or promote; no model, no writes."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign
+
 import argparse
 
 from . import cli_plugins, vocabulary as v
@@ -29,10 +32,10 @@ def _min_seen(text):
 
 
 def register(sub):
-    parser = sub.add_parser("tidy", prog="memlet admin tidy", help=COMMANDS["tidy"]["help"], description=COMMANDS["tidy"]["help"])
-    parser.add_argument("--repo", default=".", help="Repository to inspect (default: current directory).")
-    parser.add_argument("--stale-days", type=_days, default=180, metavar="N", help="Age for old unseen lessons in days (default: 180).")
-    parser.add_argument("--min-seen", type=_min_seen, default=3, metavar="N", help="Sessions needed for promotion (default: 3).")
+    parser = _call_foreign(lambda: sub.add_parser("tidy", prog="memlet admin tidy", help=COMMANDS["tidy"]["help"], description=COMMANDS["tidy"]["help"]))
+    _call_foreign(lambda: parser.add_argument("--repo", default=".", help="Repository to inspect (default: current directory)."))
+    _call_foreign(lambda: parser.add_argument("--stale-days", type=_days, default=180, metavar="N", help="Age for old unseen lessons in days (default: 180)."))
+    _call_foreign(lambda: parser.add_argument("--min-seen", type=_min_seen, default=3, metavar="N", help="Sessions needed for promotion (default: 3)."))
     cli_plugins.add_format_option(parser, help="Output format (default: json).")
 
 

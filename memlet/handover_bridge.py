@@ -138,8 +138,14 @@ def _rule_text(root, rule, cache):
     return text if hashlib.sha256(text.encode("utf-8")).hexdigest() == rule["ruleSha256"] else None
 
 
-def build(root, rules, anchors, approved, head, updated_at):
+@md.fresh_read
+def build(root, rules, anchors, approved, head, updated_at, *, _counters=None, _read_state=None):
     """Project classified rules + tier-provider-approved lessons in capsule order."""
+    with md.work_counters(_counters), md._enter_read_scope(_read_state) as state:
+        return _build_scoped(root, rules, anchors, approved, head, updated_at, _read_state=state)
+
+
+def _build_scoped(root, rules, anchors, approved, head, updated_at, *, _read_state=None):
     # Reader L493-558: strings repoHead, id/rule/anchor_status, list[str] paths;
     # rejected dicts use id/approach/reason/source; stale dicts anchor/path/reason.
     # L258, L474-475: reader emits its own boundary; keep Memlet's full wording.
@@ -230,7 +236,7 @@ def build(root, rules, anchors, approved, head, updated_at):
 
     from . import memlet_bridge as mb
     with mb._lesson_path_projection(root, None) as path_context:
-        mb.dream_items(root)
+        mb.dream_items(root, _read_state=_read_state, _path_context=path_context)
         attached = dict(path_context["paths"])
         metadata = mb.attachment_metadata(path_context)
     if metadata:
@@ -238,6 +244,8 @@ def build(root, rules, anchors, approved, head, updated_at):
             document.update(metadata)
             document["omitted"]["literalAttachments"] = len(approved)
     rejected_seen_cites, rejected_seen_texts = set(), set()
+    pending_groups = []
+    batch_entries = []
     for lesson in approved:
         if lesson.get("tier") != APPROVED:
             continue
@@ -278,20 +286,24 @@ def build(root, rules, anchors, approved, head, updated_at):
             source = _source(selected)
             ident = lesson["id"] + (("-old" if len(old) == 1 else "-old%d" % indices[0]) if replaced else "")
             status_entry = {"quote": text, "source": source}
-            mw.classify_rule_quotes(root, [status_entry])
-            tags = ["memlet-" + r.lower() for r in relations] + ["memlet-approved", "memlet-" + status_entry["anchorStatus"]]
-            if "SUPERSEDES" in relations:
-                tags.append("memlet-supersedes-replaced" if replaced else "memlet-supersedes-current")
-            cite_fields = [{k: c[k] for k in ("file", "start", "end", "sha256")} for c in selected]
-            if replaced:
-                # Reader L384-387 renders these as "DO NOT REPEAT", never active.
-                admit(hand, "rejectedApproaches", {"id": ident, "approach": text,
-                      "reason": BRIDGE_REPLACED_REASON,
-                      "source": source, "cites": cite_fields, "tags": tags}, {"approach": 110, "source": 120})
-            elif relations:
-                admit(caps, "capsules", {"id": ident, "paths": attached.get(lesson["id"], lesson.get("paths", [])),
-                      "tags": tags, "summary": text, "source": source, "cites": cite_fields,
-                      "updated_at": updated_at}, {"summary": SUMMARY_CHARS})
+            batch_entries.append(status_entry)
+            pending_groups.append((lesson, relations, replaced, selected, text, source, ident))
+    if batch_entries:
+        mw.classify_rule_quotes(root, batch_entries, _read_state=_read_state)
+    for (lesson, relations, replaced, selected, text, source, ident), status_entry in zip(pending_groups, batch_entries):
+        tags = ["memlet-" + r.lower() for r in relations] + ["memlet-approved", "memlet-" + status_entry["anchorStatus"]]
+        if "SUPERSEDES" in relations:
+            tags.append("memlet-supersedes-replaced" if replaced else "memlet-supersedes-current")
+        cite_fields = [{k: c[k] for k in ("file", "start", "end", "sha256")} for c in selected]
+        if replaced:
+            # Reader L384-387 renders these as "DO NOT REPEAT", never active.
+            admit(hand, "rejectedApproaches", {"id": ident, "approach": text,
+                  "reason": BRIDGE_REPLACED_REASON,
+                  "source": source, "cites": cite_fields, "tags": tags}, {"approach": 110, "source": 120})
+        elif relations:
+            admit(caps, "capsules", {"id": ident, "paths": attached.get(lesson["id"], lesson.get("paths", [])),
+                  "tags": tags, "summary": text, "source": source, "cites": cite_fields,
+                  "updated_at": updated_at}, {"summary": SUMMARY_CHARS})
 
     # Bound encoded bytes independently of text length (Unicode and paths count).
     for document, lists in ((caps, ("capsules",)),
@@ -306,6 +318,7 @@ def build(root, rules, anchors, approved, head, updated_at):
     return {HANDOVER_FILE: _canonical(hand) + "\n", CAPSULES_FILE: _canonical(caps) + "\n"}
 
 
+@md.fresh_read
 def write(root, rel, text):
     if rel not in (HANDOVER_FILE, CAPSULES_FILE):
         raise mw.UnsafePathError("not a managed handover bridge file")

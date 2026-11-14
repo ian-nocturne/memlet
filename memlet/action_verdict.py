@@ -5,6 +5,8 @@ when fail-on-drift is false. SARIF writes refuse symbolic links and replace file
 atomically. Report generation is pure; run_action handles the environment and I/O.
 """
 
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
+
 import json
 import os
 import pathlib
@@ -288,19 +290,19 @@ def run_action(env: Optional[Mapping[str, str]] = None, stdout: Any = None, stde
     stderr = sys.stderr if stderr is None else stderr
 
     if sys.version_info < MIN_PYTHON:
-        stderr.write(
+        _call_foreign(lambda: stderr.write(
             "::error title=Memlet Check::Python >= 3.9 is required, found %d.%d. Set the `python-version` input "
             "(for example '3.11') to let the Action install one.\n" % sys.version_info[:2]
-        )
+        ))
         return 2
 
     mode = env.get("INPUT_MODE", "audit").strip().lower() or "audit"
     if mode not in VALID_MODES:
-        stderr.write(f"::error title=Memlet Check::invalid mode '{mode}': this mode was removed in 9.0; use 'audit'.\n")
+        _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::invalid mode '{mode}': this mode was removed in 9.0; use 'audit'.\n"))
         return 2
     fmt = env.get("INPUT_FORMAT", "markdown").strip().lower() or "markdown"
     if fmt not in VALID_FORMATS:
-        stderr.write(f"::error title=Memlet Check::invalid format '{fmt}'. Choose from {VALID_FORMATS}.\n")
+        _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::invalid format '{fmt}'. Choose from {VALID_FORMATS}.\n"))
         return 2
 
     repo_path = env.get("INPUT_REPO_PATH", ".").strip() or "."
@@ -309,14 +311,14 @@ def run_action(env: Optional[Mapping[str, str]] = None, stdout: Any = None, stde
     try:
         fail_on_drift = parse_fail_on_drift(env.get("INPUT_FAIL_ON_DRIFT"))
     except ValueError as exc:
-        stderr.write(f"::error title=Memlet Check::{exc}\n")
+        _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::{exc}\n"))
         return 2
     sarif_file = env.get("INPUT_SARIF_FILE", "memlet-check.sarif").strip()
     if sarif_file:
         try:
             check_output_path(sarif_file)  # fail before running the gates; the write below checks again
         except OutputPathError as exc:
-            stderr.write(f"::error title=Memlet Check::{exc}\n")
+            _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::{exc}\n"))
             return 2
 
     audit_res: Any = None
@@ -335,18 +337,18 @@ def run_action(env: Optional[Mapping[str, str]] = None, stdout: Any = None, stde
         try:
             write_text_no_follow(sarif_file, json.dumps(audit_sarif, indent=2, ensure_ascii=False))
         except OutputPathError as exc:
-            stderr.write(f"::error title=Memlet Check::{exc}\n")
+            _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::{exc}\n"))
             return 2
     report, summary = render_report(
         fmt, mode, verdict, audit=audit_res, audit_markdown=audit_md, audit_sarif=audit_sarif
     )
-    stdout.write(report + "\n")
+    _call_foreign(lambda: stdout.write(report + "\n"))
 
     # Annotations go to stderr so stdout stays exactly the report in the chosen format.
     for b in verdict["blockers"]:
-        stderr.write(f"::error title=Memlet Check::{b['message']}\n")
+        _call_foreign(lambda: stderr.write(f"::error title=Memlet Check::{b['message']}\n"))
     for w in verdict["warnings"]:
-        stderr.write(f"::warning title=Memlet Check::{w['message']}\n")
+        _call_foreign(lambda: stderr.write(f"::warning title=Memlet Check::{w['message']}\n"))
 
     _append(env.get("GITHUB_STEP_SUMMARY"), summary + "\n")
     _append(

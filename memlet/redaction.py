@@ -32,7 +32,7 @@ def _secret_value_alternation():
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----)")
     jwt = run_tail_finder(re.compile(r"(?<![A-Za-z0-9])eyJ"), re.compile(cls + "*"), 10,
                           re.compile(r"\." + cls + r"{10,}(?:\." + cls + r"{5,})?"))
-    return LinearAlternation(_SECRET_VALUE_PATTERN, [regex_finder(before_jwt), jwt, regex_finder(after_jwt)])
+    return LinearAlternation(_SECRET_VALUE_PATTERN, [regex_finder(before_jwt), jwt, regex_finder(after_jwt)], _owned=True)
 
 
 SECRET_VALUE_REDACT_RE = _secret_value_alternation()

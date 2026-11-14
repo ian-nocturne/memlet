@@ -5,6 +5,8 @@ are stored in SQLite (memory_skills / memory_skill_events) and materialized as
 ordinary UTF-8 SKILL.md packages under <root>/memory_skills/<task>/<name>/.
 Skills are reference procedures, never auto-executed shell hooks or authority.
 """
+
+from memlet.memlet_dream import call_foreign as _call_foreign, _foreign_context
 import ast
 import hashlib
 import json
@@ -70,16 +72,8 @@ def is_skill_primary_eligible(skill):
     return True
 
 
-_GIT_BRANCH_CACHE = {}
-
-
 def detect_git_branch(root=None):
-    """Fast zero-subprocess Git branch detector (Beads style branch-aware memory scope) with 10s in-memory cache."""
-    key = str(root or '')
-    now = time.monotonic()
-    cached = _GIT_BRANCH_CACHE.get(key)
-    if cached is not None and (now - cached[1]) < 10.0:
-        return cached[0]
+    """Read the current Git branch directly, without retaining a repository cache."""
     start = Path(root) if root else Path.cwd()
     branch = 'main'
     try:
@@ -112,14 +106,7 @@ def detect_git_branch(root=None):
                         break
     except OSError:
         pass
-    if len(_GIT_BRANCH_CACHE) > 64:
-        _GIT_BRANCH_CACHE.clear()
-    _GIT_BRANCH_CACHE[key] = (branch, now)
     return branch
-
-
-_FILE_HASH_AST_CACHE = {}
-_FILE_SIGNATURE_CACHE = {}
 
 
 from memlet import code_anchors as _code_anchors
@@ -483,10 +470,10 @@ def heal_compatible_skills(db, root=None, task=None, skill_id=None, dry_run=Fals
         params.append(skill_id)
     rows = [
         _public_skill(r)
-        for r in db.execute(
+        for r in _call_foreign(lambda: list(db.execute(
             f"SELECT * FROM memory_skills WHERE {' AND '.join(where)} ORDER BY event_id DESC",
             params,
-        ).fetchall()
+        ).fetchall()))
     ]
     healed = []
     blocked = []
@@ -633,7 +620,7 @@ def heal_compatible_skills(db, root=None, task=None, skill_id=None, dry_run=Fals
             }
             _write_skill_event_and_row(db, row_payload)
             if target_ev_state != sk['evidence_state']:
-                exp_item = ledger.get_item(db, sk['task'], sk['experience_id'])
+                exp_item = _call_foreign(lambda: ledger.get_item(db, sk['task'], sk['experience_id']))
                 if exp_item and exp_item['status'] == 'active':
                     exp_source = {
                         k: v for k, v in exp_item['source'].items()
@@ -643,12 +630,12 @@ def heal_compatible_skills(db, root=None, task=None, skill_id=None, dry_run=Fals
                         'evidenceState': target_ev_state,
                         'verificationStatus': ver_status,
                     })
-                    ledger.record(
+                    _call_foreign(lambda: ledger.record(
                         db, sk['task'], sk['revision'],
                         'exp-heal:' + _digest([sk['task'], sk['experience_id'], new_file_sha, heal_count]),
                         'experience', sk['experience_id'], 'replace', exp_item['content'], exp_source,
                         event_at=now, valid_from=exp_item.get('valid_from'), valid_until=exp_item.get('valid_until'),
-                    )
+                    ))
             if root is not None:
                 events = skill_events(db, sk['task'], sk['skill_id'], limit=30)
                 staged_materialize.append((_public_skill(row_payload), events))
@@ -682,7 +669,7 @@ def ensure_schema(db):
     now_m = time.monotonic()
     db_id = id(db)
     if now_m - _ENSURED_DB_TS.get(db_id, -10.0) < 1.5:
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_skills'").fetchone():
+        if _call_foreign(lambda: db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_skills'").fetchone()):
             return
     for sql in (
         '''CREATE TABLE IF NOT EXISTS memory_skills (
@@ -786,13 +773,13 @@ def ensure_schema(db):
            last_turn_query TEXT NOT NULL DEFAULT '',
            PRIMARY KEY(task, session))''',
     ):
-        db.execute(sql)
+        _call_foreign(lambda: db.execute(sql))
     for alter_sql in (
         "ALTER TABLE memory_session_state ADD COLUMN last_primary_ids TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE memory_session_state ADD COLUMN last_turn_query TEXT NOT NULL DEFAULT ''",
     ):
         try:
-            db.execute(alter_sql)
+            _call_foreign(lambda: db.execute(alter_sql))
         except Exception:
             pass
     if len(_ENSURED_DB_TS) > 64:
@@ -1212,10 +1199,10 @@ def _public_skill(row):
 def get_skill(db, task, skill_or_exp_id):
     ledger._identifier(task, 'task')
     ledger._identifier(skill_or_exp_id, 'skillId')
-    row = db.execute(
+    row = _call_foreign(lambda: db.execute(
         'SELECT * FROM memory_skills WHERE task=? AND (skill_id=? OR experience_id=? OR name=?) ORDER BY event_id DESC LIMIT 1',
         (task, skill_or_exp_id, skill_or_exp_id, skill_or_exp_id),
-    ).fetchone()
+    ).fetchone())
     return _public_skill(row)
 
 
@@ -1224,15 +1211,15 @@ def skill_events(db, task, skill_id=None, limit=50):
     limit = ledger._integer(limit, 'limit', 1, 500)
     if skill_id:
         ledger._identifier(skill_id, 'skillId')
-        rows = db.execute(
+        rows = _call_foreign(lambda: db.execute(
             'SELECT * FROM memory_skill_events WHERE task=? AND skill_id=? ORDER BY id DESC LIMIT ?',
             (task, skill_id, limit),
-        ).fetchall()
+        ).fetchall())
     else:
-        rows = db.execute(
+        rows = _call_foreign(lambda: db.execute(
             'SELECT * FROM memory_skill_events WHERE task=? ORDER BY id DESC LIMIT ?',
             (task, limit),
-        ).fetchall()
+        ).fetchall())
     return [_public_skill(r) for r in rows]
 
 
@@ -1253,7 +1240,7 @@ def _write_skill_event_and_row(db, row):
         refreshed.append(dict(entry, symbols=symbols) if symbols != old else entry)
     if refreshed != refs:
         row['source'] = dict(source, referencedFiles=refreshed)
-    cur = db.execute(
+    cur = _call_foreign(lambda: db.execute(
         '''INSERT INTO memory_skill_events(
            task,revision,event_key,skill_id,name,experience_id,version,operation,
            status,evidence_state,scope,title,description,triggers,steps,outcome,
@@ -1273,10 +1260,10 @@ def _write_skill_event_and_row(db, row):
             row['incorrect_count'], row['missing_count'], row['valid_from'],
             row['valid_until'], row['event_at'], row['observed_at'],
         ),
-    )
+    ))
     event_id = cur.lastrowid
     row['event_id'] = event_id
-    db.execute(
+    _call_foreign(lambda: db.execute(
         '''INSERT INTO memory_skills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(task,skill_id) DO UPDATE SET
            name=excluded.name,experience_id=excluded.experience_id,revision=excluded.revision,
@@ -1301,7 +1288,7 @@ def _write_skill_event_and_row(db, row):
             row['incorrect_count'], row['missing_count'], row['valid_from'],
             row['valid_until'], row['event_at'], row['observed_at'],
         ),
-    )
+    ))
     return event_id
 
 
@@ -1309,10 +1296,10 @@ def _find_similar_skill(db, task, validated, triggers, exclude_skill_id=None):
     """Find an existing active skill in the same task with high semantic/lexical/step similarity."""
     rows = [
         _public_skill(r)
-        for r in db.execute(
+        for r in _call_foreign(lambda: list(db.execute(
             "SELECT * FROM memory_skills WHERE task=? AND status='active' ORDER BY event_id DESC",
             (task,),
-        ).fetchall()
+        ).fetchall()))
     ]
     candidates = [r for r in rows if r['skill_id'] != exclude_skill_id]
     if not candidates:
@@ -1779,7 +1766,7 @@ def apply_feedback(db, root, task, revision, session, operation, recall_id, item
             'observed_at': now,
         }
         _write_skill_event_and_row(db, row)
-        exp_item = ledger.get_item(db, task, skill['experience_id'])
+        exp_item = _call_foreign(lambda: ledger.get_item(db, task, skill['experience_id']))
         if exp_item and exp_item['status'] == 'active':
             exp_source = {
                 k: v for k, v in exp_item['source'].items()
@@ -1798,14 +1785,14 @@ def apply_feedback(db, root, task, revision, session, operation, recall_id, item
                 '조건: ' + card['conditions'],
                 '예외: ' + card['counterexamples'],
             ])
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, task, revision, 'exp-fb:' + _digest([operation, skill['experience_id']]),
                 'experience', skill['experience_id'], 'replace', exp_content, exp_source,
                 event_at=now, valid_from=exp_item.get('valid_from'), valid_until=exp_item.get('valid_until'),
-            )
+            ))
         updated = _public_skill(row)
     else:
-        db.execute(
+        _call_foreign(lambda: db.execute(
             '''UPDATE memory_skills
                SET helpful_count=?,used_count=?,incorrect_count=?,missing_count=?,
                    body=?,file_sha256=?,source=?,observed_at=?
@@ -1814,7 +1801,7 @@ def apply_feedback(db, root, task, revision, session, operation, recall_id, item
                 helpful_count, used_count, incorrect_count, missing_count,
                 body, file_sha256, _json(new_source), now, task, skill['skill_id'],
             ),
-        )
+        ))
         updated = get_skill(db, task, skill['skill_id'])
 
     events = skill_events(db, task, skill['skill_id'], limit=30)
@@ -1835,7 +1822,7 @@ def apply_feedback(db, root, task, revision, session, operation, recall_id, item
             'severity': 'warning',
         }
         case_content = format_case_content(case_card)
-        old_case = ledger.get_item(db, task, synthesized_case_id)
+        old_case = _call_foreign(lambda: ledger.get_item(db, task, synthesized_case_id))
         case_op = 'replace' if old_case and old_case['status'] == 'active' else 'assert'
         case_source = {
             'kind': 'feedback-pitfall-synthesis',
@@ -1854,10 +1841,10 @@ def apply_feedback(db, root, task, revision, session, operation, recall_id, item
             'sourceRefs': list(skill['source'].get('sourceRefs', [])),
             'case': case_card,
         }
-        ledger.record(
+        _call_foreign(lambda: ledger.record(
             db, task, revision, 'case-fb:' + _digest([operation, synthesized_case_id]),
             'case', synthesized_case_id, case_op, case_content, case_source, event_at=now,
-        )
+        ))
     sync_task_links(db, task)
     res = {
         'skillId': updated['skill_id'],
@@ -1889,16 +1876,16 @@ def sync_task_links(db, task, force=False):
     else:
         _, _, state_sig = _indexing_core.check_link_sync_needed(db, task)
     now = time.time()
-    items = ledger.current(
+    items = _call_foreign(lambda: ledger.current(
         db, task,
         kinds=['decision', 'constraint', 'fact', 'experience', 'case', 'issue', 'hypothesis'],
-    )
+    ))
     skills = [
         _public_skill(r)
-        for r in db.execute(
+        for r in _call_foreign(lambda: list(db.execute(
             "SELECT * FROM memory_skills WHERE task=? AND status='active' ORDER BY event_id DESC",
             (task,),
-        ).fetchall()
+        ).fetchall()))
     ]
     nodes = {}
     for item in items:
@@ -2062,15 +2049,15 @@ def sync_task_links(db, task, force=False):
 
     _indexing_core.build_shared_edges_inverted(nodes, node_ids, add_pair)
 
-    db.execute('DELETE FROM memory_links WHERE task=?', (task,))
+    _call_foreign(lambda: db.execute('DELETE FROM memory_links WHERE task=?', (task,)))
     if edges:
-        db.executemany(
+        _call_foreign(lambda: db.executemany(
             'INSERT OR REPLACE INTO memory_links VALUES(?,?,?,?,?,?,?)',
             [
                 (task, u, v, relation, float(weight), str(evidence_val)[:500], now)
                 for (u, v, relation), (weight, evidence_val) in sorted(edges.items())
             ],
-        )
+        ))
     _invalidate_task_link_cache(task)
     res_obj = {'taskId': task, 'directedLinks': len(edges), 'undirectedPairs': len({tuple(sorted((u, v))) for u, v, _ in edges})}
     _indexing_core.record_link_sync_state(db, task, state_sig, res_obj)
@@ -2097,33 +2084,19 @@ def _invalidate_task_link_cache(task=None):
 
 def _load_task_link_graph(db, task):
     """Load and cache adjacency list, out-degrees, and sorted [[wiki_links]] per node for a task in a single SQL query."""
-    now_m = time.monotonic()
-    fast_cached = _TASK_LINK_CACHE.get(task)
-    if fast_cached is not None and fast_cached.get('_db_id') == id(db) and (now_m - fast_cached.get('_ts', -10.0) < 0.8):
-        return fast_cached
-    ensure_schema(db)
-    stat = db.execute(
-        'SELECT count(*), COALESCE(max(updated_at), 0.0) FROM memory_links WHERE task=?',
-        (task,),
-    ).fetchone()
-    cnt = int(stat[0] or 0)
-    max_upd = round(float(stat[1] or 0.0), 4)
-    if cnt == 0:
-        empty_graph = {'adj': {}, 'out_deg': {}, 'wiki_links': {}, '_db_id': id(db), '_ts': now_m}
-        _TASK_LINK_CACHE[task] = empty_graph
-        return empty_graph
-    ckey = (_db_identity_key(db), task, cnt, max_upd)
+    ckey = (_db_identity_key(db), task)
+    revision = _call_foreign(lambda: (db.execute("PRAGMA data_version").fetchone()[0], db.total_changes, db.in_transaction))
     cached = _TASK_LINK_CACHE.get(ckey)
-    if cached is not None:
-        cached['_db_id'] = id(db)
-        cached['_ts'] = now_m
-        _TASK_LINK_CACHE[task] = cached
-        return cached
+    # data_version is connection-local. Retain the bounded connection reference,
+    # not id(db), so a new connection cannot reuse a former connection's revision.
+    if cached is not None and cached[0] is db and cached[1] == revision and not revision[2]:
+        return cached[2]
+    ensure_schema(db)
 
-    edge_rows = db.execute(
+    edge_rows = _call_foreign(lambda: db.execute(
         'SELECT source_id, target_id, relation, weight FROM memory_links WHERE task=? ORDER BY weight DESC, target_id ASC',
         (task,),
-    ).fetchall()
+    ).fetchall())
     adj = {}
     out_neighbors = {}
     max_w_by_src = {}
@@ -2144,11 +2117,12 @@ def _load_task_link_graph(db, task):
         ordered = sorted(tgt_map.items(), key=lambda kv: (-kv[1], kv[0]))
         wiki_links[u] = [f"[[{t_id}]]" for t_id, _ in ordered]
 
-    graph = {'adj': adj, 'out_deg': out_deg, 'wiki_links': wiki_links, '_db_id': id(db), '_ts': now_m}
-    if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE:
-        _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
-    _TASK_LINK_CACHE[ckey] = graph
-    _TASK_LINK_CACHE[task] = graph
+    graph = {'adj': adj, 'out_deg': out_deg, 'wiki_links': wiki_links}
+    # An uncommitted graph may be rolled back without changing total_changes.
+    if not revision[2]:
+        if len(_TASK_LINK_CACHE) >= _MAX_TASK_LINK_CACHE:
+            _TASK_LINK_CACHE.pop(next(iter(_TASK_LINK_CACHE)), None)
+        _TASK_LINK_CACHE[ckey] = (db, revision, graph)
     return graph
 
 
@@ -2255,19 +2229,19 @@ def get_links(db, task, node_id=None, limit=100):
     ensure_schema(db)
     if node_id:
         ledger._identifier(node_id, 'nodeId')
-        rows = db.execute(
+        rows = _call_foreign(lambda: db.execute(
             '''SELECT source_id, target_id, relation, weight, evidence, updated_at
                FROM memory_links WHERE task=? AND source_id=?
                ORDER BY weight DESC, target_id ASC LIMIT ?''',
             (task, node_id, limit),
-        ).fetchall()
+        ).fetchall())
     else:
-        rows = db.execute(
+        rows = _call_foreign(lambda: db.execute(
             '''SELECT source_id, target_id, relation, weight, evidence, updated_at
                FROM memory_links WHERE task=?
                ORDER BY weight DESC, source_id ASC, target_id ASC LIMIT ?''',
             (task, limit),
-        ).fetchall()
+        ).fetchall())
     return [
         {
             'sourceId': r['source_id'],
@@ -2318,7 +2292,7 @@ def _email_finder(text):
 
 def _email_alternation():
     from memlet.audit import LinearAlternation
-    return LinearAlternation(_ARCHETYPE_EMAIL_PATTERN, [_email_finder])
+    return LinearAlternation(_ARCHETYPE_EMAIL_PATTERN, [_email_finder], _owned=True)
 
 
 _ARCHETYPE_EMAIL_RE = _email_alternation()
@@ -2350,13 +2324,13 @@ def sanitize_archetype_text(text):
 def retrieve_federated_archetypes(db, current_task, query='', limit=2):
     """AFTER (arXiv:2606.23127) & sylex-memory Cross-Project Federated Archetype Transfer: recall verified procedural skills and cases across projects in WorkStore with privacy sanitization."""
     ensure_schema(db)
-    cur_proj_row = db.execute('SELECT project FROM tasks WHERE id=?', (current_task,)).fetchone()
+    cur_proj_row = _call_foreign(lambda: db.execute('SELECT project FROM tasks WHERE id=?', (current_task,)).fetchone())
     cur_project = cur_proj_row['project'] if cur_proj_row else ''
 
     # Gather verified active skills from other projects (or other tasks when project differs)
     skill_rows = [
         _public_skill(r)
-        for r in db.execute(
+        for r in _call_foreign(lambda: list(db.execute(
             '''SELECT s.* FROM memory_skills s
                LEFT JOIN tasks t ON t.id = s.task
                WHERE s.task <> ?
@@ -2367,11 +2341,11 @@ def retrieve_federated_archetypes(db, current_task, query='', limit=2):
                ORDER BY s.helpful_count DESC, s.used_count DESC, s.event_at DESC
                LIMIT 50''',
             (current_task, cur_project, cur_project),
-        ).fetchall()
+        ).fetchall()))
     ]
     case_rows = [
         ledger._public(r)
-        for r in db.execute(
+        for r in _call_foreign(lambda: list(db.execute(
             '''SELECT m.* FROM memory_items m
                LEFT JOIN tasks t ON t.id = m.task
                WHERE m.task <> ?
@@ -2381,7 +2355,7 @@ def retrieve_federated_archetypes(db, current_task, query='', limit=2):
                ORDER BY m.event_at DESC
                LIMIT 50''',
             (current_task, cur_project, cur_project),
-        ).fetchall()
+        ).fetchall()))
     ]
 
     qwords = set(_tokens(query)[:128]) if query else set()
@@ -2491,10 +2465,10 @@ def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
     if known_at is None and at is None and before is None and after is None:
         rows = [
             _public_skill(r)
-            for r in db.execute(
+            for r in _call_foreign(lambda: list(db.execute(
                 'SELECT * FROM memory_skills WHERE task=? ORDER BY event_id DESC',
                 (task,),
-            ).fetchall()
+            ).fetchall()))
         ]
     else:
         params = [task]
@@ -2502,10 +2476,10 @@ def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
         if known_at is not None:
             where.append('observed_at<=?')
             params.append(ledger._timestamp(known_at, 'known_at'))
-        rows_raw = db.execute(
+        rows_raw = _call_foreign(lambda: db.execute(
             f"SELECT * FROM memory_skill_events WHERE {' AND '.join(where)} ORDER BY id DESC",
             params,
-        ).fetchall()
+        ).fetchall())
         latest_by_skill = {}
         for r in rows_raw:
             sid = r['skill_id']
@@ -2547,12 +2521,12 @@ def snapshot_skills(db, task, at=None, known_at=None, before=None, after=None,
 
     if shared and not project_only and not verified_candidates_only:
         local_names = {r['name'] for r in filtered}
-        project = db.execute('SELECT project FROM tasks WHERE id=?', (task,)).fetchone()
+        project = _call_foreign(lambda: db.execute('SELECT project FROM tasks WHERE id=?', (task,)).fetchone())
         if project:
-            others = db.execute(
+            others = _call_foreign(lambda: db.execute(
                 'SELECT id FROM tasks WHERE project=? AND id<>? ORDER BY id LIMIT 100',
                 (project['project'], task),
-            ).fetchall()
+            ).fetchall())
             for other in others:
                 shared_rows = snapshot_skills(
                     db, other['id'], at=at, known_at=known_at, before=before, after=after,
@@ -2909,12 +2883,12 @@ def sync_task_skills(store, task, session):
     ledger._identifier(task, 'task')
     ledger._identifier(session, 'session')
     staged = []
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current or current['owner'] != session:
             raise ValueError('only the current responsible session can sync skills')
-        store._check_input_lease(db, task)
-        experiences = ledger.current(db, task, kinds=['experience'])
+        _call_foreign(lambda: store._check_input_lease(db, task))
+        experiences = _call_foreign(lambda: ledger.current(db, task, kinds=['experience']))
         for exp in experiences:
             card = exp['source'].get('experience')
             if not card or not can_auto_synthesize(card):
@@ -2922,10 +2896,10 @@ def sync_task_skills(store, task, session):
             existing = get_skill(db, task, exp['item_id'])
             if existing and existing['status'] == 'active' and existing['steps'] == card['steps']:
                 events = skill_events(db, task, existing['skill_id'], limit=30)
-                materialize_skill(store.root, existing, events)
+                materialize_skill(_call_foreign(lambda: store.root), existing, events)
                 continue
             res = stage_skill_from_experience(
-                db, store.root, task, current['revision'],
+                db, _call_foreign(lambda: store.root), task, current['revision'],
                 'skill-sync:' + _digest([task, exp['item_id'], exp['event_id']]),
                 exp['item_id'], 'assert', card, exp['source'],
                 valid_from=exp.get('valid_from'), valid_until=exp.get('valid_until'),
@@ -2934,11 +2908,11 @@ def sync_task_skills(store, task, session):
             if res and res.get('materialize'):
                 events = skill_events(db, task, res['skill']['skill_id'], limit=30)
                 staged.append((res['skill'], events))
-        heal_res = heal_compatible_skills(db, root=store.root, task=task, dry_run=False)
+        heal_res = heal_compatible_skills(db, root=_call_foreign(lambda: store.root), task=task, dry_run=False)
         sync_task_links(db, task)
     synthesized = []
     for skill_row, events in staged:
-        materialize_skill(store.root, skill_row, events)
+        materialize_skill(_call_foreign(lambda: store.root), skill_row, events)
         synthesized.append({
             'skillId': skill_row['skill_id'],
             'name': skill_row['name'],
@@ -2980,23 +2954,23 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
 
     payload = _digest(['skill_manage', session, revision, spec])
     staged = None
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current or current['owner'] != session:
             raise ValueError('only the current responsible session can manage skills')
-        prior = db.execute(
+        prior = _call_foreign(lambda: db.execute(
             'SELECT * FROM memory_batches WHERE task=? AND operation=?',
             (task, operation),
-        ).fetchone()
+        ).fetchone())
         if prior:
             if prior['digest'] != payload:
                 raise ValueError('operation changed; use a fresh operationId')
             return json.loads(prior['result'])
         if current['revision'] != revision:
             raise ValueError('memory revision changed; refresh before writing')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
 
-        refs = reference_validator(db, task, spec.get('sourceRefs'))
+        refs = _call_foreign(lambda: reference_validator(db, task, spec.get('sourceRefs')))
         explicit = spec.get('certainty') == 'explicit' and any(r['kind'] == 'instruction' for r in refs)
         scope = spec.get('scope', 'task')
         if scope not in ('task', 'project'):
@@ -3015,7 +2989,7 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
         if 'links' in spec and isinstance(spec['links'], list):
             source['links'] = [ledger._text(x, 'link', 240, empty=False) for x in spec['links'][:20]]
         if scope == 'project':
-            share = reference_validator(db, task, [spec.get('shareEvidence')])
+            share = _call_foreign(lambda: reference_validator(db, task, [spec.get('shareEvidence')]))
             if share[0]['kind'] != 'instruction':
                 raise ValueError('project sharing requires user evidence')
             source['shareEvidence'] = share[0]
@@ -3037,14 +3011,14 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
             if not existing:
                 raise ValueError('skill to retract not found')
             exp_id = existing['experience_id']
-            exp_item = ledger.get_item(db, task, exp_id)
+            exp_item = _call_foreign(lambda: ledger.get_item(db, task, exp_id))
             if exp_item and exp_item['status'] == 'active':
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, task, revision + 1, 'skill-exp-retract:' + _digest([operation, exp_id]),
                     'experience', exp_id, 'retract', '', source, event_at=now,
-                )
+                ))
             staged_res = stage_skill_from_experience(
-                db, store.root, task, revision + 1,
+                db, _call_foreign(lambda: store.root), task, revision + 1,
                 'skill-manage:' + _digest([operation, existing['skill_id']]),
                 exp_id, 'retract', None, source, valid_from=start, valid_until=end, event_at=now,
                 skill_spec={'id': existing['skill_id'], 'name': existing['name']},
@@ -3129,7 +3103,7 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
                 'observed_at': now,
             }
             _write_skill_event_and_row(db, row)
-            exp_item = ledger.get_item(db, task, existing['experience_id'])
+            exp_item = _call_foreign(lambda: ledger.get_item(db, task, existing['experience_id']))
             if exp_item and exp_item['status'] == 'active':
                 exp_source = {
                     k: v for k, v in exp_item['source'].items()
@@ -3148,11 +3122,11 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
                     '조건: ' + card['conditions'],
                     '예외: ' + card['counterexamples'],
                 ])
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, task, revision + 1, 'skill-exp-manage:' + _digest([operation, existing['experience_id']]),
                     'experience', existing['experience_id'], 'replace', exp_content, exp_source,
                     event_at=now, valid_from=exp_item.get('valid_from'), valid_until=exp_item.get('valid_until'),
-                )
+                ))
             events = skill_events(db, task, existing['skill_id'], limit=30)
             staged = (_public_skill(row), events)
         else:
@@ -3172,15 +3146,15 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
                 '조건: ' + card['conditions'],
                 '예외: ' + card['counterexamples'],
             ])
-            old_exp = ledger.get_item(db, task, exp_id)
+            old_exp = _call_foreign(lambda: ledger.get_item(db, task, exp_id))
             exp_op = 'replace' if old_exp and old_exp['status'] == 'active' else 'assert'
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, task, revision + 1, 'skill-exp:' + _digest([operation, exp_id]),
                 'experience', exp_id, exp_op, exp_content, source,
                 event_at=now, valid_from=start, valid_until=end,
-            )
+            ))
             staged_res = stage_skill_from_experience(
-                db, store.root, task, revision + 1,
+                db, _call_foreign(lambda: store.root), task, revision + 1,
                 'skill-manage:' + _digest([operation, exp_id]),
                 exp_id, exp_op, card, source,
                 valid_from=start, valid_until=end, event_at=now,
@@ -3198,10 +3172,10 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
 
         sync_task_links(db, task)
         skill_row, events = staged
-        db.execute(
+        _call_foreign(lambda: db.execute(
             'UPDATE tasks SET revision=revision+1,updated=? WHERE id=?',
             (now, task),
-        )
+        ))
         result = {
             'ok': True,
             'taskId': task,
@@ -3222,18 +3196,18 @@ def manage_skill(store, task, session, revision, operation, spec, reference_vali
                 'staleness': skill_row['staleness'],
             },
         }
-        db.execute(
+        _call_foreign(lambda: db.execute(
             'INSERT INTO memory_batches VALUES(?,?,?,?)',
             (task, operation, payload, _json(result)),
-        )
+        ))
     if staged:
-        materialize_skill(store.root, staged[0], staged[1])
+        materialize_skill(_call_foreign(lambda: store.root), staged[0], staged[1])
     return result
 
 
 def read_skill(store, task, skill_or_exp_id):
     """Read full skill record, SKILL.md content, and version history."""
-    with store.db() as db:
+    with _foreign_context(lambda: store.db()) as db:
         skill = get_skill(db, task, skill_or_exp_id)
         if not skill:
             raise ValueError('skill not found in this task')
@@ -3339,18 +3313,18 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
     ledger._identifier(task, 'task')
     now = time.time()
     staged = []
-    with store.db(True) as db:
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+    with _foreign_context(lambda: store.db(True)) as db:
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current:
             raise ValueError('업무를 찾지 못했어요.')
         active_session = session or current['owner']
         if current['owner'] != active_session:
             raise ValueError('only the current responsible session can sync markdown')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         is_explicit_user_coedit = bool(explicit_user is True)
         skills_rows = [
             _public_skill(r)
-            for r in db.execute("SELECT * FROM memory_skills WHERE task=? AND status='active' ORDER BY event_id DESC", (task,)).fetchall()
+            for r in _call_foreign(lambda: list(db.execute("SELECT * FROM memory_skills WHERE task=? AND status='active' ORDER BY event_id DESC", (task,)).fetchall()))
         ]
         rev = current['revision']
         for sk in skills_rows:
@@ -3385,7 +3359,7 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
             new_triggers = parsed['triggers'] or _triggers_for(new_card, sk['source'], sk['triggers'])
             new_title = ledger._text(parsed['title'] or sk['title'], 'title', 240, empty=False)
             new_desc = ledger._text(f"{new_card['situation']} (조건: {new_card['conditions'][:240]})", 'description', 1000, empty=False)
-            ref_files = _extract_referenced_files(new_card, root=store.root, explicit_files=sk['source'].get('referencedFiles'))
+            ref_files = _extract_referenced_files(new_card, root=_call_foreign(lambda: store.root), explicit_files=sk['source'].get('referencedFiles'))
             if is_explicit_user_coedit:
                 target_ev_state = 'user-confirmed'
                 target_ver_status = 'verified'
@@ -3406,7 +3380,7 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
                 'coeditedBySession': active_session,
                 'supersedesSkillVersion': sk['version'],
                 'referencedFiles': ref_files or sk['source'].get('referencedFiles', []),
-                'gitBranch': detect_git_branch(store.root),
+                'gitBranch': detect_git_branch(_call_foreign(lambda: store.root)),
             }
             body = render_skill_markdown(
                 name=sk['name'],
@@ -3460,7 +3434,7 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
                 'observed_at': now,
             }
             _write_skill_event_and_row(db, row)
-            exp_item = ledger.get_item(db, task, sk['experience_id'])
+            exp_item = _call_foreign(lambda: ledger.get_item(db, task, sk['experience_id']))
             if exp_item and exp_item['status'] == 'active':
                 exp_source = {
                     k: v for k, v in exp_item['source'].items()
@@ -3481,19 +3455,19 @@ def sync_skill_markdowns(store, task, session=None, explicit_user=None):
                     '조건: ' + new_card['conditions'],
                     '예외: ' + new_card['counterexamples'],
                 ])
-                ledger.record(
+                _call_foreign(lambda: ledger.record(
                     db, task, rev, 'exp-coedit:' + _digest([task, sk['experience_id'], disk_sha, rev]),
                     'experience', sk['experience_id'], 'replace', exp_content, exp_source,
                     event_at=now, valid_from=exp_item.get('valid_from'), valid_until=exp_item.get('valid_until'),
-                )
+                ))
             events = skill_events(db, task, sk['skill_id'], limit=30)
             staged.append((_public_skill(row), events))
         if staged:
             sync_task_links(db, task)
-            db.execute('UPDATE tasks SET revision=?,updated=? WHERE id=?', (rev, now, task))
+            _call_foreign(lambda: db.execute('UPDATE tasks SET revision=?,updated=? WHERE id=?', (rev, now, task)))
     synced = []
     for skill_row, events in staged:
-        materialize_skill(store.root, skill_row, events)
+        materialize_skill(_call_foreign(lambda: store.root), skill_row, events)
         synced.append({
             'skillId': skill_row['skill_id'],
             'name': skill_row['name'],
@@ -3577,21 +3551,21 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
         raise ValueError('command 또는 executionProof가 필요해요.')
 
     # Pre-check owner and skill existence before running any subprocess
-    with store.db(False) as db:
+    with _foreign_context(lambda: store.db(False)) as db:
         ensure_schema(db)
-        existing_op = db.execute(
+        existing_op = _call_foreign(lambda: db.execute(
             'SELECT * FROM memory_batches WHERE task=? AND operation=?',
             (task, op_id),
-        ).fetchone()
+        ).fetchone())
         if existing_op:
             raw_res = existing_op['result'] if 'result' in existing_op.keys() else existing_op['response']
             return json.loads(raw_res)
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current:
             raise ValueError('업무를 찾지 못했어요.')
         if current['owner'] != session:
             raise ValueError('only the current responsible session can verify skills')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         target_skill = get_skill(db, task, skill_ref)
         if not target_skill:
             raise ValueError(f'스킬을 찾지 못했어요: {skill_ref}')
@@ -3613,7 +3587,7 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
             proc = subprocess.run(
                 cmd_args,
                 shell=use_shell,
-                cwd=str(store.root),
+                cwd=str(_call_foreign(lambda: store.root)),
                 capture_output=True,
                 text=True,
                 timeout=min(max(float(timeout or 15.0), 1.0), 30.0),
@@ -3650,27 +3624,27 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
         combined_out = (combined_out + '\n[ZeroTestsRejected] 실행된 테스트 수가 0건(Ran 0 tests / 0 passed)이어서 검증 승격을 거부했어요.').strip()
         output_sha256 = _sha256_text(combined_out)
 
-    head_sha, dirty_worktree = _detect_git_head_state(store.root)
+    head_sha, dirty_worktree = _detect_git_head_state(_call_foreign(lambda: store.root))
     if isinstance(execution_proof, dict) and execution_proof.get('headSha'):
         head_sha = str(execution_proof['headSha']).strip()
 
     now = time.time()
     synthesized_case_id = None
-    with store.db(True) as db:
+    with _foreign_context(lambda: store.db(True)) as db:
         ensure_schema(db)
-        existing_op = db.execute(
+        existing_op = _call_foreign(lambda: db.execute(
             'SELECT * FROM memory_batches WHERE task=? AND operation=?',
             (task, op_id),
-        ).fetchone()
+        ).fetchone())
         if existing_op:
             raw_res = existing_op['result'] if 'result' in existing_op.keys() else existing_op['response']
             return json.loads(raw_res)
-        current = store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
+        current = _call_foreign(lambda: store.row(db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
         if not current:
             raise ValueError('업무를 찾지 못했어요.')
         if current['owner'] != session:
             raise ValueError('only the current responsible session can verify skills')
-        store._check_input_lease(db, task)
+        _call_foreign(lambda: store._check_input_lease(db, task))
         skill = get_skill(db, task, skill_ref)
         if not skill:
             raise ValueError(f'스킬을 찾지 못했어요: {skill_ref}')
@@ -3682,7 +3656,7 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
             'conditions': skill['conditions'],
             'counterexamples': skill['counterexamples'],
         }
-        ref_files = _extract_referenced_files(card, root=store.root, explicit_files=skill['source'].get('referencedFiles'))
+        ref_files = _extract_referenced_files(card, root=_call_foreign(lambda: store.root), explicit_files=skill['source'].get('referencedFiles'))
         if not ref_files:
             ref_files = list(skill['source'].get('referencedFiles') or [])
         code_anchor_digest = _digest([
@@ -3743,7 +3717,7 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
             'verificationMode': ver_mode,
             'verificationEvidence': verification_evidence,
             'referencedFiles': ref_files,
-            'gitBranch': detect_git_branch(store.root),
+            'gitBranch': detect_git_branch(_call_foreign(lambda: store.root)),
         }
         body = render_skill_markdown(
             name=skill['name'],
@@ -3798,7 +3772,7 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
             'observed_at': now,
         }
         _write_skill_event_and_row(db, row)
-        exp_item = ledger.get_item(db, task, skill['experience_id'])
+        exp_item = _call_foreign(lambda: ledger.get_item(db, task, skill['experience_id']))
         if exp_item and exp_item['status'] == 'active':
             exp_source = {
                 k: v for k, v in exp_item['source'].items()
@@ -3819,11 +3793,11 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
                 '조건: ' + card['conditions'],
                 '예외: ' + card['counterexamples'],
             ])
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, task, rev, 'exp-verify:' + _digest([op_id, skill['experience_id'], version]),
                 'experience', skill['experience_id'], 'replace', exp_content, exp_source,
                 event_at=now, valid_from=exp_item.get('valid_from'), valid_until=exp_item.get('valid_until'),
-            )
+            ))
         if exit_code != 0:
             synthesized_case_id = 'case:pitfall-' + skill['name']
             case_card = {
@@ -3836,7 +3810,7 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
                 'severity': 'warning',
             }
             case_content = format_case_content(case_card)
-            old_case = ledger.get_item(db, task, synthesized_case_id)
+            old_case = _call_foreign(lambda: ledger.get_item(db, task, synthesized_case_id))
             case_op = 'replace' if old_case and old_case['status'] == 'active' else 'assert'
             case_source = {
                 'kind': 'execution-verify-pitfall',
@@ -3848,13 +3822,13 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
                 'linkedSkillId': skill['skill_id'],
                 'case': case_card,
             }
-            ledger.record(
+            _call_foreign(lambda: ledger.record(
                 db, task, rev, 'case-verify:' + _digest([op_id, synthesized_case_id]),
                 'case', synthesized_case_id, case_op, case_content, case_source,
                 event_at=now, valid_from=now,
-            )
+            ))
         sync_task_links(db, task)
-        db.execute('UPDATE tasks SET revision=?,updated=? WHERE id=?', (rev, now, task))
+        _call_foreign(lambda: db.execute('UPDATE tasks SET revision=?,updated=? WHERE id=?', (rev, now, task)))
         updated = _public_skill(row)
         events = skill_events(db, task, skill['skill_id'], limit=30)
         res_payload = {
@@ -3870,11 +3844,11 @@ def verify_skill_execution(store, task, session, skill_id, command=None, executi
             'skill': updated,
             'synthesizedCaseId': synthesized_case_id,
         }
-        db.execute(
+        _call_foreign(lambda: db.execute(
             'INSERT OR REPLACE INTO memory_batches VALUES (?,?,?,?)',
             (task, op_id, _digest([task, op_id, skill['skill_id'], version]), _json(res_payload)),
-        )
-    materialize_skill(store.root, updated, events)
+        ))
+    materialize_skill(_call_foreign(lambda: store.root), updated, events)
     return res_payload
 
 
@@ -3882,28 +3856,28 @@ def skill_metrics(db, task):
     """Compute lightweight recall & procedural skill adoption/effectiveness metrics with bounded [0.0, 1.0] rates."""
     ledger._identifier(task, 'task')
     ensure_schema(db)
-    recalls_rows = db.execute(
+    recalls_rows = _call_foreign(lambda: db.execute(
         'SELECT id, item_refs, stats FROM memory_recalls WHERE task=? ORDER BY created DESC',
         (task,),
-    ).fetchall()
-    turn_rows = db.execute(
+    ).fetchall())
+    turn_rows = _call_foreign(lambda: db.execute(
         'SELECT id, request_id, raw_text FROM memory_turn_prompts WHERE task=?',
         (task,),
-    ).fetchall()
+    ).fetchall())
     skills_rows = [
         _public_skill(r)
-        for r in db.execute('SELECT * FROM memory_skills WHERE task=? ORDER BY event_id DESC', (task,)).fetchall()
+        for r in _call_foreign(lambda: list(db.execute('SELECT * FROM memory_skills WHERE task=? ORDER BY event_id DESC', (task,)).fetchall()))
     ]
-    case_count = db.execute(
+    case_count = _call_foreign(lambda: db.execute(
         "SELECT count(*) FROM memory_items WHERE task=? AND kind='case' AND status='active'",
         (task,),
-    ).fetchone()[0]
-    link_count = db.execute(
+    ).fetchone())[0]
+    link_count = _call_foreign(lambda: db.execute(
         'SELECT count(*) FROM memory_links WHERE task=?',
         (task,),
-    ).fetchone()[0]
+    ).fetchone())[0]
     links_by_relation = dict(
-        db.execute('SELECT relation, count(*) FROM memory_links WHERE task=? GROUP BY relation', (task,)).fetchall()
+        _call_foreign(lambda: db.execute('SELECT relation, count(*) FROM memory_links WHERE task=? GROUP BY relation', (task,)).fetchall())
     )
     impressions_by_id = Counter()
     elapsed_ms_list = []

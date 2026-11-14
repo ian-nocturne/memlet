@@ -1,4 +1,7 @@
 """CLI plug-in for sealed memory experiments."""
+
+from memlet.memlet_dream import call_foreign as _call_foreign
+
 import argparse
 from .vocabulary import JUDGE_UNAVAILABLE
 from . import cli_plugins
@@ -8,40 +11,40 @@ COMMANDS = {'eval': {'help': 'Measure memory on sealed held-out questions.', 'pr
 
 
 def register(sub):
-    parser = sub.add_parser('eval', prog='memlet admin eval', help=COMMANDS['eval']['help'])
-    parser.add_argument('--repo', default='.')
-    commands = parser.add_subparsers(dest='eval_action', required=True)
+    parser = _call_foreign(lambda: sub.add_parser('eval', prog='memlet admin eval', help=COMMANDS['eval']['help']))
+    _call_foreign(lambda: parser.add_argument('--repo', default='.'))
+    commands = _call_foreign(lambda: parser.add_subparsers(dest='eval_action', required=True))
     for name in ('init', 'questions', 'run', 'score', 'report', 'selftest', 'resolve'):
-        p = commands.add_parser(name)
-        p.add_argument('--repo', default=argparse.SUPPRESS)
+        p = _call_foreign(lambda: commands.add_parser(name))
+        _call_foreign(lambda: p.add_argument('--repo', default=argparse.SUPPRESS))
         cli_plugins.add_format_option(p)
         if name == 'selftest':
             continue
-        p.add_argument('--run', required=name != 'init')
+        _call_foreign(lambda: p.add_argument('--run', required=name != 'init'))
         if name == 'init':
-            p.add_argument('--dream-until', required=True)
-            p.add_argument('--sessions', default='session_logs', help='In-repo JSON/JSONL sessions; native transcripts limited to 2 MiB per file.')
-            p.add_argument('--budget', type=int, default=1200)
-            p.add_argument('--hints', action='store_true')
-            p.add_argument('--allow-post-split-memory', action='store_true')
+            _call_foreign(lambda: p.add_argument('--dream-until', required=True))
+            _call_foreign(lambda: p.add_argument('--sessions', default='session_logs', help='In-repo JSON/JSONL sessions; native transcripts limited to 2 MiB per file.'))
+            _call_foreign(lambda: p.add_argument('--budget', type=int, default=1200))
+            _call_foreign(lambda: p.add_argument('--hints', action='store_true'))
+            _call_foreign(lambda: p.add_argument('--allow-post-split-memory', action='store_true'))
         if name in ('questions', 'run', 'score'):
-            p.add_argument('--max-calls', type=int, default=1 if name == 'questions' else 100)
-            p.add_argument('--dry-run', action='store_true')
+            _call_foreign(lambda: p.add_argument('--max-calls', type=int, default=1 if name == 'questions' else 100))
+            _call_foreign(lambda: p.add_argument('--dry-run', action='store_true'))
         if name == 'questions':
-            group = p.add_mutually_exclusive_group(required=True)
-            group.add_argument('--from', dest='source')
-            group.add_argument('--via', help="Calls a model through your own vendor CLI.")
-            p.add_argument('--count', type=int, default=10)
+            group = _call_foreign(lambda: p.add_mutually_exclusive_group(required=True))
+            _call_foreign(lambda: group.add_argument('--from', dest='source'))
+            _call_foreign(lambda: group.add_argument('--via', help="Calls a model through your own vendor CLI."))
+            _call_foreign(lambda: p.add_argument('--count', type=int, default=10))
         if name == 'run':
-            p.add_argument('--via', required=True, help="Calls a model through your own vendor CLI.")
-            p.add_argument('--arms', nargs='+', choices=ev.ARMS)
+            _call_foreign(lambda: p.add_argument('--via', required=True, help="Calls a model through your own vendor CLI."))
+            _call_foreign(lambda: p.add_argument('--arms', nargs='+', choices=ev.ARMS))
         if name == 'score':
-            p.add_argument('--judge', help=JUDGE_UNAVAILABLE)
+            _call_foreign(lambda: p.add_argument('--judge', help=JUDGE_UNAVAILABLE))
         if name == 'resolve':
-            p.add_argument('--resolve', required=True)
-            p.add_argument('--by', required=True)
-            p.add_argument('--reason', required=True)
-            p.add_argument('--as', dest='as_status', required=True, choices=('failed', 'done-lost'))
+            _call_foreign(lambda: p.add_argument('--resolve', required=True))
+            _call_foreign(lambda: p.add_argument('--by', required=True))
+            _call_foreign(lambda: p.add_argument('--reason', required=True))
+            _call_foreign(lambda: p.add_argument('--as', dest='as_status', required=True, choices=('failed', 'done-lost')))
 
 
 def dispatch(args):
