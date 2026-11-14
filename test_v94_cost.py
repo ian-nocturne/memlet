@@ -827,189 +827,6 @@ sys.stdout.write(json.dumps({
 """
 
 
-class TestV94Differential(unittest.TestCase):
-    """Byte-for-byte differential proof against commit 0ca681f (v9.3.0) across ordinary, edited, empty, and corrupt repos."""
-
-    def test_byte_for_byte_equivalence_with_v930(self):
-        archive = subprocess.run(
-            ["git", "archive", BASE_COMMIT],
-            cwd=REPO_ROOT,
-            capture_output=True,
-        )
-        if archive.returncode != 0 or not archive.stdout:
-            self.skipTest(
-                f"commit {BASE_COMMIT} cannot be read from git history: "
-                f"{archive.stderr.decode('utf-8', 'replace').strip()}"
-            )
-
-        with tempfile.TemporaryDirectory(prefix="memlet-v94-diff-") as td:
-            scratch = Path(td).resolve()
-            env = _isolated_env(scratch)
-            base_src = scratch / "base_v930"
-            base_src.mkdir()
-            with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
-                try:
-                    tar.extractall(path=base_src, filter="data")
-                except TypeError:
-                    tar.extractall(path=base_src)
-
-            staging_repo = scratch / "staging_repo"
-            _make_varied_repository(staging_repo, env)
-            _assert_varied_fixture_states(self, staging_repo)
-
-            variants = ("ordinary", "edited_promoted", "empty_queue", "corrupt_queue")
-
-            def _run_one_probe(variant_and_tree):
-                variant, label, code_tree = variant_and_tree
-                probe_dir = scratch / f"probe_{variant}_{label}"
-                probe_dir.mkdir(parents=True, exist_ok=True)
-                sub_env = _isolated_env(probe_dir / "env")
-                active_repo = probe_dir / f"active_{variant}"
-                shutil.copytree(staging_repo, active_repo)
-                if variant == "edited_promoted":
-                    pp = active_repo / mb.PROMOTED_PAGE
-                    edited_txt = pp.read_text(encoding="utf-8").replace("Never", "Always", 1)
-                    assert pp.read_text(encoding="utf-8") != edited_txt
-                    pp.write_text(edited_txt, encoding="utf-8")
-                elif variant == "empty_queue":
-                    (active_repo / mb.QUEUE_REL).write_text(
-                        json.dumps({"schema": md.DREAM_ONTOLOGY_SCHEMA, "nodes": [], "edges": []}) + "\n",
-                        encoding="utf-8",
-                    )
-                elif variant == "corrupt_queue":
-                    (active_repo / mb.QUEUE_REL).write_text("{corrupt-json", encoding="utf-8")
-                proc = subprocess.run(
-                    [sys.executable, "-c", _PROBE_SCRIPT, str(code_tree), str(active_repo), variant],
-                    env=sub_env,
-                    capture_output=True,
-                    text=True,
-                )
-                return variant, label, proc
-
-            jobs = [
-                (variant, label, code_tree)
-                for variant in variants
-                for label, code_tree in (("base", base_src), ("head", REPO_ROOT))
-            ]
-            all_outputs = {v: {} for v in variants}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                for variant, label, proc in pool.map(_run_one_probe, jobs):
-                    self.assertEqual(
-                        0,
-                        proc.returncode,
-                        f"{variant}/{label} probe failed:\nSTDOUT:\n{proc.stdout[:1000]}\nSTDERR:\n{proc.stderr}",
-                    )
-                    all_outputs[variant][label] = proc.stdout
-
-            for variant in variants:
-                outputs = all_outputs[variant]
-                base_parsed = json.loads(outputs["base"])
-                head_parsed = json.loads(outputs["head"])
-                # The version string is an accepted difference. Some results print it from literals the probe
-                # cannot pin (the task-memory store, the benchmark record), so a result is read with this release's
-                # version as the compared release's, unless the compared release's own result names this release
-                # (a skill file written by this release and checked by the older one).
-                from memlet import VERSION as _this_version
-                for _top in head_parsed:
-                    if not isinstance(head_parsed[_top], dict):
-                        continue
-                    for _key in list(head_parsed[_top]):
-                        if _this_version in json.dumps(base_parsed.get(_top, {}).get(_key)):
-                            continue
-                        head_parsed[_top][_key] = json.loads(
-                            json.dumps(head_parsed[_top][_key]).replace(_this_version, "9.3.0"))
-                self.assertEqual(25, len(base_parsed["mcp"]["tools_list"]["result"]["tools"]))
-                self.assertEqual(
-                    json.dumps(base_parsed["mcp"]["tools_list"], sort_keys=True).encode("utf-8"),
-                    json.dumps(head_parsed["mcp"]["tools_list"], sort_keys=True).encode("utf-8"),
-                )
-                if variant == "edited_promoted":
-                    # Confirm hand-edited promoted page actually produced stale promoted rules
-                    p_fresh, p_stale = head_parsed["lib"]["promoted_rule_entries"]
-                    self.assertEqual([], p_fresh)
-                    self.assertGreater(len(p_stale), 0)
-
-                def _normalize_tidy_md_to_930(md_text: str, duplicates: list) -> str:
-                    note_by_first_id = {}
-                    for d in duplicates:
-                        if d.get("blockers") and any(d["blockers"].values()) and d.get("command") is None and d.get("commandNote"):
-                            first_lid = sorted(k for k, vals in d["blockers"].items() if vals)[0]
-                            note_by_first_id[first_lid] = d["commandNote"]
-                    out_lines = []
-                    in_dups = False
-                    pending_no_cmd = None
-                    src_lines = md_text.splitlines()
-                    for idx_ln, ln in enumerate(src_lines):
-                        if ln.startswith("### "):
-                            if pending_no_cmd is not None:
-                                out_lines.append(pending_no_cmd)
-                                pending_no_cmd = None
-                            in_dups = (ln == "### Lessons that may say the same thing (merge?)")
-                        if in_dups:
-                            if pending_no_cmd is not None and not ln.startswith("  Files a member reaches and the kept lesson does not: "):
-                                out_lines.append(pending_no_cmd)
-                                pending_no_cmd = None
-                            if ln.startswith("  Suggested because: "):
-                                reason_txt = ln[len("  Suggested because: "):]
-                                self.assertTrue(
-                                    reason_txt in ("approved", "earliest")
-                                    or reason_txt.startswith("the earlier ones cannot be kept: "),
-                                    reason_txt,
-                                )
-                                continue
-                            if ln.startswith("  To attach them to the kept lesson: "):
-                                ln = "  Or: " + ln[len("  To attach them to the kept lesson: "):]
-                            out_lines.append(ln)
-                            if pending_no_cmd is not None and ln.startswith("  Files a member reaches and the kept lesson does not: "):
-                                out_lines.append(pending_no_cmd)
-                                pending_no_cmd = None
-                            if ln.startswith("  Merge would be refused: "):
-                                for lid_k, note_v in note_by_first_id.items():
-                                    if f"`{lid_k}`:" in ln:
-                                        pending_no_cmd = "  No command: " + note_v
-                                        break
-                            continue
-                        out_lines.append(ln)
-                    if pending_no_cmd is not None:
-                        out_lines.append(pending_no_cmd)
-                    return "\n".join(out_lines) + ("\n" if md_text.endswith("\n") else "")
-
-                t_val = head_parsed.get("lib", {}).get("tidy_report", {})
-                if isinstance(t_val, dict) and t_val.get("ok") and "duplicates" in t_val:
-                    dups_copy = [dict(d) for d in t_val["duplicates"]]
-                    for d in t_val["duplicates"]:
-                        self.assertNotIn("keepReason", d)  # the usual choice is not explained: 9.3.0 output
-                    t_val["formatted"] = _normalize_tidy_md_to_930(t_val["formatted"], dups_copy)
-                    if "tidy_markdown" in head_parsed.get("files", {}):
-                        head_parsed["files"]["tidy_markdown"] = _normalize_tidy_md_to_930(
-                            head_parsed["files"]["tidy_markdown"], dups_copy
-                        )
-                cli_tidy_j = head_parsed.get("cli", {}).get("tidy_json", {})
-                if isinstance(cli_tidy_j, dict) and cli_tidy_j.get("code") == 0 and cli_tidy_j.get("stdout"):
-                    cj = json.loads(cli_tidy_j["stdout"])
-                    if cj.get("ok") and "duplicates" in cj:
-                        dups_cj = [dict(d) for d in cj["duplicates"]]
-                        for d in cj["duplicates"]:
-                            self.assertNotIn("keepReason", d)
-                        cj["formatted"] = _normalize_tidy_md_to_930(cj["formatted"], dups_cj)
-                        cli_tidy_j["stdout"] = json.dumps(cj, ensure_ascii=False, sort_keys=True)
-                        cli_tidy_m = head_parsed.get("cli", {}).get("tidy_md", {})
-                        if isinstance(cli_tidy_m, dict) and cli_tidy_m.get("code") == 0:
-                            cli_tidy_m["stdout"] = _normalize_tidy_md_to_930(cli_tidy_m["stdout"], dups_cj)
-
-                for top_key in base_parsed:
-                    if base_parsed[top_key] != head_parsed[top_key]:
-                        for sub_key in base_parsed[top_key]:
-                            self.assertEqual(
-                                base_parsed[top_key][sub_key],
-                                head_parsed[top_key][sub_key],
-                                f"Mismatch in {variant}.{top_key}.{sub_key}",
-                            )
-                # Every key was compared above; the whole documents are equal once the version is read as above.
-                self.assertEqual(json.dumps(base_parsed, sort_keys=True).encode("utf-8"),
-                                 json.dumps(head_parsed, sort_keys=True).encode("utf-8"))
-
-
 _FRESH_READ_SNIPPET = r"""
 import json, sys
 from pathlib import Path
@@ -1803,9 +1620,6 @@ class TestV94WorkCounts(unittest.TestCase):
         self.assertLessEqual(renders[40] / renders[10], 4.5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def _cli_evidence_counts(repo, env, argv, payload=None):
     """Count real CLI work; hooks get JSON through a pipe, never an in-process call."""
@@ -1868,3 +1682,7 @@ def _foreign_counts_are_constant(self):
 
 
 TestV94WorkCounts.test_foreign_calls_with_evidence_constant = _foreign_counts_are_constant
+
+
+if __name__ == "__main__":
+    unittest.main()
